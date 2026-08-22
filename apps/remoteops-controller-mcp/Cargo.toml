@@ -1,0 +1,40 @@
+[package]
+name = "remoteops-controller-mcp"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "RemoteOps 本地 STDIO MCP 服务"
+build = "../../build/windows-resource.rs"
+
+[package.metadata.winresource]
+FileDescription = "RemoteOps Controller MCP"
+ProductName = "RemoteOps"
+OriginalFilename = "remoteops-controller-mcp.exe"
+LegalCopyright = "Copyright (c) RemoteOps contributors"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+hex.workspace = true
+remoteops-application = { path = "../../crates/remoteops-application" }
+remoteops-audit = { path = "../../crates/remoteops-audit" }
+remoteops-domain = { path = "../../crates/remoteops-domain" }
+remoteops-device = { path = "../../crates/remoteops-device" }
+rmcp = { version = "3.0.1", features = ["elicitation", "server", "transport-io"] }
+schemars = "1.0"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+winresource.workspace = true
+
+[lints]
+workspace = true

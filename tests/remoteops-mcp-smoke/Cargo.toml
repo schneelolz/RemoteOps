@@ -1,0 +1,30 @@
+[package]
+name = "remoteops-mcp-smoke"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+description = "RemoteOps MCP 端到端验证工具"
+build = "../../build/windows-resource.rs"
+
+[package.metadata.winresource]
+FileDescription = "RemoteOps MCP Smoke Test"
+ProductName = "RemoteOps"
+OriginalFilename = "remoteops-mcp-smoke.exe"
+LegalCopyright = "Copyright (c) RemoteOps contributors"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+rmcp = { version = "3.0.1", features = ["client", "transport-child-process"] }
+serde_json.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+winresource.workspace = true
+
+[lints]
+workspace = true

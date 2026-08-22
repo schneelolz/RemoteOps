@@ -1,0 +1,39 @@
+[package]
+name = "remoteops-relay"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "RemoteOps TLS 中继服务"
+build = "../../build/windows-resource.rs"
+
+[package.metadata.winresource]
+FileDescription = "RemoteOps Relay"
+ProductName = "RemoteOps"
+OriginalFilename = "remoteops-relay.exe"
+LegalCopyright = "Copyright (c) RemoteOps contributors"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+rand.workspace = true
+rcgen = "0.14"
+remoteops-domain = { path = "../../crates/remoteops-domain" }
+remoteops-policy = { path = "../../crates/remoteops-policy" }
+remoteops-protocol = { path = "../../crates/remoteops-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+winresource.workspace = true
+
+[lints]
+workspace = true

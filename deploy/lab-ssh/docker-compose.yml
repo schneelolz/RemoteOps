@@ -1,0 +1,12 @@
+services:
+  remoteops-lab-ssh:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: remoteops-lab-ssh:1.1.1
+    container_name: "${REMOTEOPS_LAB_SSH_CONTAINER_NAME:-remoteops-lab-ssh}"
+    restart: "${REMOTEOPS_RESTART_POLICY:-unless-stopped}"
+    ports:
+      - "${REMOTEOPS_LAB_SSH_PORT:-22222}:22"
+    volumes:
+      - ./authorized_keys:/config/authorized_keys:ro

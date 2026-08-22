@@ -1,0 +1,33 @@
+{
+  "completed_at": "2026-07-31T20:19:04+08:00",
+  "scope": "脱敏三机实验室验收摘要",
+  "environment": {
+    "relay": "Linux Docker Relay",
+    "agents": 2,
+    "controller_roles": [
+      "human",
+      "ai"
+    ]
+  },
+  "verified": {
+    "docker_build_and_health": true,
+    "relay_restart_recovery": true,
+    "agent_identity_persistence": true,
+    "pairing_lease_expiry": true,
+    "multi_connection_isolation": true,
+    "human_and_ai_token_separation": true,
+    "human_approval_binding": true,
+    "cmd_and_windows_powershell": true,
+    "persistent_shell": true,
+    "tcp_port_probe": true,
+    "ssh_key_authentication": true,
+    "file_transfer_sha256": true,
+    "mcp_official_sdk_smoke": true,
+    "audit_export": true
+  },
+  "not_verified": [
+    "真实交换机 SSH",
+    "真实 USB/COM 串口打开、读写和断线恢复"
+  ],
+  "redaction": "已移除主机名、内网地址、GUID、会话标识、运行标识、端口映射和本地目录。"
+}

@@ -1,0 +1,8 @@
+{
+  "relay": "relay.example.com:7443",
+  "server_name": "relay.example.com",
+  "ca_cert": null,
+  "tls_fingerprint": null,
+  "reconnect_seconds": 2,
+  "owner_id": null
+}

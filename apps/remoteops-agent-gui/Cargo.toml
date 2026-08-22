@@ -1,0 +1,41 @@
+[package]
+name = "remoteops-agent-gui"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "RemoteOps Windows 现场被控端 GUI"
+build = "../../build/windows-resource.rs"
+
+[package.metadata.winresource]
+FileDescription = "RemoteOps Remote Assistance"
+ProductName = "RemoteOps"
+OriginalFilename = "remoteops-agent-gui.exe"
+LegalCopyright = "Copyright (c) RemoteOps contributors"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+eframe.workspace = true
+egui-phosphor.workspace = true
+remoteops-agent = { path = "../remoteops-agent" }
+remoteops-domain = { path = "../../crates/remoteops-domain" }
+remoteops-device = { path = "../../crates/remoteops-device" }
+remoteops-i18n = { path = "../../crates/remoteops-i18n" }
+remoteops-protocol = { path = "../../crates/remoteops-protocol" }
+rustls.workspace = true
+serde.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rfd = { version = "0.15.4", default-features = false }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+
+[build-dependencies]
+winresource.workspace = true
+
+[lints]
+workspace = true

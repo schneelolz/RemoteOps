@@ -1,0 +1,15 @@
+[package]
+name = "remoteops-session"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+remoteops-domain = { path = "../remoteops-domain" }
+
+[lints]
+workspace = true

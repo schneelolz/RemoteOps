@@ -1,0 +1,33 @@
+[package]
+name = "remoteops-agent-service"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "RemoteOps 可选 Windows Agent 服务宿主"
+build = "../../build/windows-resource.rs"
+
+[package.metadata.winresource]
+FileDescription = "RemoteOps Agent Service"
+ProductName = "RemoteOps"
+OriginalFilename = "remoteops-agent-service.exe"
+LegalCopyright = "Copyright (c) RemoteOps contributors"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+remoteops-agent = { path = "../remoteops-agent" }
+remoteops-domain = { path = "../../crates/remoteops-domain" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+windows-service = "0.8"
+
+[build-dependencies]
+winresource.workspace = true
+
+[lints]
+workspace = true

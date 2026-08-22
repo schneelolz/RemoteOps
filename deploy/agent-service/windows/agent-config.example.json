@@ -1,0 +1,9 @@
+{
+  "relay": "relay.example.com:7443",
+  "server_name": "relay.example.com",
+  "ca_cert": null,
+  "retry_seconds": 5,
+  "transfer_root": "transfers",
+  "state_file": "agent-state.json",
+  "trusted_full_access_owners": []
+}
