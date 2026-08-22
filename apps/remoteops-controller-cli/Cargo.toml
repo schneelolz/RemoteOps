@@ -1,0 +1,36 @@
+[package]
+name = "remoteops-controller-cli"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "RemoteOps 人工控制端 CLI"
+build = "../../build/windows-resource.rs"
+
+[package.metadata.winresource]
+FileDescription = "RemoteOps Controller CLI"
+ProductName = "RemoteOps"
+OriginalFilename = "remoteops-controller-cli.exe"
+LegalCopyright = "Copyright (c) RemoteOps contributors"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+hex.workspace = true
+remoteops-application = { path = "../../crates/remoteops-application" }
+remoteops-audit = { path = "../../crates/remoteops-audit" }
+remoteops-domain = { path = "../../crates/remoteops-domain" }
+remoteops-protocol = { path = "../../crates/remoteops-protocol" }
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+winresource.workspace = true
+
+[lints]
+workspace = true
+

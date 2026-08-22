@@ -1,0 +1,23 @@
+[package]
+name = "remoteops-ssh-askpass"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "RemoteOps Windows SSH askpass helper"
+build = "../../build/windows-resource.rs"
+
+[package.metadata.winresource]
+FileDescription = "RemoteOps SSH Askpass Helper"
+ProductName = "RemoteOps"
+OriginalFilename = "remoteops-ssh-askpass.exe"
+LegalCopyright = "Copyright (c) RemoteOps contributors"
+
+[build-dependencies]
+winresource.workspace = true
+
+[lints]
+workspace = true
+

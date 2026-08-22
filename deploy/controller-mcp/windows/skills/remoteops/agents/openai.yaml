@@ -1,0 +1,8 @@
+interface:
+  display_name: "RemoteOps Remote Diagnostics"
+  short_description: "Connect to field Agents for controlled remote diagnostics"
+  default_prompt: "Use $remoteops to connect to the field Agent and run read-only diagnostics."
+
+policy:
+  allow_implicit_invocation: true
+

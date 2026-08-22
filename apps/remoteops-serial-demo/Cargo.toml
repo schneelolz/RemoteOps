@@ -1,0 +1,38 @@
+[package]
+name = "remoteops-serial-demo"
+version = "0.5.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "RemoteOps 本地串口人机协作控制台 Demo"
+build = "../../build/windows-resource.rs"
+
+[package.metadata.winresource]
+FileDescription = "RemoteOps Serial AI Demo"
+ProductName = "RemoteOps"
+OriginalFilename = "remoteops-serial-demo.exe"
+LegalCopyright = "Copyright (c) RemoteOps contributors"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+hex.workspace = true
+remoteops-ai = { path = "../../crates/remoteops-ai" }
+remoteops-device = { path = "../../crates/remoteops-device" }
+remoteops-domain = { path = "../../crates/remoteops-domain" }
+remoteops-serial = { path = "../../crates/remoteops-serial" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+winresource.workspace = true
+
+[lints]
+workspace = true
+

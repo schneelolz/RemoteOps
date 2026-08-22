@@ -1,0 +1,28 @@
+services:
+  remoteops-relay:
+    build:
+      context: ../..
+      dockerfile: "${REMOTEOPS_RELAY_DOCKERFILE:-deploy/relay/Dockerfile}"
+    image: "${REMOTEOPS_RELAY_IMAGE:-remoteops-relay:0.2.0-preview.1}"
+    container_name: "${REMOTEOPS_RELAY_CONTAINER_NAME:-remoteops-relay}"
+    restart: "${REMOTEOPS_RESTART_POLICY:-unless-stopped}"
+    environment:
+      REMOTEOPS_TLS_SANS: "${REMOTEOPS_TLS_SANS:?必须设置 Relay TLS SAN，至少包含 Controller 和 Agent 使用的公网域名或 IP}"
+      REMOTEOPS_HEALTH_BIND: "0.0.0.0:8080"
+      REMOTEOPS_STATE_FILE: "/data/relay-state.json"
+      REMOTEOPS_LEASE_SECONDS: "${REMOTEOPS_LEASE_SECONDS:-600}"
+      REMOTEOPS_HUMAN_CONTROLLER_TOKEN: "${REMOTEOPS_HUMAN_CONTROLLER_TOKEN:?必须设置人工 Controller Token}"
+      REMOTEOPS_AI_CONTROLLER_TOKEN: "${REMOTEOPS_AI_CONTROLLER_TOKEN:?必须设置 AI Controller Token}"
+      REMOTEOPS_CONTROLLER_OWNER_ID: "${REMOTEOPS_CONTROLLER_OWNER_ID:?必须设置 Controller Owner ID}"
+      REMOTEOPS_MAX_CONNECTIONS: "${REMOTEOPS_MAX_CONNECTIONS:-1024}"
+      REMOTEOPS_TLS_HANDSHAKE_TIMEOUT_SECONDS: "${REMOTEOPS_TLS_HANDSHAKE_TIMEOUT_SECONDS:-10}"
+    ports:
+      - "${REMOTEOPS_RELAY_PORT:-7443}:7443"
+      - "127.0.0.1:${REMOTEOPS_HEALTH_PORT:-18080}:8080"
+    volumes:
+      - remoteops-relay-data:/data
+
+volumes:
+  remoteops-relay-data:
+    name: "${REMOTEOPS_RELAY_VOLUME_NAME:-remoteops-relay-data}"
+
