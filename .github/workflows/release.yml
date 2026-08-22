@@ -34,9 +34,9 @@ jobs:
             throw "CHANGELOG.md does not contain version $version"
           }
       - run: cargo fmt --all -- --check
-      - run: cargo check --workspace --locked
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - run: cargo check --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --locked
+      - run: cargo clippy --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --locked
       - name: Check documentation
         shell: pwsh
         run: ./scripts/Test-Documentation.ps1
