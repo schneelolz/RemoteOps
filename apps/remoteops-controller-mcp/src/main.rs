@@ -2793,6 +2793,8 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
     Ok(())
 }
 
+#[allow(unknown_lints)]
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(
     name = "remoteops-controller",
     version = "0.2.0-preview.1",

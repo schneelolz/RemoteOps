@@ -1053,7 +1053,9 @@ fn serial_input(
             return Err(SerialInputError::InvalidHexDigits);
         }
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (hex_value(pair[0]) << 4) | hex_value(pair[1]))
             .collect()
     } else {

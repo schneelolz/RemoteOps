@@ -2770,7 +2770,10 @@ fn command_summary_line_utf16_le(executable: &str, arguments: &[&str]) -> Option
         return None;
     }
     let units = bytes
-        .chunks_exact(2)
+        .as_slice()
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
     let text = String::from_utf16(&units).ok()?;
@@ -2807,14 +2810,18 @@ fn command_exists(executable: &str) -> bool {
 
 /// 创建不会在 Windows GUI 旁弹出控制台窗口的后台命令。
 fn background_command(executable: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-    let mut command = std::process::Command::new(executable);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
 
+        let mut command = std::process::Command::new(executable);
         command.creation_flags(CREATE_NO_WINDOW);
+        command
     }
-    command
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(executable)
+    }
 }
 
 fn local_hostname() -> String {
