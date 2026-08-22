@@ -18,7 +18,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-#[cfg(windows)]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 #[cfg(windows)]
 use local_encoding_ng::{Encoder, windows::EncoderCodePage};
@@ -41,7 +40,6 @@ use tokio::{
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
-#[cfg(windows)]
 #[cfg(windows)]
 const WINDOWS_OEM_CODE_PAGE: u32 = 1;
 
@@ -440,9 +438,10 @@ impl Drop for ManagedChild {
     }
 }
 
-fn spawn_managed_process(mut command: Command) -> Result<ManagedChild, DeviceError> {
+fn spawn_managed_process(command: Command) -> Result<ManagedChild, DeviceError> {
     #[cfg(windows)]
     {
+        let mut command = command;
         command.creation_flags(CREATE_NO_WINDOW.0);
         let job = win32job::Job::create()
             .map_err(|error| DeviceError::Operation(format!("无法创建 Windows Job：{error}")))?;
