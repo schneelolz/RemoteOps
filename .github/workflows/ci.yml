@@ -43,7 +43,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - run: cargo check --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --locked
+      - run: cargo check --workspace --locked
       - run: cargo test --workspace --locked -- --test-threads=1
       - shell: pwsh
         run: ./scripts/Test-Documentation.ps1
@@ -93,4 +93,4 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: msrv-1.95.0
-      - run: cargo check --workspace --locked
+      - run: cargo check --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --locked
