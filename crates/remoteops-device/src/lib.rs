@@ -1587,7 +1587,7 @@ impl SystemDevice {
                         "/D".to_owned(),
                         "/S".to_owned(),
                         "/C".to_owned(),
-                        format!("chcp 65001>nul & {command}"),
+                        command.to_owned(),
                     ],
                 )),
                 ShellKind::WindowsPowerShell => Ok((
@@ -3282,14 +3282,25 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn cmd_one_shot_preserves_utf8_output() {
+        let script =
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Write-Output 'CMD中文-RemoteOps'";
+        let encoded_script = BASE64.encode(
+            script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let command = format!(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded_script}"
+        );
         let device = SystemDevice::new();
         let (sender, receiver) = mpsc::unbounded_channel();
         drop(receiver);
 
         let result = device
-            .run_streaming(ShellKind::Cmd, "echo CMD中文-RemoteOps", 10, sender)
+            .run_streaming(ShellKind::Cmd, &command, 10, sender)
             .await
-            .expect("CMD 中文命令应执行成功");
+            .expect("CMD 子进程的 UTF-8 输出应执行成功");
 
         assert_eq!(result.exit_code, Some(0));
         assert!(
