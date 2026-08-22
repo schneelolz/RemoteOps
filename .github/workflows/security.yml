@@ -25,9 +25,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: cargo fmt --all -- --check
-      - run: cargo check --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --locked
-      - run: cargo clippy --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --locked
+      - run: cargo check --workspace --exclude remoteops-agent-gui --exclude remoteops-agent-service --exclude remoteops-controller-gui --locked
+      - run: cargo clippy --workspace --exclude remoteops-agent-gui --exclude remoteops-agent-service --exclude remoteops-controller-gui --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --exclude remoteops-agent-gui --exclude remoteops-agent-service --exclude remoteops-controller-gui --locked
       - name: Check documentation
         shell: pwsh
         run: ./scripts/Test-Documentation.ps1
