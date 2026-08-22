@@ -338,7 +338,7 @@ pub fn normalize_certificate_fingerprint(value: &str) -> Result<String, TlsError
     }
     let uppercase = compact.to_ascii_uppercase();
     let mut normalized = String::with_capacity(95);
-    for (index, chunk) in uppercase.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in uppercase.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         if index > 0 {
             normalized.push(':');
         }

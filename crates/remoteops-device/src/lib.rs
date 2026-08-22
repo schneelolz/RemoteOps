@@ -78,6 +78,7 @@ struct SshCredentialKey {
     username: String,
 }
 
+#[cfg(windows)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedSshCredential {
     host: String,
@@ -86,6 +87,7 @@ struct PersistedSshCredential {
     password: String,
 }
 
+#[cfg(windows)]
 const SSH_CREDENTIALS_FILE_NAME: &str = "ssh-credentials.dpapi";
 
 /// 仅保存在 Agent 当前进程内存中的 SSH 密码凭据。
@@ -1529,7 +1531,8 @@ impl SystemDevice {
     /// # Errors
     ///
     /// 当请求的 Shell 不可用或子进程管道无法创建时返回错误。
-    #[allow(clippy::unused_async)]
+    #[allow(unknown_lints)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn open_interactive_shell(
         &self,
         shell: ShellKind,
@@ -1699,6 +1702,7 @@ impl SystemDevice {
         }
     }
 
+    #[cfg(windows)]
     async fn run_process(
         &self,
         executable: String,
@@ -1711,6 +1715,7 @@ impl SystemDevice {
             .await
     }
 
+    #[cfg(windows)]
     async fn run_process_streaming(
         &self,
         executable: String,
@@ -3036,6 +3041,7 @@ fn decode_shell_output(output_encoding: ProcessOutputEncoding, bytes: &[u8]) -> 
     decoder.push(bytes, true)
 }
 
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
 fn encode_shell_input(shell: ShellKind, text: &str) -> Result<Vec<u8>, DeviceError> {
     #[cfg(windows)]
     if matches!(shell, ShellKind::Cmd | ShellKind::System) {
