@@ -626,6 +626,7 @@ function renderSidebar() {
     { id: 'sessions', name: '会话管理', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>', badge: activeCount },
     { id: 'agents', name: 'Agent 节点', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>', badge: agentCount },
     { id: 'identity', name: 'Relay 身份凭据', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="11" r="3"/></svg>' },
+    { id: 'settings', name: '安全设置', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-1.9 1.9-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V20h-2.7v-.09a1.7 1.7 0 0 0-1.03-1.56 1.7 1.7 0 0 0-1.88.34l-.06.06-1.9-1.9.06-.06A1.7 1.7 0 0 0 7.76 15a1.7 1.7 0 0 0-1.56-1.03H6v-2.7h.2A1.7 1.7 0 0 0 7.76 10a1.7 1.7 0 0 0-.34-1.88l-.06-.06 1.9-1.9.06.06a1.7 1.7 0 0 0 1.88.34 1.7 1.7 0 0 0 1.03-1.56V5h2.7v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 1.9 1.9-.06.06A1.7 1.7 0 0 0 19.4 10c.18.62.75 1.03 1.4 1.03h.2v2.7h-.2A1.7 1.7 0 0 0 19.4 15z"/></svg>' },
     { id: 'audit', name: '审计日志', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>', badge: auditCount }
   ];
 
@@ -1195,6 +1196,84 @@ function renderIdentityView() {
       </div>
     </div>
   `;
+}
+
+// Views: Security Settings
+function renderSettingsView() {
+  return `
+    <div>
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">
+            <svg class="w-5 h-5 text-blue-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-1.9 1.9-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V20h-2.7v-.09a1.7 1.7 0 0 0-1.03-1.56 1.7 1.7 0 0 0-1.88.34l-.06.06-1.9-1.9.06-.06A1.7 1.7 0 0 0 7.76 15a1.7 1.7 0 0 0-1.56-1.03H6v-2.7h.2A1.7 1.7 0 0 0 7.76 10a1.7 1.7 0 0 0-.34-1.88l-.06-.06 1.9-1.9.06.06a1.7 1.7 0 0 0 1.88.34 1.7 1.7 0 0 0 1.03-1.56V5h2.7v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 1.9 1.9-.06.06A1.7 1.7 0 0 0 19.4 10c.18.62.75 1.03 1.4 1.03h.2v2.7h-.2A1.7 1.7 0 0 0 19.4 15z"/></svg>
+            安全设置 (Security Settings)
+          </h1>
+          <div class="page-desc">修改管理页面密码。修改成功后所有已登录设备都需要重新登录。</div>
+        </div>
+      </div>
+
+      <div class="card" style="max-width:620px;">
+        <div class="section-title">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          修改管理页面密码
+        </div>
+        <p style="font-size:12px; color:var(--text-secondary); line-height:1.5; margin-bottom:16px;">密码会以随机盐哈希形式保存到 Relay 状态文件，不会保存明文。</p>
+        <form onsubmit="handleChangePassword(event)" style="display:flex; flex-direction:column; gap:14px;">
+          <div class="input-group">
+            <label class="input-label">当前密码</label>
+            <input id="current-admin-password" type="password" class="input font-mono" autocomplete="current-password" required />
+          </div>
+          <div class="input-group">
+            <label class="input-label">新密码</label>
+            <input id="new-admin-password" type="password" class="input font-mono" minlength="16" autocomplete="new-password" required />
+          </div>
+          <div class="input-group">
+            <label class="input-label">确认新密码</label>
+            <input id="confirm-admin-password" type="password" class="input font-mono" minlength="16" autocomplete="new-password" required />
+          </div>
+          <div id="password-change-error" style="display:none; padding:8px 10px; background:var(--status-danger-bg); border:1px solid var(--status-danger-border); border-radius:4px; color:var(--status-danger-text); font-size:11.5px;"></div>
+          <div style="display:flex; justify-content:flex-end; margin-top:4px;">
+            <button id="password-change-submit" type="submit" class="btn btn-primary btn-sm">修改密码</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+async function handleChangePassword(event) {
+  event.preventDefault();
+  const button = document.getElementById('password-change-submit');
+  const errorBox = document.getElementById('password-change-error');
+  const currentPassword = document.getElementById('current-admin-password').value;
+  const newPassword = document.getElementById('new-admin-password').value;
+  const confirmPassword = document.getElementById('confirm-admin-password').value;
+  errorBox.style.display = 'none';
+  if (newPassword !== confirmPassword) {
+    errorBox.innerText = '两次输入的新密码不一致';
+    errorBox.style.display = 'block';
+    return;
+  }
+  button.disabled = true;
+  button.innerText = '正在修改...';
+  try {
+    await apiFetch('/api/admin/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword, confirm_password: confirmPassword })
+    });
+    state.isLoggedIn = false;
+    state.api.connected = false;
+    state.api.token = '';
+    state.currentTab = 'overview';
+    renderApp();
+    showToast('密码修改成功，请使用新密码重新登录', 'success');
+  } catch (error) {
+    button.disabled = false;
+    button.innerText = '修改密码';
+    errorBox.innerText = `密码修改失败：${error.message}`;
+    errorBox.style.display = 'block';
+  }
 }
 
 // Views: Audit Logs
@@ -1776,6 +1855,7 @@ function renderApp() {
     case 'sessions': contentHtml = renderSessionsView(); break;
     case 'agents': contentHtml = renderAgentsView(); break;
     case 'identity': contentHtml = renderIdentityView(); break;
+    case 'settings': contentHtml = renderSettingsView(); break;
     case 'audit': contentHtml = renderAuditView(); break;
     default: contentHtml = renderOverviewView();
   }

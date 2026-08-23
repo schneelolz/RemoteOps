@@ -88,6 +88,13 @@ struct Args {
     /// 是否为管理 Session Cookie 添加 Secure 属性。
     #[arg(long, env = "REMOTEOPS_ADMIN_COOKIE_SECURE", default_value_t = true)]
     admin_cookie_secure: bool,
+    /// 使用 `REMOTEOPS_ADMIN_PASSWORD` 覆盖状态文件中的管理密码哈希。
+    #[arg(
+        long,
+        env = "REMOTEOPS_ADMIN_PASSWORD_FORCE_RESET",
+        default_value_t = false
+    )]
+    admin_password_force_reset: bool,
 }
 
 #[tokio::main]
@@ -142,6 +149,13 @@ async fn main() -> anyhow::Result<()> {
             )
         })?,
     );
+    relay
+        .initialize_admin_password(
+            args.admin_password.as_deref(),
+            args.admin_password_force_reset,
+        )
+        .await
+        .context("无法初始化 Relay 管理页面密码")?;
     tokio::spawn(health_server(health_listener));
     let admin_token = args.admin_token.filter(|token| !token.is_empty());
     let admin_username = args.admin_username.filter(|value| !value.is_empty());

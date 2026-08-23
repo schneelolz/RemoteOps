@@ -301,6 +301,14 @@ struct RelayState {
     in_flight: BTreeMap<RequestId, InFlightRequest>,
     next_controller_generation: u64,
     audit_log: Vec<AdminAuditEvent>,
+    admin_password_hash: Option<AdminPasswordHash>,
+}
+
+/// 管理页面密码的随机盐哈希。状态文件中不保存密码明文。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct AdminPasswordHash {
+    salt: String,
+    digest: String,
 }
 
 /// 管理审计事件。仅保存操作摘要，不保存认证令牌或绑定令牌。
@@ -345,6 +353,8 @@ struct PersistedRelayState {
     agents: Vec<PersistedAgent>,
     #[serde(default)]
     audit_log: Vec<AdminAuditEvent>,
+    #[serde(default)]
+    admin_password_hash: Option<AdminPasswordHash>,
 }
 
 /// Relay 的并发安全业务入口。
@@ -536,7 +546,7 @@ impl Relay {
             Some("relay_admin".to_owned()),
             false,
             source,
-            "管理 Token 校验失败",
+            "管理凭据校验失败",
         );
         if let Err(error) = self.persist_state_locked(&state) {
             warn!(error = %error, "无法持久化管理认证失败审计事件");
@@ -819,6 +829,111 @@ impl Relay {
             return Ok(());
         };
         save_persisted_state(path, state)
+    }
+
+    /// 使用环境变量初始化或强制重置管理页面密码。
+    pub async fn initialize_admin_password(
+        &self,
+        configured_password: Option<&str>,
+        force_reset: bool,
+    ) -> anyhow::Result<()> {
+        let Some(password) = configured_password.filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+        validate_admin_password(password).map_err(anyhow::Error::msg)?;
+        let mut state = self.state.lock().await;
+        if force_reset || state.admin_password_hash.is_none() {
+            state.admin_password_hash = Some(hash_admin_password(password));
+            self.persist_state_locked(&state)?;
+        }
+        Ok(())
+    }
+
+    /// 验证管理页面密码。
+    pub async fn admin_password_matches(&self, password: &str) -> bool {
+        let state = self.state.lock().await;
+        state
+            .admin_password_hash
+            .as_ref()
+            .is_some_and(|stored| verify_admin_password(password, stored))
+    }
+
+    /// 判断是否已经存在持久化的管理密码哈希。
+    pub async fn admin_password_configured(&self) -> bool {
+        self.state.lock().await.admin_password_hash.is_some()
+    }
+
+    /// 更新管理页面密码并持久化哈希。
+    pub async fn admin_change_password(
+        &self,
+        current_password: &str,
+        new_password: &str,
+        source: &str,
+        fallback_password: Option<&str>,
+    ) -> AdminActionOutcome {
+        let mut state = self.state.lock().await;
+        let valid = state
+            .admin_password_hash
+            .as_ref()
+            .is_some_and(|stored| verify_admin_password(current_password, stored))
+            || (state.admin_password_hash.is_none()
+                && fallback_password.is_some_and(|configured| {
+                    constant_time_bytes_eq(current_password.as_bytes(), configured.as_bytes())
+                }));
+        if !valid {
+            append_audit(
+                &mut state,
+                "admin_password_change",
+                Some("relay_admin".to_owned()),
+                false,
+                source,
+                "当前管理密码校验失败",
+            );
+            let _ = self.persist_state_locked(&state);
+            return AdminActionOutcome {
+                success: false,
+                changed: false,
+                message: "当前密码不正确".to_owned(),
+            };
+        }
+        if let Err(error) = validate_admin_password(new_password) {
+            append_audit(
+                &mut state,
+                "admin_password_change",
+                Some("relay_admin".to_owned()),
+                false,
+                source,
+                &error,
+            );
+            let _ = self.persist_state_locked(&state);
+            return AdminActionOutcome {
+                success: false,
+                changed: false,
+                message: error,
+            };
+        }
+        state.admin_password_hash = Some(hash_admin_password(new_password));
+        append_audit(
+            &mut state,
+            "admin_password_change",
+            Some("relay_admin".to_owned()),
+            true,
+            source,
+            "管理页面密码已修改，所有登录 Session 已失效",
+        );
+        if let Err(error) = self.persist_state_locked(&state) {
+            warn!(error = %error, "无法持久化管理密码修改");
+            return AdminActionOutcome {
+                success: false,
+                changed: false,
+                message: "密码修改失败，无法写入 Relay 状态文件".to_owned(),
+            };
+        }
+        AdminActionOutcome {
+            success: true,
+            changed: true,
+            message: "密码修改成功，请使用新密码重新登录".to_owned(),
+        }
     }
 
     /// 启动过期租约清理任务。
@@ -2716,6 +2831,45 @@ fn token_fingerprint(token: &str) -> Option<String> {
     Some(hex::encode(Sha256::digest(token.as_bytes())))
 }
 
+fn validate_admin_password(password: &str) -> Result<(), String> {
+    if password.chars().count() < 16 {
+        return Err("管理密码至少需要 16 个字符".to_owned());
+    }
+    if password.len() > 1024 {
+        return Err("管理密码不能超过 1024 字节".to_owned());
+    }
+    Ok(())
+}
+
+fn hash_admin_password(password: &str) -> AdminPasswordHash {
+    let salt = Uuid::new_v4().simple().to_string();
+    let digest = password_digest(password, &salt);
+    AdminPasswordHash { salt, digest }
+}
+
+fn verify_admin_password(password: &str, stored: &AdminPasswordHash) -> bool {
+    constant_time_bytes_eq(
+        password_digest(password, &stored.salt).as_bytes(),
+        stored.digest.as_bytes(),
+    )
+}
+
+fn password_digest(password: &str, salt: &str) -> String {
+    hex::encode(Sha256::digest(
+        format!("remoteops-admin-password-v1:{salt}:{password}").as_bytes(),
+    ))
+}
+
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    let maximum = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..maximum {
+        difference |= usize::from(left.get(index).copied().unwrap_or_default())
+            ^ usize::from(right.get(index).copied().unwrap_or_default());
+    }
+    difference == 0
+}
+
 fn legacy_agent_was_paired() -> bool {
     true
 }
@@ -2737,6 +2891,7 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
     }
     let now = Utc::now();
     state.audit_log = persisted.audit_log;
+    state.admin_password_hash = persisted.admin_password_hash;
     let mut session_ids = BTreeSet::new();
     ensure_agent_capacity(persisted.agents.len().saturating_sub(1))?;
     for persisted_agent in persisted.agents {
@@ -2818,6 +2973,7 @@ fn save_persisted_state(path: &Path, state: &RelayState) -> anyhow::Result<()> {
         version: PERSISTED_STATE_VERSION,
         agents,
         audit_log: state.audit_log.clone(),
+        admin_password_hash: state.admin_password_hash.clone(),
     })?;
     let file_name = path
         .file_name()
@@ -5158,5 +5314,32 @@ mod tests {
 
         let (_, _, resumed_session_id) = ready_agent(&relay, agent_id, Some(resume_token)).await;
         assert_eq!(resumed_session_id, session_id);
+    }
+
+    #[tokio::test]
+    async fn admin_password_hash_persists_and_can_be_changed() {
+        let state_file = TestStateFile::new("admin-password");
+        let initial = "initial-admin-password-123";
+        let replacement = "replacement-admin-password-456";
+        let relay = persisted_relay(&state_file.path, Duration::minutes(10)).expect("Relay 应启动");
+        relay
+            .initialize_admin_password(Some(initial), false)
+            .await
+            .expect("应初始化管理密码");
+        assert!(relay.admin_password_matches(initial).await);
+        assert!(!relay.admin_password_matches(replacement).await);
+
+        let outcome = relay
+            .admin_change_password(initial, replacement, "test", None)
+            .await;
+        assert!(outcome.success);
+        assert!(!relay.admin_password_matches(initial).await);
+        assert!(relay.admin_password_matches(replacement).await);
+        drop(relay);
+
+        let restored =
+            persisted_relay(&state_file.path, Duration::minutes(10)).expect("Relay 应恢复");
+        assert!(restored.admin_password_matches(replacement).await);
+        assert!(!restored.admin_password_matches(initial).await);
     }
 }

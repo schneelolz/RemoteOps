@@ -126,6 +126,16 @@ pub(crate) struct LoginRequest {
     password: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ChangePasswordRequest {
+    #[serde(rename = "current_password")]
+    current: String,
+    #[serde(rename = "new_password")]
+    new: String,
+    #[serde(rename = "confirm_password")]
+    confirm: String,
+}
+
 #[derive(Debug, Serialize)]
 struct LoginResponse {
     authenticated: bool,
@@ -161,6 +171,7 @@ pub(crate) async fn serve(
     let app = Router::new()
         .route("/api/admin/login", post(login))
         .route("/api/admin/logout", post(logout))
+        .route("/api/admin/password", post(change_password))
         .route("/api/admin/overview", get(overview))
         .route("/api/admin/identity", get(identity))
         .route("/api/admin/agents", get(agents))
@@ -191,14 +202,18 @@ async fn login(
     headers: HeaderMap,
     ExtractJson(request): ExtractJson<LoginRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let valid = state
+    let username_valid = state
         .username
         .as_ref()
-        .zip(state.password.as_ref())
-        .is_some_and(|(username, password)| {
-            constant_time_eq(request.username.as_bytes(), username.as_bytes())
-                && constant_time_eq(request.password.as_bytes(), password.as_bytes())
-        });
+        .is_some_and(|username| constant_time_eq(request.username.as_bytes(), username.as_bytes()));
+    let password_valid = if state.relay.admin_password_configured().await {
+        state.relay.admin_password_matches(&request.password).await
+    } else {
+        state.password.as_ref().is_some_and(|password| {
+            constant_time_eq(request.password.as_bytes(), password.as_bytes())
+        })
+    };
+    let valid = username_valid && password_valid;
     if !valid {
         let source = request_source(&headers);
         state.relay.admin_auth_failure(source).await;
@@ -225,6 +240,53 @@ async fn login(
         axum::http::header::SET_COOKIE,
         cookie.parse().expect("管理 Session Cookie 应为合法 Header"),
     );
+    Ok(response)
+}
+
+async fn change_password(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    ExtractJson(request): ExtractJson<ChangePasswordRequest>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers).await?;
+    if request.new != request.confirm {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "两次输入的新密码不一致".to_owned(),
+            }),
+        ));
+    }
+    let outcome = state
+        .relay
+        .admin_change_password(
+            &request.current,
+            &request.new,
+            request_source(&headers),
+            state.password.as_deref().map(String::as_str),
+        )
+        .await;
+    if !outcome.success {
+        let status = if outcome.message == "当前密码不正确" {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        return Err((
+            status,
+            Json(ErrorResponse {
+                error: outcome.message,
+            }),
+        ));
+    }
+    let mut response = Json(outcome).into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        session_cookie("", state.secure_cookie, true)
+            .parse()
+            .expect("管理 Session Cookie 应为合法 Header"),
+    );
+    state.sessions.lock().await.clear();
     Ok(response)
 }
 

@@ -119,6 +119,7 @@ REMOTEOPS_RELAY_ADMIN_PORT=18081
 REMOTEOPS_ADMIN_TOKEN=<至少 32 字节的随机管理 Token>
 REMOTEOPS_ADMIN_USERNAME=<管理页面用户名>
 REMOTEOPS_ADMIN_PASSWORD=<至少 16 字节的随机管理密码>
+REMOTEOPS_ADMIN_PASSWORD_FORCE_RESET=false
 REMOTEOPS_HUMAN_CONTROLLER_TOKEN=<至少 32 字节的随机值>
 REMOTEOPS_AI_CONTROLLER_TOKEN=<另一组至少 32 字节的随机值>
 REMOTEOPS_CONTROLLER_OWNER_ID=<非全零 UUID>
@@ -142,6 +143,8 @@ docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml l
 ```
 
 管理页面访问 `http://127.0.0.1:18081/`，公网反向代理访问时页面会自动使用当前 HTTPS 域名，不需要填写管理地址。登录使用 `REMOTEOPS_ADMIN_USERNAME` 和 `REMOTEOPS_ADMIN_PASSWORD`，成功后使用 HttpOnly Cookie Session。`REMOTEOPS_ADMIN_TOKEN` 保留给内部脚本和应急 API 调用。管理服务默认只绑定宿主机回环地址；需要远程访问时，应通过 HTTPS 反向代理暴露，不能直接把管理端口开放到公网。页面不显示 AI/Human Token 明文，只展示 Owner UUID、配置状态和 AI Token 指纹。
+
+登录后可在“安全设置”中修改管理页面密码。密码以随机盐哈希写入 `/data/relay-state.json`，Relay 重启后仍然有效；修改成功会使所有已有管理 Session 失效。首次部署或忘记页面密码时，可在 `.env` 中设置新密码并临时设置 `REMOTEOPS_ADMIN_PASSWORD_FORCE_RESET=true`，重启一次后再恢复为 `false`。不要在公网提交或暴露 `.env`。
 
 完成 Relay 后，再继续启动 Agent 和安装本机 MCP。完整的部署边界、证书说明、备份和故障排查见 [docs/Relay部署说明.md](docs/Relay部署说明.md)；实验室三机验收仍见 [docs/部署与三机验收手册.md](docs/部署与三机验收手册.md)。
 

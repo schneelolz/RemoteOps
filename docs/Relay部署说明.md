@@ -55,6 +55,7 @@ REMOTEOPS_RELAY_ADMIN_PORT=18081
 REMOTEOPS_ADMIN_TOKEN=<至少 32 字节的随机管理 Token>
 REMOTEOPS_ADMIN_USERNAME=<管理页面用户名>
 REMOTEOPS_ADMIN_PASSWORD=<至少 16 字节的随机管理密码>
+REMOTEOPS_ADMIN_PASSWORD_FORCE_RESET=false
 REMOTEOPS_HUMAN_CONTROLLER_TOKEN=<至少 32 字节的随机值>
 REMOTEOPS_AI_CONTROLLER_TOKEN=<另一组至少 32 字节的随机值>
 REMOTEOPS_CONTROLLER_OWNER_ID=<非全零 UUID>
@@ -87,6 +88,8 @@ docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml l
 ```
 
 管理页面位于 `http://127.0.0.1:18081/`；通过 HTTPS 反向代理访问时会自动使用当前域名。页面登录使用管理用户名和密码，服务端发放 HttpOnly Cookie Session；Bearer Token 仅保留给内部脚本和应急 API。管理服务默认只监听宿主机回环地址；如果需要远程访问，请放在 HTTPS 反向代理后面。管理页面不会返回任何 Controller Token、Agent resume token 或 Session binding token 明文。
+
+登录后进入“安全设置”即可修改管理页面密码。密码会以随机盐哈希形式保存到 Relay 状态文件，重启后仍然有效，修改后所有已有登录 Session 会失效。忘记密码时，在 `.env` 中设置新的 `REMOTEOPS_ADMIN_PASSWORD`，临时将 `REMOTEOPS_ADMIN_PASSWORD_FORCE_RESET=true`，重新部署一次后务必恢复为 `false`。不要删除状态数据卷来重置密码，否则会同时丢失 Agent 恢复状态和审计日志。
 
 健康接口返回 `ok`，且容器状态为 `healthy` 后，使用下面的形式记录 Relay 地址：
 
