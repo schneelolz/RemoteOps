@@ -143,6 +143,12 @@ struct LoginResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct SessionResponse {
+    authenticated: bool,
+    username: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -171,6 +177,7 @@ pub(crate) async fn serve(
     let app = Router::new()
         .route("/api/admin/login", post(login))
         .route("/api/admin/logout", post(logout))
+        .route("/api/admin/session", get(session_status))
         .route("/api/admin/password", post(change_password))
         .route("/api/admin/overview", get(overview))
         .route("/api/admin/identity", get(identity))
@@ -288,6 +295,17 @@ async fn change_password(
     );
     state.sessions.lock().await.clear();
     Ok(response)
+}
+
+async fn session_status(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers).await?;
+    Ok(Json(SessionResponse {
+        authenticated: true,
+        username: state.username.as_ref().map(|value| value.as_ref().clone()),
+    }))
 }
 
 async fn logout(

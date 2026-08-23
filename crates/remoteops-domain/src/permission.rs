@@ -14,4 +14,3 @@ pub enum PermissionMode {
     /// 已认证 Owner 显式授权后，操作不再逐项审批。
     FullAccess,
 }
-

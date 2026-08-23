@@ -22,4 +22,3 @@ pub enum DomainError {
     #[error("当前会话状态不允许该操作：{0}")]
     InvalidSessionState(String),
 }
-

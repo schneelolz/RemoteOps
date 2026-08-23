@@ -1592,4 +1592,3 @@ mod tests {
         assert_eq!(history.last().map(|turn| turn.user.as_str()), Some("u-9"));
     }
 }
-

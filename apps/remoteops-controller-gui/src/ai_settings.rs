@@ -532,4 +532,3 @@ experimental_bearer_token = "secret-that-must-not-appear
         LOCK.get_or_init(|| Mutex::new(()))
     }
 }
-

@@ -69,4 +69,3 @@ pub enum ShellKind {
     /// 平台默认 Shell。
     System,
 }
-

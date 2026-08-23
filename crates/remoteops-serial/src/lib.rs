@@ -999,4 +999,3 @@ mod tests {
         assert!(!redacted.contains("another-value"));
     }
 }
-

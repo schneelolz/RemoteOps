@@ -269,4 +269,3 @@ mod tests {
         assert_eq!(item.output[2].text, "stdout-2\n");
     }
 }
-

@@ -1153,4 +1153,3 @@ mod tests {
         assert!(args.ca_cert.is_none());
     }
 }
-

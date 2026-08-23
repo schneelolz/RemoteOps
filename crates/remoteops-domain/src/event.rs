@@ -580,4 +580,3 @@ mod tests {
         assert!(json.contains("\"max_pages\":50"));
     }
 }
-

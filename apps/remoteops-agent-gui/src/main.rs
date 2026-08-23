@@ -2639,4 +2639,3 @@ mod tests {
         assert_eq!(app.controller_status_label(), "控制方已连接");
     }
 }
-

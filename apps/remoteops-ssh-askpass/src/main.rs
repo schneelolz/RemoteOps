@@ -3,4 +3,3 @@ fn main() {
         print!("{password}");
     }
 }
-

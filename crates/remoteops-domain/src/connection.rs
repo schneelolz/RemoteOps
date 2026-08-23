@@ -68,4 +68,3 @@ impl ConnectionDescriptor {
             .unwrap_or_else(|| format!("连接 {}", self.display_index))
     }
 }
-

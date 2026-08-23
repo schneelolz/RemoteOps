@@ -160,4 +160,3 @@ mod tests {
         assert!(PairingCode::parse("12345678x").is_err());
     }
 }
-

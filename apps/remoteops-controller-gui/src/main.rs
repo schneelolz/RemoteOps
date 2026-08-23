@@ -3697,4 +3697,3 @@ mod tests {
         assert!(size.y < 80.0, "短消息气泡高度异常：{}", size.y);
     }
 }
-

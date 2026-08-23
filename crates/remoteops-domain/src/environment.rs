@@ -85,4 +85,3 @@ impl EnvironmentProfile {
 fn default_timestamp() -> DateTime<Utc> {
     DateTime::<Utc>::UNIX_EPOCH
 }
-

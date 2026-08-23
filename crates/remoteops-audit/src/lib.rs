@@ -398,4 +398,3 @@ mod tests {
         assert_eq!(event.permission_mode, PermissionMode::ApprovalRequired);
     }
 }
-

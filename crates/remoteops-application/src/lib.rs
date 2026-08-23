@@ -1944,4 +1944,3 @@ mod tests {
         assert!(matches!(result, Err(ApplicationError::PolicyDenied(_))));
     }
 }
-

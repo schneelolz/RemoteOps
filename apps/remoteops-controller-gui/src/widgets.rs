@@ -160,4 +160,3 @@ pub fn card(palette: Palette, fill: Color32, stroke: Color32, radius: u8, margin
         .inner_margin(margin)
         .shadow(palette.shadow_small)
 }
-

@@ -314,4 +314,3 @@ async fn main() -> anyhow::Result<()> {
     }
     windows_host::start()
 }
-

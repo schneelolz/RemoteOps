@@ -17,4 +17,3 @@ pub use tls::{
     load_native_client_config, load_pinned_client_config, load_server_config,
     normalize_certificate_fingerprint, probe_server_certificate,
 };
-

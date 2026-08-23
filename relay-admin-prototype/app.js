@@ -158,6 +158,21 @@ async function refreshRealData() {
   }
 }
 
+async function restoreSession() {
+  state.api.baseUrl = window.location.origin;
+  try {
+    const session = await apiFetch('/api/admin/session');
+    if (!session.authenticated) throw new Error('管理 Session 已失效');
+    if (session.username) state.adminUser = session.username;
+    await refreshRealData();
+    state.isLoggedIn = true;
+  } catch (_) {
+    state.isLoggedIn = false;
+    state.api.connected = false;
+  }
+  renderApp();
+}
+
 // Mock Relay Data
 const mockRelayInfo = {
   name: 'relay-prod-ap-east-1',
@@ -581,6 +596,10 @@ function renderTopBar() {
           <span class="avatar">A</span>
           <span class="font-mono text-slate-300">${state.adminUser}</span>
         </div>
+        <button class="btn btn-secondary btn-sm" onclick="navigateTo('settings')" title="修改管理页面密码">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          安全设置
+        </button>
         <button class="btn btn-ghost btn-sm text-slate-400 hover:text-red-400" onclick="logout()" title="退出登录">
           <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
         </button>
@@ -1887,5 +1906,5 @@ document.addEventListener('DOMContentLoaded', () => {
     document.body.appendChild(tc);
   }
 
-  renderApp();
+  restoreSession();
 });

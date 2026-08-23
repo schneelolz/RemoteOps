@@ -64,4 +64,3 @@ mod tests {
         assert!(!lease.is_valid_at(now + Duration::minutes(9)));
     }
 }
-
