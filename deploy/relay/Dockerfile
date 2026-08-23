@@ -7,6 +7,7 @@ COPY build ./build
 COPY crates ./crates
 COPY apps ./apps
 COPY tests ./tests
+COPY relay-admin-prototype ./relay-admin-prototype
 
 RUN cargo build --release --locked -p remoteops-relay
 
@@ -23,10 +24,11 @@ COPY --from=builder /workspace/target/release/remoteops-relay /usr/local/bin/rem
 USER remoteops
 
 VOLUME ["/data"]
-EXPOSE 7443 8080
+EXPOSE 7443 8080 18081
 
 ENV REMOTEOPS_RELAY_BIND=0.0.0.0:7443 \
     REMOTEOPS_HEALTH_BIND=0.0.0.0:8080 \
+    REMOTEOPS_ADMIN_ADDR=0.0.0.0:18081 \
     REMOTEOPS_TLS_CERT=/data/tls/cert.pem \
     REMOTEOPS_TLS_KEY=/data/tls/key.pem \
     REMOTEOPS_STATE_FILE=/data/relay-state.json \

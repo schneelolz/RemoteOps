@@ -51,6 +51,8 @@ cp deploy/relay/.env.example deploy/relay/.env
 REMOTEOPS_TLS_SANS=relay.example.com,remoteops-relay,localhost,127.0.0.1
 REMOTEOPS_RELAY_PORT=7443
 REMOTEOPS_HEALTH_PORT=18080
+REMOTEOPS_RELAY_ADMIN_PORT=18081
+REMOTEOPS_ADMIN_TOKEN=<至少 32 字节的随机管理 Token>
 REMOTEOPS_HUMAN_CONTROLLER_TOKEN=<至少 32 字节的随机值>
 REMOTEOPS_AI_CONTROLLER_TOKEN=<另一组至少 32 字节的随机值>
 REMOTEOPS_CONTROLLER_OWNER_ID=<非全零 UUID>
@@ -78,8 +80,11 @@ docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml u
 ```bash
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml ps
 curl --fail http://127.0.0.1:18080/health
+curl --fail -H "Authorization: Bearer $REMOTEOPS_ADMIN_TOKEN" http://127.0.0.1:18081/api/admin/overview
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml logs --tail 100
 ```
+
+管理页面位于 `http://127.0.0.1:18081/`。管理 API 使用独立 Bearer Token，默认只监听宿主机回环地址；如果需要远程访问，请放在 HTTPS 反向代理后面，并保留上游认证。管理页面不会返回任何 Controller Token、Agent resume token 或 Session binding token 明文。
 
 健康接口返回 `ok`，且容器状态为 `healthy` 后，使用下面的形式记录 Relay 地址：
 

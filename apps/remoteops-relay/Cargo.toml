@@ -17,8 +17,10 @@ LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
+hex.workspace = true
 rand.workspace = true
 rcgen = "0.14"
 remoteops-domain = { path = "../../crates/remoteops-domain" }

@@ -100,7 +100,7 @@ RemoteOps 的长期方向是让 AI 在控制台和图形界面之间协同工作
 
 - Linux x64 主机、Docker Engine 和 Docker Compose 插件；
 - 一个 Agent 和工程师本机都能访问的域名或 IP；
-- 对外可访问的 TCP `7443`，健康检查端口 `18080` 默认只绑定本机回环地址；
+- 对外可访问的 TCP `7443`，健康检查端口 `18080` 和管理页面端口 `18081` 默认只绑定本机回环地址；
 - 包含实际域名或 IP 的 TLS SAN。首次实验可以使用 Relay 自动生成的自签名证书，正式部署应使用受信任证书或按安全文档配置私有 CA。
 
 进入仓库根目录后，先复制部署模板：
@@ -115,6 +115,8 @@ cp deploy/relay/.env.example deploy/relay/.env
 REMOTEOPS_TLS_SANS=relay.example.com,remoteops-relay,localhost,127.0.0.1
 REMOTEOPS_RELAY_PORT=7443
 REMOTEOPS_HEALTH_PORT=18080
+REMOTEOPS_RELAY_ADMIN_PORT=18081
+REMOTEOPS_ADMIN_TOKEN=<至少 32 字节的随机管理 Token>
 REMOTEOPS_HUMAN_CONTROLLER_TOKEN=<至少 32 字节的随机值>
 REMOTEOPS_AI_CONTROLLER_TOKEN=<另一组至少 32 字节的随机值>
 REMOTEOPS_CONTROLLER_OWNER_ID=<非全零 UUID>
@@ -133,8 +135,11 @@ docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml u
 ```bash
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml ps
 curl --fail http://127.0.0.1:18080/health
+curl --fail -H "Authorization: Bearer $REMOTEOPS_ADMIN_TOKEN" http://127.0.0.1:18081/api/admin/overview
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml logs --tail 100
 ```
+
+管理页面访问 `http://127.0.0.1:18081/`。管理服务默认只绑定宿主机回环地址；需要远程访问时，应通过受认证的 HTTPS 反向代理暴露，不能直接把管理端口开放到公网。页面不显示 AI/Human Token 明文，只展示 Owner UUID、配置状态和 AI Token 指纹。
 
 完成 Relay 后，再继续启动 Agent 和安装本机 MCP。完整的部署边界、证书说明、备份和故障排查见 [docs/Relay部署说明.md](docs/Relay部署说明.md)；实验室三机验收仍见 [docs/部署与三机验收手册.md](docs/部署与三机验收手册.md)。
 

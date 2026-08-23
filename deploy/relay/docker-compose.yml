@@ -9,6 +9,8 @@ services:
     environment:
       REMOTEOPS_TLS_SANS: "${REMOTEOPS_TLS_SANS:?必须设置 Relay TLS SAN，至少包含 Controller 和 Agent 使用的公网域名或 IP}"
       REMOTEOPS_HEALTH_BIND: "0.0.0.0:8080"
+      REMOTEOPS_ADMIN_ADDR: "0.0.0.0:18081"
+      REMOTEOPS_ADMIN_TOKEN: "${REMOTEOPS_ADMIN_TOKEN:?必须设置 Relay 管理 Token}"
       REMOTEOPS_STATE_FILE: "/data/relay-state.json"
       REMOTEOPS_LEASE_SECONDS: "${REMOTEOPS_LEASE_SECONDS:-600}"
       REMOTEOPS_HUMAN_CONTROLLER_TOKEN: "${REMOTEOPS_HUMAN_CONTROLLER_TOKEN:?必须设置人工 Controller Token}"
@@ -19,6 +21,7 @@ services:
     ports:
       - "${REMOTEOPS_RELAY_PORT:-7443}:7443"
       - "127.0.0.1:${REMOTEOPS_HEALTH_PORT:-18080}:8080"
+      - "127.0.0.1:${REMOTEOPS_RELAY_ADMIN_PORT:-18081}:18081"
     volumes:
       - remoteops-relay-data:/data
 

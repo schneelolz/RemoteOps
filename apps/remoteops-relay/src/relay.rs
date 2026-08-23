@@ -23,6 +23,7 @@ use remoteops_protocol::{
     write_frame,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{Mutex, Notify, mpsc},
@@ -31,10 +32,16 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::admin::{
+    AdminActionOutcome, AdminAgent, AdminController, AdminControllerBinding, AdminIdentity,
+    AdminOverview, AdminSession, AdminSnapshot,
+};
+
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const CLIENT_HELLO_TIMEOUT: time::Duration = time::Duration::from_secs(10);
 const MAX_REGISTERED_AGENTS: usize = 1024;
 const UNPAIRED_AGENT_RETENTION: Duration = Duration::hours(24);
+const MAX_AUDIT_EVENTS: usize = 1_000;
 
 /// 有界出站队列。队列耗尽表示客户端持续消费过慢，连接任务会主动结束。
 #[derive(Clone)]
@@ -293,6 +300,19 @@ struct RelayState {
     approvals: BTreeMap<ApprovalId, RelayApprovalRecord>,
     in_flight: BTreeMap<RequestId, InFlightRequest>,
     next_controller_generation: u64,
+    audit_log: Vec<AdminAuditEvent>,
+}
+
+/// 管理审计事件。仅保存操作摘要，不保存认证令牌或绑定令牌。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AdminAuditEvent {
+    pub id: u64,
+    pub timestamp: DateTime<Utc>,
+    pub action: String,
+    pub target: Option<String>,
+    pub success: bool,
+    pub source: String,
+    pub summary: String,
 }
 
 /// Relay 重启后需要恢复的最小 Agent 租约状态。
@@ -323,6 +343,8 @@ struct PersistedRelayState {
     version: u16,
     /// 已登记的 Agent。
     agents: Vec<PersistedAgent>,
+    #[serde(default)]
+    audit_log: Vec<AdminAuditEvent>,
 }
 
 /// Relay 的并发安全业务入口。
@@ -336,6 +358,7 @@ pub struct Relay {
     human_controller_token: String,
     ai_controller_token: String,
     policy: DefaultPolicy,
+    started_at: DateTime<Utc>,
 }
 
 impl Relay {
@@ -362,6 +385,384 @@ impl Relay {
             human_controller_token,
             ai_controller_token,
             policy: DefaultPolicy::default(),
+            started_at: Utc::now(),
+        }
+    }
+
+    /// 返回管理页面使用的脱敏快照。
+    #[allow(clippy::too_many_lines)]
+    pub async fn admin_snapshot(&self) -> AdminSnapshot {
+        let state = self.state.lock().await;
+        let now = Utc::now();
+        let agents = state
+            .agents
+            .values()
+            .map(|agent| AdminAgent {
+                agent_instance_id: agent.hello.agent_instance_id,
+                session_id: agent.session_id,
+                hostname: agent.hello.hostname.clone(),
+                operating_system: agent.hello.operating_system.clone(),
+                state: if agent.ready && agent.sender.is_some() {
+                    "online"
+                } else if agent.lease.is_valid_at(now) {
+                    "reconnecting"
+                } else {
+                    "offline"
+                }
+                .to_owned(),
+                pairing_code_configured: agent.lease.is_valid_at(now),
+                lease_expires_at: agent.lease.expires_at,
+                last_seen: agent.last_seen,
+                connection_generation: agent.connection_generation,
+                ready: agent.ready,
+                ever_paired: agent.ever_paired,
+                permission_mode: agent.permission_mode,
+            })
+            .collect::<Vec<_>>();
+        let controllers = state
+            .controllers
+            .iter()
+            .map(|(id, controller)| AdminController {
+                controller_instance_id: *id,
+                kind: format!("{:?}", controller.kind).to_lowercase(),
+                owner_id: controller.owner_id,
+                connection_generation: controller.connection_generation,
+                session_ids: controller.sessions.iter().copied().collect(),
+            })
+            .collect::<Vec<_>>();
+        let sessions = state
+            .agents
+            .values()
+            .map(|agent| {
+                let bindings = state.session_bindings.get(&agent.session_id);
+                let controller_bindings = bindings
+                    .map(|bindings| {
+                        bindings
+                            .all()
+                            .map(|binding| AdminControllerBinding {
+                                controller_instance_id: binding.controller_id,
+                                kind: format!("{:?}", binding.controller_kind).to_lowercase(),
+                                owner_id: binding.owner_id,
+                                permission_mode: bindings
+                                    .permission_mode_for(binding.controller_kind),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                AdminSession {
+                    session_id: agent.session_id,
+                    agent_instance_id: agent.hello.agent_instance_id,
+                    hostname: agent.hello.hostname.clone(),
+                    operating_system: agent.hello.operating_system.clone(),
+                    state: if agent.ready && agent.sender.is_some() {
+                        "online"
+                    } else if agent.lease.is_valid_at(now) {
+                        "reconnecting"
+                    } else {
+                        "offline"
+                    }
+                    .to_owned(),
+                    role: bindings.map_or("unbound".to_owned(), |value| {
+                        format!("{:?}", value.role()).to_lowercase()
+                    }),
+                    permission_mode: bindings
+                        .map_or(agent.permission_mode, SessionBindings::permission_mode),
+                    owner_id: bindings.and_then(|value| value.owner_id),
+                    controller_bindings,
+                    pending_approvals: state
+                        .approvals
+                        .values()
+                        .filter(|approval| {
+                            approval.session_id == agent.session_id
+                                && approval.state == ApprovalState::Pending
+                        })
+                        .count(),
+                    in_flight_requests: state
+                        .in_flight
+                        .values()
+                        .filter(|request| request.session_id == agent.session_id)
+                        .count(),
+                    lease_expires_at: agent.lease.expires_at,
+                    last_seen: agent.last_seen,
+                    connection_generation: agent.connection_generation,
+                }
+            })
+            .collect::<Vec<_>>();
+        let identity = AdminIdentity {
+            owner_id: self.controller_owner_id,
+            human_token_configured: !self.human_controller_token.is_empty(),
+            ai_token_configured: !self.ai_controller_token.is_empty(),
+            ai_token_fingerprint: token_fingerprint(&self.ai_controller_token),
+        };
+        let overview = AdminOverview {
+            owner_id: self.controller_owner_id,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            uptime_seconds: u64::try_from((now - self.started_at).num_seconds().max(0))
+                .unwrap_or_default(),
+            online_agents: agents
+                .iter()
+                .filter(|agent| agent.state == "online")
+                .count(),
+            active_sessions: sessions
+                .iter()
+                .filter(|session| {
+                    session.state == "online" && !session.controller_bindings.is_empty()
+                })
+                .count(),
+            connected_controllers: controllers.len(),
+            pending_approvals: state
+                .approvals
+                .values()
+                .filter(|approval| approval.state == ApprovalState::Pending)
+                .count(),
+            in_flight_requests: state.in_flight.len(),
+        };
+        AdminSnapshot {
+            overview,
+            identity,
+            agents,
+            controllers,
+            sessions,
+            audit: state.audit_log.clone(),
+        }
+    }
+
+    /// 记录管理 API 认证失败，不保存提交的 Token。
+    pub async fn admin_auth_failure(&self, source: &str) {
+        let mut state = self.state.lock().await;
+        append_audit(
+            &mut state,
+            "admin_login",
+            Some("relay_admin".to_owned()),
+            false,
+            source,
+            "管理 Token 校验失败",
+        );
+        if let Err(error) = self.persist_state_locked(&state) {
+            warn!(error = %error, "无法持久化管理认证失败审计事件");
+        }
+    }
+
+    /// 管理员关闭 Session，释放全部 Controller 绑定并清理相关状态。
+    pub async fn admin_close_session(
+        &self,
+        session_id: SessionId,
+        source: &str,
+    ) -> AdminActionOutcome {
+        let (revocations, removals, failures, found) = {
+            let mut state = self.state.lock().await;
+            let Some(bindings) = state.session_bindings.remove(&session_id) else {
+                let exists = state
+                    .agents
+                    .values()
+                    .any(|agent| agent.session_id == session_id);
+                append_audit(
+                    &mut state,
+                    "session_close",
+                    Some(session_id.to_string()),
+                    exists,
+                    source,
+                    if exists {
+                        "Session 已经没有活动绑定"
+                    } else {
+                        "Session 不存在"
+                    },
+                );
+                let _ = self.persist_state_locked(&state);
+                return AdminActionOutcome {
+                    success: exists,
+                    changed: false,
+                    message: if exists {
+                        "Session 已经关闭".to_owned()
+                    } else {
+                        "Session 不存在".to_owned()
+                    },
+                };
+            };
+            let mut revocations = Vec::new();
+            let mut removals = Vec::new();
+            for binding in bindings.all() {
+                if let Some(agent_sender) = state
+                    .agents
+                    .values()
+                    .find(|agent| agent.session_id == session_id && agent.ready)
+                    .and_then(|agent| agent.sender.clone())
+                {
+                    revocations.push((agent_sender, session_id, binding.binding_token.clone()));
+                }
+                if let Some(controller) = state.controllers.get_mut(&binding.controller_id) {
+                    controller.sessions.remove(&session_id);
+                    removals.push((controller.sender.clone(), session_id));
+                }
+            }
+            let abandoned = state
+                .in_flight
+                .iter()
+                .filter(|(_, request)| request.session_id == session_id)
+                .map(|(id, request)| (*id, request.clone()))
+                .collect::<Vec<_>>();
+            let mut failures = Vec::new();
+            for (request_id, request) in abandoned {
+                state.in_flight.remove(&request_id);
+                if let Some(controller) = state.controllers.get(&request.controller_id) {
+                    failures.push((controller.sender.clone(), request_id));
+                }
+            }
+            state
+                .approvals
+                .retain(|_, approval| approval.session_id != session_id);
+            append_audit(
+                &mut state,
+                "session_close",
+                Some(session_id.to_string()),
+                true,
+                source,
+                "管理员关闭 Session",
+            );
+            let _ = self.persist_state_locked(&state);
+            (revocations, removals, failures, true)
+        };
+        for (sender, session_id, binding_token) in revocations {
+            let _ = sender.send(WireMessage::ControllerBindingRevoked {
+                session_id,
+                binding_token,
+            });
+        }
+        for (sender, session_id) in removals {
+            let _ = sender.send(WireMessage::ConnectionRemoved {
+                session_id,
+                reason: "管理员关闭 Session".to_owned(),
+            });
+        }
+        for (sender, request_id) in failures {
+            let _ = sender.send(WireMessage::Error {
+                code: "session_closed".to_owned(),
+                message: "Session 已被管理员关闭".to_owned(),
+                request_id: Some(request_id),
+            });
+        }
+        AdminActionOutcome {
+            success: found,
+            changed: true,
+            message: "Session 已关闭".to_owned(),
+        }
+    }
+
+    /// 管理员请求 Agent 紧急停止当前任务。
+    #[allow(clippy::too_many_lines)]
+    pub async fn admin_emergency_stop(
+        &self,
+        session_id: SessionId,
+        source: &str,
+    ) -> AdminActionOutcome {
+        let (sender, authorized) = {
+            let mut state = self.state.lock().await;
+            let Some(agent) = state
+                .agents
+                .values()
+                .find(|agent| {
+                    agent.session_id == session_id && agent.ready && agent.sender.is_some()
+                })
+                .cloned()
+            else {
+                append_audit(
+                    &mut state,
+                    "emergency_stop",
+                    Some(session_id.to_string()),
+                    false,
+                    source,
+                    "Agent 不在线",
+                );
+                let _ = self.persist_state_locked(&state);
+                return AdminActionOutcome {
+                    success: false,
+                    changed: false,
+                    message: "Agent 不在线".to_owned(),
+                };
+            };
+            let Some(bindings) = state.session_bindings.get(&session_id) else {
+                append_audit(
+                    &mut state,
+                    "emergency_stop",
+                    Some(session_id.to_string()),
+                    false,
+                    source,
+                    "Session 没有活动 Controller 绑定",
+                );
+                let _ = self.persist_state_locked(&state);
+                return AdminActionOutcome {
+                    success: false,
+                    changed: false,
+                    message: "Session 没有活动 Controller 绑定".to_owned(),
+                };
+            };
+            let Some(binding) = bindings.all().next().cloned() else {
+                return AdminActionOutcome {
+                    success: false,
+                    changed: false,
+                    message: "Session 没有活动 Controller 绑定".to_owned(),
+                };
+            };
+            let request_id = RequestId::new();
+            let request = RemoteRequest {
+                request_id,
+                session_id,
+                source: binding.controller_kind.event_source(),
+                operation: RemoteOperation::EmergencyStop,
+                approval_id: None,
+                payload_base64: None,
+            };
+            let authorized = AuthorizedRemoteRequest {
+                request,
+                authorization: RelayAuthorization {
+                    controller_instance_id: binding.controller_id,
+                    owner_id: binding.owner_id,
+                    controller_kind: binding.controller_kind,
+                    permission_mode: bindings.permission_mode_for(binding.controller_kind),
+                    binding_token: binding.binding_token.clone(),
+                    approval: ApprovalState::NotRequired,
+                },
+            };
+            let sender = agent.sender.clone().expect("在线 Agent 必须有发送器");
+            let stopped = state
+                .in_flight
+                .iter()
+                .filter(|(_, request)| request.session_id == session_id)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            for id in stopped {
+                state.in_flight.remove(&id);
+            }
+            state.in_flight.insert(
+                request_id,
+                InFlightRequest {
+                    agent_id: agent.hello.agent_instance_id,
+                    session_id,
+                    controller_id: binding.controller_id,
+                    owner_id: binding.owner_id,
+                    controller_generation: binding.controller_generation,
+                    controller_kind: binding.controller_kind,
+                    source: binding.controller_kind.event_source(),
+                    approval: ApprovalState::NotRequired,
+                    previous_takeover: None,
+                },
+            );
+            append_audit(
+                &mut state,
+                "emergency_stop",
+                Some(session_id.to_string()),
+                true,
+                source,
+                "已向 Agent 发送紧急停止请求",
+            );
+            let _ = self.persist_state_locked(&state);
+            (sender, authorized)
+        };
+        let _ = sender.send(WireMessage::AuthorizedRemoteRequest(authorized));
+        AdminActionOutcome {
+            success: true,
+            changed: true,
+            message: "已向 Agent 发送紧急停止请求".to_owned(),
         }
     }
 
@@ -2265,6 +2666,40 @@ impl Relay {
 
 const PERSISTED_STATE_VERSION: u16 = 1;
 
+fn append_audit(
+    state: &mut RelayState,
+    action: &str,
+    target: Option<String>,
+    success: bool,
+    source: &str,
+    summary: &str,
+) {
+    let id = state
+        .audit_log
+        .last()
+        .map_or(1, |event| event.id.saturating_add(1));
+    state.audit_log.push(AdminAuditEvent {
+        id,
+        timestamp: Utc::now(),
+        action: action.to_owned(),
+        target,
+        success,
+        source: source.to_owned(),
+        summary: summary.to_owned(),
+    });
+    if state.audit_log.len() > MAX_AUDIT_EVENTS {
+        let remove = state.audit_log.len() - MAX_AUDIT_EVENTS;
+        state.audit_log.drain(0..remove);
+    }
+}
+
+fn token_fingerprint(token: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    Some(hex::encode(Sha256::digest(token.as_bytes())))
+}
+
 fn legacy_agent_was_paired() -> bool {
     true
 }
@@ -2285,6 +2720,7 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
         );
     }
     let now = Utc::now();
+    state.audit_log = persisted.audit_log;
     let mut session_ids = BTreeSet::new();
     ensure_agent_capacity(persisted.agents.len().saturating_sub(1))?;
     for persisted_agent in persisted.agents {
@@ -2365,6 +2801,7 @@ fn save_persisted_state(path: &Path, state: &RelayState) -> anyhow::Result<()> {
     let contents = serde_json::to_vec_pretty(&PersistedRelayState {
         version: PERSISTED_STATE_VERSION,
         agents,
+        audit_log: state.audit_log.clone(),
     })?;
     let file_name = path
         .file_name()
@@ -4707,4 +5144,3 @@ mod tests {
         assert_eq!(resumed_session_id, session_id);
     }
 }
-
