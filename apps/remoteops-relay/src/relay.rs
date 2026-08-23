@@ -543,6 +543,22 @@ impl Relay {
         }
     }
 
+    /// 记录管理页面登录成功，不保存密码或 Session Cookie。
+    pub async fn admin_auth_success(&self, username: &str) {
+        let mut state = self.state.lock().await;
+        append_audit(
+            &mut state,
+            "admin_login",
+            Some("relay_admin".to_owned()),
+            true,
+            username,
+            "管理页面登录成功",
+        );
+        if let Err(error) = self.persist_state_locked(&state) {
+            warn!(error = %error, "无法持久化管理登录成功审计事件");
+        }
+    }
+
     /// 管理员关闭 Session，释放全部 Controller 绑定并清理相关状态。
     pub async fn admin_close_session(
         &self,

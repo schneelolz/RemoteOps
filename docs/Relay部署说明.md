@@ -53,6 +53,8 @@ REMOTEOPS_RELAY_PORT=7443
 REMOTEOPS_HEALTH_PORT=18080
 REMOTEOPS_RELAY_ADMIN_PORT=18081
 REMOTEOPS_ADMIN_TOKEN=<至少 32 字节的随机管理 Token>
+REMOTEOPS_ADMIN_USERNAME=<管理页面用户名>
+REMOTEOPS_ADMIN_PASSWORD=<至少 16 字节的随机管理密码>
 REMOTEOPS_HUMAN_CONTROLLER_TOKEN=<至少 32 字节的随机值>
 REMOTEOPS_AI_CONTROLLER_TOKEN=<另一组至少 32 字节的随机值>
 REMOTEOPS_CONTROLLER_OWNER_ID=<非全零 UUID>
@@ -84,7 +86,7 @@ curl --fail -H "Authorization: Bearer $REMOTEOPS_ADMIN_TOKEN" http://127.0.0.1:1
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml logs --tail 100
 ```
 
-管理页面位于 `http://127.0.0.1:18081/`。管理 API 使用独立 Bearer Token，默认只监听宿主机回环地址；如果需要远程访问，请放在 HTTPS 反向代理后面，并保留上游认证。管理页面不会返回任何 Controller Token、Agent resume token 或 Session binding token 明文。
+管理页面位于 `http://127.0.0.1:18081/`；通过 HTTPS 反向代理访问时会自动使用当前域名。页面登录使用管理用户名和密码，服务端发放 HttpOnly Cookie Session；Bearer Token 仅保留给内部脚本和应急 API。管理服务默认只监听宿主机回环地址；如果需要远程访问，请放在 HTTPS 反向代理后面。管理页面不会返回任何 Controller Token、Agent resume token 或 Session binding token 明文。
 
 健康接口返回 `ok`，且容器状态为 `healthy` 后，使用下面的形式记录 Relay 地址：
 
@@ -159,4 +161,3 @@ docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml l
 - 发布前必须独立复核 Token、TLS 私钥、Owner UUID、控制码和状态卷备份策略。
 
 更完整的安全说明见 [安全模型](安全模型.md) 和 [发布与产物说明](发布与产物说明.md)。
-

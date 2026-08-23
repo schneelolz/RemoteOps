@@ -24,7 +24,7 @@ struct Args {
     /// Docker 健康检查监听地址。
     #[arg(long, env = "REMOTEOPS_HEALTH_BIND", default_value = "0.0.0.0:8080")]
     health_bind: String,
-    /// Web 管理服务监听地址；未配置管理 Token 时不启动。
+    /// Web 管理服务监听地址；未配置管理凭据时不启动。
     #[arg(long, env = "REMOTEOPS_ADMIN_ADDR", default_value = "127.0.0.1:18081")]
     admin_bind: String,
     /// PEM 服务端证书。
@@ -79,6 +79,15 @@ struct Args {
     /// Web 管理服务独立认证令牌。
     #[arg(long, env = "REMOTEOPS_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
+    /// Web 管理页面登录用户名。
+    #[arg(long, env = "REMOTEOPS_ADMIN_USERNAME")]
+    admin_username: Option<String>,
+    /// Web 管理页面登录密码。
+    #[arg(long, env = "REMOTEOPS_ADMIN_PASSWORD", hide_env_values = true)]
+    admin_password: Option<String>,
+    /// 是否为管理 Session Cookie 添加 Secure 属性。
+    #[arg(long, env = "REMOTEOPS_ADMIN_COOKIE_SECURE", default_value_t = true)]
+    admin_cookie_secure: bool,
 }
 
 #[tokio::main]
@@ -134,19 +143,31 @@ async fn main() -> anyhow::Result<()> {
         })?,
     );
     tokio::spawn(health_server(health_listener));
-    if let Some(admin_token) = args.admin_token.filter(|token| !token.is_empty()) {
+    let admin_token = args.admin_token.filter(|token| !token.is_empty());
+    let admin_username = args.admin_username.filter(|value| !value.is_empty());
+    let admin_password = args.admin_password.filter(|value| !value.is_empty());
+    if admin_token.is_some() || (admin_username.is_some() && admin_password.is_some()) {
         let admin_listener = TcpListener::bind(&args.admin_bind)
             .await
             .with_context(|| format!("无法监听管理服务 {}", args.admin_bind))?;
         let admin_relay = relay.clone();
         tokio::spawn(async move {
-            if let Err(error) = admin::serve(admin_listener, admin_relay, admin_token).await {
+            if let Err(error) = admin::serve(
+                admin_listener,
+                admin_relay,
+                admin_token,
+                admin_username,
+                admin_password,
+                args.admin_cookie_secure,
+            )
+            .await
+            {
                 error!(error = %error, "管理服务异常结束");
             }
         });
         info!(admin_bind = %args.admin_bind, "RemoteOps Relay 管理服务已启动");
     } else {
-        warn!("未配置 REMOTEOPS_ADMIN_TOKEN，管理服务未启动");
+        warn!("未配置管理页面用户名密码或 REMOTEOPS_ADMIN_TOKEN，管理服务未启动");
     }
     relay.clone().spawn_cleanup();
     let connection_slots = Arc::new(Semaphore::new(args.max_connections.max(1)));

@@ -1,9 +1,13 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration as StdDuration, Instant},
+};
 
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Json as ExtractJson, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -13,7 +17,8 @@ use remoteops_domain::{
     AgentInstanceId, ControllerInstanceId, ControllerOwnerId, PermissionMode, SessionId,
 };
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Mutex};
+use uuid::Uuid;
 
 use crate::relay::{AdminAuditEvent, Relay};
 
@@ -21,6 +26,10 @@ use crate::relay::{AdminAuditEvent, Relay};
 pub(crate) struct AdminState {
     pub relay: Arc<Relay>,
     pub token: Arc<String>,
+    pub username: Option<Arc<String>>,
+    pub password: Option<Arc<String>>,
+    pub sessions: Arc<Mutex<HashMap<String, Instant>>>,
+    pub secure_cookie: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -111,6 +120,18 @@ pub(crate) struct AdminActionOutcome {
     pub message: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginResponse {
+    authenticated: bool,
+    username: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
@@ -124,13 +145,22 @@ pub(crate) struct AuditQuery {
 pub(crate) async fn serve(
     listener: TcpListener,
     relay: Arc<Relay>,
-    token: String,
+    token: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    secure_cookie: bool,
 ) -> anyhow::Result<()> {
     let state = AdminState {
         relay,
-        token: Arc::new(token),
+        token: Arc::new(token.unwrap_or_default()),
+        username: username.map(Arc::new),
+        password: password.map(Arc::new),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        secure_cookie,
     };
     let app = Router::new()
+        .route("/api/admin/login", post(login))
+        .route("/api/admin/logout", post(logout))
         .route("/api/admin/overview", get(overview))
         .route("/api/admin/identity", get(identity))
         .route("/api/admin/agents", get(agents))
@@ -154,6 +184,65 @@ pub(crate) async fn serve(
     axum::serve(listener, app)
         .await
         .context("管理 HTTP 服务已停止")
+}
+
+async fn login(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    ExtractJson(request): ExtractJson<LoginRequest>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let valid = state
+        .username
+        .as_ref()
+        .zip(state.password.as_ref())
+        .is_some_and(|(username, password)| {
+            constant_time_eq(request.username.as_bytes(), username.as_bytes())
+                && constant_time_eq(request.password.as_bytes(), password.as_bytes())
+        });
+    if !valid {
+        let source = request_source(&headers);
+        state.relay.admin_auth_failure(source).await;
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "用户名或密码错误".to_owned(),
+            }),
+        ));
+    }
+    let session_id = Uuid::new_v4().simple().to_string();
+    state.sessions.lock().await.insert(
+        session_id.clone(),
+        Instant::now() + StdDuration::from_hours(8),
+    );
+    state.relay.admin_auth_success(&request.username).await;
+    let cookie = session_cookie(&session_id, state.secure_cookie, false);
+    let mut response = Json(LoginResponse {
+        authenticated: true,
+        username: request.username,
+    })
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        cookie.parse().expect("管理 Session Cookie 应为合法 Header"),
+    );
+    Ok(response)
+}
+
+async fn logout(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(session_id) = cookie_value(&headers, "remoteops_admin_session") {
+        state.sessions.lock().await.remove(&session_id);
+    }
+    let mut response = Json(serde_json::json!({"authenticated": false})).into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        session_cookie("", state.secure_cookie, true)
+            .parse()
+            .expect("管理 Session Cookie 应为合法 Header"),
+    );
+    Ok(response)
 }
 
 async fn overview(
@@ -252,6 +341,16 @@ async fn authorize(
     state: &AdminState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if let Some(session_id) = cookie_value(headers, "remoteops_admin_session") {
+        let mut sessions = state.sessions.lock().await;
+        if sessions
+            .get(&session_id)
+            .is_some_and(|expires_at| *expires_at > Instant::now())
+        {
+            return Ok(());
+        }
+        sessions.remove(&session_id);
+    }
     let expected = format!("Bearer {}", state.token);
     let supplied = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -260,11 +359,10 @@ async fn authorize(
     if constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
         Ok(())
     } else {
-        let source = headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("admin_http");
-        state.relay.admin_auth_failure(source).await;
+        state
+            .relay
+            .admin_auth_failure(request_source(headers))
+            .await;
         Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -272,6 +370,40 @@ async fn authorize(
             }),
         ))
     }
+}
+
+fn request_source(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("admin_http")
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (key, value) = cookie.trim().split_once('=')?;
+                (key == name).then(|| value.to_owned())
+            })
+        })
+}
+
+fn session_cookie(session_id: &str, secure: bool, expired: bool) -> String {
+    let mut cookie = format!(
+        "remoteops_admin_session={session_id}; HttpOnly; SameSite=Strict; Path=/; {}",
+        if expired {
+            "Max-Age=0"
+        } else {
+            "Max-Age=28800"
+        }
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
 }
 
 fn parse_session(value: &str) -> Result<SessionId, (StatusCode, Json<ErrorResponse>)> {

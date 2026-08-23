@@ -17,7 +17,7 @@ python3 -m http.server 8080
 ```
 然后在浏览器访问：`http://localhost:8080`
 
-静态预览仍需在登录页填写一个可访问的 Relay 管理地址和 `REMOTEOPS_ADMIN_TOKEN`；页面不会把 Token 写入浏览器持久化存储。
+静态预览需要由同源 Relay 管理服务提供登录接口；生产页面使用管理员用户名和密码登录，页面不会把密码或 Token 写入浏览器持久化存储。
 
 ---
 
@@ -27,7 +27,7 @@ python3 -m http.server 8080
 - **交互验证**：
   - 点击右上角退出登录图标即可回到登录页。
   - 支持切换管理 Token 的「显示/隐藏」状态。
-  - 输入 Relay 管理地址和 Token，页面会调用 `/api/admin/overview` 验证凭据；错误 Token 会显示未授权状态。
+  - 输入管理员用户名和密码，页面会调用 `/api/admin/login`，成功后使用 HttpOnly Cookie 访问管理 API。
 
 ### 2. 概览页 (`/overview`)
 - **核心要素**：

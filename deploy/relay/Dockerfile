@@ -29,6 +29,7 @@ EXPOSE 7443 8080 18081
 ENV REMOTEOPS_RELAY_BIND=0.0.0.0:7443 \
     REMOTEOPS_HEALTH_BIND=0.0.0.0:8080 \
     REMOTEOPS_ADMIN_ADDR=0.0.0.0:18081 \
+    REMOTEOPS_ADMIN_COOKIE_SECURE=true \
     REMOTEOPS_TLS_CERT=/data/tls/cert.pem \
     REMOTEOPS_TLS_KEY=/data/tls/key.pem \
     REMOTEOPS_STATE_FILE=/data/relay-state.json \
@@ -40,4 +41,3 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
     CMD curl --fail --silent --show-error http://127.0.0.1:8080/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/remoteops-relay"]
-

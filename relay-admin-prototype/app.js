@@ -46,9 +46,12 @@ function permissionLabel(value) {
 }
 
 async function apiFetch(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (state.api.token) headers.Authorization = `Bearer ${state.api.token}`;
   const response = await fetch(`${state.api.baseUrl}${path}`, {
     ...options,
-    headers: { ...(options.headers || {}), Authorization: `Bearer ${state.api.token}` }
+    credentials: 'same-origin',
+    headers
   });
   if (!response.ok) {
     let detail = `HTTP ${response.status}`;
@@ -133,7 +136,7 @@ function applyApiData(overview, identity, agents, sessions, audit) {
 }
 
 async function refreshRealData() {
-  if (!state.api.baseUrl || !state.api.token) return;
+  if (!state.api.baseUrl) return;
   state.api.loading = true;
   state.api.error = null;
   try {
@@ -397,6 +400,7 @@ function navigateTo(tabName) {
 }
 
 function logout() {
+  fetch(`${state.api.baseUrl}/api/admin/logout`, { method: 'POST', credentials: 'same-origin' }).catch(() => {});
   state.isLoggedIn = false;
   state.api.token = '';
   state.api.connected = false;
@@ -1318,21 +1322,21 @@ function renderLoginView() {
           </div>
         </div>
 
-        <form onsubmit="handleMockLogin(event)" style="display:flex; flex-direction:column; gap:14px;">
+        <form onsubmit="handleLogin(event)" style="display:flex; flex-direction:column; gap:14px;">
           <div class="input-group">
-            <label class="input-label">Relay 管理地址 (Management URL)</label>
-            <input type="text" id="login-url" class="input font-mono" value="http://127.0.0.1:18081" required />
+            <label class="input-label">用户名 (Username)</label>
+            <input type="text" id="login-username" class="input font-mono" autocomplete="username" required />
           </div>
 
           <div class="input-group">
             <div style="display:flex; justify-content:space-between; align-items:center;">
-              <label class="input-label">管理 Token (Admin Token)</label>
-              <button type="button" class="btn btn-ghost btn-sm" style="padding:0; font-size:11px;" onclick="toggleTokenVisibility()">
-                <span id="token-toggle-text">显示</span>
+              <label class="input-label">密码 (Password)</label>
+              <button type="button" class="btn btn-ghost btn-sm" style="padding:0; font-size:11px;" onclick="togglePasswordVisibility()">
+                <span id="password-toggle-text">显示</span>
               </button>
             </div>
-            <input type="password" id="login-token" class="input font-mono" placeholder="请输入演示管理 Token" required />
-            <span style="font-size:10.5px; color:var(--text-muted);">注：管理 Token 是独立管理凭据，非 MCP 或 Agent 控制码</span>
+            <input type="password" id="login-password" class="input font-mono" autocomplete="current-password" required />
+            <span style="font-size:10.5px; color:var(--text-muted);">当前页面使用 HTTPS 同源登录，不需要填写 Relay 地址或 MCP Token。</span>
           </div>
 
           <div id="login-error-box" style="display:none; padding:8px 10px; background:var(--status-danger-bg); border:1px solid var(--status-danger-border); border-radius:4px; color:var(--status-danger-text); font-size:11.5px;"></div>
@@ -1351,9 +1355,9 @@ function renderLoginView() {
 }
 
 // Login Interactivity
-function toggleTokenVisibility() {
-  const input = document.getElementById('login-token');
-  const toggleText = document.getElementById('token-toggle-text');
+function togglePasswordVisibility() {
+  const input = document.getElementById('login-password');
+  const toggleText = document.getElementById('password-toggle-text');
   if (!input) return;
   if (input.type === 'password') {
     input.type = 'text';
@@ -1364,20 +1368,25 @@ function toggleTokenVisibility() {
   }
 }
 
-async function handleMockLogin(e) {
+async function handleLogin(e) {
   e.preventDefault();
   const btn = document.getElementById('login-submit-btn');
   const errBox = document.getElementById('login-error-box');
-  const token = document.getElementById('login-token').value;
-  const baseUrl = document.getElementById('login-url').value.trim().replace(/\/$/, '');
+  const username = document.getElementById('login-username').value;
+  const password = document.getElementById('login-password').value;
 
   btn.disabled = true;
   btn.innerText = '正在验证管理凭据...';
   errBox.style.display = 'none';
 
-  state.api.baseUrl = baseUrl;
-  state.api.token = token;
+  state.api.baseUrl = window.location.origin;
+  state.api.token = '';
   try {
+    await apiFetch('/api/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
     await refreshRealData();
     btn.disabled = false;
     btn.innerText = '进入控制台';
@@ -1389,8 +1398,7 @@ async function handleMockLogin(e) {
     btn.disabled = false;
     btn.innerText = '进入控制台';
     errBox.style.display = 'block';
-    errBox.innerText = `管理服务连接失败：${error.message}`;
-    state.api.token = '';
+    errBox.innerText = `登录失败：${error.message}`;
   }
 }
 

@@ -11,6 +11,9 @@ services:
       REMOTEOPS_HEALTH_BIND: "0.0.0.0:8080"
       REMOTEOPS_ADMIN_ADDR: "0.0.0.0:18081"
       REMOTEOPS_ADMIN_TOKEN: "${REMOTEOPS_ADMIN_TOKEN:?必须设置 Relay 管理 Token}"
+      REMOTEOPS_ADMIN_USERNAME: "${REMOTEOPS_ADMIN_USERNAME:?必须设置 Relay 管理页面用户名}"
+      REMOTEOPS_ADMIN_PASSWORD: "${REMOTEOPS_ADMIN_PASSWORD:?必须设置 Relay 管理页面密码}"
+      REMOTEOPS_ADMIN_COOKIE_SECURE: "${REMOTEOPS_ADMIN_COOKIE_SECURE:-true}"
       REMOTEOPS_STATE_FILE: "/data/relay-state.json"
       REMOTEOPS_LEASE_SECONDS: "${REMOTEOPS_LEASE_SECONDS:-600}"
       REMOTEOPS_HUMAN_CONTROLLER_TOKEN: "${REMOTEOPS_HUMAN_CONTROLLER_TOKEN:?必须设置人工 Controller Token}"
@@ -28,4 +31,3 @@ services:
 volumes:
   remoteops-relay-data:
     name: "${REMOTEOPS_RELAY_VOLUME_NAME:-remoteops-relay-data}"
-
