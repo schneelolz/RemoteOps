@@ -1,6 +1,6 @@
 ---
 name: remoteops
-description: 使用 RemoteOps MCP 连接和诊断远程 Agent。用户提到 RemoteOps、RemoteOps 控制码/配对码、九位控制码（如 123-456-789）、现场 Agent、Relay，或要求通过 RemoteOps 检查远程电脑的进程、证书、网络、服务、文件、Shell、SSH、串口时使用。当前任务看不到 RemoteOps MCP 工具时，立即明确报告未加载并停止；禁止改用 Computer Use、屏幕操作、本机 Shell、SSH 直连或其他远控工具，也禁止声称已操作远端。
+description: 仅在用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，使用 RemoteOps MCP 连接和诊断现场 Agent。普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不触发本 Skill；不得把 RemoteOps 强加到用户未指定的远程任务上，也不得声称已操作远端。
 ---
 
 # RemoteOps 远程诊断
@@ -8,8 +8,8 @@ description: 使用 RemoteOps MCP 连接和诊断远程 Agent。用户提到 Rem
 ## 路由规则
 
 - 用户明确称九位数字为 RemoteOps 控制码或配对码时，必须优先使用 RemoteOps MCP。
-- 不要把 RemoteOps 当成远程桌面。除非用户另行明确要求，否则不要改用 Computer Use、屏幕操作、本机 Shell、SSH 直连或其他远控工具。
-- 当前任务看不到 RemoteOps MCP 工具时，立即说明“当前任务未加载 RemoteOps MCP”，请用户确认安装后完全退出并重新打开 Codex，再新建任务。不要声称已经连接、检查、修改或重启远程电脑。
+- 用户明确要求通过 RemoteOps 执行远程操作时，使用 RemoteOps MCP；未明确要求 RemoteOps 的普通服务器、云主机、跳板机、SSH 或其他远程运维任务，继续使用用户指定的常规工具和流程。
+- 不要把 RemoteOps 当成远程桌面。RemoteOps 任务看不到 RemoteOps MCP 工具时，立即说明“当前任务未加载 RemoteOps MCP”，请用户确认安装后完全退出并重新打开 Codex，再新建任务；不要声称已经连接、检查、修改或重启远程电脑。
 
 ## 工作流
 
@@ -30,4 +30,3 @@ description: 使用 RemoteOps MCP 连接和诊断远程 Agent。用户提到 Rem
 - 不在最终回复中暴露控制码、Token、`session_id`、`approval_id` 或恢复令牌。
 - 连接或工具失败时报告实际阶段和脱敏错误，不伪造远端结果。
 - 若用户要求检查某个进程绑定证书，先确认进程及路径，再检查签名证书、证书有效期和相关服务或监听配置；不要仅凭进程名猜测证书来源。
-
