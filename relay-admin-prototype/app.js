@@ -1231,28 +1231,35 @@ function renderSettingsView() {
         </div>
       </div>
 
-      <div class="card" style="max-width:620px;">
+      <div class="card settings-card">
         <div class="section-title">
           <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
           修改管理页面密码
         </div>
-        <p style="font-size:12px; color:var(--text-secondary); line-height:1.5; margin-bottom:16px;">密码会以随机盐哈希形式保存到 Relay 状态文件，不会保存明文。</p>
-        <form onsubmit="handleChangePassword(event)" style="display:flex; flex-direction:column; gap:14px;">
+        <p class="settings-intro">密码会以随机盐哈希形式保存到 Relay 状态文件，不会保存明文。</p>
+        <div class="settings-policy">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
+          <span>新密码至少需要 12 个字符。</span>
+        </div>
+        <form onsubmit="handleChangePassword(event)" class="settings-form">
           <div class="input-group">
             <label class="input-label">当前密码</label>
             <input id="current-admin-password" type="password" class="input font-mono" autocomplete="current-password" required />
           </div>
           <div class="input-group">
             <label class="input-label">新密码</label>
-            <input id="new-admin-password" type="password" class="input font-mono" minlength="16" autocomplete="new-password" required />
+            <input id="new-admin-password" type="password" class="input font-mono" minlength="12" autocomplete="new-password" required />
           </div>
           <div class="input-group">
             <label class="input-label">确认新密码</label>
-            <input id="confirm-admin-password" type="password" class="input font-mono" minlength="16" autocomplete="new-password" required />
+            <input id="confirm-admin-password" type="password" class="input font-mono" minlength="12" autocomplete="new-password" required />
           </div>
           <div id="password-change-error" style="display:none; padding:8px 10px; background:var(--status-danger-bg); border:1px solid var(--status-danger-border); border-radius:4px; color:var(--status-danger-text); font-size:11.5px;"></div>
-          <div style="display:flex; justify-content:flex-end; margin-top:4px;">
-            <button id="password-change-submit" type="submit" class="btn btn-primary btn-sm">修改密码</button>
+          <div class="settings-form-actions">
+            <button id="password-change-submit" type="submit" class="btn btn-primary settings-submit">
+              <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-1.9 1.9-.06-.06A1.7 1.7 0 0 0 15.96 18a1.7 1.7 0 0 0-1.03 1.56V20h-2.7v-.09A1.7 1.7 0 0 0 11.2 18a1.7 1.7 0 0 0-1.88.34l-.06.06-1.9-1.9.06-.06A1.7 1.7 0 0 0 7.76 15a1.7 1.7 0 0 0-1.56-1.03H6v-2.7h.2A1.7 1.7 0 0 0 7.76 10a1.7 1.7 0 0 0-.34-1.88l-.06-.06 1.9-1.9.06.06a1.7 1.7 0 0 0 1.88.34 1.7 1.7 0 0 0 1.03-1.56V5h2.7v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 1.9 1.9-.06.06A1.7 1.7 0 0 0 19.4 10c.18.62.75 1.03 1.4 1.03h.2v2.7h-.2A1.7 1.7 0 0 0 19.4 15z"/></svg>
+              <span id="password-change-submit-text">修改密码</span>
+            </button>
           </div>
         </form>
       </div>
@@ -1274,7 +1281,7 @@ async function handleChangePassword(event) {
     return;
   }
   button.disabled = true;
-  button.innerText = '正在修改...';
+  document.getElementById('password-change-submit-text').innerText = '正在修改...';
   try {
     await apiFetch('/api/admin/password', {
       method: 'POST',
@@ -1289,7 +1296,7 @@ async function handleChangePassword(event) {
     showToast('密码修改成功，请使用新密码重新登录', 'success');
   } catch (error) {
     button.disabled = false;
-    button.innerText = '修改密码';
+    document.getElementById('password-change-submit-text').innerText = '修改密码';
     errorBox.innerText = `密码修改失败：${error.message}`;
     errorBox.style.display = 'block';
   }

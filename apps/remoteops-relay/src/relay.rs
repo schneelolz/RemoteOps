@@ -2831,9 +2831,13 @@ fn token_fingerprint(token: &str) -> Option<String> {
     Some(hex::encode(Sha256::digest(token.as_bytes())))
 }
 
+const MIN_ADMIN_PASSWORD_CHARS: usize = 12;
+
 fn validate_admin_password(password: &str) -> Result<(), String> {
-    if password.chars().count() < 16 {
-        return Err("管理密码至少需要 16 个字符".to_owned());
+    if password.chars().count() < MIN_ADMIN_PASSWORD_CHARS {
+        return Err(format!(
+            "管理密码至少需要 {MIN_ADMIN_PASSWORD_CHARS} 个字符"
+        ));
     }
     if password.len() > 1024 {
         return Err("管理密码不能超过 1024 字节".to_owned());
@@ -5341,5 +5345,11 @@ mod tests {
             persisted_relay(&state_file.path, Duration::minutes(10)).expect("Relay 应恢复");
         assert!(restored.admin_password_matches(replacement).await);
         assert!(!restored.admin_password_matches(initial).await);
+    }
+
+    #[test]
+    fn admin_password_requires_twelve_characters() {
+        assert!(validate_admin_password("123456789012").is_ok());
+        assert!(validate_admin_password("12345678901").is_err());
     }
 }
