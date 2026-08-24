@@ -2256,7 +2256,7 @@ fn agent_native_options(renderer: eframe::Renderer, initial_setup: bool) -> efra
     } else {
         RUNNING_WINDOW_SIZE
     };
-    let mut options = eframe::NativeOptions {
+    let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("remoteops-agent-gui")
             .with_inner_size(initial_size)

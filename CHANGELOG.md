@@ -5,7 +5,7 @@
 ## [未发布]
 
 - 准备首个 GitHub Technical Preview。
-- 当前源码候选版本为 `0.2.0-preview.1`，尚未创建公开 Release；此前内部构建和现场复测不构成公开版本历史。
+- 当前源码候选版本为 `0.2.0-preview.2`，尚未创建公开 Release；此前内部构建和现场复测不构成公开版本历史。
 - 线协议先升级到 v9，增加短时单次 Agent 入网码、可确认的 Controller 会话释放和同 Owner 新实例接管通知；随后升级到 v10，取消普通 Agent 首次连接所需的入网码和部署级注册 Token；v11 增加有状态分块文件传输、下载覆盖授权和完整文件校验；当前 v12 继续作为源码协议版本。
 - 公网 CA Agent 继续零证书配置；未知自签名证书由 GUI 在发送 RemoteOps 凭据前展示 SHA-256 指纹，经独立渠道核对后可仅本次继续或固定保存，无界面 CLI/Service 仍需预置 CA 或已核对指纹。
 - 修复 Codex 接受 MCP 授权后完全控制仍未生效的问题：配对默认逐项确认，完全控制只通过 `set_control_mode` 的 Codex 工具授权开启，不再嵌套确认；Agent 端没有授权按钮。
@@ -18,8 +18,15 @@
 - 新增 MCP `close_shell`；持久 Shell 执行 `exit` 后不再误报失败。CMD、Windows PowerShell 5.1 和 PowerShell 7 的一次性与持久子进程统一隐藏窗口，并规范 UTF-8 中文输出及 ANSI 清理。
 - 修复持久 Windows PowerShell 5.1 和 PowerShell 7 每条命令落入子作用域、导致普通变量与函数不能跨命令保留的问题，并补充双版本回归测试。
 - 修复 Windows PowerShell 5.1 下正式构建、发布门禁和 MCP 安装脚本的编码与旧 .NET API 兼容问题；旧式 granular 审批配置可迁移为当前 Codex 内联语法，并保留空行及其他配置段。
+- 修复 Relay 紧急停止授权顺序、管理台动态 HTML 转义、管理密码 Argon2id 迁移、管理登录限速及跨平台 Clippy 门禁。
 
-## [0.2.0-preview.1] - 未发布
+## [0.2.0-preview.2] - 未发布
+
+### 安全与质量修复
+
+- 保持线协议 v12 和现有管理 API 路径不变。
+
+## [0.2.0-preview.1] - 历史候选，未发布
 
 ### 首个公开预览
 
@@ -49,4 +56,3 @@
 - macOS 安装器使用 Keychain 保存 Controller Token，不把 Token 写入 Codex 配置、RemoteOps JSON、日志或安装包。
 - Windows 正式发布产物静态链接 MSVC CRT，不要求现场机器另行安装 VC++ 运行库。
 - 发布工作流强制校验 Git 标签与 Cargo 版本一致，将 Technical Preview 标记为 prerelease，并拒绝缺少许可证、依赖清单、哈希不一致或包含额外文件的发布资产。
-

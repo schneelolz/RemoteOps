@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
 use remoteops_domain::{
@@ -304,9 +305,11 @@ struct RelayState {
     admin_password_hash: Option<AdminPasswordHash>,
 }
 
-/// 管理页面密码的随机盐哈希。状态文件中不保存密码明文。
+/// 管理页面密码哈希。`algorithm` 缺省时表示可迁移的旧 SHA-256 格式；新值使用 Argon2id。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct AdminPasswordHash {
+    #[serde(default)]
+    algorithm: Option<String>,
     salt: String,
     digest: String,
 }
@@ -548,9 +551,7 @@ impl Relay {
             source,
             "管理凭据校验失败",
         );
-        if let Err(error) = self.persist_state_locked(&state) {
-            warn!(error = %error, "无法持久化管理认证失败审计事件");
-        }
+        // 失败请求来自未认证的调用方；保留有界内存审计，避免每次尝试同步重写完整状态文件。
     }
 
     /// 记录管理页面登录成功，不保存密码或 Session Cookie。
@@ -851,11 +852,18 @@ impl Relay {
 
     /// 验证管理页面密码。
     pub async fn admin_password_matches(&self, password: &str) -> bool {
-        let state = self.state.lock().await;
-        state
-            .admin_password_hash
-            .as_ref()
-            .is_some_and(|stored| verify_admin_password(password, stored))
+        let mut state = self.state.lock().await;
+        let Some(stored) = state.admin_password_hash.as_ref() else {
+            return false;
+        };
+        let valid = verify_admin_password(password, stored);
+        if valid && stored.algorithm.is_none() {
+            state.admin_password_hash = Some(hash_admin_password(password));
+            if let Err(error) = self.persist_state_locked(&state) {
+                warn!(error = %error, "无法持久化管理密码 Argon2id 迁移");
+            }
+        }
+        valid
     }
 
     /// 判断是否已经存在持久化的管理密码哈希。
@@ -2161,6 +2169,18 @@ impl Relay {
             return;
         }
 
+        if matches!(request.operation, RemoteOperation::EmergencyStop)
+            && controller_kind == ControllerKind::Ai
+        {
+            send_request_error(
+                controller_sender,
+                &request,
+                "human_only",
+                "只有人工 Controller 可以接管、释放或紧急停止会话",
+            );
+            return;
+        }
+
         if matches!(request.operation, RemoteOperation::EmergencyStop) {
             let stopped_request_ids: Vec<_> = state
                 .in_flight
@@ -2201,9 +2221,7 @@ impl Relay {
         if controller_kind == ControllerKind::Ai
             && matches!(
                 &request.operation,
-                RemoteOperation::HumanTakeover
-                    | RemoteOperation::ReleaseHumanTakeover
-                    | RemoteOperation::EmergencyStop
+                RemoteOperation::HumanTakeover | RemoteOperation::ReleaseHumanTakeover
             )
         {
             send_request_error(
@@ -2846,16 +2864,31 @@ fn validate_admin_password(password: &str) -> Result<(), String> {
 }
 
 fn hash_admin_password(password: &str) -> AdminPasswordHash {
-    let salt = Uuid::new_v4().simple().to_string();
-    let digest = password_digest(password, &salt);
-    AdminPasswordHash { salt, digest }
+    let salt = SaltString::generate(&mut rand::rngs::OsRng);
+    let digest = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("Argon2id 密码哈希生成不应失败")
+        .to_string();
+    AdminPasswordHash {
+        algorithm: Some("argon2id".to_owned()),
+        salt: salt.to_string(),
+        digest,
+    }
 }
 
 fn verify_admin_password(password: &str, stored: &AdminPasswordHash) -> bool {
-    constant_time_bytes_eq(
-        password_digest(password, &stored.salt).as_bytes(),
-        stored.digest.as_bytes(),
-    )
+    match stored.algorithm.as_deref() {
+        Some("argon2id") => PasswordHash::new(&stored.digest).is_ok_and(|hash| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &hash)
+                .is_ok()
+        }),
+        None => constant_time_bytes_eq(
+            password_digest(password, &stored.salt).as_bytes(),
+            stored.digest.as_bytes(),
+        ),
+        _ => false,
+    }
 }
 
 fn password_digest(password: &str, salt: &str) -> String {
@@ -2886,6 +2919,14 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
         .with_context(|| format!("无法读取 Relay 状态文件 {}", path.display()))?;
     let persisted: PersistedRelayState = serde_json::from_str(&contents)
         .with_context(|| format!("Relay 状态文件格式无效：{}", path.display()))?;
+    if persisted
+        .admin_password_hash
+        .as_ref()
+        .and_then(|hash| hash.algorithm.as_deref())
+        .is_some_and(|algorithm| algorithm != "argon2id")
+    {
+        bail!("Relay 状态文件包含无法识别的管理密码哈希格式，请重置密码");
+    }
     if persisted.version != PERSISTED_STATE_VERSION {
         bail!(
             "Relay 状态文件版本 {} 不受支持，当前版本为 {}",
@@ -4566,6 +4607,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ai_emergency_stop_is_rejected_without_side_effects() {
+        let relay = relay(Duration::minutes(10));
+        let agent_id = AgentInstanceId::new();
+        let (agent, mut agent_receiver, session_id) = ready_agent(&relay, agent_id, None).await;
+        let (ai_id, ai_generation, mut ai_receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        relay
+            .pair_controller(
+                ai_id,
+                ai_generation,
+                PairRequest {
+                    request_id: RequestId::new(),
+                    pairing_code: agent.welcome.pairing_code,
+                    permission_mode: PermissionMode::FullAccess,
+                },
+            )
+            .await;
+        let stopped_request_id = RequestId::new();
+        relay.state.lock().await.in_flight.insert(
+            stopped_request_id,
+            InFlightRequest {
+                agent_id,
+                session_id,
+                controller_id: ai_id,
+                owner_id: test_owner_id(),
+                controller_generation: ai_generation,
+                controller_kind: ControllerKind::Ai,
+                source: EventSource::Ai,
+                approval: ApprovalState::NotRequired,
+                previous_takeover: None,
+            },
+        );
+        let before = relay.state.lock().await;
+        let before_in_flight = before.in_flight.len();
+        let before_mode = before
+            .session_bindings
+            .get(&session_id)
+            .expect("Session 绑定应存在")
+            .permission_mode();
+        let before_takeover = before
+            .session_bindings
+            .get(&session_id)
+            .expect("Session 绑定应存在")
+            .human_takeover;
+        drop(before);
+        while agent_receiver.try_recv().is_ok() {}
+
+        relay
+            .forward_controller_request(
+                ai_id,
+                ai_generation,
+                RemoteRequest {
+                    request_id: RequestId::new(),
+                    session_id,
+                    source: EventSource::Ai,
+                    operation: RemoteOperation::EmergencyStop,
+                    approval_id: None,
+                    payload_base64: None,
+                },
+                &ai_sender(&relay, ai_id).await,
+            )
+            .await;
+
+        assert!(
+            matches!(ai_receiver.recv().await, Some(WireMessage::Error { ref code, .. }) if code == "human_only")
+        );
+        assert!(
+            agent_receiver.try_recv().is_err(),
+            "拒绝的 AI 请求不得转发到 Agent"
+        );
+        let state = relay.state.lock().await;
+        assert_eq!(state.in_flight.len(), before_in_flight);
+        assert!(state.in_flight.contains_key(&stopped_request_id));
+        assert_eq!(
+            state
+                .session_bindings
+                .get(&session_id)
+                .unwrap()
+                .permission_mode(),
+            before_mode
+        );
+        assert_eq!(
+            state
+                .session_bindings
+                .get(&session_id)
+                .unwrap()
+                .human_takeover,
+            before_takeover
+        );
+    }
+
+    #[tokio::test]
     async fn duplicate_controller_instance_is_rejected() {
         let relay = relay(Duration::minutes(10));
         let controller_id = ControllerInstanceId::new();
@@ -5345,6 +5478,39 @@ mod tests {
             persisted_relay(&state_file.path, Duration::minutes(10)).expect("Relay 应恢复");
         assert!(restored.admin_password_matches(replacement).await);
         assert!(!restored.admin_password_matches(initial).await);
+    }
+
+    #[tokio::test]
+    async fn legacy_sha256_password_is_migrated_after_successful_login() {
+        let state_file = TestStateFile::new("legacy-admin-password");
+        let password = "legacy-admin-password-123";
+        let relay = persisted_relay(&state_file.path, Duration::minutes(10)).expect("Relay 应启动");
+        {
+            let mut state = relay.state.lock().await;
+            let salt = "legacy-salt".to_owned();
+            let digest = password_digest(password, &salt);
+            state.admin_password_hash = Some(AdminPasswordHash {
+                algorithm: None,
+                salt,
+                digest,
+            });
+            relay
+                .persist_state_locked(&state)
+                .expect("旧密码应能写入状态");
+        }
+        assert!(relay.admin_password_matches(password).await);
+        let state = relay.state.lock().await;
+        assert_eq!(
+            state
+                .admin_password_hash
+                .as_ref()
+                .unwrap()
+                .algorithm
+                .as_deref(),
+            Some("argon2id")
+        );
+        drop(state);
+        assert!(!relay.admin_password_matches("wrong-password-123").await);
     }
 
     #[test]

@@ -30,6 +30,26 @@ const state = {
   }
 };
 
+// All values originating in Relay/API responses or operator input pass through this
+// helper before being interpolated into an HTML template. Event-handler arguments
+// additionally use encodeURIComponent below so quotes cannot escape an attribute.
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeEventValue(value) {
+  return encodeURIComponent(String(value ?? ''));
+}
+
+function eventValue(value) {
+  return `decodeURIComponent('${safeEventValue(value)}')`;
+}
+
 function formatApiDate(value) {
   if (!value) return '-';
   const date = new Date(value);
@@ -62,24 +82,24 @@ async function apiFetch(path, options = {}) {
 }
 
 function applyApiData(overview, identity, agents, sessions, audit) {
-  mockRelayInfo.address = window.location.hostname || '127.0.0.1';
+  mockRelayInfo.address = escapeHtml(window.location.hostname || '127.0.0.1');
   mockRelayInfo.aiTokenCreatedAt = '-';
   mockRelayInfo.aiTokenLastRotated = '-';
-  mockRelayInfo.ownerUuid = String(identity.owner_id || overview.owner_id || '');
+  mockRelayInfo.ownerUuid = escapeHtml(String(identity.owner_id || overview.owner_id || ''));
   mockRelayInfo.aiTokenConfigured = Boolean(identity.ai_token_configured);
-  mockRelayInfo.aiTokenFingerprint = identity.ai_token_fingerprint || '-';
-  mockRelayInfo.version = overview.version || '-';
+  mockRelayInfo.aiTokenFingerprint = escapeHtml(identity.ai_token_fingerprint || '-');
+  mockRelayInfo.version = escapeHtml(overview.version || '-');
   mockRelayInfo.uptime = `${Math.floor((overview.uptime_seconds || 0) / 86400)}d ${Math.floor((overview.uptime_seconds || 0) % 86400 / 3600)}h`;
   mockRelayInfo.currentConnections = overview.connected_controllers || 0;
   mockRelayInfo.maxConnections = Math.max(overview.connected_controllers || 0, 1);
 
   const agentById = new Map(agents.map(agent => [String(agent.agent_instance_id), agent]));
   mockAgents.splice(0, mockAgents.length, ...agents.map(agent => ({
-    id: String(agent.agent_instance_id),
-    hostname: agent.hostname,
-    os: agent.operating_system,
+    id: escapeHtml(String(agent.agent_instance_id)),
+    hostname: escapeHtml(agent.hostname),
+    os: escapeHtml(agent.operating_system),
     status: agent.state === 'online' ? 'online' : 'offline',
-    sessionId: agent.session_id ? String(agent.session_id) : 'None',
+    sessionId: agent.session_id ? escapeHtml(String(agent.session_id)) : 'None',
     codeStatus: agent.pairing_code_configured ? '控制码已生成' : '控制码未生成',
     lease: formatApiDate(agent.lease_expires_at),
     heartbeat: formatApiDate(agent.last_seen),
@@ -93,20 +113,20 @@ function applyApiData(overview, identity, agents, sessions, audit) {
     const agent = agentById.get(String(session.agent_instance_id));
     const permissionMode = session.permission_mode || 'approval_required';
     return {
-      id: String(session.session_id),
-      agentName: agent?.hostname || session.hostname,
-      agentId: String(session.agent_instance_id),
+      id: escapeHtml(String(session.session_id)),
+      agentName: escapeHtml(agent?.hostname || session.hostname),
+      agentId: escapeHtml(String(session.agent_instance_id)),
       agentStatus: session.state === 'online' ? 'online' : 'offline',
-      hostname: session.hostname,
-      os: session.operating_system,
+      hostname: escapeHtml(session.hostname),
+      os: escapeHtml(session.operating_system),
       capabilities: [],
       controllerType: ai ? 'AI (MCP)' : human ? 'Human' : 'None',
-      controllerName: ai ? `AI Controller (${String(ai.controller_instance_id).slice(0, 8)})` : human ? `Human Controller (${String(human.controller_instance_id).slice(0, 8)})` : 'None',
-      controllerInstanceId: String((ai || human)?.controller_instance_id || '-'),
-      humanController: human ? `Connected (${String(human.controller_instance_id).slice(0, 8)})` : 'None',
-      ownerUuid: session.owner_id ? String(session.owner_id) : mockRelayInfo.ownerUuid,
+      controllerName: escapeHtml(ai ? `AI Controller (${String(ai.controller_instance_id).slice(0, 8)})` : human ? `Human Controller (${String(human.controller_instance_id).slice(0, 8)})` : 'None'),
+      controllerInstanceId: escapeHtml(String((ai || human)?.controller_instance_id || '-')),
+      humanController: escapeHtml(human ? `Connected (${String(human.controller_instance_id).slice(0, 8)})` : 'None'),
+      ownerUuid: escapeHtml(session.owner_id ? String(session.owner_id) : mockRelayInfo.ownerUuid),
       permissionMode,
-      permissionLabel: permissionLabel(permissionMode),
+      permissionLabel: escapeHtml(permissionLabel(permissionMode)),
       connectTime: formatApiDate(session.last_seen),
       lastHeartbeat: formatApiDate(session.last_seen),
       pendingApprovals: session.pending_approvals || 0,
@@ -120,17 +140,17 @@ function applyApiData(overview, identity, agents, sessions, audit) {
   mockAuditLogs = audit.map(event => ({
     id: event.id,
     time: formatApiDate(event.timestamp),
-    operator: event.source || 'admin_api',
-    action: String(event.action || '').toUpperCase(),
-    target: event.target || '-',
+    operator: escapeHtml(event.source || 'admin_api'),
+    action: escapeHtml(String(event.action || '').toUpperCase()),
+    target: escapeHtml(event.target || '-'),
     result: event.success ? 'SUCCESS' : 'FAILED',
     ip: '-',
-    details: event.summary || '-'
+      details: escapeHtml(event.summary || '-'),
   }));
   mockEvents.splice(0, mockEvents.length, ...audit.slice(-5).reverse().map(event => ({
     time: formatApiDate(event.timestamp).slice(11, 19),
-    type: String(event.action || 'SYSTEM').toUpperCase(),
-    desc: event.summary || String(event.action || '系统事件'),
+    type: escapeHtml(String(event.action || 'SYSTEM').toUpperCase()),
+    desc: escapeHtml(event.summary || String(event.action || '系统事件')),
     badge: event.success ? 'online' : 'danger'
   })));
 }
@@ -163,7 +183,7 @@ async function restoreSession() {
   try {
     const session = await apiFetch('/api/admin/session');
     if (!session.authenticated) throw new Error('管理 Session 已失效');
-    if (session.username) state.adminUser = session.username;
+    if (session.username) state.adminUser = escapeHtml(session.username);
     await refreshRealData();
     state.isLoggedIn = true;
   } catch (_) {
@@ -374,10 +394,10 @@ function showToast(message, type = 'success') {
     ? `<svg class="w-4 h-4 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>`
     : `<svg class="w-4 h-4 text-red-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`;
 
-  toast.innerHTML = `
-    ${iconSvg}
-    <span>${message}</span>
-  `;
+  toast.innerHTML = iconSvg;
+  const toastText = document.createElement('span');
+  toastText.textContent = String(message ?? '');
+  toast.appendChild(toastText);
   container.appendChild(toast);
 
   setTimeout(() => {
@@ -594,7 +614,7 @@ function renderTopBar() {
         </button>
         <div class="admin-pill">
           <span class="avatar">A</span>
-          <span class="font-mono text-slate-300">${state.adminUser}</span>
+          <span class="font-mono text-slate-300">${escapeHtml(state.adminUser)}</span>
         </div>
         <button class="btn btn-secondary btn-sm" onclick="navigateTo('settings')" title="修改管理页面密码">
           <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
@@ -682,7 +702,7 @@ function renderSidebar() {
 
 // Views: Overview
 function renderOverviewView() {
-  if (state.api.error) return renderErrorState(`管理 API 请求失败：${state.api.error}`);
+  if (state.api.error) return renderErrorState(`管理 API 请求失败：${escapeHtml(state.api.error)}`);
   if (state.prototypeScenario === 'api_error') {
     return renderErrorState('获取 Relay 概览数据失败: Connection Refused (500)');
   }
@@ -842,7 +862,7 @@ function renderOverviewView() {
 
 // Views: Session Management
 function renderSessionsView() {
-  if (state.api.error) return renderErrorState(`管理 API 请求失败：${state.api.error}`);
+  if (state.api.error) return renderErrorState(`管理 API 请求失败：${escapeHtml(state.api.error)}`);
   if (state.prototypeScenario === 'api_error') {
     return renderErrorState('加载会话列表失败: Relay API 响应 500');
   }
@@ -898,7 +918,7 @@ function renderSessionsView() {
             type="text"
             class="input font-mono"
             placeholder="搜索 Session ID / Agent..."
-            value="${state.filters.keyword}"
+            value="${escapeHtml(state.filters.keyword)}"
             style="width: 220px;"
             oninput="state.filters.keyword = this.value; renderApp();"
           />
@@ -973,7 +993,7 @@ function renderSessionTable(sessions) {
           ${sessions.map(s => {
             const isOnline = s.agentStatus === 'online';
             return `
-              <tr onclick="openSessionDrawer('${s.id}')">
+              <tr onclick="openSessionDrawer(${eventValue(s.id)})">
                 <td>
                   <span class="badge ${isOnline ? 'badge-online' : 'badge-offline'}">
                     <span class="badge-dot"></span>
@@ -981,46 +1001,46 @@ function renderSessionTable(sessions) {
                   </span>
                 </td>
                 <td>
-                  <span class="copyable-text" onclick="event.stopPropagation(); copyToClipboard('${s.id}', 'Session ID');" title="点击复制完整 Session ID">
-                    ${truncate(s.id, 8, 6)}
+                  <span class="copyable-text" onclick="event.stopPropagation(); copyToClipboard(${eventValue(s.id)}, 'Session ID');" title="点击复制完整 Session ID">
+                    ${escapeHtml(truncate(s.id, 8, 6))}
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                   </span>
                 </td>
                 <td>
-                  <div style="font-weight:600; color:var(--text-primary); font-size:12.5px;">${s.agentName}</div>
-                  <div class="font-mono" style="font-size:11px; color:var(--text-muted);">${s.agentId}</div>
+                  <div style="font-weight:600; color:var(--text-primary); font-size:12.5px;">${escapeHtml(s.agentName)}</div>
+                  <div class="font-mono" style="font-size:11px; color:var(--text-muted);">${escapeHtml(s.agentId)}</div>
                 </td>
                 <td>
                   ${s.controllerType.includes('AI') ? `
                     <div style="display:flex; align-items:center; gap:4px;">
                       <span class="badge badge-info" style="font-size:10px;">MCP</span>
-                      <span style="font-size:11.5px; color:var(--text-primary);">${s.controllerName.replace('AI Controller ', '')}</span>
+                      <span style="font-size:11.5px; color:var(--text-primary);">${escapeHtml(s.controllerName.replace('AI Controller ', ''))}</span>
                     </div>
                   ` : `<span style="color:var(--text-muted); font-size:11.5px;">未连接</span>`}
                 </td>
                 <td>
                   ${s.humanController !== 'None' ? `
-                    <span class="badge badge-info" style="font-size:10.5px;">${s.humanController}</span>
+                    <span class="badge badge-info" style="font-size:10.5px;">${escapeHtml(s.humanController)}</span>
                   ` : `<span style="color:var(--text-muted); font-size:11.5px;">无</span>`}
                 </td>
                 <td>
-                  <span class="copyable-text" onclick="event.stopPropagation(); copyToClipboard('${s.ownerUuid}', 'Owner UUID');" title="点击复制 Owner UUID">
-                    ${truncate(s.ownerUuid, 6, 4)}
+                  <span class="copyable-text" onclick="event.stopPropagation(); copyToClipboard(${eventValue(s.ownerUuid)}, 'Owner UUID');" title="点击复制 Owner UUID">
+                    ${escapeHtml(truncate(s.ownerUuid, 6, 4))}
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                   </span>
                 </td>
                 <td>
-                  <span class="tag" style="${s.permissionMode === 'FullAccess' ? 'border-color:var(--status-danger-border); color:var(--status-danger-text);' : ''}">${s.permissionLabel}</span>
+                  <span class="tag" style="${s.permissionMode === 'FullAccess' ? 'border-color:var(--status-danger-border); color:var(--status-danger-text);' : ''}">${escapeHtml(s.permissionLabel)}</span>
                 </td>
                 <td>
-                  <span class="font-mono text-slate-400">${s.lastHeartbeat}</span>
+                  <span class="font-mono text-slate-400">${escapeHtml(s.lastHeartbeat)}</span>
                 </td>
                 <td style="text-align:right;" onclick="event.stopPropagation();">
                   <div style="display:inline-flex; gap:6px;">
-                    <button class="btn btn-secondary btn-sm" onclick="openSessionDrawer('${s.id}')">详情</button>
+                    <button class="btn btn-secondary btn-sm" onclick="openSessionDrawer(${eventValue(s.id)})">详情</button>
                     ${isOnline ? `
-                      <button class="btn btn-warning btn-sm" onclick="openModal('terminateSession', { id: '${s.id}', agentName: '${s.agentName}' })">关闭</button>
-                      <button class="btn btn-danger btn-sm" onclick="openModal('emergencyStop', { id: '${s.id}', agentName: '${s.agentName}' })">🛑 紧急停止</button>
+                      <button class="btn btn-warning btn-sm" onclick="openModal('terminateSession', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })">关闭</button>
+                      <button class="btn btn-danger btn-sm" onclick="openModal('emergencyStop', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })">🛑 紧急停止</button>
                     ` : `
                       <button class="btn btn-secondary btn-sm" disabled title="Agent 离线，无法立即清理远端会话">清理记录</button>
                       <button class="btn btn-danger btn-sm" disabled title="Agent 离线且没有可执行的紧急操作">🛑 紧急停止</button>
@@ -1038,7 +1058,7 @@ function renderSessionTable(sessions) {
 
 // Views: Agent Management
 function renderAgentsView() {
-  if (state.api.error) return renderErrorState(`管理 API 请求失败：${state.api.error}`);
+  if (state.api.error) return renderErrorState(`管理 API 请求失败：${escapeHtml(state.api.error)}`);
   if (state.prototypeScenario === 'api_error') {
     return renderErrorState('获取 Agent 列表失败: 500 Internal Server Error');
   }
@@ -1087,19 +1107,19 @@ function renderAgentsView() {
                         ${agt.status === 'online' ? 'Online' : 'Offline'}
                       </span>
                     </td>
-                    <td class="font-mono text-slate-200 font-semibold">${agt.id}</td>
-                    <td class="font-mono text-slate-300">${agt.hostname}</td>
-                    <td style="color:var(--text-muted); font-size:11.5px;">${agt.os}</td>
+                    <td class="font-mono text-slate-200 font-semibold">${escapeHtml(agt.id)}</td>
+                    <td class="font-mono text-slate-300">${escapeHtml(agt.hostname)}</td>
+                    <td style="color:var(--text-muted); font-size:11.5px;">${escapeHtml(agt.os)}</td>
                     <td class="font-mono">
-                      ${agt.sessionId !== 'None' ? `<span class="copyable-text" onclick="copyToClipboard('${agt.sessionId}', 'Session ID')">${agt.sessionId}</span>` : '<span style="color:var(--text-muted);">-</span>'}
+                      ${agt.sessionId !== 'None' ? `<span class="copyable-text" onclick="copyToClipboard(${eventValue(agt.sessionId)}, 'Session ID')">${escapeHtml(agt.sessionId)}</span>` : '<span style="color:var(--text-muted);">-</span>'}
                     </td>
                     <td>
-                      <span class="tag" style="background:var(--bg-input);">${agt.codeStatus}</span>
+                      <span class="tag" style="background:var(--bg-input);">${escapeHtml(agt.codeStatus)}</span>
                     </td>
-                    <td class="font-mono text-slate-400">${agt.heartbeat}</td>
+                    <td class="font-mono text-slate-400">${escapeHtml(agt.heartbeat)}</td>
                     <td class="font-mono text-slate-400">${agt.pairCount} 次</td>
                     <td style="text-align:right;">
-                      <button class="btn btn-secondary btn-sm" onclick="showToast('Agent ${agt.id} 详细诊断就绪', 'info');">诊断</button>
+                      <button class="btn btn-secondary btn-sm" onclick="showToast(${eventValue(`Agent ${agt.id} 详细诊断就绪`)}, 'info');">诊断</button>
                     </td>
                   </tr>
                 `).join('')}
@@ -1141,8 +1161,8 @@ function renderIdentityView() {
             <div class="input-group">
               <label class="input-label">完整 Owner UUID</label>
               <div class="code-box">
-                <span>${mockRelayInfo.ownerUuid}</span>
-                <button class="btn btn-secondary btn-sm" onclick="copyToClipboard('${mockRelayInfo.ownerUuid}', 'Owner UUID')">
+                <span>${escapeHtml(mockRelayInfo.ownerUuid)}</span>
+                <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(${eventValue(mockRelayInfo.ownerUuid)}, 'Owner UUID')">
                   <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                   复制 UUID
                 </button>
@@ -1151,7 +1171,7 @@ function renderIdentityView() {
 
             <div style="display:flex; gap:16px; font-size:12px; color:var(--text-muted); margin-top:4px;">
               <span>脱敏摘要: <strong class="font-mono text-slate-300">550e...0000</strong></span>
-              <span>关联业务地址: <strong class="font-mono text-slate-300">${mockRelayInfo.address}:${mockRelayInfo.servicePort}</strong></span>
+              <span>关联业务地址: <strong class="font-mono text-slate-300">${escapeHtml(mockRelayInfo.address)}:${mockRelayInfo.servicePort}</strong></span>
             </div>
           </div>
         </div>
@@ -1178,7 +1198,7 @@ function renderIdentityView() {
             </div>
             <div class="kv-item">
               <span class="kv-label">Token 指纹 (SHA-256)</span>
-              <span class="kv-value font-mono text-slate-300">${mockRelayInfo.aiTokenFingerprint}</span>
+              <span class="kv-value font-mono text-slate-300">${escapeHtml(mockRelayInfo.aiTokenFingerprint)}</span>
             </div>
             <div class="kv-item">
               <span class="kv-label">创建时间</span>
@@ -1304,7 +1324,7 @@ async function handleChangePassword(event) {
 
 // Views: Audit Logs
 function renderAuditView() {
-  if (state.api.error) return renderErrorState(`管理 API 请求失败：${state.api.error}`);
+  if (state.api.error) return renderErrorState(`管理 API 请求失败：${escapeHtml(state.api.error)}`);
   if (state.prototypeScenario === 'api_error') {
     return renderErrorState('审计日志检索异常: 500 DB Query Timeout');
   }
@@ -1373,20 +1393,20 @@ function renderAuditView() {
             <tbody>
               ${logs.map(log => `
                 <tr>
-                  <td class="font-mono text-slate-400" style="font-size:11.5px;">${log.time}</td>
-                  <td class="font-mono text-slate-200">${log.operator}</td>
+                  <td class="font-mono text-slate-400" style="font-size:11.5px;">${escapeHtml(log.time)}</td>
+                  <td class="font-mono text-slate-200">${escapeHtml(log.operator)}</td>
                   <td>
-                    <span class="tag" style="font-weight:600;">${log.action}</span>
+                    <span class="tag" style="font-weight:600;">${escapeHtml(log.action)}</span>
                   </td>
-                  <td class="font-mono">${log.target}</td>
+                  <td class="font-mono">${escapeHtml(log.target)}</td>
                   <td>
                     <span class="badge ${log.result === 'SUCCESS' ? 'badge-online' : 'badge-danger'}">
                       <span class="badge-dot"></span>
-                      ${log.result}
+                      ${escapeHtml(log.result)}
                     </span>
                   </td>
-                  <td class="font-mono text-slate-400">${log.ip}</td>
-                  <td style="color:var(--text-primary); font-size:12px;">${log.details}</td>
+                  <td class="font-mono text-slate-400">${escapeHtml(log.ip)}</td>
+                  <td style="color:var(--text-primary); font-size:12px;">${escapeHtml(log.details)}</td>
                 </tr>
               `).join('')}
             </tbody>
@@ -1538,14 +1558,14 @@ function renderDrawer() {
   drawer.innerHTML = `
     <div class="drawer-header">
       <div>
-        <div style="font-size:14px; font-weight:700; color:var(--text-primary); display:flex; align-items:center; gap:8px;">
+          <div style="font-size:14px; font-weight:700; color:var(--text-primary); display:flex; align-items:center; gap:8px;">
           <span>Session 详情</span>
           <span class="badge ${s.agentStatus === 'online' ? 'badge-online' : 'badge-offline'}">
             <span class="badge-dot"></span>
             ${s.agentStatus === 'online' ? 'Active' : 'Offline'}
           </span>
         </div>
-        <div class="font-mono text-slate-400" style="font-size:11px; margin-top:2px;">${truncate(s.id, 10, 8)}</div>
+        <div class="font-mono text-slate-400" style="font-size:11px; margin-top:2px;">${escapeHtml(truncate(s.id, 10, 8))}</div>
       </div>
       <button class="btn btn-ghost btn-sm" onclick="closeSessionDrawer()">
         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -1563,24 +1583,24 @@ function renderDrawer() {
           <div class="kv-item">
             <span class="kv-label">完整 Session ID</span>
             <span class="kv-value">
-              <span class="copyable-text" onclick="copyToClipboard('${s.id}', 'Session ID')">
-                ${s.id}
+              <span class="copyable-text" onclick="copyToClipboard(${eventValue(s.id)}, 'Session ID')">
+                ${escapeHtml(s.id)}
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
               </span>
             </span>
           </div>
           <div class="kv-item">
             <span class="kv-label">Agent 节点</span>
-            <span class="kv-value font-semibold text-slate-200">${s.agentName} (${s.agentId})</span>
+            <span class="kv-value font-semibold text-slate-200">${escapeHtml(s.agentName)} (${escapeHtml(s.agentId)})</span>
           </div>
           <div class="kv-item">
             <span class="kv-label">主机名 / OS</span>
-            <span class="kv-value font-mono text-slate-300">${s.hostname} / ${s.os}</span>
+            <span class="kv-value font-mono text-slate-300">${escapeHtml(s.hostname)} / ${escapeHtml(s.os)}</span>
           </div>
           <div class="kv-item">
             <span class="kv-label">能力列表 (Capabilities)</span>
             <span class="kv-value" style="display:flex; flex-wrap:wrap; gap:4px; justify-content:flex-end;">
-              ${s.capabilities.map(c => `<span class="tag">${c}</span>`).join('')}
+              ${s.capabilities.map(c => `<span class="tag">${escapeHtml(c)}</span>`).join('')}
             </span>
           </div>
           <div class="kv-item">
@@ -1603,21 +1623,21 @@ function renderDrawer() {
         <div class="key-value-list">
           <div class="kv-item">
             <span class="kv-label">AI Controller (MCP)</span>
-            <span class="kv-value font-semibold text-blue-400">${s.controllerName}</span>
+            <span class="kv-value font-semibold text-blue-400">${escapeHtml(s.controllerName)}</span>
           </div>
           <div class="kv-item">
             <span class="kv-label">Controller 实例 ID</span>
-            <span class="kv-value font-mono">${s.controllerInstanceId}</span>
+            <span class="kv-value font-mono">${escapeHtml(s.controllerInstanceId)}</span>
           </div>
           <div class="kv-item">
             <span class="kv-label">Human Controller</span>
-            <span class="kv-value">${s.humanController}</span>
+            <span class="kv-value">${escapeHtml(s.humanController)}</span>
           </div>
           <div class="kv-item">
             <span class="kv-label">Owner UUID</span>
             <span class="kv-value">
-              <span class="copyable-text" onclick="copyToClipboard('${s.ownerUuid}', 'Owner UUID')">
-                ${s.ownerUuid}
+              <span class="copyable-text" onclick="copyToClipboard(${eventValue(s.ownerUuid)}, 'Owner UUID')">
+                ${escapeHtml(s.ownerUuid)}
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
               </span>
             </span>
@@ -1625,7 +1645,7 @@ function renderDrawer() {
           <div class="kv-item">
             <span class="kv-label">当前权限模式</span>
             <span class="kv-value">
-              <span class="tag" style="color:var(--status-info-text); border-color:var(--status-info-border);">${s.permissionLabel}</span>
+              <span class="tag" style="color:var(--status-info-text); border-color:var(--status-info-border);">${escapeHtml(s.permissionLabel)}</span>
             </span>
           </div>
         </div>
@@ -1665,7 +1685,7 @@ function renderDrawer() {
               <div style="font-size:12px; font-weight:600; color:var(--text-primary);">${s.agentStatus === 'online' ? '关闭当前会话' : '清理离线会话记录'}</div>
               <div style="font-size:11px; color:var(--text-muted);">${s.agentStatus === 'online' ? '断开 Controller 连接并清理会话状态' : 'Agent 离线，清理操作需等待 Relay 状态确认'}</div>
             </div>
-            <button class="btn btn-warning btn-sm" ${s.agentStatus === 'online' ? `onclick="openModal('terminateSession', { id: '${s.id}', agentName: '${s.agentName}' })"` : 'disabled title="Agent 离线，当前原型不执行清理"'}>${s.agentStatus === 'online' ? '关闭会话' : '暂不可用'}</button>
+            <button class="btn btn-warning btn-sm" ${s.agentStatus === 'online' ? `onclick="openModal('terminateSession', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })"` : 'disabled title="Agent 离线，当前原型不执行清理"'}>${s.agentStatus === 'online' ? '关闭会话' : '暂不可用'}</button>
           </div>
 
           <div style="display:flex; justify-content:space-between; align-items:center; border-top:1px solid rgba(239,68,68,0.2); padding-top:8px;">
@@ -1673,7 +1693,7 @@ function renderDrawer() {
               <div style="font-size:12px; font-weight:600; color:var(--status-danger-text);">🛑 紧急停止 (Emergency Stop)</div>
               <div style="font-size:11px; color:var(--text-muted);">${s.agentStatus === 'online' ? '立即终止正在执行的远程操作并强制断开' : 'Agent 离线且没有可立即执行的远程操作'}</div>
             </div>
-            <button class="btn btn-danger btn-sm" ${s.agentStatus === 'online' ? `onclick="openModal('emergencyStop', { id: '${s.id}', agentName: '${s.agentName}' })"` : 'disabled title="Agent 离线，无法立即执行"'}>紧急停止</button>
+            <button class="btn btn-danger btn-sm" ${s.agentStatus === 'online' ? `onclick="openModal('emergencyStop', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })"` : 'disabled title="Agent 离线，无法立即执行"'}>紧急停止</button>
           </div>
         </div>
       </div>
@@ -1721,10 +1741,10 @@ function renderModal() {
         <div class="modal-body">
           <p>您即将关闭以下活跃会话：</p>
           <div class="code-box">
-            <span>Session ID: ${data?.id}</span>
+            <span>Session ID: ${escapeHtml(data?.id)}</span>
           </div>
           <div style="font-size:12px; color:var(--text-muted); line-height:1.5;">
-            目标 Agent: <strong class="text-slate-200">${data?.agentName}</strong><br/>
+            目标 Agent: <strong class="text-slate-200">${escapeHtml(data?.agentName)}</strong><br/>
             关闭会话后，当前连接中的 AI / Human Controller 将立即失去控制权，未完成的交互指令将被中断。
           </div>
         </div>
@@ -1749,7 +1769,7 @@ function renderModal() {
             <strong>高危风险提示：</strong> 此操作将通过 Relay 向 Agent 节点发送紧急停止请求，立即终止正在执行的远程操作并强制断开当前会话，且不可自动恢复！
           </div>
           <div>
-            目标会话: <span class="font-mono text-slate-200">${data?.id}</span> (${data?.agentName})
+            目标会话: <span class="font-mono text-slate-200">${escapeHtml(data?.id)}</span> (${escapeHtml(data?.agentName)})
           </div>
           <div class="input-group">
             <label class="input-label" style="color:var(--status-danger-text);">请输入 "STOP" 以解锁确认按钮：</label>
@@ -1803,8 +1823,8 @@ function renderModal() {
         <div class="modal-body">
           <p style="font-size:12px;">以下是新生成的 AI Controller Token（仅展示一次）：</p>
           <div class="code-box">
-            <span style="color:#6ee7b7;">${data?.newToken}</span>
-            <button class="btn btn-secondary btn-sm" onclick="copyToClipboard('${data?.newToken}', '新 Token')">复制</button>
+            <span style="color:#6ee7b7;">${escapeHtml(data?.newToken)}</span>
+            <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(${eventValue(data?.newToken)}, '新 Token')">复制</button>
           </div>
           <div style="font-size:11.5px; color:var(--status-degraded-text); line-height:1.4;">
             ⚠️ 关闭此弹窗后将无法再次查看完整明文。请立刻更新 MCP Server 配置文件。
@@ -1845,7 +1865,7 @@ function renderErrorState(errMsg) {
     <div class="empty-state">
       <svg class="empty-state-icon text-red-500" style="opacity:1;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
       <div class="empty-state-title" style="color:var(--status-danger-text);">Relay 服务请求异常</div>
-      <div class="empty-state-desc font-mono" style="font-size:11.5px;">${errMsg}</div>
+      <div class="empty-state-desc font-mono" style="font-size:11.5px;">${escapeHtml(errMsg)}</div>
       <div style="display:flex; gap:10px; margin-top:8px;">
         <button class="btn btn-secondary btn-sm" onclick="setPrototypeScenario('normal')">恢复正常状态</button>
         <button class="btn btn-primary btn-sm" onclick="showToast('正在重试...', 'info'); refreshRealData().then(renderApp).catch(() => renderApp());">重试连接</button>

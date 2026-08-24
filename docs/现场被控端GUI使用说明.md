@@ -1,9 +1,9 @@
 # RemoteOps 现场被控端 GUI 使用说明
 
-> 文档状态：当前现场客户机手册，适用于 Agent GUI `0.2.0-preview.1`。
+> 文档状态：当前现场客户机手册，适用于 Agent GUI `0.2.0-preview.2`。
 
-- 适用版本：`0.2.0-preview.1`
-- 正式程序：`artifacts/release/0.2.0-preview.1/windows-x64/remoteops-agent-gui.exe`
+- 适用版本：`0.2.0-preview.2`
+- 正式程序：`artifacts/release/0.2.0-preview.2/windows-x64/remoteops-agent-gui.exe`
 - Relay：由部署者配置，不内置公共默认值
 - 使用方式：管理员完成一次配置后，现场人员双击启动
 - 运行依赖：正式发布 EXE 静态链接 MSVC CRT，不需要另装 VC++ 运行库

@@ -7,7 +7,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$expectedVersion = '0.2.0-preview.1'
+$expectedVersion = '0.2.0-preview.2'
 $configPath = Join-Path $CodexHome 'config.toml'
 $installDirectory = Join-Path $CodexHome 'remoteops'
 $installedExecutable = $null

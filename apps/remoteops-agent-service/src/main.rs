@@ -1,21 +1,27 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    ffi::OsString,
-    fs,
     path::{Path, PathBuf},
-    sync::mpsc,
     time::Duration,
 };
 
+#[cfg(windows)]
+use std::{ffi::OsString, fs, sync::mpsc};
+
 use anyhow::Context;
+#[cfg(windows)]
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use remoteops_agent::{AgentConfig, AgentEvent, run_agent};
+#[cfg(windows)]
+use remoteops_agent::AgentEvent;
+use remoteops_agent::{AgentConfig, run_agent};
+#[cfg(windows)]
 use remoteops_domain::AgentInstanceId;
+#[cfg(windows)]
 use serde::Serialize;
 use tokio::sync::watch;
 
+#[cfg(windows)]
 const SERVICE_NAME: &str = "RemoteOpsAgent";
 
 /// `RemoteOps` Agent 服务宿主参数。
@@ -40,6 +46,7 @@ struct Args {
 }
 
 /// 仅供本机服务管理使用的短期状态。
+#[cfg(windows)]
 #[derive(Debug, Default, Serialize)]
 struct RuntimeStatus {
     /// 当前服务状态。
@@ -61,6 +68,7 @@ fn load_config(path: &Path) -> anyhow::Result<AgentConfig> {
     config.normalize_and_validate()
 }
 
+#[cfg(windows)]
 fn write_status(path: &Path, status: &RuntimeStatus) {
     let Ok(contents) = serde_json::to_vec_pretty(status) else {
         return;
@@ -80,6 +88,7 @@ fn write_status(path: &Path, status: &RuntimeStatus) {
     }
 }
 
+#[cfg(windows)]
 fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: AgentEvent) {
     match event {
         AgentEvent::Started {

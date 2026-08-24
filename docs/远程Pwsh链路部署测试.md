@@ -1,6 +1,6 @@
 # RemoteOps 远程 Pwsh 链路部署测试
 
-- 适用版本：RemoteOps `0.2.0-preview.1`
+- 适用版本：RemoteOps `0.2.0-preview.2`
 - 测试链路：Codex → 本地 STDIO MCP → TLS Relay → Windows Agent → PowerShell 7
 - 阶段定位：受控试点，不是生产无人值守运维
 
@@ -70,11 +70,11 @@ pwsh.exe 持久 Shell
 构建脚本会生成并核对：
 
 ```text
-artifacts/release/0.2.0-preview.1/windows-x64/manifest.json
+artifacts/release/0.2.0-preview.2/windows-x64/manifest.json
 artifacts/linux-x64/manifest.json
 ```
 
-部署前必须确认所有正式组件为 `0.2.0-preview.1`，并保留 Release 中的 SHA-256 用于传输后核对。串口 Demo 仍独立使用 `0.5.0`。
+部署前必须确认所有正式组件为 `0.2.0-preview.2`，并保留 Release 中的 SHA-256 用于传输后核对。串口 Demo 仍独立使用 `0.5.0`。
 
 ## 四、部署 Relay
 

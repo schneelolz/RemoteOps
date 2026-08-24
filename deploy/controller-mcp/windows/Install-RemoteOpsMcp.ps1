@@ -17,7 +17,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$packageVersion = '0.2.0-preview.1'
+$packageVersion = '0.2.0-preview.2'
 $tokenVariable = 'REMOTEOPS_CONTROLLER_TOKEN'
 $ownerVariable = 'REMOTEOPS_CONTROLLER_OWNER_ID'
 $sourceExecutable = Join-Path $PSScriptRoot 'remoteops-controller-mcp.exe'

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration as StdDuration, Instant},
 };
@@ -7,7 +8,7 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Json as ExtractJson, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Json as ExtractJson, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -30,7 +31,20 @@ pub(crate) struct AdminState {
     pub password: Option<Arc<String>>,
     pub sessions: Arc<Mutex<HashMap<String, Instant>>>,
     pub secure_cookie: bool,
+    login_attempts: Arc<Mutex<HashMap<(String, String), LoginAttempt>>>,
 }
+
+#[derive(Clone, Debug)]
+struct LoginAttempt {
+    failures: u32,
+    blocked_until: Instant,
+    last_seen: Instant,
+}
+
+const MAX_LOGIN_ATTEMPTS: usize = 2_048;
+const LOGIN_ATTEMPT_TTL: StdDuration = StdDuration::from_mins(15);
+const MAX_USERNAME_BYTES: usize = 256;
+const MAX_PASSWORD_BYTES: usize = 1_024;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct AdminSnapshot {
@@ -173,6 +187,7 @@ pub(crate) async fn serve(
         password: password.map(Arc::new),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         secure_cookie,
+        login_attempts: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = Router::new()
         .route("/api/admin/login", post(login))
@@ -197,18 +212,41 @@ pub(crate) async fn serve(
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
+        .layer(DefaultBodyLimit::max(8 * 1024))
         .with_state(state)
         .fallback(index);
-    axum::serve(listener, app)
-        .await
-        .context("管理 HTTP 服务已停止")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("管理 HTTP 服务已停止")
 }
 
 async fn login(
     State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     ExtractJson(request): ExtractJson<LoginRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    if request.username.len() > MAX_USERNAME_BYTES || request.password.len() > MAX_PASSWORD_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "用户名或密码长度超出限制".to_owned(),
+            }),
+        ));
+    }
+    let peer = peer.to_string();
+    if !login_allowed(&state, &peer, &request.username).await {
+        state.relay.admin_auth_failure(&peer).await;
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: "登录尝试过于频繁，请稍后重试".to_owned(),
+            }),
+        ));
+    }
     let username_valid = state
         .username
         .as_ref()
@@ -222,8 +260,9 @@ async fn login(
     };
     let valid = username_valid && password_valid;
     if !valid {
+        record_login_failure(&state, &peer, &request.username).await;
         let source = request_source(&headers);
-        state.relay.admin_auth_failure(source).await;
+        state.relay.admin_auth_failure(&source).await;
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -231,6 +270,7 @@ async fn login(
             }),
         ));
     }
+    clear_login_failures(&state, &peer, &request.username).await;
     let session_id = Uuid::new_v4().simple().to_string();
     state.sessions.lock().await.insert(
         session_id.clone(),
@@ -269,7 +309,7 @@ async fn change_password(
         .admin_change_password(
             &request.current,
             &request.new,
-            request_source(&headers),
+            &request_source(&headers),
             state.password.as_deref().map(String::as_str),
         )
         .await;
@@ -441,7 +481,7 @@ async fn authorize(
     } else {
         state
             .relay
-            .admin_auth_failure(request_source(headers))
+            .admin_auth_failure(&request_source(headers))
             .await;
         Err((
             StatusCode::UNAUTHORIZED,
@@ -452,11 +492,67 @@ async fn authorize(
     }
 }
 
-fn request_source(headers: &HeaderMap) -> &str {
-    headers
+fn request_source(headers: &HeaderMap) -> String {
+    let Some(value) = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("admin_http")
+    else {
+        return "admin_http".to_owned();
+    };
+    if value.len() > 128 || value.chars().any(char::is_control) {
+        return "admin_http".to_owned();
+    }
+    let addresses = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if addresses.is_empty() || addresses.iter().any(|part| part.parse::<IpAddr>().is_err()) {
+        return "admin_http".to_owned();
+    }
+    // This is audit metadata only. Authentication and rate limiting use the TCP peer.
+    addresses.join(",")
+}
+
+async fn login_allowed(state: &AdminState, peer: &str, username: &str) -> bool {
+    let now = Instant::now();
+    let mut attempts = state.login_attempts.lock().await;
+    attempts.retain(|_, entry| now.duration_since(entry.last_seen) < LOGIN_ATTEMPT_TTL);
+    attempts
+        .get(&(peer.to_owned(), username.to_owned()))
+        .is_none_or(|entry| entry.blocked_until <= now)
+}
+
+async fn record_login_failure(state: &AdminState, peer: &str, username: &str) {
+    let now = Instant::now();
+    let mut attempts = state.login_attempts.lock().await;
+    attempts.retain(|_, entry| now.duration_since(entry.last_seen) < LOGIN_ATTEMPT_TTL);
+    if attempts.len() >= MAX_LOGIN_ATTEMPTS
+        && let Some(oldest) = attempts
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_seen)
+            .map(|(key, _)| key.clone())
+    {
+        attempts.remove(&oldest);
+    }
+    let key = (peer.to_owned(), username.to_owned());
+    let entry = attempts.entry(key).or_insert(LoginAttempt {
+        failures: 0,
+        blocked_until: now,
+        last_seen: now,
+    });
+    entry.failures = entry.failures.saturating_add(1);
+    let delay = 2u64.saturating_pow(entry.failures.min(6));
+    entry.blocked_until = now + StdDuration::from_secs(delay.min(60));
+    entry.last_seen = now;
+}
+
+async fn clear_login_failures(state: &AdminState, peer: &str, username: &str) {
+    state
+        .login_attempts
+        .lock()
+        .await
+        .remove(&(peer.to_owned(), username.to_owned()));
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -516,8 +612,15 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../../../relay-admin-prototype/index.html"))
+async fn index() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            "default-src 'self'; script-src 'self'; script-src-attr 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        )],
+        Html(include_str!("../../../relay-admin-prototype/index.html")),
+    )
+        .into_response()
 }
 async fn app_js() -> Response {
     (
@@ -535,4 +638,61 @@ async fn style_css() -> Response {
         include_str!("../../../relay-admin-prototype/style.css"),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use remoteops_domain::ControllerOwnerId;
+
+    fn test_state() -> AdminState {
+        AdminState {
+            relay: Arc::new(Relay::new(
+                Duration::minutes(10),
+                5,
+                ControllerOwnerId::new(),
+                "human-token-for-tests-123456".to_owned(),
+                "ai-token-for-tests-123456".to_owned(),
+            )),
+            token: Arc::new(String::new()),
+            username: None,
+            password: None,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            secure_cookie: false,
+            login_attempts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn login_limiter_backoffs_and_clears_on_success() {
+        let state = test_state();
+        assert!(login_allowed(&state, "127.0.0.1:1", "admin").await);
+        record_login_failure(&state, "127.0.0.1:1", "admin").await;
+        assert!(!login_allowed(&state, "127.0.0.1:1", "admin").await);
+        clear_login_failures(&state, "127.0.0.1:1", "admin").await;
+        assert!(login_allowed(&state, "127.0.0.1:1", "admin").await);
+    }
+
+    #[tokio::test]
+    async fn login_limiter_evicts_oldest_entry_at_capacity() {
+        let state = test_state();
+        for index in 0..=MAX_LOGIN_ATTEMPTS {
+            record_login_failure(&state, "127.0.0.1:1", &format!("user-{index}")).await;
+        }
+        let attempts = state.login_attempts.lock().await;
+        assert_eq!(attempts.len(), MAX_LOGIN_ATTEMPTS);
+    }
+
+    #[test]
+    fn forwarded_for_is_only_used_for_valid_bounded_ip_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.7, 2001:db8::1".parse().unwrap(),
+        );
+        assert_eq!(request_source(&headers), "203.0.113.7,2001:db8::1");
+        headers.insert("x-forwarded-for", "<script>".parse().unwrap());
+        assert_eq!(request_source(&headers), "admin_http");
+    }
 }

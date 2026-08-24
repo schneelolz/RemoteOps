@@ -17,6 +17,7 @@ LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -39,4 +40,3 @@ winresource.workspace = true
 
 [lints]
 workspace = true
-
