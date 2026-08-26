@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-EXPECTED_VERSION="0.2.0-preview.2"
+EXPECTED_VERSION="0.2.0-preview.4"
 KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
@@ -72,4 +72,3 @@ fi
 if [[ "$failures" -ne 0 ]]; then exit 1; fi
 echo
 echo "RemoteOps MCP 安装检查通过。完全重启 Codex 后输入 /mcp 查看 remoteops。"
-

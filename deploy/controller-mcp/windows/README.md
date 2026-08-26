@@ -1,6 +1,6 @@
 # RemoteOps MCP Windows x64 安装说明
 
-- 版本：`0.2.0-preview.2`
+- 版本：`0.2.0-preview.4`
 - 适用系统：Windows x64
 - Codex MCP 名称：`remoteops`
 - 许可证：`AGPL-3.0-only`
@@ -66,7 +66,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.p
 安装内容：
 
 ```text
-%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.2.exe
+%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.4.exe
 %USERPROFILE%\.codex\remoteops\controller-config.json
 %USERPROFILE%\.codex\config.toml
 %USERPROFILE%\.agents\skills\remoteops\SKILL.md

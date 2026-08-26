@@ -31,10 +31,11 @@ use remoteops_domain::{
 };
 use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel};
 use remoteops_protocol::{
-    AgentHello, AgentPermissionModeChanged, AgentResumeCommitAck, AgentWelcomeAck,
-    AuthorizedRemoteRequest, ClientHello, ControllerBinding, PROTOCOL_VERSION, RemoteRequest,
-    RemoteResponse, WireMessage, connect_tls, load_client_config, load_native_client_config,
-    load_pinned_client_config, normalize_certificate_fingerprint, read_frame, write_frame,
+    AgentHello, AgentLeaseRenewed, AgentPermissionModeChanged, AgentResumeCommitAck,
+    AgentWelcomeAck, AuthorizedRemoteRequest, ClientHello, ControllerBinding, PROTOCOL_VERSION,
+    RemoteRequest, RemoteResponse, WireMessage, connect_tls, load_client_config,
+    load_native_client_config, load_pinned_client_config, normalize_certificate_fingerprint,
+    read_frame, write_frame,
 };
 use remoteops_serial::{
     SerialDirection, SerialObservedChunk, SerialQueryError, SerialQueryPlan, SerialQueryRunner,
@@ -153,11 +154,7 @@ impl AgentConfig {
             if config_path.is_some() {
                 bail!("Agent 配置文件不存在：{}", path.display());
             }
-            return Ok(Self {
-                ssh_credentials: SshCredentialStore::load_persisted()
-                    .context("无法加载本地 DPAPI SSH 凭据")?,
-                ..Self::default()
-            });
+            return Ok(Self::default());
         }
 
         let text = fs::read_to_string(&path)
@@ -165,11 +162,7 @@ impl AgentConfig {
         let file_config: AgentFileConfig = serde_json::from_str(&text)
             .with_context(|| format!("Agent 配置文件格式无效：{}", path.display()))?;
         let base_directory = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut config = Self {
-            ssh_credentials: SshCredentialStore::load_persisted()
-                .context("无法加载本地 DPAPI SSH 凭据")?,
-            ..Self::default()
-        };
+        let mut config = Self::default();
         if let Some(relay) = file_config.relay {
             config.relay = relay;
         }
@@ -381,6 +374,11 @@ pub enum AgentEvent {
         /// 供工程师配对的临时控制码。
         pairing_code: String,
         /// 控制码租约到期时间。
+        lease_expires_at: DateTime<Utc>,
+    },
+    /// Relay 接受心跳续租后更新控制码租约到期时间。
+    LeaseRenewed {
+        /// 控制码租约新的到期时间。
         lease_expires_at: DateTime<Utc>,
     },
     /// 当前已绑定的控制端数量发生变化。
@@ -1175,6 +1173,9 @@ where
                     &controller_bindings,
                     &local_permission_policy,
                 );
+            }
+            Ok(WireMessage::AgentLeaseRenewed(AgentLeaseRenewed { lease_expires_at })) => {
+                emit_agent_event(event_sender, AgentEvent::LeaseRenewed { lease_expires_at });
             }
             Ok(WireMessage::ControllerBindingRevoked {
                 session_id,
@@ -3039,6 +3040,12 @@ fn print_agent_event(event: &AgentEvent) {
             println!("Relay 已连接");
             println!("控制码：{pairing_code}");
             println!("控制码租约到期时间：{}", lease_expires_at.to_rfc3339());
+        }
+        AgentEvent::LeaseRenewed { lease_expires_at } => {
+            println!(
+                "控制码租约已续期，到期时间：{}",
+                lease_expires_at.to_rfc3339()
+            );
         }
         AgentEvent::ControllerCountChanged { active_connections } => {
             if *active_connections > 0 {

@@ -7,7 +7,7 @@ use remoteops_domain::{
 use serde::{Deserialize, Serialize};
 
 /// 当前线协议版本。
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 
 /// Controller 的受信任调用身份。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -109,6 +109,13 @@ pub struct AgentResumeCommitted {
 pub struct AgentResumeCommitAck {
     /// 当前 Agent 传输连接代次。
     pub connection_generation: u64,
+}
+
+/// Relay 接受 Agent 心跳后通知新的租约到期时间。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentLeaseRenewed {
+    /// 当前控制码租约到期时间。
+    pub lease_expires_at: DateTime<Utc>,
 }
 
 /// Agent 本地用户更新当前进程的权限上限。
@@ -302,6 +309,8 @@ pub enum WireMessage {
     AgentResumeCommitted(AgentResumeCommitted),
     /// Agent 确认已切换到提交后的恢复令牌。
     AgentResumeCommitAck(AgentResumeCommitAck),
+    /// Relay 通知 Agent 心跳续租后的新到期时间。
+    AgentLeaseRenewed(AgentLeaseRenewed),
     /// Controller 连接就绪。
     ControllerWelcome {
         /// Relay 当前协议版本。
@@ -427,6 +436,16 @@ mod tests {
         let json = serde_json::to_vec(&message).expect("授权消息应可编码");
         let decoded: WireMessage = serde_json::from_slice(&json).expect("授权消息应可解码");
 
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn agent_lease_renewed_round_trips_json() {
+        let message = WireMessage::AgentLeaseRenewed(AgentLeaseRenewed {
+            lease_expires_at: Utc::now(),
+        });
+        let json = serde_json::to_vec(&message).expect("续租消息应可编码");
+        let decoded: WireMessage = serde_json::from_slice(&json).expect("续租消息应可解码");
         assert_eq!(decoded, message);
     }
 

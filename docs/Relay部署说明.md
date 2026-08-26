@@ -1,6 +1,6 @@
 # Relay 部署说明
 
-本文面向第一次部署 RemoteOps Relay 的部署者，适用于公开源码版本 `0.2.0-preview.2`。
+本文面向第一次部署 RemoteOps Relay 的部署者，适用于公开源码版本 `0.2.0-preview.4`。
 
 Relay 是现场 Agent 与工程师本机 MCP 之间的中转服务。首版官方部署路径是 Linux x64 + Docker；Windows 宿主机通过 Docker Desktop 或 WSL2 运行 Linux 容器可以作为试点方式，但当前没有独立平台验收。Relay 核心程序虽然可以在 Windows 编译，原生 Windows 服务化部署暂不属于首版交付路径。
 

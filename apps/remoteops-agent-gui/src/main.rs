@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use eframe::egui::{
     self, Align, Align2, Color32, FontDefinitions, FontFamily, FontId, Frame, Grid, Layout, Margin,
@@ -24,11 +24,10 @@ use remoteops_agent::{
     legacy_agent_config_path, run_agent_with_permission_control,
 };
 use remoteops_device::{SshHostKeyScan, scan_ssh_host_keys, trust_ssh_host_keys};
-use remoteops_domain::{AgentInstanceId, Capability, CapabilitySet, PermissionMode};
+use remoteops_domain::{AgentInstanceId, Capability, CapabilitySet};
 use remoteops_i18n::{Language, Translator};
 use remoteops_protocol::{
-    ControllerKind, connect_tls, load_native_client_config, load_pinned_client_config,
-    probe_server_certificate,
+    connect_tls, load_native_client_config, load_pinned_client_config, probe_server_certificate,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -36,14 +35,14 @@ use tokio::sync::watch;
 /// 首次设置页使用的固定窗口内部尺寸。
 const SETUP_WINDOW_SIZE: Vec2 = Vec2::new(640.0, 330.0);
 /// 日常运行页使用的固定窗口内部尺寸。
-const RUNNING_WINDOW_SIZE: Vec2 = Vec2::new(480.0, 420.0);
+const RUNNING_WINDOW_SIZE: Vec2 = Vec2::new(520.0, 410.0);
 /// Windows 后台进程创建标志，避免权限探测弹出控制台窗口。
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 控制码及复制按钮所在行的固定高度。
-const PAIRING_CODE_ROW_HEIGHT: f32 = 32.0;
+const PAIRING_CODE_ROW_HEIGHT: f32 = 40.0;
 /// 复制控制码图标按钮的固定边长。
-const COPY_CODE_BUTTON_SIZE: f32 = 32.0;
+const COPY_CODE_BUTTON_SIZE: f32 = 36.0;
 
 /// 根据当前内容宽度返回控制码行的有界尺寸。
 fn pairing_code_row_size(available_width: f32) -> Vec2 {
@@ -334,6 +333,8 @@ impl UiStatus {
 }
 
 /// 被控端窗口状态。
+#[allow(clippy::struct_excessive_bools)]
+#[allow(dead_code)]
 struct RemoteOpsAgentApp {
     /// 当前进程的运行诊断日志。
     diagnostics: StartupDiagnostics,
@@ -369,6 +370,8 @@ struct RemoteOpsAgentApp {
     capabilities: CapabilitySet,
     /// 当前临时控制码。
     pairing_code: Option<String>,
+    /// 当前控制码的 Relay 租约到期时间。
+    pairing_code_expires_at: Option<DateTime<Utc>>,
     /// 当前活动控制端数量。
     active_connections: usize,
     /// 当前 Owner、Controller 类型和权限绑定。
@@ -383,6 +386,8 @@ struct RemoteOpsAgentApp {
     language_file: Option<PathBuf>,
     /// 是否展示停止确认框。
     show_stop_confirmation: bool,
+    /// 是否展示高级设置框。
+    show_advanced_settings: bool,
     /// 是否允许本次窗口关闭请求直接执行。
     allow_close: bool,
     /// 复制成功提示的截止时间。
@@ -496,6 +501,7 @@ impl RemoteOpsAgentApp {
             transfer_root: None,
             capabilities: CapabilitySet::default(),
             pairing_code: None,
+            pairing_code_expires_at: None,
             active_connections: 0,
             controller_bindings: Vec::new(),
             permission_control: AgentPermissionControl::default(),
@@ -503,6 +509,7 @@ impl RemoteOpsAgentApp {
             translator,
             language_file,
             show_stop_confirmation: false,
+            show_advanced_settings: false,
             allow_close: false,
             copied_until: None,
             layout_is_setup: None,
@@ -623,14 +630,18 @@ impl RemoteOpsAgentApp {
             AgentEvent::Connecting => self.status = UiStatus::Connecting,
             AgentEvent::Connected {
                 pairing_code,
-                lease_expires_at: _,
+                lease_expires_at,
             } => {
                 self.pairing_code = Some(pairing_code);
+                self.pairing_code_expires_at = Some(lease_expires_at);
                 self.status = if self.active_connections > 0 {
                     UiStatus::Controlled
                 } else {
                     UiStatus::Waiting
                 };
+            }
+            AgentEvent::LeaseRenewed { lease_expires_at } => {
+                self.pairing_code_expires_at = Some(lease_expires_at);
             }
             AgentEvent::ControllerCountChanged { active_connections } => {
                 self.active_connections = active_connections;
@@ -900,64 +911,128 @@ impl RemoteOpsAgentApp {
         }
     }
 
-    /// 渲染顶部连接状态、控制码和 Relay 信息。
+    /// 渲染当前服务状态、控制码和工程师连接状态。
     fn render_status_card(&mut self, ui: &mut egui::Ui) {
         Frame::new()
             .fill(Color32::WHITE)
-            .inner_margin(Margin::symmetric(20, 9))
+            .inner_margin(Margin::symmetric(20, 5))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(icons::CIRCLE)
-                            .color(self.status.color())
-                            .size(11.0),
-                    );
-                    ui.label(
-                        RichText::new(self.status.label(&self.translator))
-                            .color(Color32::from_rgb(22, 101, 52))
-                            .strong()
-                            .size(14.0),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let connection_hint = if self.active_connections > 0 {
-                            self.controller_status_label()
-                        } else {
-                            self.translator.text("status.pairing_code_ephemeral")
-                        };
+                ui.vertical_centered(|ui| {
+                    ui.horizontal(|ui| {
+                        let content_width = 24.0
+                            + ui.spacing().item_spacing.x
+                            + ui.painter()
+                                .layout_no_wrap(
+                                    self.primary_status_label(),
+                                    FontId::proportional(16.0),
+                                    self.status.color(),
+                                )
+                                .size()
+                                .x;
+                        ui.add_space(centered_left_padding(ui.available_width(), content_width));
                         ui.label(
-                            RichText::new(connection_hint)
-                                .color(Color32::from_rgb(71, 85, 105))
-                                .size(12.0),
+                            RichText::new(icons::CHECK_CIRCLE)
+                                .color(self.status.color())
+                                .size(21.0),
+                        );
+                        ui.label(
+                            RichText::new(self.primary_status_label())
+                                .color(self.status.color())
+                                .strong()
+                                .size(16.0),
                         );
                     });
                 });
                 if let Some(detail) = self.status.detail() {
-                    ui.label(
-                        RichText::new(detail)
-                            .color(Color32::from_rgb(100, 116, 139))
-                            .size(11.0),
-                    );
+                    ui.vertical_centered(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(detail)
+                                    .color(Color32::from_rgb(100, 116, 139))
+                                    .size(11.0),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(detail);
+                    });
                 }
-                ui.add_space(1.0);
+                ui.add_space(3.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new(self.translator.text("agent.pairing_code"))
-                            .color(Color32::from_rgb(71, 85, 105))
-                            .size(13.0),
-                    );
                     self.render_pairing_code_row(ui);
                     ui.label(
-                        RichText::new(format!(
-                            "{}  ·  Relay: {}",
-                            self.translator.text("agent.outbound_secure"),
-                            self.relay
-                        ))
-                        .color(Color32::from_rgb(71, 85, 105))
-                        .size(11.0),
+                        RichText::new(self.pairing_code_expiry_label())
+                            .color(Color32::from_rgb(71, 85, 105))
+                            .size(12.0),
+                    );
+                });
+                ui.add_space(3.0);
+                ui.separator();
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let label = self.controller_status_label();
+                    let content_width = 21.0
+                        + ui.spacing().item_spacing.x
+                        + ui.painter()
+                            .layout_no_wrap(
+                                label.clone(),
+                                FontId::proportional(14.0),
+                                Color32::from_rgb(30, 64, 108),
+                            )
+                            .size()
+                            .x;
+                    ui.add_space(centered_left_padding(ui.available_width(), content_width));
+                    ui.label(
+                        RichText::new(if self.active_connections > 0 {
+                            icons::USER_CHECK
+                        } else {
+                            icons::USERS
+                        })
+                        .color(Color32::from_rgb(30, 64, 108))
+                        .size(19.0),
+                    );
+                    ui.label(
+                        RichText::new(label)
+                            .color(Color32::from_rgb(30, 64, 108))
+                            .strong()
+                            .size(14.0),
                     );
                 });
             });
+    }
+
+    /// 返回主状态区使用的简短文案。
+    fn primary_status_label(&self) -> String {
+        if matches!(self.status, UiStatus::Waiting | UiStatus::Controlled) {
+            self.translator.text("agent.status.ready")
+        } else {
+            self.status.label(&self.translator)
+        }
+    }
+
+    /// 返回当前控制码的租约倒计时文案。
+    fn pairing_code_expiry_label(&self) -> String {
+        let Some(expires_at) = self.pairing_code_expires_at.as_ref() else {
+            return self.translator.text("status.pairing_code_ephemeral");
+        };
+        let Some(seconds) = pairing_code_remaining_seconds(expires_at, &Utc::now()) else {
+            return self.translator.text("agent.pairing_code.expired");
+        };
+        self.translator.text_with(
+            "agent.pairing_code.expires_in",
+            &[("time", &format_countdown(seconds))],
+        )
+    }
+
+    /// 判断当前控制码是否仍可复制。
+    fn pairing_code_is_active(&self) -> bool {
+        self.pairing_code.is_some()
+            && self
+                .pairing_code_expires_at
+                .as_ref()
+                .is_none_or(|expires_at| {
+                    pairing_code_remaining_seconds(expires_at, &Utc::now()).is_some()
+                })
     }
 
     /// 将控制码和复制按钮作为一个整体水平居中展示。
@@ -966,14 +1041,19 @@ impl RemoteOpsAgentApp {
             pairing_code_row_size(ui.available_width()),
             Layout::left_to_right(Align::Center),
             |ui| {
-                let code = self.pairing_code.as_deref().unwrap_or("--- --- ---");
+                let code = self
+                    .pairing_code
+                    .as_deref()
+                    .map_or_else(|| "--- --- ---".to_owned(), display_pairing_code);
+                let code_active = self.pairing_code_is_active();
+                let code_color = if code_active {
+                    Color32::from_rgb(30, 41, 59)
+                } else {
+                    Color32::from_rgb(148, 163, 184)
+                };
                 let code_width = ui
                     .painter()
-                    .layout_no_wrap(
-                        code.to_owned(),
-                        FontId::monospace(27.0),
-                        Color32::from_rgb(13, 110, 253),
-                    )
+                    .layout_no_wrap(code.clone(), FontId::monospace(36.0), code_color)
                     .size()
                     .x;
                 ui.add_space(pairing_code_left_padding(
@@ -981,12 +1061,7 @@ impl RemoteOpsAgentApp {
                     code_width,
                     ui.spacing().item_spacing.x,
                 ));
-                ui.label(
-                    RichText::new(code)
-                        .color(Color32::from_rgb(13, 110, 253))
-                        .size(27.0)
-                        .monospace(),
-                );
+                ui.label(RichText::new(code).color(code_color).size(32.0).monospace());
                 let copied = self
                     .copied_until
                     .is_some_and(|deadline| deadline > Instant::now());
@@ -995,7 +1070,7 @@ impl RemoteOpsAgentApp {
                     .scope(|ui| {
                         stabilize_copy_button_style(ui.style_mut());
                         ui.add_enabled(
-                            self.pairing_code.is_some(),
+                            code_active,
                             egui::Button::new(
                                 RichText::new(icon)
                                     .color(Color32::from_rgb(51, 65, 85))
@@ -1007,7 +1082,8 @@ impl RemoteOpsAgentApp {
                             .min_size(Vec2::splat(COPY_CODE_BUTTON_SIZE)),
                         )
                     })
-                    .inner;
+                    .inner
+                    .on_hover_text(self.translator.text("agent.action.copy"));
                 if response.clicked()
                     && let Some(pairing_code) = &self.pairing_code
                 {
@@ -1021,58 +1097,48 @@ impl RemoteOpsAgentApp {
     /// 返回当前已绑定控制端的简短状态。
     fn controller_status_label(&self) -> String {
         match self.active_connections {
-            0 => self.translator.text("status.waiting"),
-            _ => self.translator.text("status.controller_one"),
+            0 => self.translator.text("agent.engineer.waiting"),
+            _ => self.translator.text("status.controlled"),
         }
     }
 
-    /// 渲染紧凑的能力授权列表。
+    /// 渲染紧凑的能力可用性摘要。
     fn render_capabilities(&self, ui: &mut egui::Ui) {
         Frame::new()
             .fill(Color32::WHITE)
-            .inner_margin(Margin::symmetric(12, 0))
+            .inner_margin(Margin::symmetric(20, 4))
             .show(ui, |ui| {
-                let width = ui.available_width() / 4.0;
-                Grid::new("agent-capabilities")
-                    .num_columns(4)
-                    .min_col_width(width)
-                    .max_col_width(width)
-                    .spacing(Vec2::ZERO)
-                    .show(ui, |ui| {
-                        self.render_capability(
-                            ui,
-                            icons::TERMINAL_WINDOW,
-                            &self.translator.text("agent.capability.command"),
-                            self.has_shell_capability(),
-                            width,
-                        );
-                        self.render_capability(
-                            ui,
-                            icons::FOLDER_OPEN,
-                            &self.translator.text("agent.capability.file"),
-                            self.capabilities.contains(Capability::FileTransfer),
-                            width,
-                        );
-                        self.render_capability(
-                            ui,
-                            icons::DESKTOP,
-                            &self.translator.text("agent.capability.ssh"),
-                            self.capabilities.contains(Capability::Ssh),
-                            width,
-                        );
-                        self.render_capability(
-                            ui,
-                            icons::PLUGS_CONNECTED,
-                            &self.translator.text("agent.capability.serial"),
-                            self.capabilities.contains(Capability::Serial),
-                            width,
-                        );
-                        ui.end_row();
-                    });
+                ui.columns(4, |columns| {
+                    self.render_capability(
+                        &mut columns[0],
+                        icons::TERMINAL_WINDOW,
+                        &self.translator.text("agent.capability.command_short"),
+                        self.has_shell_capability(),
+                    );
+                    self.render_capability(
+                        &mut columns[1],
+                        icons::FOLDER_OPEN,
+                        &self.translator.text("agent.capability.file_short"),
+                        self.capabilities.contains(Capability::FileTransfer),
+                    );
+                    self.render_capability(
+                        &mut columns[2],
+                        icons::DESKTOP,
+                        &self.translator.text("agent.capability.ssh_short"),
+                        self.capabilities.contains(Capability::Ssh),
+                    );
+                    self.render_capability(
+                        &mut columns[3],
+                        icons::PLUGS_CONNECTED,
+                        &self.translator.text("agent.capability.serial_short"),
+                        self.capabilities.contains(Capability::Serial),
+                    );
+                });
             });
     }
 
     /// 渲染仅当前进程有效的 SSH 凭据窗口。
+    #[allow(dead_code)]
     fn render_ssh_credentials(&mut self, ctx: &egui::Context) {
         if !self.show_ssh_credentials {
             return;
@@ -1175,6 +1241,7 @@ impl RemoteOpsAgentApp {
     }
 
     /// 渲染等待现场核对的 SSH 主机密钥指纹。
+    #[allow(dead_code)]
     fn render_pending_ssh_host_keys(&mut self, ui: &mut egui::Ui) {
         let Some(scan) = &self.ssh_pending_host_keys else {
             return;
@@ -1201,6 +1268,7 @@ impl RemoteOpsAgentApp {
     }
 
     /// 校验表单并扫描 SSH 主机密钥，扫描期间不会使用密码登录。
+    #[allow(dead_code)]
     fn scan_ssh_credential_host(&mut self) {
         let host = self.ssh_host.trim();
         let username = self.ssh_username.trim();
@@ -1237,6 +1305,7 @@ impl RemoteOpsAgentApp {
     }
 
     /// 保存现场用户已经核对的主机密钥，并录入当前进程密码。
+    #[allow(dead_code)]
     fn confirm_ssh_credential_host(&mut self) {
         let Some(scan) = self.ssh_pending_host_keys.take() else {
             return;
@@ -1284,52 +1353,77 @@ impl RemoteOpsAgentApp {
         self.ssh_credential_error = None;
     }
 
-    /// 渲染提升权限、Controller 绑定、本地授权和传输目录快照。
-    fn render_runtime_details(&self, ui: &mut egui::Ui) {
-        Frame::new()
-            .fill(Color32::from_rgb(248, 250, 252))
-            .inner_margin(Margin::symmetric(14, 8))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                Self::render_detail_line(
-                    ui,
-                    icons::SHIELD_CHECK,
-                    localized_label(self.translator.language(), "提升权限", "Elevation"),
-                    elevation_label(self.elevated, self.translator.language()),
+    /// 渲染只读运行信息和 SSH 凭据入口。
+    #[allow(clippy::too_many_lines)]
+    fn render_advanced_settings(&mut self, ctx: &egui::Context) {
+        if !self.show_advanced_settings {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("agent-advanced-settings"))
+            .backdrop_color(Color32::from_black_alpha(90))
+            .frame(
+                Frame::new()
+                    .fill(Color32::WHITE)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+                    .corner_radius(8.0)
+                    .inner_margin(Margin::symmetric(20, 18))
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 2,
+                        color: Color32::from_black_alpha(45),
+                    }),
+            );
+        modal.show(ctx, |ui| {
+            ui.set_min_width(400.0);
+            ui.set_max_width(420.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(icons::GEAR)
+                        .size(22.0)
+                        .color(Color32::from_rgb(51, 65, 85)),
                 );
-                Self::render_detail_line(
-                    ui,
-                    icons::LOCK_KEY,
-                    localized_label(self.translator.language(), "本地权限", "Local policy"),
-                    permission_mode_label(
-                        self.permission_control.permission_mode(),
-                        self.translator.language(),
-                    ),
+                ui.label(
+                    RichText::new(self.translator.text("agent.advanced.title"))
+                        .size(19.0)
+                        .strong(),
                 );
-                let bindings = controller_bindings_label(
-                    &self.controller_bindings,
-                    self.translator.language(),
-                );
-                Self::render_detail_line(
-                    ui,
-                    icons::USERS_THREE,
-                    localized_label(self.translator.language(), "控制端", "Controllers"),
-                    bindings,
-                );
-                let transfer_root = self.transfer_root.as_ref().map_or_else(
-                    || {
-                        localized_label(self.translator.language(), "尚未初始化", "Not initialized")
-                            .to_owned()
-                    },
-                    |path| path.display().to_string(),
-                );
-                Self::render_detail_line(
-                    ui,
-                    icons::FOLDER_OPEN,
-                    localized_label(self.translator.language(), "传输目录", "Transfer root"),
-                    transfer_root,
-                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .button(RichText::new(icons::X).size(17.0))
+                        .on_hover_text(self.translator.text("agent.advanced.close"))
+                        .clicked()
+                    {
+                        self.show_advanced_settings = false;
+                    }
+                });
             });
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+            Self::render_detail_line(
+                ui,
+                icons::CLOUD,
+                &self.translator.text("agent.advanced.relay"),
+                self.relay.clone(),
+            );
+            Self::render_detail_line(
+                ui,
+                icons::SHIELD_CHECK,
+                &self.translator.text("agent.advanced.elevation"),
+                elevation_label(self.elevated, self.translator.language()),
+            );
+            let transfer_root = self.transfer_root.as_ref().map_or_else(
+                || self.translator.text("agent.advanced.not_initialized"),
+                |path| path.display().to_string(),
+            );
+            Self::render_detail_line(
+                ui,
+                icons::FOLDER_OPEN,
+                &self.translator.text("agent.advanced.transfer_root"),
+                transfer_root,
+            );
+        });
     }
 
     /// 渲染一行紧凑运行详情，长值通过悬停查看全文。
@@ -1342,85 +1436,32 @@ impl RemoteOpsAgentApp {
             );
             ui.label(
                 RichText::new(format!("{label}:"))
-                    .size(11.0)
+                    .size(12.0)
                     .color(Color32::from_rgb(71, 85, 105)),
             );
-            ui.add(egui::Label::new(RichText::new(&value).size(11.0)).truncate())
+            ui.add(egui::Label::new(RichText::new(&value).size(12.0)).truncate())
                 .on_hover_text(value);
         });
     }
 
     /// 渲染单个能力项。
-    fn render_capability(
-        &self,
-        ui: &mut egui::Ui,
-        icon: &str,
-        label: &str,
-        enabled: bool,
-        width: f32,
-    ) {
-        Frame::new()
-            .fill(Color32::WHITE)
-            .inner_margin(Margin::symmetric(4, 6))
-            .show(ui, |ui| {
-                let available_width = (width - 8.0).max(0.0);
-                ui.set_min_size(Vec2::new(available_width, 28.0));
-                ui.horizontal(|ui| {
-                    let status = if enabled {
-                        self.translator.text("agent.capability.enabled")
-                    } else {
-                        self.translator.text("agent.capability.disabled")
-                    };
-                    let icon_width = ui
-                        .painter()
-                        .layout_no_wrap(
-                            icon.to_owned(),
-                            FontId::proportional(21.0),
-                            Color32::from_rgb(30, 41, 59),
-                        )
-                        .size()
-                        .x;
-                    let label_width = ui
-                        .painter()
-                        .layout_no_wrap(
-                            label.to_owned(),
-                            FontId::proportional(13.0),
-                            Color32::from_rgb(30, 41, 59),
-                        )
-                        .size()
-                        .x;
-                    let status_width = ui
-                        .painter()
-                        .layout_no_wrap(
-                            format!("{}  {status}", icons::CIRCLE),
-                            FontId::proportional(10.0),
-                            Color32::from_rgb(0, 166, 81),
-                        )
-                        .size()
-                        .x;
-                    let content_width = icon_width + 4.0 + label_width.max(status_width);
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.add_space(centered_left_padding(available_width, content_width));
-                    ui.label(
-                        RichText::new(icon)
-                            .size(21.0)
-                            .color(Color32::from_rgb(30, 41, 59)),
-                    );
-                    ui.add_space(4.0);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(label).strong().size(13.0));
-                        ui.label(
-                            RichText::new(format!("{}  {status}", icons::CIRCLE))
-                                .color(if enabled {
-                                    Color32::from_rgb(0, 166, 81)
-                                } else {
-                                    Color32::from_rgb(100, 116, 139)
-                                })
-                                .size(10.0),
-                        );
-                    });
-                });
-            });
+    fn render_capability(&self, ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool) {
+        let color = if enabled {
+            Color32::from_rgb(30, 41, 59)
+        } else {
+            Color32::from_rgb(148, 163, 184)
+        };
+        let status = if enabled {
+            self.translator.text("agent.capability.enabled")
+        } else {
+            self.translator.text("agent.capability.disabled")
+        };
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(icon).size(20.0).color(color))
+                .on_hover_text(&status);
+            ui.label(RichText::new(label).strong().size(11.0).color(color))
+                .on_hover_text(status);
+        });
     }
 
     /// 判断是否存在任一命令 Shell 能力。
@@ -1432,6 +1473,46 @@ impl RemoteOpsAgentApp {
         ]
         .into_iter()
         .any(|capability| self.capabilities.contains(capability))
+    }
+
+    /// 渲染高级设置与停止协助操作栏。
+    fn render_action_bar(&mut self, ui: &mut egui::Ui) {
+        Frame::new()
+            .fill(Color32::WHITE)
+            .inner_margin(Margin::symmetric(16, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(format!(
+                            "{}  {}",
+                            icons::GEAR,
+                            self.translator.text("agent.action.advanced_settings")
+                        ))
+                        .clicked()
+                    {
+                        self.show_advanced_settings = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let stop = egui::Button::new(
+                            RichText::new(format!(
+                                "{}  {}",
+                                icons::STOP_CIRCLE,
+                                self.translator.text("agent.action.stop_remote")
+                            ))
+                            .color(Color32::from_rgb(220, 38, 38))
+                            .strong(),
+                        )
+                        .fill(Color32::WHITE)
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(239, 68, 68)))
+                        .corner_radius(6.0)
+                        .min_size(Vec2::new(190.0, 38.0));
+                        if ui.add(stop).clicked() {
+                            self.show_stop_confirmation = true;
+                        }
+                    });
+                });
+            });
     }
 
     /// 渲染停止确认框。
@@ -1545,6 +1626,33 @@ fn setup_error_message(error: &str) -> String {
     error.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// 将控制码统一显示为连字符分隔的三位一组，和复制值保持一致。
+fn display_pairing_code(code: &str) -> String {
+    let digits: String = code.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() == 9 {
+        return format!("{}-{}-{}", &digits[..3], &digits[3..6], &digits[6..]);
+    }
+    code.to_owned()
+}
+
+/// 返回控制码距离租约到期的剩余秒数；已过期时返回 None。
+fn pairing_code_remaining_seconds(expires_at: &DateTime<Utc>, now: &DateTime<Utc>) -> Option<i64> {
+    let seconds = (*expires_at - *now).num_seconds();
+    (seconds > 0).then_some(seconds)
+}
+
+/// 格式化控制码倒计时，最多显示到小时级别。
+fn format_countdown(seconds: i64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
 /// 返回适合当前界面语言的短标签。
 fn localized_label(language: Language, zh_cn: &'static str, en_us: &'static str) -> &'static str {
     match language {
@@ -1561,47 +1669,6 @@ fn elevation_label(elevated: Option<bool>, language: Language) -> String {
         None => localized_label(language, "未知", "Unknown"),
     }
     .to_owned()
-}
-
-/// 返回权限模式的稳定界面文本。
-fn permission_mode_label(permission_mode: PermissionMode, language: Language) -> String {
-    match permission_mode {
-        PermissionMode::ReadOnly => localized_label(language, "只读", "Read only"),
-        PermissionMode::ApprovalRequired => {
-            localized_label(language, "逐项确认", "Per-action approval")
-        }
-        PermissionMode::ControllerApproved => {
-            localized_label(language, "控制端已确认", "Controller approved")
-        }
-        PermissionMode::FullAccess => localized_label(language, "完全控制", "Full access"),
-    }
-    .to_owned()
-}
-
-/// 返回当前 Controller 角色、请求权限和 Agent 本地授权摘要。
-fn controller_bindings_label(bindings: &[AgentControllerBinding], language: Language) -> String {
-    if bindings.is_empty() {
-        return localized_label(language, "无", "None").to_owned();
-    }
-    bindings
-        .iter()
-        .map(|binding| {
-            let role = match binding.controller_kind {
-                ControllerKind::Human => localized_label(language, "人工", "Human"),
-                ControllerKind::Ai => "AI",
-            };
-            let local_authorization = if binding.full_access_authorized_locally {
-                localized_label(language, "已授权", "authorized")
-            } else {
-                localized_label(language, "未授权", "not authorized")
-            };
-            format!(
-                "{role} / {} / FullAccess {local_authorization}",
-                permission_mode_label(binding.permission_mode, language)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 /// 检测当前 GUI 进程是否已提升权限，并避免创建可见控制台窗口。
@@ -1746,41 +1813,43 @@ impl eframe::App for RemoteOpsAgentApp {
                             ui.label(
                                 RichText::new(icons::SHIELD_CHECK)
                                     .color(Color32::from_rgb(13, 110, 253))
-                                    .size(17.0),
+                                    .size(19.0),
                             );
                             ui.label(
                                 RichText::new(self.translator.text("app.agent_title"))
                                     .strong()
-                                    .size(14.0),
+                                    .size(15.0),
                             );
                             let language_width = ui.available_width();
                             ui.allocate_ui_with_layout(
                                 Vec2::new(language_width, 24.0),
                                 Layout::right_to_left(Align::Center),
                                 |ui| {
-                                    for language in [Language::EnUs, Language::ZhCn] {
+                                    for (index, language) in
+                                        [Language::EnUs, Language::ZhCn].into_iter().enumerate()
+                                    {
                                         let selected = self.translator.language() == language;
                                         if ui
                                             .selectable_label(
                                                 selected,
-                                                self.translator
-                                                    .text(&format!("language.{}", language.code())),
+                                                self.translator.text(&format!(
+                                                    "language.{}.short",
+                                                    language.code()
+                                                )),
+                                            )
+                                            .on_hover_text(
+                                                self.translator.text("language.switch_hint"),
                                             )
                                             .clicked()
                                         {
                                             self.set_language(language, &ctx);
                                         }
-                                    }
-                                    if ui
-                                        .button(icons::KEY)
-                                        .on_hover_text(localized_label(
-                                            self.translator.language(),
-                                            "SSH 凭据",
-                                            "SSH credentials",
-                                        ))
-                                        .clicked()
-                                    {
-                                        self.show_ssh_credentials = true;
+                                        if index == 0 {
+                                            ui.label(
+                                                RichText::new("|")
+                                                    .color(Color32::from_rgb(148, 163, 184)),
+                                            );
+                                        }
                                     }
                                 },
                             );
@@ -1789,13 +1858,13 @@ impl eframe::App for RemoteOpsAgentApp {
                 ui.separator();
                 self.render_status_card(ui);
                 ui.separator();
-                self.render_runtime_details(ui);
-                ui.separator();
                 self.render_capabilities(ui);
+                ui.separator();
+                self.render_action_bar(ui);
             });
         self.render_stop_confirmation(&ctx);
+        self.render_advanced_settings(&ctx);
         self.render_certificate_confirmation(&ctx);
-        self.render_ssh_credentials(&ctx);
         ctx.request_repaint_after(Duration::from_millis(500));
     }
 
@@ -2383,7 +2452,7 @@ mod tests {
         assert!(options.run_and_return);
         assert!(!options.persist_window);
         assert!(options.centered);
-        assert_eq!(RUNNING_WINDOW_SIZE, Vec2::new(480.0, 420.0));
+        assert_eq!(RUNNING_WINDOW_SIZE, Vec2::new(520.0, 410.0));
         assert_eq!(options.viewport.inner_size, Some(RUNNING_WINDOW_SIZE));
         assert_eq!(options.viewport.min_inner_size, Some(RUNNING_WINDOW_SIZE));
         assert_eq!(options.viewport.max_inner_size, Some(RUNNING_WINDOW_SIZE));
@@ -2395,13 +2464,28 @@ mod tests {
 
     #[test]
     fn pairing_code_row_has_bounded_height_in_running_window() {
-        assert_eq!(pairing_code_row_size(321.0), Vec2::new(321.0, 32.0));
+        assert_eq!(pairing_code_row_size(321.0), Vec2::new(321.0, 40.0));
     }
 
     #[test]
     fn pairing_code_content_uses_explicit_centering_padding() {
-        assert!((pairing_code_left_padding(440.0, 164.0, 8.0) - 118.0).abs() < f32::EPSILON);
+        assert!((pairing_code_left_padding(440.0, 164.0, 8.0) - 116.0).abs() < f32::EPSILON);
         assert!(pairing_code_left_padding(180.0, 164.0, 8.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pairing_code_display_and_countdown_are_stable() {
+        assert_eq!(display_pairing_code("482-915-307"), "482-915-307");
+        assert_eq!(display_pairing_code("pending"), "pending");
+        assert_eq!(format_countdown(599), "09:59");
+        assert_eq!(format_countdown(3_661), "1:01:01");
+
+        let now = DateTime::parse_from_rfc3339("2026-08-25T10:00:00Z")
+            .expect("测试时间应有效")
+            .with_timezone(&Utc);
+        let future = now + chrono::Duration::seconds(90);
+        assert_eq!(pairing_code_remaining_seconds(&future, &now), Some(90));
+        assert_eq!(pairing_code_remaining_seconds(&now, &now), None);
     }
 
     #[test]
@@ -2555,22 +2639,8 @@ mod tests {
 
         assert_eq!(
             permission_control.permission_mode(),
-            PermissionMode::FullAccess
+            remoteops_domain::PermissionMode::FullAccess
         );
-    }
-
-    #[test]
-    fn controller_binding_summary_includes_role_permission_and_local_authorization() {
-        let bindings = vec![AgentControllerBinding {
-            owner_id: remoteops_domain::ControllerOwnerId::new(),
-            controller_kind: ControllerKind::Ai,
-            permission_mode: PermissionMode::ControllerApproved,
-            full_access_authorized_locally: true,
-        }];
-
-        let summary = controller_bindings_label(&bindings, Language::ZhCn);
-
-        assert_eq!(summary, "AI / 控制端已确认 / FullAccess 已授权");
     }
 
     #[test]
@@ -2615,6 +2685,7 @@ mod tests {
             transfer_root: None,
             capabilities: CapabilitySet::default(),
             pairing_code: None,
+            pairing_code_expires_at: None,
             active_connections: 1,
             controller_bindings: Vec::new(),
             permission_control: AgentPermissionControl::default(),
@@ -2622,6 +2693,7 @@ mod tests {
             translator: Translator::new(remoteops_i18n::Language::ZhCn),
             language_file: None,
             show_stop_confirmation: false,
+            show_advanced_settings: false,
             allow_close: false,
             copied_until: None,
             layout_is_setup: None,
@@ -2636,6 +2708,6 @@ mod tests {
             ssh_credential_error: None,
             ssh_pending_host_keys: None,
         };
-        assert_eq!(app.controller_status_label(), "控制方已连接");
+        assert_eq!(app.controller_status_label(), "工程师已连接");
     }
 }

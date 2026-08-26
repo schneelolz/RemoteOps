@@ -109,6 +109,9 @@ fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: Agen
             status.pairing_code = Some(pairing_code);
             status.pairing_code_expires_at = Some(lease_expires_at);
         }
+        AgentEvent::LeaseRenewed { lease_expires_at } => {
+            status.pairing_code_expires_at = Some(lease_expires_at);
+        }
         AgentEvent::ControllerCountChanged { active_connections } => {
             status.active_connections = active_connections;
             status.status = if active_connections == 0 {

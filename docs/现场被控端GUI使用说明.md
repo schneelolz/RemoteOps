@@ -1,9 +1,9 @@
 # RemoteOps 现场被控端 GUI 使用说明
 
-> 文档状态：当前现场客户机手册，适用于 Agent GUI `0.2.0-preview.2`。
+> 文档状态：当前现场客户机手册，适用于 Agent GUI `0.2.0-preview.4`。
 
-- 适用版本：`0.2.0-preview.2`
-- 正式程序：`artifacts/release/0.2.0-preview.2/windows-x64/remoteops-agent-gui.exe`
+- 适用版本：`0.2.0-preview.4`
+- 正式程序：`artifacts/release/0.2.0-preview.4/windows-x64/remoteops-agent-gui.exe`
 - Relay：由部署者配置，不内置公共默认值
 - 使用方式：管理员完成一次配置后，现场人员双击启动
 - 运行依赖：正式发布 EXE 静态链接 MSVC CRT，不需要另装 VC++ 运行库
@@ -16,7 +16,7 @@
 4. 等待窗口显示“等待工程师连接”和九位临时控制码；
 5. 通过可信渠道把本次控制码提供给工程师；
 6. 工程师配对后，窗口状态切换为“工程师已连接”；
-7. 工作完成后直接关闭窗口，并在确认框中结束本次协助。
+7. 工作完成后点击“停止远程协助”或关闭窗口，并在确认框中结束本次协助。
 
 GUI 默认将配置保存为与 EXE 同级的 `agent-config.json`；程序目录不可写时回退到 `%LOCALAPPDATA%\RemoteOps\agent-config.json`。旧版用户目录配置继续兼容，但同级配置优先。Agent 只主动出站连接配置的 Relay，不会在客户机监听公网端口。
 
@@ -35,11 +35,12 @@ Agent 首次连接不需要入网码、部署级 Agent Token 或 Controller Toke
 
 ## 三、窗口信息
 
-- 主状态：启动、连接、等待工程师、工程师已连接、自动重连、停止或失败；
-- 临时控制码：仅用于本次协助，可使用“复制控制码”按钮复制；
-- 控制端状态：显示当前在线控制端数量；同一 Agent Session 只绑定一个 `ControllerOwnerId`，该 Owner 可以同时使用 Human 和 AI 角色；
-- 能力授权：根据现场机器实际能力显示命令诊断、文件传输、SSH 和串口；
-- Relay 与 Agent 标识：只用于现场故障排查，不包含恢复令牌或 Controller Token。
+- 主状态：显示服务是否就绪，以及启动、连接、自动重连、停止或失败状态；
+- 临时控制码：以三位一组显示并提供租约倒计时，到期后自动禁用复制，Relay 刷新控制码后恢复；
+- 工程师状态：在“等待工程师连接”和“工程师已连接”之间切换；同一 Agent Session 仍只绑定一个 `ControllerOwnerId`；
+- 能力摘要：以只读图标显示命令、文件、SSH 和串口是否可用，不提供权限开关；
+- 高级设置：显示 Relay、进程提升状态和传输目录；不显示 MCP 的逐项确认、完全控制、Controller 授权或 SSH 凭据明细；
+- 停止入口：主窗口始终显示“停止远程协助”，点击后复用关闭窗口时的确认流程。
 
 ## 四、控制模式
 
@@ -49,15 +50,14 @@ Agent 首次连接不需要入网码、部署级 Agent Token 或 Controller Toke
 - 使用者可以在 MCP 侧仅为当前 `session_id` 临时开启完全控制；授权只保存在 MCP 内存，空闲一小时失效；
 - Human 与 AI 使用同一个 Owner，属于同一控制者，Agent 界面不会把二者显示为两个控制者；
 - Agent 仍校验 TLS 身份、Owner、会话、能力、路径和结构化操作，不因 MCP 完全控制而绕过这些边界；
-- 现场人员需要立即终止当前任务和连接时，直接关闭 Agent 窗口并确认结束本次协助。
+- 现场人员需要立即终止当前任务和连接时，点击“停止远程协助”或直接关闭 Agent 窗口，并确认结束本次协助。
 
 ## 五、安全行为
 
 - GUI 不展示或导出 Agent 恢复令牌；
-- 密码 SSH 首次连接采用 TOFU：Agent 自动扫描并固定主机密钥，后续由 `StrictHostKeyChecking=yes` 严格校验；如需人工预先核对，仍可在 GUI 中扫描并确认指纹；
+- 密码 SSH 首次连接采用 TOFU：Agent 自动扫描并固定主机密钥，后续由 `StrictHostKeyChecking=yes` 严格校验；主机密钥不会由 MCP 的 transfer-root 或命令参数替换；
 - SSH 主机信任保存在 Agent 专用本地目录，不接受控制端通过传输目录替换密码认证的 `known_hosts`；
-- 密码通过当前 Windows 用户范围的 DPAPI 加密保存在 `%LOCALAPPDATA%\\RemoteOps\\ssh-credentials.dpapi`，解密后只进入 Agent 进程内存；明文不进入配置、RemoteOps 协议、Relay、MCP 参数或 SSH 命令行；
-- 删除 GUI 中的 SSH 目标会同步删除对应内存凭据并更新 DPAPI 密文；删除全部目标后密文文件为空凭据，可手动删除该文件以清除本机全部凭据；
+- 密码由 MCP 通过受控链路一次性注入，Agent 仅在当前进程内存中使用；明文不写入配置、日志或审计，Agent 重启后需要重新注入；
 - 网络设备只读白名单命令免确认执行；其他 SSH 命令在只读模式下拒绝、默认模式下逐项确认、完全控制下按当前会话授权执行；现场首轮应从 `display version` 开始；
 - 关闭窗口前会明确提示工程师将断开、当前任务将终止；
 - GUI 不静默驻留托盘，窗口关闭后 Agent 进程结束；

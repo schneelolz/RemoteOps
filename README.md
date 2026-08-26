@@ -28,9 +28,9 @@ flowchart LR
 
 ## 当前状态
 
-当前源码版本为 `0.2.0-preview.2`，这是准备中的首个 GitHub Technical Preview 候选。当前源码适合开发者和试点验证，不建议直接用于关键生产环境；GitHub Release 产物仍需完成独立构建和发布门禁。
+当前源码版本为 `0.2.0-preview.4`，这是准备中的首个 GitHub Technical Preview 候选。当前源码适合开发者和试点验证，不建议直接用于关键生产环境；GitHub Release 产物仍需完成独立构建和发布门禁。
 
-- 协议版本：`v12`
+- 协议版本：`v13`
 - 当前现场端：Windows x64 Agent
 - 首版 Relay 部署：Linux x64 + Docker
 - Codex 控制端：Windows x64、Apple Silicon macOS
@@ -38,7 +38,7 @@ flowchart LR
 - AI 入口：本地 STDIO MCP（Model Context Protocol）
 - 许可证：[AGPL-3.0-only](LICENSE)
 
-已完成核心链路、权限模型、环境画像、MCP 工具、双语 GUI 和串口本地回归。以下事项仍待公开发布前或试点中验证：低权限 Windows、Windows Service、真实串口/交换机硬件、代码签名，以及 `0.2.0-preview.2` Agent GUI 和静默 MCP 调用在 Windows Server、RDP、云主机及虚拟机中的兼容性复测。
+已完成核心链路、权限模型、环境画像、MCP 工具、双语 GUI 和串口本地回归。以下事项仍待公开发布前或试点中验证：低权限 Windows、Windows Service、真实串口/交换机硬件、代码签名，以及 `0.2.0-preview.4` Agent GUI 和静默 MCP 调用在 Windows Server、RDP、云主机及虚拟机中的兼容性复测。
 
 ## 它适合解决的问题
 
@@ -156,7 +156,7 @@ Agent 窗口会显示连接状态、临时控制码、本机能力和当前协�
 
 #### 2.3 安装本机 MCP
 
-Windows x64 解压 `RemoteOps-MCP-Windows-x64-0.2.0-preview.2.zip`，在解压目录运行：
+Windows x64 解压 `RemoteOps-MCP-Windows-x64-0.2.0-preview.4.zip`，在解压目录运行：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.ps1 `
@@ -166,7 +166,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.p
 
 安装脚本会隐藏提示输入 AI Controller Token，并将 Token 和 Owner 保存为当前 Windows 用户环境变量。私有 CA 或证书指纹分别使用 `-CaCert` 或 `-TlsFingerprint`，两者只能选择一种。安装完成后完全退出并重新打开 Codex，确认 `/mcp` 中存在并已连接 `remoteops`。
 
-Apple Silicon Mac 解压 `RemoteOps-MCP-macOS-arm64-0.2.0-preview.2.tar.gz`，进入解压目录运行：
+Apple Silicon Mac 解压 `RemoteOps-MCP-macOS-arm64-0.2.0-preview.4.tar.gz`，进入解压目录运行：
 
 ```bash
 chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.sh

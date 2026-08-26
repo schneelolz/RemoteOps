@@ -3,9 +3,9 @@
 > 文档状态：当前 Codex 操作手册。底层配置原理见[Codex MCP 接入说明](CodexMCP接入说明.md)，不要从历史验收报告复制安装参数。
 
 - 更新日期：2026-08-16
-- 发布状态：`0.2.0-preview.2` Technical Preview
-- MCP 版本：`0.2.0-preview.2`
-- 现场 Agent 版本：`0.2.0-preview.2`
+- 发布状态：`0.2.0-preview.4` Technical Preview
+- MCP 版本：`0.2.0-preview.4`
+- 现场 Agent 版本：`0.2.0-preview.4`
 - Relay：由部署者配置
 
 ## 一、推荐安装方式
@@ -13,13 +13,13 @@
 Windows x64 安装包：
 
 ```text
-artifacts\release\0.2.0-preview.2\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.2.zip
+artifacts\release\0.2.0-preview.4\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.4.zip
 ```
 
 解压后运行 `Install-RemoteOpsMcp.ps1`。安装后的默认程序和配置位置为：
 
 ```text
-%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.2.exe
+%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.4.exe
 %USERPROFILE%\.codex\remoteops\controller-config.json
 %USERPROFILE%\.codex\config.toml
 ```
@@ -32,7 +32,7 @@ artifacts\release\0.2.0-preview.2\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.2.
 %USERPROFILE%\.codex\config.toml.remoteops-backup-<时间戳>
 ```
 
-Apple Silicon Mac 使用 `RemoteOps-MCP-macOS-arm64-0.2.0-preview.2.tar.gz`。安装器把 Token 保存到 macOS Keychain，不写入 Codex 配置；安装、检测和卸载命令见 [macOS MCP 接入说明](macOSMCP接入说明.md)。Windows 或 Mac 上运行的 MCP 都可以通过 Relay 控制现有 Windows Agent。
+Apple Silicon Mac 使用 `RemoteOps-MCP-macOS-arm64-0.2.0-preview.4.tar.gz`。安装器把 Token 保存到 macOS Keychain，不写入 Codex 配置；安装、检测和卸载命令见 [macOS MCP 接入说明](macOSMCP接入说明.md)。Windows 或 Mac 上运行的 MCP 都可以通过 Relay 控制现有 Windows Agent。
 
 ## 二、为什么当前任务还看不到 MCP
 

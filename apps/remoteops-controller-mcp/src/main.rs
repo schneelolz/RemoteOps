@@ -15,7 +15,6 @@ use remoteops_application::{
     ApplicationError, ControllerKind, OperationResult, RelayClient, RelayClientConfig,
 };
 use remoteops_audit::sha256_bytes;
-use remoteops_device::SshCredentialStore;
 use remoteops_domain::{
     ApprovalId, Capability, ControllerInstanceId, ControllerOwnerId, EventSource, FileTransferId,
     PairingCode, PermissionMode, PowerAction, RemoteOperation, SerialDataBits, SerialFlowControl,
@@ -307,7 +306,6 @@ struct RemoteOpsMcp {
     transfer_root: Arc<PathBuf>,
     command_mode: CommandMode,
     full_access_grants: Arc<Mutex<BTreeMap<SessionId, FullAccessGrant>>>,
-    ssh_credentials: SshCredentialStore,
 }
 
 const FULL_ACCESS_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
@@ -655,8 +653,8 @@ struct ProvisionSshCredentialInput {
     port: Option<u16>,
     /// SSH 用户名。
     username: String,
-    /// 控制端本地 DPAPI 凭据库引用，格式为 `ssh://用户名@主机:端口`。
-    credential_ref: String,
+    /// 本次注入使用的 SSH 密码；不会写入配置、日志或审计。
+    password: String,
     /// 完全控制模式下不需要；逐项确认模式可携带一次性审批标识。
     approval_id: Option<String>,
 }
@@ -920,19 +918,13 @@ struct EventsOutput {
 
 #[tool_router]
 impl RemoteOpsMcp {
-    fn new(
-        client: RelayClient,
-        transfer_root: PathBuf,
-        command_mode: CommandMode,
-        ssh_credentials: SshCredentialStore,
-    ) -> Self {
+    fn new(client: RelayClient, transfer_root: PathBuf, command_mode: CommandMode) -> Self {
         Self {
             client,
             shells: Arc::new(Mutex::new(BTreeMap::new())),
             transfer_root: Arc::new(transfer_root),
             command_mode,
             full_access_grants: Arc::new(Mutex::new(BTreeMap::new())),
-            ssh_credentials,
         }
     }
 
@@ -2100,10 +2092,10 @@ impl RemoteOpsMcp {
         }
     }
 
-    /// 将控制端本地 DPAPI 凭据按精确目标绑定注入 Agent，密码不进入 MCP 参数或审计。
+    /// 将一次性 SSH 密码按精确目标绑定注入 Agent；密码不会写入配置、日志或审计。
     #[tool(
         name = "provision_ssh_credential",
-        description = "从控制端当前 Windows 用户的 DPAPI SSH 凭据库读取 credential_ref，并通过受控链路注入精确 Agent；密码不会写入配置、日志或工具结果。credential_ref 必须匹配 ssh://用户名@主机:端口。",
+        description = "通过受控链路向精确 Agent 注入一次性 SSH 密码；密码不会写入配置、日志或工具结果。",
         annotations(
             title = "注入 SSH 凭据",
             read_only_hint = false,
@@ -2119,25 +2111,25 @@ impl RemoteOpsMcp {
     ) -> Result<Json<ActionOutput>, String> {
         let session_id = parse_session_id(&input.session_id)?;
         let port = input.port.unwrap_or(22);
-        let expected_ref = SshCredentialStore::credential_ref(&input.host, port, &input.username);
-        if input.credential_ref != expected_ref {
-            return Err("credential_ref 与主机、端口或用户名不匹配".to_owned());
+        if input.password.is_empty() {
+            return Err("SSH 密码不能为空".to_owned());
         }
-        let password = self
-            .ssh_credentials
-            .get(&input.host, port, &input.username)
-            .ok_or_else(|| "控制端 DPAPI 凭据库中不存在该 credential_ref".to_owned())?;
+        let credential_ref = format!(
+            "ssh://{}@{}:{}",
+            input.username.trim(),
+            input.host.trim().to_ascii_lowercase(),
+            port
+        );
         let operation = RemoteOperation::ProvisionSshCredential {
             host: input.host,
             port,
             username: input.username,
-            credential_ref: input.credential_ref,
+            credential_ref,
         };
         let authorization = self
             .authorize_mutation(&context, session_id, "注入 SSH 凭据", input.approval_id)
             .await?;
-        let payload = BASE64.encode(password.as_bytes());
-        drop(password);
+        let payload = BASE64.encode(input.password.as_bytes());
         self.execute_authorized(session_id, operation, authorization, Some(payload))
             .await
     }
@@ -2797,7 +2789,7 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(
     name = "remoteops-controller",
-    version = "0.2.0-preview.2",
+    version = "0.2.0-preview.4",
     instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。配对后默认逐项确认，Agent 端没有逐项确认或完全控制按钮，绝对不要引导用户去 Agent 点击授权。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。修改操作在逐项确认模式下由 MCP 向当前用户确认；用户明确要求完全控制时只调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制按 session_id 独立保存在 MCP 内存，空闲一小时自动失效，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。不要向用户输出 Token、session_id、approval_id 或恢复令牌。"
 )]
 impl ServerHandler for RemoteOpsMcp {}
@@ -2864,9 +2856,7 @@ async fn run_mcp() -> anyhow::Result<()> {
         }
     }
 
-    let ssh_credentials = SshCredentialStore::load_persisted()
-        .context("无法加载控制端本地 DPAPI SSH 凭据；请检查当前 Windows 用户凭据库")?;
-    let service = RemoteOpsMcp::new(client, transfer_root, args.command_mode, ssh_credentials)
+    let service = RemoteOpsMcp::new(client, transfer_root, args.command_mode)
         .serve(stdio())
         .await
         .context("启动 STDIO MCP 服务失败")?;

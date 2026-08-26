@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PACKAGE_VERSION="0.2.0-preview.2"
+PACKAGE_VERSION="0.2.0-preview.4"
 KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
@@ -225,4 +225,3 @@ echo "配置：$CONFIG_PATH"
 echo "Relay 配置：$CONNECTION_CONFIG"
 echo "Token：已保存到当前用户的 macOS Keychain（未写入配置文件）。"
 echo "请完全退出并重新打开 Codex，然后输入 /mcp 检查 remoteops。"
-

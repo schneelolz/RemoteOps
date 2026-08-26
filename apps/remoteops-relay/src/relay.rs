@@ -17,9 +17,9 @@ use remoteops_domain::{
 };
 use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel, approval_operations_match};
 use remoteops_protocol::{
-    AgentHello, AgentResumeCommitted, AgentWelcome, ApprovalDecision, ApprovalRequest,
-    ApprovalResult, AuthorizedRemoteRequest, ClientHello, ControllerBinding, ControllerHello,
-    ControllerKind, PROTOCOL_VERSION, PairRequest, PairResult, RelayAuthorization,
+    AgentHello, AgentLeaseRenewed, AgentResumeCommitted, AgentWelcome, ApprovalDecision,
+    ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest, ClientHello, ControllerBinding,
+    ControllerHello, ControllerKind, PROTOCOL_VERSION, PairRequest, PairResult, RelayAuthorization,
     ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest, WireMessage, read_frame,
     write_frame,
 };
@@ -1056,7 +1056,12 @@ impl Relay {
                     }
                 }
                 Ok(WireMessage::Heartbeat { .. }) => {
-                    if self.renew_agent(agent_id, connection_generation).await {
+                    if let Some(lease_expires_at) =
+                        self.renew_agent(agent_id, connection_generation).await
+                    {
+                        let _ = sender.send(WireMessage::AgentLeaseRenewed(AgentLeaseRenewed {
+                            lease_expires_at,
+                        }));
                         let _ = sender.send(WireMessage::HeartbeatAck {
                             received_at: Utc::now(),
                         });
@@ -1692,21 +1697,29 @@ impl Relay {
         Some((update, bindings))
     }
 
-    async fn renew_agent(&self, agent_id: AgentInstanceId, connection_generation: u64) -> bool {
+    async fn renew_agent(
+        &self,
+        agent_id: AgentInstanceId,
+        connection_generation: u64,
+    ) -> Option<DateTime<Utc>> {
         let now = Utc::now();
         let mut state = self.state.lock().await;
         let minimum_interval = Duration::seconds(
             i64::try_from((self.heartbeat_seconds / 2).max(1)).unwrap_or(i64::MAX),
         );
-        let (original_last_seen, original_lease, original_lease_expired, should_persist) = {
-            let Some(agent) = state.agents.get_mut(&agent_id) else {
-                return false;
-            };
+        let (
+            original_last_seen,
+            original_lease,
+            original_lease_expired,
+            should_persist,
+            lease_expires_at,
+        ) = {
+            let agent = state.agents.get_mut(&agent_id)?;
             if agent.connection_generation != connection_generation || !agent.ready {
-                return false;
+                return None;
             }
             if now - agent.last_seen < minimum_interval {
-                return false;
+                return None;
             }
             let original_last_seen = agent.last_seen;
             let original_lease = agent.lease.clone();
@@ -1714,6 +1727,7 @@ impl Relay {
             agent.last_seen = now;
             agent.lease.renew(now, self.lease_lifetime);
             agent.lease_expired = false;
+            let lease_expires_at = agent.lease.expires_at;
             let persistence_reserve = self.lease_lifetime / 2;
             let should_persist = agent.persisted_lease_expires_at - now <= persistence_reserve;
             (
@@ -1721,10 +1735,11 @@ impl Relay {
                 original_lease,
                 original_lease_expired,
                 should_persist,
+                lease_expires_at,
             )
         };
         if !should_persist {
-            return true;
+            return Some(lease_expires_at);
         }
         if let Err(error) = self.persist_state_locked(&state) {
             if let Some(agent) = state.agents.get_mut(&agent_id)
@@ -1740,14 +1755,14 @@ impl Relay {
                 error = %error,
                 "Relay 无法持久化心跳租约，拒绝确认续租"
             );
-            return false;
+            return None;
         }
         if let Some(agent) = state.agents.get_mut(&agent_id)
             && agent.connection_generation == connection_generation
         {
             agent.persisted_lease_expires_at = agent.lease.expires_at;
         }
-        true
+        Some(lease_expires_at)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3570,6 +3585,7 @@ mod tests {
             relay
                 .renew_agent(agent_id, registration.connection_generation)
                 .await
+                .is_some()
         );
         let renewed_expiry = relay
             .state
@@ -3581,9 +3597,10 @@ mod tests {
             .lease
             .expires_at;
         assert!(
-            !relay
+            relay
                 .renew_agent(agent_id, registration.connection_generation)
-                .await,
+                .await
+                .is_none(),
             "小于最小心跳间隔的请求不得再次续租"
         );
         assert_eq!(
@@ -3615,11 +3632,41 @@ mod tests {
             relay
                 .renew_agent(agent_id, registration.connection_generation)
                 .await
+                .is_some()
         );
         let state = relay.state.lock().await;
         let agent = state.agents.get(&agent_id).expect("Agent 应存在");
         assert!(agent.lease.expires_at > persisted_expiry);
         assert_eq!(agent.persisted_lease_expires_at, persisted_expiry);
+    }
+
+    #[tokio::test]
+    async fn accepted_heartbeat_returns_current_lease_expiry_for_agent_notification() {
+        let relay = relay(Duration::minutes(10));
+        let agent_id = AgentInstanceId::new();
+        let (registration, _, _) = ready_agent(&relay, agent_id, None).await;
+        {
+            let mut state = relay.state.lock().await;
+            state
+                .agents
+                .get_mut(&agent_id)
+                .expect("Agent 应存在")
+                .last_seen = Utc::now() - Duration::seconds(30);
+        }
+        let renewed_expiry = relay
+            .renew_agent(agent_id, registration.connection_generation)
+            .await
+            .expect("接受的心跳必须返回新的租约到期时间");
+        let state = relay.state.lock().await;
+        assert_eq!(
+            renewed_expiry,
+            state
+                .agents
+                .get(&agent_id)
+                .expect("Agent 应存在")
+                .lease
+                .expires_at
+        );
     }
 
     #[tokio::test]

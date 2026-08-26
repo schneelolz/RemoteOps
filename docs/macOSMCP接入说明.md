@@ -16,7 +16,7 @@ Intel Mac、Universal Binary、Developer ID 签名和 Apple Notarization 尚未�
 
 你需要：
 
-1. `RemoteOps-MCP-macOS-arm64-0.2.0-preview.2.tar.gz`；
+1. `RemoteOps-MCP-macOS-arm64-0.2.0-preview.4.tar.gz`；
 2. Relay 地址，例如 `relay.example.com:7443`；
 3. AI Controller Token，长度至少 32 个字符；
 4. Relay 配置的统一 Controller Owner UUID；
@@ -25,8 +25,8 @@ Intel Mac、Universal Binary、Developer ID 签名和 Apple Notarization 尚未�
 ## 安装
 
 ```bash
-tar -xzf RemoteOps-MCP-macOS-arm64-0.2.0-preview.2.tar.gz
-cd RemoteOps-MCP-macOS-arm64-0.2.0-preview.2
+tar -xzf RemoteOps-MCP-macOS-arm64-0.2.0-preview.4.tar.gz
+cd RemoteOps-MCP-macOS-arm64-0.2.0-preview.4
 chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.sh
 ./install-remoteops-mcp.sh \
   --relay relay.example.com:7443 \
@@ -50,7 +50,7 @@ chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.
 默认安装位置：
 
 ```text
-~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.2
+~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.4
 ~/.codex/remoteops/launch-remoteops-controller-mcp.sh
 ~/.codex/remoteops/controller-config.json
 ~/.codex/config.toml

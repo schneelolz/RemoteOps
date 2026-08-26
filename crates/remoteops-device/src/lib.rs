@@ -1,7 +1,5 @@
 //! Shell、SSH、串口、文件和端口探测的抽象接口。
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::{
     collections::BTreeMap,
     env, fmt,
@@ -78,18 +76,6 @@ struct SshCredentialKey {
     username: String,
 }
 
-#[cfg(windows)]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct PersistedSshCredential {
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-}
-
-#[cfg(windows)]
-const SSH_CREDENTIALS_FILE_NAME: &str = "ssh-credentials.dpapi";
-
 /// 仅保存在 Agent 当前进程内存中的 SSH 密码凭据。
 #[derive(Clone, Default)]
 pub struct SshCredentialStore {
@@ -148,102 +134,31 @@ impl SshCredentialStore {
         self.len() == 0
     }
 
-    /// 从当前 Windows 用户范围的 DPAPI 密文加载凭据；不存在时返回空存储。
+    /// 创建空的进程内存凭据存储。
     ///
     /// # Errors
     ///
     /// 当密文无法读取、解密或反序列化时返回错误。
     pub fn load_persisted() -> Result<Self, DeviceError> {
-        #[cfg(windows)]
-        {
-            let path = default_ssh_credentials_file()?;
-            let encrypted = match std::fs::read(path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(Self::default());
-                }
-                Err(error) => return Err(DeviceError::Operation(error.to_string())),
-            };
-            let plain = dpapi_unprotect(&encrypted)?;
-            let entries: Vec<PersistedSshCredential> =
-                serde_json::from_slice(&plain).map_err(|error| {
-                    DeviceError::Operation(format!("SSH 凭据密文格式无效：{error}"))
-                })?;
-            let store = Self::default();
-            for entry in entries {
-                store.upsert(&entry.host, entry.port, &entry.username, entry.password);
-            }
-            Ok(store)
-        }
-        #[cfg(not(windows))]
-        {
-            Ok(Self::default())
-        }
+        Ok(Self::default())
     }
 
-    /// 将当前凭据以当前 Windows 用户范围 DPAPI 密文保存到本地数据目录。
+    /// 保留兼容接口；凭据不会写入磁盘。
     ///
     /// # Errors
     ///
     /// 当凭据无法序列化、加密或写入本地数据目录时返回错误。
     pub fn persist(&self) -> Result<(), DeviceError> {
-        #[cfg(windows)]
-        {
-            let entries = self
-                .credentials
-                .read()
-                .map_err(|_| DeviceError::Operation("SSH 凭据锁已损坏".to_owned()))?
-                .iter()
-                .map(|(key, password)| PersistedSshCredential {
-                    host: key.host.clone(),
-                    port: key.port,
-                    username: key.username.clone(),
-                    password: password.clone(),
-                })
-                .collect::<Vec<_>>();
-            let plain = serde_json::to_vec(&entries)
-                .map_err(|error| DeviceError::Operation(format!("无法序列化 SSH 凭据：{error}")))?;
-            let encrypted = dpapi_protect(&plain)?;
-            let path = default_ssh_credentials_file()?;
-            let parent = path
-                .parent()
-                .ok_or_else(|| DeviceError::Operation("无法确定凭据目录".to_owned()))?;
-            std::fs::create_dir_all(parent)
-                .map_err(|error| DeviceError::Operation(error.to_string()))?;
-            let temporary = path.with_extension("dpapi.tmp");
-            std::fs::write(&temporary, encrypted)
-                .map_err(|error| DeviceError::Operation(error.to_string()))?;
-            std::fs::rename(&temporary, &path).map_err(|error| {
-                let _ = std::fs::remove_file(&temporary);
-                DeviceError::Operation(error.to_string())
-            })?;
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        {
-            Ok(())
-        }
+        Ok(())
     }
 
-    /// 删除本地 DPAPI 凭据密文。
+    /// 保留兼容接口；当前版本没有本地凭据文件。
     ///
     /// # Errors
     ///
     /// 当凭据文件存在但无法删除时返回错误。
     pub fn clear_persisted() -> Result<(), DeviceError> {
-        #[cfg(windows)]
-        {
-            let path = default_ssh_credentials_file()?;
-            match std::fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(DeviceError::Operation(error.to_string())),
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            Ok(())
-        }
+        Ok(())
     }
 
     /// 返回精确匹配目标的密码；密码只在调用方进程内存中短暂存在。
@@ -270,65 +185,6 @@ impl SshCredentialStore {
             port
         )
     }
-}
-
-#[cfg(windows)]
-fn default_ssh_credentials_file() -> Result<PathBuf, DeviceError> {
-    env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|path| path.join("RemoteOps").join(SSH_CREDENTIALS_FILE_NAME))
-        .ok_or_else(|| DeviceError::Operation("无法确定 Agent 本地数据目录".to_owned()))
-}
-
-#[cfg(windows)]
-fn dpapi_protect(plain: &[u8]) -> Result<Vec<u8>, DeviceError> {
-    dpapi_transform(plain, true)
-}
-
-#[cfg(windows)]
-fn dpapi_unprotect(encrypted: &[u8]) -> Result<Vec<u8>, DeviceError> {
-    dpapi_transform(encrypted, false)
-}
-
-#[cfg(windows)]
-fn dpapi_transform(input: &[u8], protect: bool) -> Result<Vec<u8>, DeviceError> {
-    let encoded = BASE64.encode(input);
-    let operation = if protect { "Protect" } else { "Unprotect" };
-    let script = format!(
-        "Add-Type -AssemblyName System.Security; $encodedInput = [Console]::In.ReadToEnd(); $bytes = [Convert]::FromBase64String($encodedInput); $result = [System.Security.Cryptography.ProtectedData]::{operation}($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser); [Convert]::ToBase64String($result)"
-    );
-    let mut child = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &script,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .spawn()
-        .map_err(|error| DeviceError::Operation(format!("无法启动 DPAPI：{error}")))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| DeviceError::Operation("DPAPI 输入管道不可用".to_owned()))?
-        .write_all(encoded.as_bytes())
-        .map_err(|error| DeviceError::Operation(format!("DPAPI 输入失败：{error}")))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| DeviceError::Operation(format!("DPAPI 执行失败：{error}")))?;
-    if !output.status.success() {
-        return Err(DeviceError::Operation(format!(
-            "DPAPI 操作失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    BASE64
-        .decode(String::from_utf8_lossy(&output.stdout).trim())
-        .map_err(|error| DeviceError::Operation(format!("DPAPI 返回无效数据：{error}")))
 }
 
 // 为同一进程内的临时文件名提供无锁递增后缀。
@@ -4061,14 +3917,13 @@ mod tests {
         assert!(credentials.is_empty());
     }
 
-    #[cfg(windows)]
     #[test]
-    fn dpapi_round_trip_uses_current_windows_user_scope() {
-        let plain = b"remoteops-dpapi-test";
-        let encrypted = dpapi_protect(plain).expect("DPAPI 加密应成功");
-        assert_ne!(encrypted, plain);
-        let decrypted = dpapi_unprotect(&encrypted).expect("DPAPI 解密应成功");
-        assert_eq!(decrypted, plain);
+    fn ssh_credentials_are_process_only() {
+        let credentials = SshCredentialStore::default();
+        credentials.upsert("192.0.2.10", 22, "admin", "secret-value".to_owned());
+        credentials.persist().expect("进程内凭据兼容保存接口应成功");
+        let fresh = SshCredentialStore::load_persisted().expect("进程重启加载应返回空存储");
+        assert!(fresh.is_empty());
     }
 
     #[test]

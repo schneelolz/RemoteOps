@@ -1,6 +1,6 @@
 # RemoteOps 控制端 GUI 使用说明
 
-> 文档状态：人工 Controller GUI 使用手册，适用于 `0.2.0-preview.2` Technical Preview。现场被控端请阅读[现场被控端 GUI 使用说明](现场被控端GUI使用说明.md)。
+> 文档状态：人工 Controller GUI 使用手册，适用于 `0.2.0-preview.4` Technical Preview。现场被控端请阅读[现场被控端 GUI 使用说明](现场被控端GUI使用说明.md)。
 
 ## 当前定位
 

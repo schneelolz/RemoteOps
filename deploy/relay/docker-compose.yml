@@ -3,7 +3,7 @@ services:
     build:
       context: ../..
       dockerfile: "${REMOTEOPS_RELAY_DOCKERFILE:-deploy/relay/Dockerfile}"
-    image: "${REMOTEOPS_RELAY_IMAGE:-remoteops-relay:0.2.0-preview.2}"
+    image: "${REMOTEOPS_RELAY_IMAGE:-remoteops-relay:0.2.0-preview.4}"
     container_name: "${REMOTEOPS_RELAY_CONTAINER_NAME:-remoteops-relay}"
     restart: "${REMOTEOPS_RESTART_POLICY:-unless-stopped}"
     environment:

@@ -8,9 +8,9 @@ It addresses a common field-support problem: installing an AI client, configurin
 
 ## Current status
 
-The current source version is `0.2.0-preview.2`, the candidate for the first GitHub Technical Preview. This source is intended for developer and pilot evaluation, not critical production use. GitHub Release artifacts still require the independent build and release gates described below.
+The current source version is `0.2.0-preview.4`, the candidate for the first GitHub Technical Preview. This source is intended for developer and pilot evaluation, not critical production use. GitHub Release artifacts still require the independent build and release gates described below.
 
-- Protocol: `v12`
+- Protocol: `v13`
 - Field endpoint: Windows x64 Agent
 - Relay: self-hosted Linux x64 Docker
 - AI entry point: local STDIO MCP (Model Context Protocol)

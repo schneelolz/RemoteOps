@@ -1,6 +1,6 @@
 ---
 name: remoteops
-description: 仅在用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，使用 RemoteOps MCP 连接和诊断现场 Agent。普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不触发本 Skill；不得把 RemoteOps 强加到用户未指定的远程任务上，也不得声称已操作远端。
+description: 仅在用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，使用 RemoteOps MCP 连接和诊断现场 Agent。普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不触发本 Skill；看不到 RemoteOps MCP 工具时必须报告当前任务未加载 RemoteOps MCP，禁止改用 Computer Use 或声称已操作远端。
 ---
 
 # RemoteOps 远程诊断

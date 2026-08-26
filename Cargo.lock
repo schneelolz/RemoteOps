@@ -3495,7 +3495,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3518,7 +3518,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3540,7 +3540,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-service"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3569,7 +3569,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-application"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3590,7 +3590,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-audit"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "chrono",
  "regex",
@@ -3602,7 +3602,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-cli"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3620,7 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-gui"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3651,7 +3651,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-mcp"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3674,7 +3674,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-device"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3693,7 +3693,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-domain"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "chrono",
  "serde",
@@ -3704,7 +3704,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-i18n"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -3714,7 +3714,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-mcp-smoke"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -3727,7 +3727,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-policy"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "chrono",
  "regex",
@@ -3738,7 +3738,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-protocol"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "bytes",
  "chrono",
@@ -3758,7 +3758,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-relay"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3783,7 +3783,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-serial"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3815,7 +3815,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-session"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "chrono",
  "remoteops-domain",
@@ -3823,7 +3823,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-ssh-askpass"
-version = "0.2.0-preview.2"
+version = "0.2.0-preview.4"
 dependencies = [
  "winresource",
 ]
