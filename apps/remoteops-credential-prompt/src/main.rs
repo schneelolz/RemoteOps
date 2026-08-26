@@ -1,14 +1,15 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use std::{
-    io::{IsTerminal as _, Write as _},
-    process::{Command, Stdio},
-};
+use std::io::{IsTerminal as _, Write as _};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize as _, Zeroizing};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use zeroize::Zeroize as _;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
