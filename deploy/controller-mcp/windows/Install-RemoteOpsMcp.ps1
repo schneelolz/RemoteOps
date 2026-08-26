@@ -17,10 +17,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$packageVersion = '0.2.0-preview.4'
+$packageVersion = '0.2.0-preview.5'
 $tokenVariable = 'REMOTEOPS_CONTROLLER_TOKEN'
 $ownerVariable = 'REMOTEOPS_CONTROLLER_OWNER_ID'
 $sourceExecutable = Join-Path $PSScriptRoot 'remoteops-controller-mcp.exe'
+$sourceCredentialPrompt = Join-Path $PSScriptRoot 'remoteops-credential-prompt.exe'
 $sourceSkill = Join-Path $PSScriptRoot 'skills\remoteops'
 $defaultCodexHome = Join-Path $env:USERPROFILE '.codex'
 $isDefaultCodexHome = [IO.Path]::GetFullPath($CodexHome).TrimEnd('\') -eq
@@ -150,6 +151,9 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 if (-not (Test-Path -LiteralPath $sourceExecutable -PathType Leaf)) {
     throw "安装包缺少 $sourceExecutable"
 }
+if (-not (Test-Path -LiteralPath $sourceCredentialPrompt -PathType Leaf)) {
+    throw "安装包缺少 $sourceCredentialPrompt"
+}
 if (-not (Test-Path -LiteralPath (Join-Path $sourceSkill 'SKILL.md') -PathType Leaf)) {
     throw "安装包缺少 RemoteOps skill：$sourceSkill"
 }
@@ -157,6 +161,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $sourceSkill 'SKILL.md') -PathType L
 $versionOutput = (& $sourceExecutable --version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($packageVersion)) {
     throw "MCP 可执行文件版本不正确：$versionOutput"
+}
+$promptVersionOutput = (& $sourceCredentialPrompt --version 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $promptVersionOutput -notmatch [regex]::Escape($packageVersion)) {
+    throw "SSH 密码安全输入程序版本不正确：$promptVersionOutput"
 }
 
 $userToken = [Environment]::GetEnvironmentVariable($tokenVariable, 'User')
@@ -194,6 +202,7 @@ $ownerValue = $OwnerId.ToString('D')
 
 $installDirectory = Join-Path $CodexHome 'remoteops'
 $installedExecutable = Join-Path $installDirectory "remoteops-controller-mcp-$packageVersion.exe"
+$installedCredentialPrompt = Join-Path $installDirectory 'remoteops-credential-prompt.exe'
 $connectionConfigPath = Join-Path $installDirectory 'controller-config.json'
 $standardSkillDirectory = if ($isDefaultCodexHome) {
     Join-Path $env:USERPROFILE '.agents\skills\remoteops'
@@ -204,6 +213,7 @@ else {
 $compatSkillDirectory = Join-Path $CodexHome 'skills\remoteops'
 $configPath = Join-Path $CodexHome 'config.toml'
 New-Item -ItemType Directory -Force -Path $installDirectory | Out-Null
+Copy-Item -LiteralPath $sourceCredentialPrompt -Destination $installedCredentialPrompt -Force
 try {
     Copy-Item -LiteralPath $sourceExecutable -Destination $installedExecutable -Force
 }
@@ -335,4 +345,3 @@ Write-Host "命令模式：$CommandMode"
 Write-Host '统一 Controller Owner 已保存到当前 Windows 用户环境变量（不会显示其值）。'
 Write-Host '请完全退出并重新打开 Codex，然后输入 /mcp 检查 remoteops。'
 Write-Host '安装脚本未输出、未写入 config.toml，也未打包 Controller Token。'
-

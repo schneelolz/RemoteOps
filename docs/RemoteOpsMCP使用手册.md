@@ -3,9 +3,9 @@
 > 文档状态：当前 Codex 操作手册。底层配置原理见[Codex MCP 接入说明](CodexMCP接入说明.md)，不要从历史验收报告复制安装参数。
 
 - 更新日期：2026-08-16
-- 发布状态：`0.2.0-preview.4` Technical Preview
-- MCP 版本：`0.2.0-preview.4`
-- 现场 Agent 版本：`0.2.0-preview.4`
+- 发布状态：`0.2.0-preview.5` Technical Preview
+- MCP 版本：`0.2.0-preview.5`
+- 现场 Agent 版本：`0.2.0-preview.5`
 - Relay：由部署者配置
 
 ## 一、推荐安装方式
@@ -13,13 +13,13 @@
 Windows x64 安装包：
 
 ```text
-artifacts\release\0.2.0-preview.4\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.4.zip
+artifacts\release\0.2.0-preview.5\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.5.zip
 ```
 
 解压后运行 `Install-RemoteOpsMcp.ps1`。安装后的默认程序和配置位置为：
 
 ```text
-%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.4.exe
+%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.5.exe
 %USERPROFILE%\.codex\remoteops\controller-config.json
 %USERPROFILE%\.codex\config.toml
 ```
@@ -32,7 +32,7 @@ artifacts\release\0.2.0-preview.4\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.4.
 %USERPROFILE%\.codex\config.toml.remoteops-backup-<时间戳>
 ```
 
-Apple Silicon Mac 使用 `RemoteOps-MCP-macOS-arm64-0.2.0-preview.4.tar.gz`。安装器把 Token 保存到 macOS Keychain，不写入 Codex 配置；安装、检测和卸载命令见 [macOS MCP 接入说明](macOSMCP接入说明.md)。Windows 或 Mac 上运行的 MCP 都可以通过 Relay 控制现有 Windows Agent。
+Apple Silicon Mac 使用 `RemoteOps-MCP-macOS-arm64-0.2.0-preview.5.tar.gz`。安装器把 Token 保存到 macOS Keychain，不写入 Codex 配置；安装、检测和卸载命令见 [macOS MCP 接入说明](macOSMCP接入说明.md)。Windows 或 Mac 上运行的 MCP 都可以通过 Relay 控制现有 Windows Agent。
 
 ## 二、为什么当前任务还看不到 MCP
 
@@ -190,6 +190,14 @@ Get-NetIPAddress -AddressFamily IPv4
 
 上传开始时会声明目标路径、大小、完整 SHA-256 和覆盖标志，每个分块再校验 SHA-256，并按连续偏移写入同目录临时文件。只有大小和完整哈希均匹配才原子提交；断线、取消、解绑或紧急停止会清理未完成临时上传。下载也先写同目录临时文件并验证完整哈希，覆盖失败时恢复或保留原文件，不会先删除目标文件。嵌套目标目录会在受控根目录内按需创建，绝对路径、`..`、符号链接逃逸和目录覆盖都会被拒绝。
 
+### SSH 密码安全输入
+
+SSH 用户名、目标和命令可以在 Codex 中提供，但密码不得写入对话或 MCP 参数。需要密码认证时，`run_ssh` 设置 `use_password=true`；MCP 会在控制端本机打开安全窗口，用户选择“仅本次使用”或显式勾选“在 MCP 内存记住 10 分钟”。密码用 Agent 当前进程的 HPKE 公钥加密，经 Relay 原样转发，并只用于当前 SSH 请求。
+
+十分钟缓存严格绑定 `session_id`、主机、端口和用户名，固定到期且不写磁盘；MCP 重启、连接关闭或调用 `clear_ssh_credential_cache` 会立即清除。若密码已经写入 Codex 对话，后续加密无法清除既有任务记录，应更换该密码。
+
+这一边界遵循 OpenAI 的 [MCP and Connectors](https://developers.openai.com/api/docs/guides/tools-connectors-mcp) 数据共享说明，以及 [Build an MCP server](https://developers.openai.com/plugins/build/mcp-server#tool-annotations-and-elicitation) 中“不使用 elicitation 收集秘密”的要求。
+
 ## 八、主要 MCP 工具
 
 - `pair_connection`：配对 Agent；
@@ -209,7 +217,8 @@ Get-NetIPAddress -AddressFamily IPv4
 - `list_services`、`control_service`：查看或启动、停止、重启 Windows Service；
 - `power_control`：重启或关机；
 - `list_serial_ports`、`write_serial`、`run_serial_query`、`close_serial`：受控串口操作；
-- `run_ssh`：从 Agent 发起明确目标的 SSH 命令；网络设备只读白名单免确认，其他命令在只读模式下拒绝、默认模式下逐项确认、完全控制下执行；
+- `run_ssh`：从 Agent 发起明确目标的 SSH 命令；`use_password=true` 时由控制端本机安全窗口直接获取并端到端加密密码；网络设备只读白名单免确认，其他命令在只读模式下拒绝、默认模式下逐项确认、完全控制下执行；
+- `clear_ssh_credential_cache`：清除 MCP 内存中精确目标的十分钟 SSH 密码缓存；
 - `upload_file`、`download_file`：受控分块文件交换，支持 16 GiB 单文件上限、超过 1 GiB 单独确认和可恢复原子提交；
 - `close_connection`：关闭连接。
 
@@ -291,4 +300,3 @@ Test-NetConnection relay.example.com -Port 7443
 - IP、网关和 DNS 已成功读取；
 - 当前 Codex App 任务需要在应用重启后才会加载新 MCP；
 - 未安装 PowerShell 7 的现场机器仍可使用 `windows_power_shell`；需要 `pwsh` 时，应先安装 PowerShell 7 并重启 Agent。
-

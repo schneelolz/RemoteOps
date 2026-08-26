@@ -20,10 +20,9 @@ use eframe::egui::{
 use egui_phosphor::regular as icons;
 use remoteops_agent::{
     AgentConfig, AgentControllerBinding, AgentEvent, AgentEventSender, AgentPermissionControl,
-    SshCredentialStore, active_agent_config_path, default_agent_config_path, initialize_tracing,
+    active_agent_config_path, default_agent_config_path, initialize_tracing,
     legacy_agent_config_path, run_agent_with_permission_control,
 };
-use remoteops_device::{SshHostKeyScan, scan_ssh_host_keys, trust_ssh_host_keys};
 use remoteops_domain::{AgentInstanceId, Capability, CapabilitySet};
 use remoteops_i18n::{Language, Translator};
 use remoteops_protocol::{
@@ -396,35 +395,6 @@ struct RemoteOpsAgentApp {
     layout_is_setup: Option<bool>,
     /// 启动窗口等待稳定外框并完成居中的状态。
     window_centering: WindowCenteringState,
-    /// 与后台 Agent 共享、仅存在于当前进程内存中的 SSH 凭据。
-    ssh_credentials: SshCredentialStore,
-    /// 当前界面已添加的 SSH 目标，不包含密码。
-    ssh_credential_targets: Vec<SshCredentialTarget>,
-    /// 是否显示 SSH 凭据录入窗口。
-    show_ssh_credentials: bool,
-    /// SSH 凭据表单中的目标主机。
-    ssh_host: String,
-    /// SSH 凭据表单中的端口。
-    ssh_port: String,
-    /// SSH 凭据表单中的用户名。
-    ssh_username: String,
-    /// SSH 凭据表单中的密码；保存后立即清空。
-    ssh_password: String,
-    /// SSH 凭据表单校验错误。
-    ssh_credential_error: Option<String>,
-    /// 等待现场用户核对并确认的 SSH 主机密钥。
-    ssh_pending_host_keys: Option<SshHostKeyScan>,
-}
-
-/// GUI 中展示的 SSH 凭据目标，不包含密码。
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SshCredentialTarget {
-    /// 目标主机。
-    host: String,
-    /// SSH 端口。
-    port: u16,
-    /// 登录用户名。
-    username: String,
 }
 
 /// 启动窗口的居中校准状态。
@@ -479,10 +449,6 @@ impl RemoteOpsAgentApp {
         let (event_sender, events) = mpsc::channel();
         let (trust_sender, trust_events) = mpsc::channel();
         let (shutdown, _) = watch::channel(false);
-        let ssh_credentials = match &startup {
-            StartupState::Ready { config, .. } => config.ssh_credentials.clone(),
-            StartupState::Setup(setup) => setup.base_config.ssh_credentials.clone(),
-        };
         let mut app = Self {
             diagnostics,
             event_sender,
@@ -514,15 +480,6 @@ impl RemoteOpsAgentApp {
             copied_until: None,
             layout_is_setup: None,
             window_centering: WindowCenteringState::default(),
-            ssh_credentials,
-            ssh_credential_targets: Vec::new(),
-            show_ssh_credentials: false,
-            ssh_host: String::new(),
-            ssh_port: "22".to_owned(),
-            ssh_username: String::new(),
-            ssh_password: String::new(),
-            ssh_credential_error: None,
-            ssh_pending_host_keys: None,
         };
         match startup {
             StartupState::Ready {
@@ -1137,223 +1094,7 @@ impl RemoteOpsAgentApp {
             });
     }
 
-    /// 渲染仅当前进程有效的 SSH 凭据窗口。
-    #[allow(dead_code)]
-    fn render_ssh_credentials(&mut self, ctx: &egui::Context) {
-        if !self.show_ssh_credentials {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new(localized_label(
-            self.translator.language(),
-            "SSH 凭据",
-            "SSH credentials",
-        ))
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .default_width(430.0)
-        .show(ctx, |ui| {
-            Grid::new("agent-ssh-credential-form")
-                .num_columns(2)
-                .spacing(Vec2::new(10.0, 8.0))
-                .show(ui, |ui| {
-                    ui.label(localized_label(self.translator.language(), "主机", "Host"));
-                    ui.text_edit_singleline(&mut self.ssh_host);
-                    ui.end_row();
-                    ui.label(localized_label(self.translator.language(), "端口", "Port"));
-                    ui.text_edit_singleline(&mut self.ssh_port);
-                    ui.end_row();
-                    ui.label(localized_label(
-                        self.translator.language(),
-                        "用户名",
-                        "Username",
-                    ));
-                    ui.text_edit_singleline(&mut self.ssh_username);
-                    ui.end_row();
-                    ui.label(localized_label(
-                        self.translator.language(),
-                        "密码",
-                        "Password",
-                    ));
-                    ui.add(egui::TextEdit::singleline(&mut self.ssh_password).password(true));
-                    ui.end_row();
-                });
-            if let Some(error) = &self.ssh_credential_error {
-                ui.colored_label(Color32::from_rgb(190, 24, 35), error);
-            }
-            ui.horizontal(|ui| {
-                if ui
-                    .button(localized_label(
-                        self.translator.language(),
-                        "扫描主机密钥",
-                        "Scan host key",
-                    ))
-                    .clicked()
-                {
-                    self.scan_ssh_credential_host();
-                }
-                ui.label(
-                    RichText::new(localized_label(
-                        self.translator.language(),
-                        "仅当前进程有效",
-                        "Current process only",
-                    ))
-                    .size(11.0)
-                    .color(Color32::from_rgb(100, 116, 139)),
-                );
-            });
-            self.render_pending_ssh_host_keys(ui);
-            if !self.ssh_credential_targets.is_empty() {
-                ui.separator();
-                let mut remove = None;
-                for (index, target) in self.ssh_credential_targets.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "{}@{}:{}",
-                            target.username, target.host, target.port
-                        ));
-                        if ui
-                            .small_button(icons::TRASH)
-                            .on_hover_text(localized_label(
-                                self.translator.language(),
-                                "删除",
-                                "Remove",
-                            ))
-                            .clicked()
-                        {
-                            remove = Some(index);
-                        }
-                    });
-                }
-                if let Some(index) = remove {
-                    let target = self.ssh_credential_targets.remove(index);
-                    let _ =
-                        self.ssh_credentials
-                            .remove(&target.host, target.port, &target.username);
-                    if let Err(error) = self.ssh_credentials.persist() {
-                        self.ssh_credential_error = Some(error.to_string());
-                    }
-                }
-            }
-        });
-        self.show_ssh_credentials = open;
-    }
-
-    /// 渲染等待现场核对的 SSH 主机密钥指纹。
-    #[allow(dead_code)]
-    fn render_pending_ssh_host_keys(&mut self, ui: &mut egui::Ui) {
-        let Some(scan) = &self.ssh_pending_host_keys else {
-            return;
-        };
-        ui.separator();
-        ui.label(localized_label(
-            self.translator.language(),
-            "请通过可信渠道核对以下 SHA-256 指纹，确认前不会发送密码：",
-            "Verify these SHA-256 fingerprints through a trusted channel. The password is not sent before confirmation:",
-        ));
-        for fingerprint in &scan.fingerprints {
-            ui.monospace(fingerprint);
-        }
-        if ui
-            .button(localized_label(
-                self.translator.language(),
-                "指纹一致，信任并添加",
-                "Fingerprint matches; trust and add",
-            ))
-            .clicked()
-        {
-            self.confirm_ssh_credential_host();
-        }
-    }
-
-    /// 校验表单并扫描 SSH 主机密钥，扫描期间不会使用密码登录。
-    #[allow(dead_code)]
-    fn scan_ssh_credential_host(&mut self) {
-        let host = self.ssh_host.trim();
-        let username = self.ssh_username.trim();
-        let Ok(port) = self.ssh_port.trim().parse::<u16>() else {
-            self.ssh_credential_error = Some(
-                localized_label(
-                    self.translator.language(),
-                    "SSH 端口无效",
-                    "Invalid SSH port",
-                )
-                .to_owned(),
-            );
-            return;
-        };
-        if host.is_empty() || username.is_empty() || self.ssh_password.is_empty() {
-            self.ssh_credential_error = Some(
-                localized_label(
-                    self.translator.language(),
-                    "主机、用户名和密码不能为空",
-                    "Host, username, and password are required",
-                )
-                .to_owned(),
-            );
-            return;
-        }
-        self.ssh_pending_host_keys = None;
-        match scan_ssh_host_keys(host, port, 8) {
-            Ok(scan) => {
-                self.ssh_pending_host_keys = Some(scan);
-                self.ssh_credential_error = None;
-            }
-            Err(error) => self.ssh_credential_error = Some(error.to_string()),
-        }
-    }
-
-    /// 保存现场用户已经核对的主机密钥，并录入当前进程密码。
-    #[allow(dead_code)]
-    fn confirm_ssh_credential_host(&mut self) {
-        let Some(scan) = self.ssh_pending_host_keys.take() else {
-            return;
-        };
-        let username = self.ssh_username.trim();
-        if username.is_empty() || self.ssh_password.is_empty() {
-            self.ssh_credential_error = Some(
-                localized_label(
-                    self.translator.language(),
-                    "用户名和密码不能为空",
-                    "Username and password are required",
-                )
-                .to_owned(),
-            );
-            self.ssh_pending_host_keys = Some(scan);
-            return;
-        }
-        if let Err(error) = trust_ssh_host_keys(&scan) {
-            self.ssh_credential_error = Some(error.to_string());
-            self.ssh_pending_host_keys = Some(scan);
-            return;
-        }
-        let host = scan.host.clone();
-        let port = scan.port;
-        self.ssh_credentials.upsert(
-            &host,
-            port,
-            username,
-            std::mem::take(&mut self.ssh_password),
-        );
-        if let Err(error) = self.ssh_credentials.persist() {
-            self.ssh_credential_error = Some(error.to_string());
-            return;
-        }
-        let target = SshCredentialTarget {
-            host,
-            port,
-            username: username.to_owned(),
-        };
-        if !self.ssh_credential_targets.contains(&target) {
-            self.ssh_credential_targets.push(target);
-        }
-        self.ssh_host.clear();
-        self.ssh_username.clear();
-        self.ssh_credential_error = None;
-    }
-
-    /// 渲染只读运行信息和 SSH 凭据入口。
+    /// 渲染只读运行信息；SSH 密码只在控制端 MCP 的本机安全窗口录入。
     #[allow(clippy::too_many_lines)]
     fn render_advanced_settings(&mut self, ctx: &egui::Context) {
         if !self.show_advanced_settings {
@@ -2325,6 +2066,7 @@ fn agent_native_options(renderer: eframe::Renderer, initial_setup: bool) -> efra
     } else {
         RUNNING_WINDOW_SIZE
     };
+    #[allow(unused_mut)] // 仅 Windows 配置 WGPU 和事件循环时需要可变。
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("remoteops-agent-gui")
@@ -2698,15 +2440,6 @@ mod tests {
             copied_until: None,
             layout_is_setup: None,
             window_centering: WindowCenteringState::default(),
-            ssh_credentials: SshCredentialStore::default(),
-            ssh_credential_targets: Vec::new(),
-            show_ssh_credentials: false,
-            ssh_host: String::new(),
-            ssh_port: "22".to_owned(),
-            ssh_username: String::new(),
-            ssh_password: String::new(),
-            ssh_credential_error: None,
-            ssh_pending_host_keys: None,
         };
         assert_eq!(app.controller_status_label(), "工程师已连接");
     }

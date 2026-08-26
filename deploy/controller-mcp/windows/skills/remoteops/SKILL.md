@@ -21,6 +21,7 @@ description: 仅在用户明确提到 RemoteOps、Relay、RemoteOps Agent、控�
 6. 优先使用结构化只读工具；一次性 Shell 的只读诊断使用 `run_readonly_command`。需要保持目录、变量或模块状态时调用 `open_shell`，持久 Shell 的所有命令都使用 `run_command` 并接受逐项确认或完全控制约束。
 7. 结合用户目标分析结果。信息不足时继续只读检查，不要提前声称结论。
 8. 逐项确认模式下，写入、终止进程、服务控制、重启、文件变更、可写串口等操作由 MCP 向当前用户确认。完全控制按 `session_id` 独立生效，空闲一小时自动失效，成功操作后重新计时。
+9. SSH 密码不得写入对话、提示词或 MCP 工具参数。需要密码认证时调用 `run_ssh` 并设置 `use_password=true`，由控制端本机安全窗口直接向用户获取；用户说“忘记该 SSH 密码”时调用 `clear_ssh_credential_cache`。
 
 ## 使用约束
 

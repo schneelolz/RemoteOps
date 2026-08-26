@@ -7,11 +7,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$expectedVersion = '0.2.0-preview.4'
+$expectedVersion = '0.2.0-preview.5'
 $configPath = Join-Path $CodexHome 'config.toml'
 $installDirectory = Join-Path $CodexHome 'remoteops'
 $installedExecutable = $null
 $connectionConfigPath = Join-Path $installDirectory 'controller-config.json'
+$credentialPromptPath = Join-Path $installDirectory 'remoteops-credential-prompt.exe'
 $defaultCodexHome = Join-Path $env:USERPROFILE '.codex'
 $isDefaultCodexHome = [IO.Path]::GetFullPath($CodexHome).TrimEnd('\') -eq
     [IO.Path]::GetFullPath($defaultCodexHome).TrimEnd('\')
@@ -23,6 +24,13 @@ else {
 }
 $compatSkillPath = Join-Path $CodexHome 'skills\remoteops\SKILL.md'
 $failures = [System.Collections.Generic.List[string]]::new()
+
+if (-not (Test-Path -LiteralPath $credentialPromptPath -PathType Leaf)) {
+    $failures.Add("未找到 SSH 密码安全输入程序：$credentialPromptPath")
+}
+else {
+    Write-Host '[通过] SSH 密码安全输入程序已安装。'
+}
 
 foreach ($skillPath in @($standardSkillPath, $compatSkillPath) | Select-Object -Unique) {
     if (-not (Test-Path -LiteralPath $skillPath -PathType Leaf)) {
@@ -207,4 +215,3 @@ if ($failures.Count -gt 0) {
 
 Write-Host ''
 Write-Host 'RemoteOps MCP 安装检查通过。完全重启 Codex 后输入 /mcp 查看 remoteops。'
-

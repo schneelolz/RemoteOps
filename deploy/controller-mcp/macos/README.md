@@ -1,6 +1,6 @@
 # RemoteOps MCP macOS Apple Silicon 安装说明
 
-- 版本：`0.2.0-preview.4`
+- 版本：`0.2.0-preview.5`
 - 适用系统：macOS 13 或更高版本，Apple Silicon（arm64）
 - Codex MCP 名称：`remoteops`
 
@@ -22,7 +22,8 @@ chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.
 安装位置：
 
 ```text
-~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.4
+~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.5
+~/.codex/remoteops/remoteops-credential-prompt
 ~/.codex/remoteops/launch-remoteops-controller-mcp.sh
 ~/.codex/remoteops/controller-config.json
 ~/.codex/config.toml
@@ -42,6 +43,8 @@ chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.
 这是 RemoteOps 控制码 123-456-789。请检查现场电脑的网络和指定进程，只进行只读诊断。
 ```
 
+需要 SSH 密码认证时，只在对话中提供目标、用户名和命令，并让 `run_ssh` 设置 `use_password=true`。MCP 会打开 Mac 本机隐藏输入窗口；密码不会进入 Codex 对话或工具参数。窗口默认仅本次使用，也可由用户显式选择在 MCP 内存中固定保存 10 分钟，并通过 `clear_ssh_credential_cache` 提前清除。
+
 ## 卸载
 
 ```bash
@@ -49,4 +52,3 @@ chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.
 ```
 
 卸载器会删除 MCP、Codex 配置段、RemoteOps skill 和 Keychain Token，但保留本地审计日志与文件交换目录。
-

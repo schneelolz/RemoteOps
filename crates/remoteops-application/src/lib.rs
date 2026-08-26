@@ -1419,14 +1419,6 @@ fn audit_operation(operation: &RemoteOperation) -> String {
             command.len(),
             sha256_bytes(command.as_bytes())
         ),
-        RemoteOperation::ProvisionSshCredential {
-            host,
-            port,
-            username,
-            credential_ref,
-        } => format!(
-            "provision_ssh_credential target={username}@{host}:{port} credential_ref={credential_ref}"
-        ),
         RemoteOperation::RunSerialQuery {
             serial_session_id,
             command,
@@ -1550,6 +1542,8 @@ mod tests {
             operating_system: "Windows 11".to_owned(),
             capabilities: CapabilitySet::default(),
             environment: remoteops_domain::EnvironmentProfile::empty(),
+            credential_encryption_public_key: String::new(),
+            credential_encryption_key_id: String::new(),
             state,
             role: SessionRole::HumanControl,
             permission_mode: PermissionMode::ApprovalRequired,

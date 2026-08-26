@@ -403,17 +403,6 @@ pub enum RemoteOperation {
         /// 是否声明为只读命令。
         readonly: bool,
     },
-    /// 将控制端本地凭据库中的 SSH 密码注入 Agent 的本地凭据库。
-    ProvisionSshCredential {
-        /// SSH 目标主机。
-        host: String,
-        /// SSH 目标端口。
-        port: u16,
-        /// SSH 用户名。
-        username: String,
-        /// 控制端本地凭据引用，不是密码。
-        credential_ref: String,
-    },
     /// 关闭连接。
     CloseConnection,
     /// 人工接管写入权。

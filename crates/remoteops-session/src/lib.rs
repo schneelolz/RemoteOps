@@ -215,6 +215,8 @@ mod tests {
             operating_system: "Windows".to_owned(),
             capabilities: CapabilitySet::default(),
             environment: remoteops_domain::EnvironmentProfile::empty(),
+            credential_encryption_public_key: String::new(),
+            credential_encryption_key_id: String::new(),
             state: ConnectionState::Online,
             role: SessionRole::AiReadOnly,
             permission_mode: PermissionMode::ReadOnly,

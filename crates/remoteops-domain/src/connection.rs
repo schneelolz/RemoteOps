@@ -48,6 +48,12 @@ pub struct ConnectionDescriptor {
     pub capabilities: CapabilitySet,
     /// Agent 启动后自动采集的脱敏环境画像。
     pub environment: EnvironmentProfile,
+    /// 当前 Agent 进程用于端到端凭据加密的 HPKE 公钥。
+    #[serde(default)]
+    pub credential_encryption_public_key: String,
+    /// 当前 HPKE 公钥的 SHA-256 标识。
+    #[serde(default)]
+    pub credential_encryption_key_id: String,
     /// 当前连接状态。
     pub state: ConnectionState,
     /// 当前写入角色。

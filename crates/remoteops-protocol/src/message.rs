@@ -7,7 +7,7 @@ use remoteops_domain::{
 use serde::{Deserialize, Serialize};
 
 /// 当前线协议版本。
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// Controller 的受信任调用身份。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -47,6 +47,10 @@ pub struct AgentHello {
     pub capabilities: CapabilitySet,
     /// 启动后自动采集的脱敏环境画像。
     pub environment: EnvironmentProfile,
+    /// 当前 Agent 进程用于 SSH 密码端到端加密的 HPKE 公钥。
+    pub credential_encryption_public_key: String,
+    /// 当前 HPKE 公钥的 SHA-256 标识。
+    pub credential_encryption_key_id: String,
 }
 
 /// Controller 建立传输连接时的身份声明。

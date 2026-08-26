@@ -5,15 +5,15 @@
 ## 当前基线
 
 - 项目：RemoteOps
-- 当前源码版本：`0.2.0-preview.4`
-- 首个计划公开版本：`0.2.0-preview.4`
-- 当前协议版本：`v13`
+- 当前源码版本：`0.2.0-preview.5`
+- 首个计划公开版本：`0.2.0-preview.5`
+- 当前协议版本：`v14`
 - 发布阶段：GitHub Technical Preview 准备中，尚未创建首个 GitHub Release
 - 现场端：Windows x64 Agent
 - Relay：Linux x64 + Docker
 - Codex MCP：Windows x64、Apple Silicon macOS
 
-公开版本以实际 GitHub Release 为准，当前源码候选版本为 `0.2.0-preview.4`，尚未创建首个公开 Release。迁移前的 `4.x` 只代表内部开发和验收历史，不属于公开版本序列。v9 完成 Controller 会话释放、同 Owner 新实例接管和 MCP 授权修复；v10 取消普通 Agent 首次连接所需的入网码和部署级注册 Token；v11 增加大文件分块传输、权限状态修复、持久 Shell 显式关闭及完整 Windows 隐藏进程回归；v13 增加 Agent 租约续期事件和一次性 SSH 凭据注入。Agent、Relay 和 Controller 必须使用同一协议版本。
+公开版本以实际 GitHub Release 为准，当前源码候选版本为 `0.2.0-preview.5`，尚未创建首个公开 Release。迁移前的 `4.x` 只代表内部开发和验收历史，不属于公开版本序列。v9 完成 Controller 会话释放、同 Owner 新实例接管和 MCP 授权修复；v10 取消普通 Agent 首次连接所需的入网码和部署级注册 Token；v11 增加大文件分块传输、权限状态修复、持久 Shell 显式关闭及完整 Windows 隐藏进程回归；v13 增加 Agent 租约续期事件；v14 将 SSH 密码改为控制端本机安全窗口输入和 MCP 到 Agent 的 HPKE 单次加密载荷。Agent、Relay 和 Controller 必须使用同一协议版本。
 
 ## 已完成
 
@@ -34,7 +34,7 @@
 - MCP 与 CLI 使用 1 MiB 分块上传和下载，单文件上限为 16 GiB；超过 1 GiB 时必须在读取、哈希和发送前单独确认。上传和本地下载覆盖使用同目录临时文件、分块与完整 SHA-256 校验和可恢复原子提交，失败时保留原文件。
 - Relay 分别保存 Human 与 AI 权限，Human 配对不再覆盖 AI 的 `ControllerApproved`；人工接管期间 AI 临时只读，释放后恢复。Agent GUI、Controller GUI、CLI 和 MCP 使用或显示同一有效权限来源。
 - MCP 与随包 `remoteops` skill 支持自然语言路由，RemoteOps 控制码会优先进入配对和受控远程诊断流程。
-- Agent GUI 已移除控制模式选择和 SSH 凭据管理入口；控制模式统一由使用者侧 MCP 管理，SSH 密码由 MCP 一次性注入并仅驻留 Agent 进程内存。运行页采用 `520 × 410` 固定紧凑窗口，突出会随在线心跳刷新的控制码租约倒计时、工程师连接状态和能力摘要，并保留停止确认和屏幕工作区居中。
+- Agent GUI 已移除控制模式选择和 SSH 凭据管理入口；控制模式统一由使用者侧 MCP 管理。SSH 密码只在控制端本机安全窗口输入，可单次使用或在 MCP 内存固定缓存十分钟，并通过 HPKE 绑定精确请求发送；Agent 不建立密码仓库。运行页采用 `520 × 410` 固定紧凑窗口，突出会随在线心跳刷新的控制码租约倒计时、工程师连接状态和能力摘要，并保留停止确认和屏幕工作区居中。
 - Apple Silicon macOS MCP 已加入源码适配、Keychain Token、标准 macOS 数据目录、安装/检测/卸载脚本和 GitHub Actions 构建链路。
 - Relay 恢复后，Agent 可使用有效状态和恢复令牌重新认证；同一 MCP 进程会重试已知配对。审批和在途写操作不会自动重放。
 - 本地 MCP 编译和单元测试已通过；Windows、Linux 和 macOS 的完整首发产物仍需由干净 CI 生成并复核。
@@ -64,9 +64,8 @@
 
 ## 本地保留物
 
-`artifacts/release/0.2.0-preview.4` 是 Git 忽略的当前本地候选产物，不等于已公开 Release；该目录仅代表首个计划公开产物基线。自有 Relay 配置继续独立放在 `artifacts/local-test`，不混入可分发产物。`target` 是可随时重建的 Cargo 缓存。
+`artifacts/release/0.2.0-preview.5` 是 Git 忽略的当前本地候选产物，不等于已公开 Release；该目录仅代表首个计划公开产物基线。自有 Relay 配置继续独立放在 `artifacts/local-test`，不混入可分发产物。`target` 是可随时重建的 Cargo 缓存。
 
 ## 判断
 
 RemoteOps 已具备公开 Technical Preview 的产品形态。macOS MCP 可以明显降低 Mac 上 Codex 用户的试用门槛，但在 GitHub macOS arm64 CI 和真实 Apple Silicon Mac 安装验收完成前，仍应表述为“已实现、待实机验收”，不能宣称已经完成生产兼容。
-

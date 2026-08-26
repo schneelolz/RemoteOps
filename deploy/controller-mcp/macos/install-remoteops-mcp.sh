@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PACKAGE_VERSION="0.2.0-preview.4"
+PACKAGE_VERSION="0.2.0-preview.5"
 KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
@@ -71,9 +71,14 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 SOURCE_BINARY="$SCRIPT_DIR/remoteops-controller-mcp"
+SOURCE_CREDENTIAL_PROMPT="$SCRIPT_DIR/remoteops-credential-prompt"
 SOURCE_SKILL="$SCRIPT_DIR/skills/remoteops"
 if [[ ! -x "$SOURCE_BINARY" ]]; then
   echo "安装包缺少可执行文件：$SOURCE_BINARY" >&2
+  exit 1
+fi
+if [[ ! -x "$SOURCE_CREDENTIAL_PROMPT" ]]; then
+  echo "安装包缺少可执行文件：$SOURCE_CREDENTIAL_PROMPT" >&2
   exit 1
 fi
 if [[ ! -f "$SOURCE_SKILL/SKILL.md" ]]; then
@@ -82,6 +87,10 @@ if [[ ! -f "$SOURCE_SKILL/SKILL.md" ]]; then
 fi
 if ! "$SOURCE_BINARY" --version | grep -Fq "$PACKAGE_VERSION"; then
   echo "MCP 可执行文件版本与安装包不一致。" >&2
+  exit 1
+fi
+if ! "$SOURCE_CREDENTIAL_PROMPT" --version | grep -Fq "$PACKAGE_VERSION"; then
+  echo "SSH 密码安全输入程序版本与安装包不一致。" >&2
   exit 1
 fi
 
@@ -120,6 +129,7 @@ fi
 
 INSTALL_DIR="$CODEX_HOME/remoteops"
 INSTALLED_BINARY="$INSTALL_DIR/remoteops-controller-mcp-$PACKAGE_VERSION"
+INSTALLED_CREDENTIAL_PROMPT="$INSTALL_DIR/remoteops-credential-prompt"
 LAUNCHER="$INSTALL_DIR/launch-remoteops-controller-mcp.sh"
 CONNECTION_CONFIG="$INSTALL_DIR/controller-config.json"
 CONFIG_PATH="$CODEX_HOME/config.toml"
@@ -127,6 +137,7 @@ STANDARD_SKILL_DIR="$HOME/.agents/skills/remoteops"
 COMPAT_SKILL_DIR="$CODEX_HOME/skills/remoteops"
 mkdir -p "$INSTALL_DIR" "$STANDARD_SKILL_DIR" "$COMPAT_SKILL_DIR"
 install -m 755 "$SOURCE_BINARY" "$INSTALLED_BINARY"
+install -m 755 "$SOURCE_CREDENTIAL_PROMPT" "$INSTALLED_CREDENTIAL_PROMPT"
 
 INSTALLED_CA=""
 if [[ -n "$CA_CERT" ]]; then

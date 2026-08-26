@@ -18,13 +18,14 @@ members = [
     "apps/remoteops-ssh-askpass",
     "apps/remoteops-controller-cli",
     "apps/remoteops-controller-mcp",
+    "apps/remoteops-credential-prompt",
     "apps/remoteops-controller-gui",
     "apps/remoteops-serial-demo",
     "tests/remoteops-mcp-smoke",
 ]
 
 [workspace.package]
-version = "0.2.0-preview.4"
+version = "0.2.0-preview.5"
 edition = "2024"
 license = "AGPL-3.0-only"
 authors = ["RemoteOps contributors"]
@@ -42,6 +43,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = "0.29"
 futures-util = "0.3"
 hex = "0.4"
+hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 process-wrap = { version = "9.1", features = ["tokio1"] }
 rand = "0.8"
 regex = "1.11"
@@ -58,6 +60,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.17", features = ["v4", "serde"] }
+zeroize = "1.9"
 winresource = "0.1.31"
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "persistence", "wgpu"] }
 egui-phosphor = "0.13.0"

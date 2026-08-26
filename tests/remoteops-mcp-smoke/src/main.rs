@@ -133,6 +133,8 @@ async fn main() -> anyhow::Result<()> {
         "read_output",
         "upload_file",
         "download_file",
+        "run_ssh",
+        "clear_ssh_credential_cache",
         "request_action_approval",
         "close_connection",
     ];
@@ -158,6 +160,8 @@ async fn main() -> anyhow::Result<()> {
         "open_serial",
         "upload_file",
         "download_file",
+        "run_ssh",
+        "clear_ssh_credential_cache",
         "request_action_approval",
         "close_connection",
     ];
@@ -194,6 +198,12 @@ async fn main() -> anyhow::Result<()> {
         bail!("审批申请本身不应声明 destructive_hint=true");
     }
     assert_approval_tool_cannot_decide(approval_tool)?;
+    for tool in &tools {
+        let schema = serde_json::to_string(&tool.input_schema)?;
+        if schema.contains("\"password\"") {
+            bail!("MCP 工具 {} 的输入架构暴露了 password 字段", tool.name);
+        }
+    }
 
     for pair in &args.pair {
         let (pairing_code, alias) = pair

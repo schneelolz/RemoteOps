@@ -1,6 +1,6 @@
 # RemoteOps 控制端 GUI 使用说明
 
-> 文档状态：人工 Controller GUI 使用手册，适用于 `0.2.0-preview.4` Technical Preview。现场被控端请阅读[现场被控端 GUI 使用说明](现场被控端GUI使用说明.md)。
+> 文档状态：人工 Controller GUI 使用手册，适用于 `0.2.0-preview.5` Technical Preview。现场被控端请阅读[现场被控端 GUI 使用说明](现场被控端GUI使用说明.md)。
 
 ## 当前定位
 
@@ -138,4 +138,3 @@ GUI、CLI 和 MCP 必须继续复用同一个 `session_id`，不得使用别名�
 - 在保留的三机环境中完成 GUI 手动添加两台 Agent，并与 Codex MCP 同时连接同一 Relay；
 - 在真实远程 Agent + `COM7` 环境中确认可写打开审批、人工写入、AI 主动查询、自动分页、脱敏结果、拔插和断线恢复；
 - 交换机 SSH 现场硬件验收。
-

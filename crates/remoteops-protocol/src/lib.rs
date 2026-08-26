@@ -1,10 +1,15 @@
 //! Agent、Relay 和 Controller 共用的版本化线协议。
 
 mod codec;
+mod credential;
 mod message;
 mod tls;
 
 pub use codec::{FrameError, MAX_FRAME_SIZE, read_frame, write_frame};
+pub use credential::{
+    CredentialEncryptionContext, CredentialEncryptionError, CredentialEncryptionKeyPair,
+    EncryptedCredentialPayload, open_credential, seal_credential,
+};
 pub use message::{
     AgentHello, AgentLeaseRenewed, AgentPermissionModeChanged, AgentResumeCommitAck,
     AgentResumeCommitted, AgentWelcome, AgentWelcomeAck, ApprovalDecision, ApprovalRequest,

@@ -4,11 +4,13 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Component, Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow, bail};
+use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use clap::{Parser, ValueEnum};
 use remoteops_application::{
@@ -21,6 +23,7 @@ use remoteops_domain::{
     SerialLineEnding, SerialParity, SerialSettings, SerialStopBits, SerialTerminalProfile,
     ServiceAction, SessionId, ShellId, ShellKind,
 };
+use remoteops_protocol::{CredentialEncryptionContext, PROTOCOL_VERSION, seal_credential};
 use rmcp::{
     Json, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -38,9 +41,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
     sync::Mutex,
+    time::timeout,
 };
 use tracing_subscriber::EnvFilter;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// `RemoteOps` 本地 STDIO MCP Server。
 #[derive(Debug, Parser)]
@@ -306,9 +312,13 @@ struct RemoteOpsMcp {
     transfer_root: Arc<PathBuf>,
     command_mode: CommandMode,
     full_access_grants: Arc<Mutex<BTreeMap<SessionId, FullAccessGrant>>>,
+    ssh_credential_cache: Arc<Mutex<BTreeMap<SshCredentialCacheKey, CachedSshCredential>>>,
+    credential_prompt: Arc<dyn CredentialPrompt>,
 }
 
 const FULL_ACCESS_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
+const SSH_CREDENTIAL_CACHE_TIMEOUT: Duration = Duration::from_mins(10);
+const CREDENTIAL_PROMPT_TIMEOUT: Duration = Duration::from_mins(5);
 const ELICITATION_TIMEOUT: Duration = Duration::from_mins(2);
 const FILE_CHUNK_BYTES: usize = 1024 * 1024;
 const LARGE_TRANSFER_CONFIRM_BYTES: u64 = 1024 * 1024 * 1024;
@@ -631,6 +641,7 @@ struct RunSerialQueryInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SshInput {
     session_id: String,
     host: String,
@@ -640,23 +651,59 @@ struct SshInput {
     known_hosts_file: Option<String>,
     command: String,
     readonly: bool,
+    /// 为 true 时由 MCP 本机安全窗口取得密码；密码不属于工具参数。
+    use_password: Option<bool>,
     approval_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct ProvisionSshCredentialInput {
-    /// `list_connections` 返回的不可变 `session_id`。
+#[serde(deny_unknown_fields)]
+struct ClearSshCredentialCacheInput {
     session_id: String,
-    /// SSH 目标主机。
     host: String,
-    /// SSH 端口，省略时为 22。
     port: Option<u16>,
-    /// SSH 用户名。
     username: String,
-    /// 本次注入使用的 SSH 密码；不会写入配置、日志或审计。
-    password: String,
-    /// 完全控制模式下不需要；逐项确认模式可携带一次性审批标识。
-    approval_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SshCredentialCacheKey {
+    session_id: SessionId,
+    host: String,
+    port: u16,
+    username: String,
+}
+
+struct CachedSshCredential {
+    password: Zeroizing<String>,
+    expires_at: Instant,
+}
+
+struct CredentialPromptRequest<'a> {
+    host: &'a str,
+    port: u16,
+    username: &'a str,
+    command_sha256: &'a str,
+}
+
+struct PromptedCredential {
+    password: Zeroizing<String>,
+    remember: bool,
+}
+
+#[async_trait]
+trait CredentialPrompt: Send + Sync {
+    async fn prompt(
+        &self,
+        request: CredentialPromptRequest<'_>,
+    ) -> Result<Option<PromptedCredential>, String>;
+}
+
+struct ProcessCredentialPrompt;
+
+#[derive(Deserialize)]
+struct PromptWireResponse {
+    action: String,
+    password: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -916,6 +963,130 @@ struct EventsOutput {
     events: Vec<serde_json::Value>,
 }
 
+#[async_trait]
+impl CredentialPrompt for ProcessCredentialPrompt {
+    async fn prompt(
+        &self,
+        request: CredentialPromptRequest<'_>,
+    ) -> Result<Option<PromptedCredential>, String> {
+        let executable = credential_prompt_executable()?;
+        let mut output = timeout(
+            CREDENTIAL_PROMPT_TIMEOUT,
+            Command::new(executable)
+                .arg("--host")
+                .arg(request.host)
+                .arg("--port")
+                .arg(request.port.to_string())
+                .arg("--username")
+                .arg(request.username)
+                .arg("--command-sha256")
+                .arg(request.command_sha256)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| "SSH 密码安全输入窗口等待超时".to_owned())?
+        .map_err(|error| format!("无法启动 SSH 密码安全输入窗口：{error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "SSH 密码安全输入窗口失败：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        if output.stdout.len() > 8192 {
+            return Err("SSH 密码安全输入窗口返回数据过大".to_owned());
+        }
+        let parsed = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("SSH 密码安全输入结果格式无效：{error}"));
+        output.stdout.zeroize();
+        let mut wire: PromptWireResponse = parsed?;
+        match wire.action.as_str() {
+            "cancel" => {
+                if let Some(password) = wire.password.as_mut() {
+                    password.zeroize();
+                }
+                Ok(None)
+            }
+            "use_once" | "remember_10_minutes" => {
+                let password = Zeroizing::new(
+                    wire.password
+                        .take()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| "SSH 密码不能为空".to_owned())?,
+                );
+                if password.len() > 4096 {
+                    return Err("SSH 密码超过 4096 字节上限".to_owned());
+                }
+                Ok(Some(PromptedCredential {
+                    password,
+                    remember: wire.action == "remember_10_minutes",
+                }))
+            }
+            _ => Err("SSH 密码安全输入窗口返回了未知操作".to_owned()),
+        }
+    }
+}
+
+fn credential_prompt_executable() -> Result<PathBuf, String> {
+    let directory = std::env::current_exe()
+        .map_err(|error| format!("无法定位 MCP 程序目录：{error}"))?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "MCP 程序路径缺少父目录".to_owned())?;
+    let file_name = if cfg!(windows) {
+        "remoteops-credential-prompt.exe"
+    } else {
+        "remoteops-credential-prompt"
+    };
+    let executable = directory.join(file_name);
+    executable.is_file().then_some(executable).ok_or_else(|| {
+        format!("MCP 安装包缺少本机安全输入程序 {file_name}；请重新安装完整 RemoteOps MCP 包")
+    })
+}
+
+fn cached_ssh_password(
+    cache: &mut BTreeMap<SshCredentialCacheKey, CachedSshCredential>,
+    key: &SshCredentialCacheKey,
+    now: Instant,
+) -> Option<Zeroizing<String>> {
+    cache.retain(|_, credential| credential.expires_at > now);
+    cache.get(key).map(|credential| credential.password.clone())
+}
+
+fn remember_ssh_password(
+    cache: &mut BTreeMap<SshCredentialCacheKey, CachedSshCredential>,
+    key: SshCredentialCacheKey,
+    password: Zeroizing<String>,
+    now: Instant,
+) {
+    cache.insert(
+        key,
+        CachedSshCredential {
+            password,
+            expires_at: now + SSH_CREDENTIAL_CACHE_TIMEOUT,
+        },
+    );
+}
+
+fn validate_ssh_prompt_target(host: &str, username: &str) -> Result<(), String> {
+    if host.trim().is_empty()
+        || username.trim().is_empty()
+        || host.starts_with('-')
+        || host.chars().any(char::is_whitespace)
+        || host.chars().any(char::is_control)
+        || username.starts_with('-')
+        || username.contains('@')
+        || username.chars().any(char::is_whitespace)
+        || username.chars().any(char::is_control)
+    {
+        return Err("SSH 主机或用户名格式无效".to_owned());
+    }
+    Ok(())
+}
+
 #[tool_router]
 impl RemoteOpsMcp {
     fn new(client: RelayClient, transfer_root: PathBuf, command_mode: CommandMode) -> Self {
@@ -925,7 +1096,110 @@ impl RemoteOpsMcp {
             transfer_root: Arc::new(transfer_root),
             command_mode,
             full_access_grants: Arc::new(Mutex::new(BTreeMap::new())),
+            ssh_credential_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            credential_prompt: Arc::new(ProcessCredentialPrompt),
         }
+    }
+
+    async fn ssh_password(
+        &self,
+        key: &SshCredentialCacheKey,
+        command_sha256: &str,
+    ) -> Result<Zeroizing<String>, String> {
+        {
+            let mut cache = self.ssh_credential_cache.lock().await;
+            if let Some(password) = cached_ssh_password(&mut cache, key, Instant::now()) {
+                return Ok(password);
+            }
+        }
+        let prompted = self
+            .credential_prompt
+            .prompt(CredentialPromptRequest {
+                host: &key.host,
+                port: key.port,
+                username: &key.username,
+                command_sha256,
+            })
+            .await?
+            .ok_or_else(|| "用户取消了 SSH 密码输入".to_owned())?;
+        if prompted.remember {
+            let mut cache = self.ssh_credential_cache.lock().await;
+            remember_ssh_password(
+                &mut cache,
+                key.clone(),
+                prompted.password.clone(),
+                Instant::now(),
+            );
+        }
+        Ok(prompted.password)
+    }
+
+    async fn clear_cached_ssh_credentials_for_session(&self, session_id: SessionId) {
+        self.ssh_credential_cache
+            .lock()
+            .await
+            .retain(|key, _| key.session_id != session_id);
+    }
+
+    async fn encrypted_ssh_payload(
+        &self,
+        session_id: SessionId,
+        operation: &RemoteOperation,
+    ) -> Result<String, String> {
+        let RemoteOperation::RunSsh {
+            host,
+            port,
+            username,
+            command,
+            ..
+        } = operation
+        else {
+            return Err("只有 SSH 操作可以携带加密密码".to_owned());
+        };
+        let connection = self
+            .client
+            .list_connections()
+            .await
+            .into_iter()
+            .find(|connection| connection.session_id == session_id)
+            .ok_or_else(|| "未找到 session_id".to_owned())?;
+        if connection.state != remoteops_domain::ConnectionState::Online {
+            return Err("Agent 当前不在线，不能请求或发送 SSH 密码".to_owned());
+        }
+        if connection.credential_encryption_public_key.is_empty()
+            || connection.credential_encryption_key_id.is_empty()
+        {
+            return Err("Agent 未提供 v14 凭据加密公钥；请同步升级 Agent、Relay 和 MCP".to_owned());
+        }
+        let cache_key = SshCredentialCacheKey {
+            session_id,
+            host: host.trim().to_ascii_lowercase(),
+            port: *port,
+            username: username.trim().to_owned(),
+        };
+        let command_sha256 = sha256_bytes(command.as_bytes());
+        let mut password = self.ssh_password(&cache_key, &command_sha256).await?;
+        let context = CredentialEncryptionContext {
+            protocol_version: PROTOCOL_VERSION,
+            agent_instance_id: connection.agent_instance_id,
+            session_id,
+            envelope_id: remoteops_domain::RequestId::new(),
+            host: cache_key.host,
+            port: cache_key.port,
+            username: cache_key.username,
+            command_sha256,
+        };
+        let encrypted = seal_credential(
+            &connection.credential_encryption_public_key,
+            &connection.credential_encryption_key_id,
+            &context,
+            password.as_bytes(),
+        )
+        .map_err(|error| error.to_string())?;
+        password.zeroize();
+        let serialized = serde_json::to_vec(&encrypted)
+            .map_err(|error| format!("无法编码 SSH 加密凭据：{error}"))?;
+        Ok(BASE64.encode(serialized))
     }
 
     async fn ensure_connection_exists(&self, session_id: SessionId) -> Result<(), String> {
@@ -2056,7 +2330,7 @@ impl RemoteOpsMcp {
 
     #[tool(
         name = "run_ssh",
-        description = "由 Agent 使用本地受控密钥和 known_hosts 连接明确 SSH 目标；非只读命令默认必须审批。",
+        description = "由 Agent 连接明确 SSH 目标；设置 use_password=true 时，MCP 在本机安全窗口取得密码并端到端加密，密码不得写入对话或工具参数。非只读命令默认必须审批。",
         annotations(
             title = "执行 SSH 命令",
             read_only_hint = false,
@@ -2071,67 +2345,90 @@ impl RemoteOpsMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<Json<ActionOutput>, String> {
         let session_id = parse_session_id(&input.session_id)?;
+        let port = input.port.unwrap_or(22);
+        let use_password = input.use_password.unwrap_or(false);
+        validate_ssh_prompt_target(&input.host, &input.username)?;
+        if use_password && input.identity_file.is_some() {
+            return Err("密码 SSH 不能同时指定 identity_file".to_owned());
+        }
+        if use_password && input.known_hosts_file.is_some() {
+            return Err("密码 SSH 使用 Agent 专用 known_hosts，不能由控制端指定路径".to_owned());
+        }
+        let authorization = if input.readonly {
+            None
+        } else {
+            Some(
+                self.authorize_mutation(&context, session_id, "非只读 SSH 命令", input.approval_id)
+                    .await?,
+            )
+        };
         let operation = RemoteOperation::RunSsh {
             host: input.host,
-            port: input.port.unwrap_or(22),
+            port,
             username: input.username,
             identity_file: input.identity_file,
             known_hosts_file: input.known_hosts_file,
             command: input.command,
             readonly: input.readonly,
         };
-        if input.readonly {
-            self.execute_simple(session_id.to_string(), operation, None, None)
+        let payload = if use_password {
+            Some(self.encrypted_ssh_payload(session_id, &operation).await?)
+        } else {
+            None
+        };
+        if let Some(authorization) = authorization {
+            self.execute_authorized(session_id, operation, authorization, payload)
                 .await
         } else {
-            let authorization = self
-                .authorize_mutation(&context, session_id, "非只读 SSH 命令", input.approval_id)
-                .await?;
-            self.execute_authorized(session_id, operation, authorization, None)
+            self.execute_simple(session_id.to_string(), operation, None, payload)
                 .await
         }
     }
 
-    /// 将一次性 SSH 密码按精确目标绑定注入 Agent；密码不会写入配置、日志或审计。
     #[tool(
-        name = "provision_ssh_credential",
-        description = "通过受控链路向精确 Agent 注入一次性 SSH 密码；密码不会写入配置、日志或工具结果。",
+        name = "clear_ssh_credential_cache",
+        description = "清除 MCP 本机内存中为精确 session_id、主机、端口和用户名短时保存的 SSH 密码；不会向 Relay 或 Agent 发送密码。",
         annotations(
-            title = "注入 SSH 凭据",
+            title = "清除 SSH 密码缓存",
             read_only_hint = false,
-            destructive_hint = true,
+            destructive_hint = false,
             idempotent_hint = true,
-            open_world_hint = true
+            open_world_hint = false
         )
     )]
-    async fn provision_ssh_credential(
+    async fn clear_ssh_credential_cache(
         &self,
-        Parameters(input): Parameters<ProvisionSshCredentialInput>,
-        context: RequestContext<RoleServer>,
+        Parameters(input): Parameters<ClearSshCredentialCacheInput>,
     ) -> Result<Json<ActionOutput>, String> {
         let session_id = parse_session_id(&input.session_id)?;
-        let port = input.port.unwrap_or(22);
-        if input.password.is_empty() {
-            return Err("SSH 密码不能为空".to_owned());
-        }
-        let credential_ref = format!(
-            "ssh://{}@{}:{}",
-            input.username.trim(),
-            input.host.trim().to_ascii_lowercase(),
-            port
-        );
-        let operation = RemoteOperation::ProvisionSshCredential {
-            host: input.host,
-            port,
-            username: input.username,
-            credential_ref,
+        self.ensure_connection_exists(session_id).await?;
+        let key = SshCredentialCacheKey {
+            session_id,
+            host: input.host.trim().to_ascii_lowercase(),
+            port: input.port.unwrap_or(22),
+            username: input.username.trim().to_owned(),
         };
-        let authorization = self
-            .authorize_mutation(&context, session_id, "注入 SSH 凭据", input.approval_id)
-            .await?;
-        let payload = BASE64.encode(input.password.as_bytes());
-        self.execute_authorized(session_id, operation, authorization, Some(payload))
+        let cleared = self
+            .ssh_credential_cache
+            .lock()
             .await
+            .remove(&key)
+            .is_some();
+        Ok(Json(ActionOutput {
+            status: "completed".to_owned(),
+            session_id: session_id.to_string(),
+            request_id: None,
+            exit_code: Some(0),
+            summary: if cleared {
+                "已清除精确目标的 SSH 密码缓存"
+            } else {
+                "精确目标没有活动的 SSH 密码缓存"
+            }
+            .to_owned(),
+            approval_id: None,
+            sha256: None,
+            details: None,
+        }))
     }
 
     /// 上传控制端本机文件到 Agent。
@@ -2486,6 +2783,8 @@ impl RemoteOpsMcp {
             .await
             .retain(|_, handle| handle.session_id != session_id);
         self.full_access_grants.lock().await.remove(&session_id);
+        self.clear_cached_ssh_credentials_for_session(session_id)
+            .await;
         Ok(Json(action_output(session_id, result)))
     }
 
@@ -2789,8 +3088,8 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(
     name = "remoteops-controller",
-    version = "0.2.0-preview.4",
-    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。配对后默认逐项确认，Agent 端没有逐项确认或完全控制按钮，绝对不要引导用户去 Agent 点击授权。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。修改操作在逐项确认模式下由 MCP 向当前用户确认；用户明确要求完全控制时只调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制按 session_id 独立保存在 MCP 内存，空闲一小时自动失效，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。不要向用户输出 Token、session_id、approval_id 或恢复令牌。"
+    version = "0.2.0-preview.5",
+    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。配对后默认逐项确认，Agent 端没有逐项确认或完全控制按钮，绝对不要引导用户去 Agent 点击授权。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；用户明确要求完全控制时只调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制按 session_id 独立保存在 MCP 内存，空闲一小时自动失效，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
 )]
 impl ServerHandler for RemoteOpsMcp {}
 
@@ -3202,11 +3501,105 @@ fn application_error(error: ApplicationError) -> String {
 mod tests {
     use super::*;
 
+    struct FakeCredentialPrompt {
+        response: Mutex<Option<PromptedCredential>>,
+    }
+
+    #[async_trait]
+    impl CredentialPrompt for FakeCredentialPrompt {
+        async fn prompt(
+            &self,
+            _request: CredentialPromptRequest<'_>,
+        ) -> Result<Option<PromptedCredential>, String> {
+            Ok(self.response.lock().await.take())
+        }
+    }
+
     #[test]
     fn codex_allow_action_confirms_without_boolean_form_value() {
         assert!(elicitation_accepted(&ElicitationAction::Accept));
         assert!(!elicitation_accepted(&ElicitationAction::Decline));
         assert!(!elicitation_accepted(&ElicitationAction::Cancel));
+    }
+
+    #[test]
+    fn ssh_tool_input_rejects_inline_passwords() {
+        let input = serde_json::json!({
+            "session_id": SessionId::new().to_string(),
+            "host": "192.0.2.10",
+            "port": 22,
+            "username": "admin",
+            "identity_file": null,
+            "known_hosts_file": null,
+            "command": "display version",
+            "readonly": true,
+            "use_password": true,
+            "approval_id": null,
+            "password": "must-not-enter-mcp-arguments"
+        });
+        assert!(serde_json::from_value::<SshInput>(input).is_err());
+
+        let schema =
+            serde_json::to_value(schemars::schema_for!(SshInput)).expect("SSH 输入架构应可序列化");
+        assert!(schema["properties"].get("password").is_none());
+        assert!(schema["properties"].get("use_password").is_some());
+        assert!(validate_ssh_prompt_target("192.0.2.10", "admin").is_ok());
+        assert!(validate_ssh_prompt_target("-oProxyCommand=calc", "admin").is_err());
+        assert!(validate_ssh_prompt_target("192.0.2.10", "bad@user").is_err());
+    }
+
+    #[test]
+    fn ssh_credential_cache_is_exact_and_has_fixed_expiry() {
+        let now = Instant::now();
+        let key = SshCredentialCacheKey {
+            session_id: SessionId::new(),
+            host: "192.0.2.10".to_owned(),
+            port: 22,
+            username: "admin".to_owned(),
+        };
+        let mut cache = BTreeMap::new();
+        remember_ssh_password(
+            &mut cache,
+            key.clone(),
+            Zeroizing::new("secret-value".to_owned()),
+            now,
+        );
+        assert_eq!(
+            cached_ssh_password(&mut cache, &key, now)
+                .expect("精确目标应命中缓存")
+                .as_str(),
+            "secret-value"
+        );
+
+        let mut other = key.clone();
+        other.session_id = SessionId::new();
+        assert!(cached_ssh_password(&mut cache, &other, now).is_none());
+        assert!(
+            cached_ssh_password(&mut cache, &key, now + SSH_CREDENTIAL_CACHE_TIMEOUT,).is_none()
+        );
+        assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn credential_prompt_abstraction_supports_cancel_and_memory_choice() {
+        let prompt = FakeCredentialPrompt {
+            response: Mutex::new(Some(PromptedCredential {
+                password: Zeroizing::new("secret-value".to_owned()),
+                remember: true,
+            })),
+        };
+        let prompted = prompt
+            .prompt(CredentialPromptRequest {
+                host: "192.0.2.10",
+                port: 22,
+                username: "admin",
+                command_sha256: &"a".repeat(64),
+            })
+            .await
+            .expect("假安全窗口应成功")
+            .expect("假安全窗口应返回凭据");
+        assert!(prompted.remember);
+        assert_eq!(prompted.password.as_str(), "secret-value");
     }
 
     fn test_args(config: PathBuf) -> Args {

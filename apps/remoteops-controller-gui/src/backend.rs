@@ -2134,6 +2134,8 @@ fn demo_connection(index: u32, alias: &str, hostname: &str) -> ConnectionDescrip
         operating_system: "Windows 11".to_owned(),
         capabilities: CapabilitySet::default(),
         environment: remoteops_domain::EnvironmentProfile::empty(),
+        credential_encryption_public_key: String::new(),
+        credential_encryption_key_id: String::new(),
         state: ConnectionState::Online,
         role: SessionRole::HumanControl,
         permission_mode: PermissionMode::ApprovalRequired,

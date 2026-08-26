@@ -71,6 +71,7 @@ $packageDirectory = [IO.Path]::GetFullPath((Join-Path $resolvedOutputRoot $packa
 $archivePath = Join-Path $resolvedOutputRoot "$packageName.zip"
 $templateDirectory = Join-Path $workspaceRoot 'deploy\controller-mcp\windows'
 $releaseExecutable = Join-Path $workspaceRoot 'target\release\remoteops-controller-mcp.exe'
+$credentialPromptExecutable = Join-Path $workspaceRoot 'target\release\remoteops-credential-prompt.exe'
 $resolvedArtifactDirectory = [IO.Path]::GetFullPath($ArtifactDirectory)
 $artifactExecutable = Join-Path $resolvedArtifactDirectory 'remoteops-controller-mcp.exe'
 $manifestPath = Join-Path $resolvedArtifactDirectory 'manifest.json'
@@ -84,7 +85,7 @@ if (-not $packageDirectory.StartsWith(
 
 Push-Location $workspaceRoot
 try {
-    cargo build --release --locked -p remoteops-controller-mcp
+    cargo build --release --locked -p remoteops-controller-mcp -p remoteops-credential-prompt
     if ($LASTEXITCODE -ne 0) {
         throw 'remoteops-controller-mcp Release 构建失败。'
     }
@@ -118,6 +119,7 @@ New-Item -ItemType Directory -Force -Path $packageDirectory | Out-Null
 New-Item -ItemType Directory -Force -Path $resolvedArtifactDirectory | Out-Null
 Copy-Item -LiteralPath $releaseExecutable -Destination $artifactExecutable -Force
 Copy-Item -LiteralPath $releaseExecutable -Destination (Join-Path $packageDirectory 'remoteops-controller-mcp.exe')
+Copy-Item -LiteralPath $credentialPromptExecutable -Destination (Join-Path $packageDirectory 'remoteops-credential-prompt.exe')
 Copy-Item -LiteralPath (Join-Path $templateDirectory 'README.md') -Destination $packageDirectory
 Copy-Item -LiteralPath (Join-Path $templateDirectory 'Install-RemoteOpsMcp.ps1') -Destination $packageDirectory
 Copy-Item -LiteralPath (Join-Path $templateDirectory 'Test-RemoteOpsMcp.ps1') -Destination $packageDirectory
@@ -139,6 +141,10 @@ if (Test-Path -LiteralPath (Join-Path $skillSource 'agents') -PathType Container
 $actualVersion = (& (Join-Path $packageDirectory 'remoteops-controller-mcp.exe') --version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $actualVersion -notmatch [regex]::Escape($version)) {
     throw "打包程序版本不正确：$actualVersion"
+}
+$promptVersion = (& (Join-Path $packageDirectory 'remoteops-credential-prompt.exe') --version 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $promptVersion -notmatch [regex]::Escape($version)) {
+    throw "凭据安全输入程序版本不正确：$promptVersion"
 }
 
 if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
@@ -180,4 +186,3 @@ if ($LASTEXITCODE -ne 0) {
 $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 Write-Host "安装包：$archivePath"
 Write-Host "SHA256：$hash"
-

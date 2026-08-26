@@ -3206,6 +3206,8 @@ fn descriptor(agent: &AgentRecord, state: ConnectionState) -> ConnectionDescript
         operating_system: agent.hello.operating_system.clone(),
         capabilities: agent.hello.capabilities.clone(),
         environment: agent.hello.environment.clone(),
+        credential_encryption_public_key: agent.hello.credential_encryption_public_key.clone(),
+        credential_encryption_key_id: agent.hello.credential_encryption_key_id.clone(),
         state,
         role: SessionRole::HumanControl,
         permission_mode: agent.permission_mode,
@@ -3362,6 +3364,8 @@ mod tests {
             operating_system: "Windows 11".to_owned(),
             capabilities: CapabilitySet::new([Capability::Cmd]),
             environment: remoteops_domain::EnvironmentProfile::empty(),
+            credential_encryption_public_key: "test-public-key".to_owned(),
+            credential_encryption_key_id: "test-key-id".to_owned(),
         }
     }
 
@@ -4982,7 +4986,7 @@ mod tests {
             source: EventSource::Human,
             operation: run_command("Get-Process", false),
             approval_id: Some(ApprovalId::new()),
-            payload_base64: None,
+            payload_base64: Some("opaque-hpke-envelope".to_owned()),
         };
         relay
             .forward_controller_request(controller_id, generation, request, &error_sender)
@@ -4995,6 +4999,10 @@ mod tests {
             RemoteOperation::RunCommand { readonly: true, .. }
         ));
         assert!(authorized.request.approval_id.is_none());
+        assert_eq!(
+            authorized.request.payload_base64.as_deref(),
+            Some("opaque-hpke-envelope")
+        );
         assert_eq!(
             authorized.authorization.approval,
             ApprovalState::NotRequired

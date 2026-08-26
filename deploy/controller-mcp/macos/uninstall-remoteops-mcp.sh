@@ -23,6 +23,7 @@ if [[ -f "$CONFIG_PATH" ]]; then
 fi
 
 rm -f "$CODEX_HOME/remoteops"/remoteops-controller-mcp-*
+rm -f "$CODEX_HOME/remoteops/remoteops-credential-prompt"
 rm -f "$CODEX_HOME/remoteops/launch-remoteops-controller-mcp.sh"
 rm -f "$CODEX_HOME/remoteops/controller-config.json"
 rm -f "$CODEX_HOME/remoteops/relay-ca.pem"
@@ -30,4 +31,3 @@ rm -rf "$HOME/.agents/skills/remoteops" "$CODEX_HOME/skills/remoteops"
 security delete-generic-password -a "$CURRENT_USER" -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
 
 echo "RemoteOps MCP 已卸载。审计日志和文件交换目录仍保留。"
-

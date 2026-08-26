@@ -16,6 +16,7 @@ serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
@@ -33,4 +34,3 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cr
 
 [lints]
 workspace = true
-

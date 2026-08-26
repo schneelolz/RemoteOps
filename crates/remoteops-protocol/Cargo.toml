@@ -8,8 +8,10 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+hpke.workspace = true
 remoteops-domain = { path = "../remoteops-domain" }
 rustls.workspace = true
 rustls-native-certs.workspace = true
@@ -21,10 +23,10 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 x509-parser = "0.18"
+zeroize.workspace = true
 
 [dev-dependencies]
 rcgen = "0.14"
 
 [lints]
 workspace = true
-

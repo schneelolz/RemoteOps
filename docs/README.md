@@ -2,7 +2,7 @@
 
 源码、自动化测试和实际部署环境是事实来源。带“验收”“交接”或具体阶段名称的文档保存历史背景，不应当作当前默认配置。
 
-RemoteOps `0.2.0-preview.4` 当前源码候选不内置公共 Relay 地址；该版本计划作为首个 GitHub Technical Preview。部署者必须通过配置文件、环境变量或命令行参数提供自己的 Relay；公网 CA 使用系统可信根，私有 CA 可以配置 PEM，Agent GUI 也支持人工核对并固定 SHA-256 指纹。
+RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该版本计划作为首个 GitHub Technical Preview。部署者必须通过配置文件、环境变量或命令行参数提供自己的 Relay；公网 CA 使用系统可信根，私有 CA 可以配置 PEM，Agent GUI 也支持人工核对并固定 SHA-256 指纹。
 
 公开开发状态、当前门禁和未来阶段见 [项目状态](PROJECT_STATUS.md) 与 [路线图](ROADMAP.md)。图形化能力暂不进入第一阶段，调研结果见 [Visual Provider 调研](VISUAL_PROVIDER_RESEARCH.md)。
 
@@ -50,4 +50,3 @@ RemoteOps `0.2.0-preview.4` 当前源码候选不内置公共 Relay 地址；该
 - 所有目标操作绑定不可变 `session_id`，不能根据主机名或别名猜测目标。
 - 发布包由 CI 从源码构建，并附带 SHA-256；`artifacts` 只是本地临时目录。
 - `target`、运行状态文件、审计日志、控制码、恢复令牌、TLS 私钥和任何本地 Token 都不属于公开发布内容。
-

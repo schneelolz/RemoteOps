@@ -8,9 +8,9 @@ It addresses a common field-support problem: installing an AI client, configurin
 
 ## Current status
 
-The current source version is `0.2.0-preview.4`, the candidate for the first GitHub Technical Preview. This source is intended for developer and pilot evaluation, not critical production use. GitHub Release artifacts still require the independent build and release gates described below.
+The current source version is `0.2.0-preview.5`, the candidate for the first GitHub Technical Preview. This source is intended for developer and pilot evaluation, not critical production use. GitHub Release artifacts still require the independent build and release gates described below.
 
-- Protocol: `v13`
+- Protocol: `v14`
 - Field endpoint: Windows x64 Agent
 - Relay: self-hosted Linux x64 Docker
 - AI entry point: local STDIO MCP (Model Context Protocol)
@@ -48,6 +48,7 @@ flowchart LR
 - Controller CLI, Human Controller GUI, and Codex STDIO MCP
 - Capability discovery for CMD, Windows PowerShell, PowerShell 7, and OpenSSH
 - Structured shell, file, process, service, restart, bounded TCP, SSH, and serial operations
+- SSH passwords are collected by a local secure prompt and HPKE-encrypted to the Agent without entering Codex chat, MCP arguments, or Relay audit data
 - CLI/MCP file transfers use 1 MiB chunks with a 16 GiB per-file limit; transfers above 1 GiB require a separate confirmation, and uploads plus local download overwrites use same-directory temporary files, SHA-256 verification, and recoverable atomic commits
 - One-shot and persistent CMD, Windows PowerShell, and PowerShell 7 child processes run hidden on Windows; persistent shells support explicit `close_shell` and clean up correctly after `exit`
 - `ReadOnly`, `ApprovalRequired`, `ControllerApproved`, and `FullAccess` protocol semantics; the Agent still enforces the final capability and operation boundary
@@ -155,4 +156,3 @@ See [`SECURITY.md`](SECURITY.md) and [`docs/安全模型.md`](docs/%E5%AE%89%E5%
 ## License
 
 RemoteOps is licensed under [`AGPL-3.0-only`](LICENSE). It remains self-hosted and provider-neutral; integrating a third-party Visual Provider requires an independent review of its licenses and commercial restrictions.
-

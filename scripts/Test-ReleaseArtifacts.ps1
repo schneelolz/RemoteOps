@@ -164,6 +164,21 @@ if ($leaks.Count -gt 0) {
     exit 1
 }
 
+$packagedWindowsMcp = Join-Path $resolvedArtifactRoot 'remoteops-controller-mcp.exe'
+$packagedMacMcp = Join-Path $resolvedArtifactRoot 'remoteops-controller-mcp'
+if (Test-Path -LiteralPath $packagedWindowsMcp -PathType Leaf) {
+    $credentialPrompt = Join-Path $resolvedArtifactRoot 'remoteops-credential-prompt.exe'
+    if (-not (Test-Path -LiteralPath $credentialPrompt -PathType Leaf)) {
+        throw 'Windows MCP package is missing remoteops-credential-prompt.exe.'
+    }
+}
+elseif (Test-Path -LiteralPath $packagedMacMcp -PathType Leaf) {
+    $credentialPrompt = Join-Path $resolvedArtifactRoot 'remoteops-credential-prompt'
+    if (-not (Test-Path -LiteralPath $credentialPrompt -PathType Leaf)) {
+        throw 'macOS MCP package is missing remoteops-credential-prompt.'
+    }
+}
+
 if (-not [string]::IsNullOrWhiteSpace($ReferenceMcpExecutable)) {
     $resolvedReferenceMcp = [IO.Path]::GetFullPath($ReferenceMcpExecutable)
     $packagedMcp = Join-Path $resolvedArtifactRoot 'remoteops-controller-mcp.exe'
@@ -172,6 +187,15 @@ if (-not [string]::IsNullOrWhiteSpace($ReferenceMcpExecutable)) {
     }
     if (-not (Test-Path -LiteralPath $packagedMcp -PathType Leaf)) {
         throw "MCP package executable does not exist: $packagedMcp"
+    }
+    $credentialPromptName = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        'remoteops-credential-prompt.exe'
+    }
+    else {
+        'remoteops-credential-prompt'
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $resolvedArtifactRoot $credentialPromptName) -PathType Leaf)) {
+        throw "MCP package is missing the credential prompt helper: $credentialPromptName"
     }
     $referenceHash = (Get-FileHash -LiteralPath $resolvedReferenceMcp -Algorithm SHA256).Hash.ToLowerInvariant()
     $packageHash = (Get-FileHash -LiteralPath $packagedMcp -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -193,4 +217,3 @@ if (-not [string]::IsNullOrWhiteSpace($ReferenceMcpExecutable)) {
 }
 
 Write-Host "Release path sanitization passed for $((Get-ChildItem -LiteralPath $resolvedArtifactRoot -Recurse -File).Count) files."
-

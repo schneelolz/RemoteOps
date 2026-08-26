@@ -28,9 +28,9 @@ flowchart LR
 
 ## 当前状态
 
-当前源码版本为 `0.2.0-preview.4`，这是准备中的首个 GitHub Technical Preview 候选。当前源码适合开发者和试点验证，不建议直接用于关键生产环境；GitHub Release 产物仍需完成独立构建和发布门禁。
+当前源码版本为 `0.2.0-preview.5`，这是准备中的首个 GitHub Technical Preview 候选。当前源码适合开发者和试点验证，不建议直接用于关键生产环境；GitHub Release 产物仍需完成独立构建和发布门禁。
 
-- 协议版本：`v13`
+- 协议版本：`v14`
 - 当前现场端：Windows x64 Agent
 - 首版 Relay 部署：Linux x64 + Docker
 - Codex 控制端：Windows x64、Apple Silicon macOS
@@ -38,7 +38,7 @@ flowchart LR
 - AI 入口：本地 STDIO MCP（Model Context Protocol）
 - 许可证：[AGPL-3.0-only](LICENSE)
 
-已完成核心链路、权限模型、环境画像、MCP 工具、双语 GUI 和串口本地回归。以下事项仍待公开发布前或试点中验证：低权限 Windows、Windows Service、真实串口/交换机硬件、代码签名，以及 `0.2.0-preview.4` Agent GUI 和静默 MCP 调用在 Windows Server、RDP、云主机及虚拟机中的兼容性复测。
+已完成核心链路、权限模型、环境画像、MCP 工具、双语 GUI 和串口本地回归。以下事项仍待公开发布前或试点中验证：低权限 Windows、Windows Service、真实串口/交换机硬件、代码签名，以及 `0.2.0-preview.5` Agent GUI 和静默 MCP 调用在 Windows Server、RDP、云主机及虚拟机中的兼容性复测。
 
 ## 它适合解决的问题
 
@@ -57,6 +57,7 @@ flowchart LR
 - Windows Controller CLI/GUI，以及 Windows x64、Apple Silicon macOS 的 Codex STDIO MCP
 - CMD、Windows PowerShell、PowerShell 7、OpenSSH 能力发现
 - 结构化 Shell、文件、进程、服务、重启、指定 TCP、SSH 和串口操作
+- SSH 密码由控制端本机安全窗口获取并使用 HPKE 端到端加密，不进入 Codex 对话、MCP 参数或 Relay 审计
 - CLI/MCP 文件传输使用 1 MiB 分块，单文件上限 16 GiB；超过 1 GiB 时必须由当前用户单独确认，上传和下载覆盖均使用同目录临时文件、SHA-256 校验和可恢复原子提交
 - 一次性及持久 CMD、Windows PowerShell、PowerShell 7 子进程在 Windows 上隐藏运行；持久 Shell 可显式 `close_shell`，执行 `exit` 后也会正确清理句柄
 - `ReadOnly`、`ApprovalRequired`、`ControllerApproved`、`FullAccess` 四种底层权限语义；普通 MCP 使用 `ControllerApproved`，Agent 本地仍执行最终安全校验
@@ -156,7 +157,7 @@ Agent 窗口会显示连接状态、临时控制码、本机能力和当前协�
 
 #### 2.3 安装本机 MCP
 
-Windows x64 解压 `RemoteOps-MCP-Windows-x64-0.2.0-preview.4.zip`，在解压目录运行：
+Windows x64 解压 `RemoteOps-MCP-Windows-x64-0.2.0-preview.5.zip`，在解压目录运行：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.ps1 `
@@ -166,7 +167,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.p
 
 安装脚本会隐藏提示输入 AI Controller Token，并将 Token 和 Owner 保存为当前 Windows 用户环境变量。私有 CA 或证书指纹分别使用 `-CaCert` 或 `-TlsFingerprint`，两者只能选择一种。安装完成后完全退出并重新打开 Codex，确认 `/mcp` 中存在并已连接 `remoteops`。
 
-Apple Silicon Mac 解压 `RemoteOps-MCP-macOS-arm64-0.2.0-preview.4.tar.gz`，进入解压目录运行：
+Apple Silicon Mac 解压 `RemoteOps-MCP-macOS-arm64-0.2.0-preview.5.tar.gz`，进入解压目录运行：
 
 ```bash
 chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.sh

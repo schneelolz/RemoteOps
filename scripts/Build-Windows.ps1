@@ -75,6 +75,7 @@ try {
         -p remoteops-ssh-askpass `
         -p remoteops-controller-cli `
         -p remoteops-controller-mcp `
+        -p remoteops-credential-prompt `
         -p remoteops-controller-gui `
         -p remoteops-serial-demo `
         -p remoteops-mcp-smoke
@@ -89,6 +90,7 @@ try {
         'remoteops-ssh-askpass',
         'remoteops-controller-cli',
         'remoteops-controller-mcp',
+        'remoteops-credential-prompt',
         'remoteops-controller-gui',
         'remoteops-serial-demo',
         'remoteops-mcp-smoke'
@@ -116,6 +118,7 @@ try {
         @{ File = 'remoteops-ssh-askpass.exe'; Package = 'remoteops-ssh-askpass' },
         @{ File = 'remoteops-controller-cli.exe'; Package = 'remoteops-controller-cli' },
         @{ File = 'remoteops-controller-mcp.exe'; Package = 'remoteops-controller-mcp' },
+        @{ File = 'remoteops-credential-prompt.exe'; Package = 'remoteops-credential-prompt' },
         @{ File = 'remoteops-controller-gui.exe'; Package = 'remoteops-controller-gui' },
         @{ File = 'remoteops-serial-demo.exe'; Package = 'remoteops-serial-demo' },
         @{ File = 'remoteops-mcp-smoke.exe'; Package = 'remoteops-mcp-smoke' }
@@ -199,4 +202,3 @@ finally {
         $env:CXXFLAGS = $previousCxxFlags
     }
 }
-

@@ -6,7 +6,7 @@
 [RemoteOps MCP 使用手册](RemoteOpsMCP使用手册.md)。
 
 - 核对日期：2026-08-13
-- 当前版本：`0.2.0-preview.4`
+- 当前版本：`0.2.0-preview.5`
 - MCP 传输：本地 STDIO
 - MCP SDK：官方 `modelcontextprotocol/rust-sdk` 的 `rmcp`
 - 官方依据：[Model Context Protocol](https://learn.chatgpt.com/docs/extend/mcp.md)
@@ -45,7 +45,7 @@ RemoteOps 只启动本地 STDIO MCP，不开放公网 MCP HTTP。公网只部署
 Windows x64 优先使用：
 
 ```text
-artifacts\release\0.2.0-preview.4\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.4.zip
+artifacts\release\0.2.0-preview.5\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.5.zip
 ```
 
 安装包内的 `README.md` 可直接交给安装者或安装者的 Codex 阅读。`Install-RemoteOpsMcp.ps1` 会保留其他 Codex 配置、创建备份，并安全配置 Token 与统一 Owner 环境变量转发。
@@ -53,7 +53,7 @@ artifacts\release\0.2.0-preview.4\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.4.
 Apple Silicon Mac 使用：
 
 ```text
-RemoteOps-MCP-macOS-arm64-0.2.0-preview.4.tar.gz
+RemoteOps-MCP-macOS-arm64-0.2.0-preview.5.tar.gz
 ```
 
 macOS 安装器把 Token 保存到当前用户 Keychain，由 `~/.codex/remoteops/launch-remoteops-controller-mcp.sh` 在启动 MCP 时读取。非敏感的 Owner UUID 写入 `controller-config.json`，因此从 Finder 启动 Codex 时不依赖 shell 环境变量继承。完整步骤见 [macOS MCP 接入说明](macOSMCP接入说明.md)。
@@ -64,7 +64,7 @@ macOS 安装器把 Token 保存到当前用户 Keychain，由 `~/.codex/remoteop
 approval_policy = { granular = { sandbox_approval = true, rules = true, mcp_elicitations = true, request_permissions = false, skill_approval = false } }
 
 [mcp_servers.remoteops]
-command = 'C:\Users\<用户名>\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.4.exe'
+command = 'C:\Users\<用户名>\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.5.exe'
 args = ['--config', 'C:\Users\<用户名>\.codex\remoteops\controller-config.json', '--command-mode', 'agent-controlled']
 env_vars = ['REMOTEOPS_CONTROLLER_TOKEN', 'REMOTEOPS_CONTROLLER_OWNER_ID']
 startup_timeout_sec = 15
@@ -143,6 +143,7 @@ $env:REMOTEOPS_CONTROLLER_OWNER_ID = '<与 AI MCP 相同的 Owner UUID>'
 - `power_control`
 - `list_serial_ports`、`write_serial`、`run_serial_query`、`close_serial`
 - `run_ssh`
+- `clear_ssh_credential_cache`
 - `open_serial`
 - `read_output`
 - `upload_file`
@@ -163,6 +164,7 @@ $env:REMOTEOPS_CONTROLLER_OWNER_ID = '<与 AI MCP 相同的 Owner UUID>'
 完全控制下无需逐项确认，但只对当前 session_id 生效，空闲一小时后恢复逐项确认。
 用户在聊天中要求切换时调用 set_control_mode；Codex 对该工具的授权是唯一确认，不再嵌套 MCP 交互确认。
 通过 read_output 查看人工、AI、系统和远端输出。
+SSH 密码不能写进对话；需要密码时让 run_ssh 设置 use_password=true，并在控制端本机安全窗口输入。
 ```
 
 同一 Agent Session 只允许一个 `ControllerOwnerId`。Human Controller 和 AI Controller 可以共享这个 Owner 并分工协作，但 Human 和 AI 不能被配置成两个不同 Owner 后同时控制同一会话。
@@ -194,5 +196,4 @@ PowerShell 7 的 MCP 枚举值为 `power_shell`；Windows PowerShell 5.1 为 `wi
 .\scripts\Invoke-LabE2E.ps1 -SkipBuild
 ```
 
-本机 STDIO MCP、官方 SDK Smoke 和三机链路的历史结果见[第一阶段验收报告](第一阶段验收报告.md)。旧版本 Linux Docker Relay 记录仅作为历史证据；当前 Technical Preview 使用 `0.2.0-preview.4`，公网来源 IP 白名单和真实远端 PowerShell 7 仍需按[远程 Pwsh 链路部署测试](远程Pwsh链路部署测试.md)完成现场验收。
-
+本机 STDIO MCP、官方 SDK Smoke 和三机链路的历史结果见[第一阶段验收报告](第一阶段验收报告.md)。旧版本 Linux Docker Relay 记录仅作为历史证据；当前 Technical Preview 使用 `0.2.0-preview.5`，公网来源 IP 白名单和真实远端 PowerShell 7 仍需按[远程 Pwsh 链路部署测试](远程Pwsh链路部署测试.md)完成现场验收。

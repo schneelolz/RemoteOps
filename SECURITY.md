@@ -24,8 +24,9 @@ RemoteOps 可以在远程 Windows 主机上执行受控操作，安全问题可�
 - 用户可以仅为一个 `session_id` 临时开启完全控制；授权只保存在 MCP 进程内存中，空闲一小时失效，MCP 重启、主动断开、会话变化或手动切回逐项确认后立即失效。
 - 兼容模式下的一次性 Human Controller 审批仍必须绑定精确目标、精确参数和连接代次，且只能消费一次；MCP 不能批准自己的请求。
 - Relay 的 Human/AI Controller Token 必须互不相同，并通过环境变量或专用凭据系统提供。Agent 首次登记不使用预共享 Token。
+- SSH 密码不得进入 Codex 对话、提示词或 MCP 工具参数；控制端 MCP 只通过同机安全窗口获取密码，并使用 Agent 当前进程公钥 HPKE 加密。可选十分钟缓存只存在于 MCP 内存并严格绑定会话与目标，Agent 解密后仅用于当前 SSH 请求。
+- HPKE 防止密码出现在 Relay 正常转发、日志和状态文件中，但当前信任模型不抵御 Relay 主动替换 Agent 公钥；TLS、Relay 身份验证、结构化授权和 SSH 主机密钥校验仍不可省略。
 - 新 Agent 只凭 Relay 地址建立受限的待配对连接，只有持有 Controller Token 的已认证 Controller 才能使用九位控制码绑定会话；取得高熵恢复令牌后，重连只使用恢复令牌。Relay 同时限制连接数、握手时间、出站队列、Agent 总数和心跳频率，并回收断线后长期过期且从未配对的身份。
 - TLS 私钥、Controller Token 和 Agent 恢复令牌不得进入源码仓库或发布包。
 
 更完整的威胁与信任边界见 [安全模型](docs/安全模型.md)。
-

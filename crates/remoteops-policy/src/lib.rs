@@ -315,8 +315,7 @@ impl DefaultPolicy {
             | RemoteOperation::DeleteFile { .. }
             | RemoteOperation::TcpExchange { .. }
             | RemoteOperation::TerminateProcess { .. }
-            | RemoteOperation::WriteSerial { .. }
-            | RemoteOperation::ProvisionSshCredential { .. } => RiskLevel::Mutating,
+            | RemoteOperation::WriteSerial { .. } => RiskLevel::Mutating,
             RemoteOperation::ControlService { .. } | RemoteOperation::PowerControl { .. } => {
                 RiskLevel::High
             }

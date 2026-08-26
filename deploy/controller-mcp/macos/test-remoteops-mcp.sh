@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-EXPECTED_VERSION="0.2.0-preview.4"
+EXPECTED_VERSION="0.2.0-preview.5"
 KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
@@ -19,8 +19,10 @@ CONFIG_PATH="$CODEX_HOME/config.toml"
 CONNECTION_CONFIG="$CODEX_HOME/remoteops/controller-config.json"
 LAUNCHER="$CODEX_HOME/remoteops/launch-remoteops-controller-mcp.sh"
 BINARY="$CODEX_HOME/remoteops/remoteops-controller-mcp-$EXPECTED_VERSION"
+CREDENTIAL_PROMPT="$CODEX_HOME/remoteops/remoteops-credential-prompt"
 
 [[ -x "$BINARY" ]] && pass "MCP 程序存在且可执行。" || fail "未找到当前版本 MCP：$BINARY"
+[[ -x "$CREDENTIAL_PROMPT" ]] && pass "SSH 密码安全输入程序存在且可执行。" || fail "缺少 SSH 密码安全输入程序。"
 if [[ -x "$BINARY" ]]; then
   version_output="$($BINARY --version 2>&1 || true)"
   [[ "$version_output" == *"$EXPECTED_VERSION"* ]] && pass "MCP 版本：$version_output" || fail "MCP 版本不正确：$version_output"

@@ -1,9 +1,9 @@
 # RemoteOps 现场被控端 GUI 使用说明
 
-> 文档状态：当前现场客户机手册，适用于 Agent GUI `0.2.0-preview.4`。
+> 文档状态：当前现场客户机手册，适用于 Agent GUI `0.2.0-preview.5`。
 
-- 适用版本：`0.2.0-preview.4`
-- 正式程序：`artifacts/release/0.2.0-preview.4/windows-x64/remoteops-agent-gui.exe`
+- 适用版本：`0.2.0-preview.5`
+- 正式程序：`artifacts/release/0.2.0-preview.5/windows-x64/remoteops-agent-gui.exe`
 - Relay：由部署者配置，不内置公共默认值
 - 使用方式：管理员完成一次配置后，现场人员双击启动
 - 运行依赖：正式发布 EXE 静态链接 MSVC CRT，不需要另装 VC++ 运行库
@@ -57,7 +57,7 @@ Agent 首次连接不需要入网码、部署级 Agent Token 或 Controller Toke
 - GUI 不展示或导出 Agent 恢复令牌；
 - 密码 SSH 首次连接采用 TOFU：Agent 自动扫描并固定主机密钥，后续由 `StrictHostKeyChecking=yes` 严格校验；主机密钥不会由 MCP 的 transfer-root 或命令参数替换；
 - SSH 主机信任保存在 Agent 专用本地目录，不接受控制端通过传输目录替换密码认证的 `known_hosts`；
-- 密码由 MCP 通过受控链路一次性注入，Agent 仅在当前进程内存中使用；明文不写入配置、日志或审计，Agent 重启后需要重新注入；
+- 密码只在控制端 MCP 的本机安全窗口输入，不进入 Codex 对话或工具参数；MCP 用当前 Agent 进程的 HPKE 公钥加密，Agent 解密后仅用于当前 SSH 请求，不建立密码仓库；
 - 网络设备只读白名单命令免确认执行；其他 SSH 命令在只读模式下拒绝、默认模式下逐项确认、完全控制下按当前会话授权执行；现场首轮应从 `display version` 开始；
 - 关闭窗口前会明确提示工程师将断开、当前任务将终止；
 - GUI 不静默驻留托盘，窗口关闭后 Agent 进程结束；
@@ -140,4 +140,3 @@ cargo clippy -p remoteops-agent -p remoteops-agent-gui --all-targets --locked --
 ```
 
 `Test-AgentGuiCodexMcp.ps1` 默认从剪贴板读取 GUI 复制的控制码，也可以通过 `-PairingCode` 显式提供。脚本仅在子进程内传递控制码，最终结果不会输出控制码、Token、`session_id` 或审批标识。
-

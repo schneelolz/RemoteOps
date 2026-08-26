@@ -1,15 +1,14 @@
 //! Shell、SSH、串口、文件和端口探测的抽象接口。
 
 use std::{
-    collections::BTreeMap,
-    env, fmt,
+    env,
     fs::OpenOptions as StdOpenOptions,
     io::{Read, Seek, SeekFrom, Write},
     ops::{Deref, DerefMut},
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
@@ -38,6 +37,7 @@ use tokio::{
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+use zeroize::{Zeroize as _, Zeroizing};
 #[cfg(windows)]
 const WINDOWS_OEM_CODE_PAGE: u32 = 1;
 
@@ -65,125 +65,6 @@ impl SshHostKeyScan {
     #[must_use]
     pub fn key_count(&self) -> usize {
         self.entries.len()
-    }
-}
-
-/// Agent 本地 SSH 密码凭据键。
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct SshCredentialKey {
-    host: String,
-    port: u16,
-    username: String,
-}
-
-/// 仅保存在 Agent 当前进程内存中的 SSH 密码凭据。
-#[derive(Clone, Default)]
-pub struct SshCredentialStore {
-    credentials: Arc<RwLock<BTreeMap<SshCredentialKey, String>>>,
-}
-
-impl fmt::Debug for SshCredentialStore {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SshCredentialStore")
-            .field("credential_count", &self.len())
-            .finish()
-    }
-}
-
-impl SshCredentialStore {
-    /// 新增或替换一个精确匹配主机、端口和用户名的内存凭据。
-    pub fn upsert(&self, host: &str, port: u16, username: &str, password: String) {
-        if let Ok(mut credentials) = self.credentials.write() {
-            credentials.insert(
-                SshCredentialKey {
-                    host: host.trim().to_ascii_lowercase(),
-                    port,
-                    username: username.trim().to_owned(),
-                },
-                password,
-            );
-        }
-    }
-
-    /// 删除一个精确匹配的内存凭据。
-    #[must_use]
-    pub fn remove(&self, host: &str, port: u16, username: &str) -> bool {
-        self.credentials.write().is_ok_and(|mut credentials| {
-            credentials
-                .remove(&SshCredentialKey {
-                    host: host.trim().to_ascii_lowercase(),
-                    port,
-                    username: username.trim().to_owned(),
-                })
-                .is_some()
-        })
-    }
-
-    /// 返回当前进程内存中的凭据数量。
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.credentials
-            .read()
-            .map_or(0, |credentials| credentials.len())
-    }
-
-    /// 判断当前进程内存中是否没有凭据。
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// 创建空的进程内存凭据存储。
-    ///
-    /// # Errors
-    ///
-    /// 当密文无法读取、解密或反序列化时返回错误。
-    pub fn load_persisted() -> Result<Self, DeviceError> {
-        Ok(Self::default())
-    }
-
-    /// 保留兼容接口；凭据不会写入磁盘。
-    ///
-    /// # Errors
-    ///
-    /// 当凭据无法序列化、加密或写入本地数据目录时返回错误。
-    pub fn persist(&self) -> Result<(), DeviceError> {
-        Ok(())
-    }
-
-    /// 保留兼容接口；当前版本没有本地凭据文件。
-    ///
-    /// # Errors
-    ///
-    /// 当凭据文件存在但无法删除时返回错误。
-    pub fn clear_persisted() -> Result<(), DeviceError> {
-        Ok(())
-    }
-
-    /// 返回精确匹配目标的密码；密码只在调用方进程内存中短暂存在。
-    #[must_use]
-    pub fn get(&self, host: &str, port: u16, username: &str) -> Option<String> {
-        self.credentials.read().ok().and_then(|credentials| {
-            credentials
-                .get(&SshCredentialKey {
-                    host: host.trim().to_ascii_lowercase(),
-                    port,
-                    username: username.trim().to_owned(),
-                })
-                .cloned()
-        })
-    }
-
-    /// 生成绑定主机、端口和用户名的稳定凭据引用。
-    #[must_use]
-    pub fn credential_ref(host: &str, port: u16, username: &str) -> String {
-        format!(
-            "ssh://{}@{}:{}",
-            username.trim(),
-            host.trim().to_ascii_lowercase(),
-            port
-        )
     }
 }
 
@@ -1102,8 +983,6 @@ pub struct SystemDevice {
     pub allow_ssh_without_password: bool,
     /// Agent 文件上传、下载和 SSH 凭据允许访问的根目录。
     transfer_root: Arc<PathBuf>,
-    /// Agent 当前进程内存中的 SSH 密码凭据。
-    ssh_credentials: SshCredentialStore,
 }
 
 impl SystemDevice {
@@ -1116,7 +995,6 @@ impl SystemDevice {
         Self {
             allow_ssh_without_password: true,
             transfer_root: Arc::new(root),
-            ssh_credentials: SshCredentialStore::default(),
         }
     }
 
@@ -1133,48 +1011,13 @@ impl SystemDevice {
         Ok(Self {
             allow_ssh_without_password: true,
             transfer_root: Arc::new(canonical),
-            ssh_credentials: SshCredentialStore::default(),
         })
-    }
-
-    /// 使用与 Agent GUI 共享的进程内 SSH 凭据存储。
-    #[must_use]
-    pub fn with_ssh_credentials(mut self, credentials: SshCredentialStore) -> Self {
-        self.ssh_credentials = credentials;
-        self
     }
 
     /// 返回规范化后的文件交换根目录。
     #[must_use]
     pub fn transfer_root(&self) -> &Path {
         self.transfer_root.as_path()
-    }
-
-    /// 判断当前进程内存中是否存在精确匹配的 SSH 密码凭据。
-    #[must_use]
-    pub fn has_ssh_credential(&self, host: &str, port: u16, username: &str) -> bool {
-        self.ssh_credentials.get(host, port, username).is_some()
-    }
-
-    /// 写入并持久化一个 SSH 密码凭据。
-    ///
-    /// # Errors
-    ///
-    /// 当主机、用户名或密码为空，或凭据无法持久化时返回错误。
-    pub fn provision_ssh_credential(
-        &self,
-        host: &str,
-        port: u16,
-        username: &str,
-        password: String,
-    ) -> Result<(), DeviceError> {
-        if host.trim().is_empty() || username.trim().is_empty() || password.is_empty() {
-            return Err(DeviceError::InvalidInput(
-                "SSH 凭据的主机、用户名和密码不能为空".to_owned(),
-            ));
-        }
-        self.ssh_credentials.upsert(host, port, username, password);
-        self.ssh_credentials.persist()
     }
 
     /// 创建一次限定在交换目录内的分块上传会话。
@@ -1603,7 +1446,7 @@ impl SystemDevice {
             timeout_seconds,
             output,
             output_encoding,
-            &[],
+            Vec::new(),
         )
         .await
     }
@@ -1615,7 +1458,7 @@ impl SystemDevice {
         timeout_seconds: u64,
         output: mpsc::UnboundedSender<CommandOutputChunk>,
         output_encoding: ProcessOutputEncoding,
-        environment: &[(String, String)],
+        mut environment: Vec<(String, String)>,
     ) -> Result<CommandResult, DeviceError> {
         let mut command = Command::new(executable);
         command
@@ -1624,7 +1467,11 @@ impl SystemDevice {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.envs(environment.iter().cloned());
-        let mut child = spawn_managed_process(command)?;
+        let child_result = spawn_managed_process(command);
+        for (_, value) in &mut environment {
+            value.zeroize();
+        }
+        let mut child = child_result?;
         let stdout = child
             .stdout()
             .take()
@@ -2171,9 +2018,7 @@ impl SshProvider for SystemDevice {
             ));
         }
         validate_ssh_destination(host, username)?;
-        let password = password
-            .map(str::to_owned)
-            .or_else(|| self.ssh_credentials.get(host, port, username));
+        let password = password.map(|value| Zeroizing::new(value.to_owned()));
         if password.is_none() && !self.allow_ssh_without_password {
             return Err(DeviceError::Unsupported(
                 "当前策略禁止无密码 SSH".to_owned(),
@@ -2239,7 +2084,7 @@ impl SshProvider for SystemDevice {
                 ("SSH_ASKPASS".to_owned(), path_for_child_process(&askpass)),
                 ("SSH_ASKPASS_REQUIRE".to_owned(), "force".to_owned()),
                 ("DISPLAY".to_owned(), "remoteops".to_owned()),
-                ("REMOTEOPS_SSH_PASSWORD".to_owned(), password),
+                ("REMOTEOPS_SSH_PASSWORD".to_owned(), password.to_string()),
             ]);
         }
         arguments.extend([
@@ -2257,7 +2102,7 @@ impl SshProvider for SystemDevice {
             timeout_seconds,
             output,
             ProcessOutputEncoding::Utf8,
-            &environment,
+            environment,
         )
         .await
     }
@@ -3901,29 +3746,6 @@ mod tests {
             "服务列表包含替换字符：{:?}",
             result.stdout
         );
-    }
-
-    #[test]
-    fn ssh_credential_store_debug_output_never_contains_password() {
-        let credentials = SshCredentialStore::default();
-        credentials.upsert("192.0.2.10", 22, "admin", "secret-value".to_owned());
-
-        let debug = format!("{credentials:?}");
-
-        assert!(debug.contains("credential_count"));
-        assert!(!debug.contains("secret-value"));
-        assert_eq!(credentials.len(), 1);
-        assert!(credentials.remove("192.0.2.10", 22, "admin"));
-        assert!(credentials.is_empty());
-    }
-
-    #[test]
-    fn ssh_credentials_are_process_only() {
-        let credentials = SshCredentialStore::default();
-        credentials.upsert("192.0.2.10", 22, "admin", "secret-value".to_owned());
-        credentials.persist().expect("进程内凭据兼容保存接口应成功");
-        let fresh = SshCredentialStore::load_persisted().expect("进程重启加载应返回空存储");
-        assert!(fresh.is_empty());
     }
 
     #[test]

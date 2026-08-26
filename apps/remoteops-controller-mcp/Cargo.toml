@@ -17,13 +17,14 @@ LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 base64.workspace = true
 clap.workspace = true
 hex.workspace = true
 remoteops-application = { path = "../../crates/remoteops-application" }
 remoteops-audit = { path = "../../crates/remoteops-audit" }
 remoteops-domain = { path = "../../crates/remoteops-domain" }
-remoteops-device = { path = "../../crates/remoteops-device" }
+remoteops-protocol = { path = "../../crates/remoteops-protocol" }
 rmcp = { version = "3.0.1", features = ["elicitation", "server", "transport-io"] }
 schemars = "1.0"
 serde.workspace = true
@@ -32,10 +33,10 @@ sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [build-dependencies]
 winresource.workspace = true
 
 [lints]
 workspace = true
-

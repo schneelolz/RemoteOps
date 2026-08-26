@@ -17,7 +17,6 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use remoteops_audit::sha256_bytes;
-pub use remoteops_device::SshCredentialStore;
 use remoteops_device::{
     CommandOutputChunk, FileTransferProvider, MAX_FILE_CHUNK_BYTES, PortProbeProvider,
     SerialProvider, ShellProvider, SshProvider, SystemDevice, SystemDuplexSerialSession,
@@ -32,10 +31,11 @@ use remoteops_domain::{
 use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel};
 use remoteops_protocol::{
     AgentHello, AgentLeaseRenewed, AgentPermissionModeChanged, AgentResumeCommitAck,
-    AgentWelcomeAck, AuthorizedRemoteRequest, ClientHello, ControllerBinding, PROTOCOL_VERSION,
-    RemoteRequest, RemoteResponse, WireMessage, connect_tls, load_client_config,
+    AgentWelcomeAck, AuthorizedRemoteRequest, ClientHello, ControllerBinding,
+    CredentialEncryptionContext, CredentialEncryptionKeyPair, EncryptedCredentialPayload,
+    PROTOCOL_VERSION, RemoteRequest, RemoteResponse, WireMessage, connect_tls, load_client_config,
     load_native_client_config, load_pinned_client_config, normalize_certificate_fingerprint,
-    read_frame, write_frame,
+    open_credential, read_frame, write_frame,
 };
 use remoteops_serial::{
     SerialDirection, SerialObservedChunk, SerialQueryError, SerialQueryPlan, SerialQueryRunner,
@@ -120,8 +120,6 @@ pub struct AgentConfig {
     pub trusted_full_access_owners: BTreeMap<ControllerOwnerId, DateTime<Utc>>,
     /// 仅当前 Agent 进程生命周期授权 `FullAccess` 的 Owner。
     pub session_full_access_owners: BTreeSet<ControllerOwnerId>,
-    /// 仅当前 Agent 进程使用的 SSH 密码凭据。
-    pub ssh_credentials: SshCredentialStore,
 }
 
 impl Default for AgentConfig {
@@ -137,7 +135,6 @@ impl Default for AgentConfig {
             state_file: default_state_file(),
             trusted_full_access_owners: BTreeMap::new(),
             session_full_access_owners: BTreeSet::new(),
-            ssh_credentials: SshCredentialStore::default(),
         }
     }
 }
@@ -633,6 +630,8 @@ struct RequestRuntimeState {
     serial_sessions: Arc<Mutex<BTreeMap<SerialSessionId, SerialRuntime>>>,
     /// 分块文件上传会话。
     file_uploads: Arc<Mutex<BTreeMap<FileTransferId, FileUploadRuntime>>>,
+    /// 当前连接已经消费的加密凭据载荷标识。
+    used_credential_envelopes: Arc<Mutex<BTreeSet<RequestId>>>,
 }
 
 struct PendingTask {
@@ -889,14 +888,12 @@ pub async fn run_agent_with_permission_control(
     let state = load_agent_state(&config.state_file, config.instance_id)?;
     let agent_instance_id = state.agent_instance_id;
     let device = Arc::new(
-        SystemDevice::with_transfer_root(&config.transfer_root)
-            .map(|device| device.with_ssh_credentials(config.ssh_credentials.clone()))
-            .with_context(|| {
-                format!(
-                    "无法初始化 Agent 文件交换目录 {}",
-                    config.transfer_root.display()
-                )
-            })?,
+        SystemDevice::with_transfer_root(&config.transfer_root).with_context(|| {
+            format!(
+                "无法初始化 Agent 文件交换目录 {}",
+                config.transfer_root.display()
+            )
+        })?,
     );
     let environment = detect_environment_profile(device.as_ref()).await;
     let capabilities = capabilities_from_environment(&environment);
@@ -906,6 +903,7 @@ pub async fn run_agent_with_permission_control(
         |version| format!("{version} {}", environment.architecture),
     );
     let resume_token = Arc::new(Mutex::new(state.resume_token));
+    let credential_encryption = Arc::new(CredentialEncryptionKeyPair::generate());
     let sequence = Arc::new(AtomicU64::new(1));
     let shell_sessions = Arc::new(Mutex::new(BTreeMap::<ShellId, ShellRuntime>::new()));
     let serial_sessions = Arc::new(Mutex::new(BTreeMap::<SerialSessionId, SerialRuntime>::new()));
@@ -968,6 +966,7 @@ pub async fn run_agent_with_permission_control(
             shell_sessions.clone(),
             serial_sessions.clone(),
             local_permission_policy.clone(),
+            credential_encryption.clone(),
             permission_control.subscribe(),
             event_sender.as_ref(),
             connection_shutdown,
@@ -1020,6 +1019,7 @@ async fn run_connection<S>(
     shell_sessions: Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
     serial_sessions: Arc<Mutex<BTreeMap<SerialSessionId, SerialRuntime>>>,
     local_permission_policy: Arc<LocalPermissionPolicy>,
+    credential_encryption: Arc<CredentialEncryptionKeyPair>,
     mut permission_mode_updates: watch::Receiver<PermissionMode>,
     event_sender: Option<&AgentEventSender>,
     mut shutdown: watch::Receiver<bool>,
@@ -1035,6 +1035,8 @@ where
         operating_system,
         capabilities,
         environment,
+        credential_encryption_public_key: credential_encryption.public_key_base64().to_owned(),
+        credential_encryption_key_id: credential_encryption.key_id().to_owned(),
     }));
     write_frame(&mut stream, &hello).await?;
     let welcome = match read_frame::<WireMessage, _>(&mut stream).await? {
@@ -1107,6 +1109,7 @@ where
     });
     let tasks = Arc::new(Mutex::new(BTreeMap::<RequestId, PendingTask>::new()));
     let recent_task_terminals = Arc::new(Mutex::new(BTreeMap::<RequestId, TaskTerminal>::new()));
+    let used_credential_envelopes = Arc::new(Mutex::new(BTreeSet::<RequestId>::new()));
     let file_uploads = Arc::new(Mutex::new(
         BTreeMap::<FileTransferId, FileUploadRuntime>::new(),
     ));
@@ -1327,10 +1330,12 @@ where
                 let sequence_clone = sequence.clone();
                 let tasks_clone = tasks.clone();
                 let recent_task_terminals_clone = recent_task_terminals.clone();
+                let credential_encryption = credential_encryption.clone();
                 let runtime_state = RequestRuntimeState {
                     shell_sessions: shell_sessions.clone(),
                     serial_sessions: serial_sessions.clone(),
                     file_uploads: file_uploads.clone(),
+                    used_credential_envelopes: used_credential_envelopes.clone(),
                 };
                 let terminal = Arc::new(AtomicTaskTerminal::running());
                 let interactive_shell = pending_interactive_shell(&request, &shell_sessions).await;
@@ -1345,6 +1350,8 @@ where
                         &sender_clone,
                         &sequence_clone,
                         &runtime_state,
+                        agent_instance_id,
+                        credential_encryption.as_ref(),
                         request,
                         terminal_clone.as_ref(),
                     )
@@ -1551,16 +1558,29 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_request(
     device: &SystemDevice,
     sender: &mpsc::UnboundedSender<WireMessage>,
     sequence: &Arc<AtomicU64>,
     runtime_state: &RequestRuntimeState,
+    agent_instance_id: AgentInstanceId,
+    credential_encryption: &CredentialEncryptionKeyPair,
     request: RemoteRequest,
     terminal: &AtomicTaskTerminal,
 ) -> TaskTerminal {
     send_event(sender, sequence, &request, EventPayload::OperationStarted);
-    let result = execute_operation(device, device, &request, runtime_state, sender, sequence).await;
+    let result = execute_operation(
+        device,
+        device,
+        &request,
+        runtime_state,
+        agent_instance_id,
+        credential_encryption,
+        sender,
+        sequence,
+    )
+    .await;
     let final_terminal = if result.is_ok() {
         TaskTerminal::Completed
     } else {
@@ -1621,12 +1641,14 @@ async fn execute_request(
     final_terminal
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_operation(
     device: &SystemDevice,
     ssh_provider: &dyn SshProvider,
     request: &RemoteRequest,
     runtime_state: &RequestRuntimeState,
+    agent_instance_id: AgentInstanceId,
+    credential_encryption: &CredentialEncryptionKeyPair,
     sender: &mpsc::UnboundedSender<WireMessage>,
     sequence: &Arc<AtomicU64>,
 ) -> anyhow::Result<RemoteResponse> {
@@ -1644,26 +1666,6 @@ async fn execute_operation(
         details: None,
     };
     match &request.operation {
-        RemoteOperation::ProvisionSshCredential {
-            host,
-            port,
-            username,
-            credential_ref,
-        } => {
-            let expected_ref = SshCredentialStore::credential_ref(host, *port, username);
-            if credential_ref != &expected_ref {
-                bail!("SSH 凭据引用与目标不匹配");
-            }
-            let payload = request
-                .payload_base64
-                .as_deref()
-                .ok_or_else(|| anyhow!("SSH 凭据注入缺少密码负载"))?;
-            let password =
-                String::from_utf8(BASE64.decode(payload).context("SSH 凭据负载 Base64 无效")?)
-                    .context("SSH 凭据负载不是有效 UTF-8")?;
-            device.provision_ssh_credential(host, *port, username, password)?;
-            response.summary = format!("已注入 SSH 凭据 {credential_ref}");
-        }
         RemoteOperation::OpenShell { shell } => {
             let session = device.open_interactive_shell(*shell).await?;
             let shell_id = ShellId::new();
@@ -2088,12 +2090,23 @@ async fn execute_operation(
             command,
             ..
         } => {
+            let password = decrypt_ssh_password(
+                request,
+                runtime_state,
+                agent_instance_id,
+                credential_encryption,
+                host,
+                *port,
+                username,
+                command,
+            )
+            .await?;
             let result = ssh_provider
                 .run_command(
                     host,
                     *port,
                     username,
-                    None,
+                    password.as_ref().map(|value| value.as_str()),
                     identity_file.as_deref(),
                     known_hosts_file.as_deref(),
                     command,
@@ -2324,6 +2337,50 @@ async fn execute_operation(
         }
     }
     Ok(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decrypt_ssh_password(
+    request: &RemoteRequest,
+    runtime_state: &RequestRuntimeState,
+    agent_instance_id: AgentInstanceId,
+    credential_encryption: &CredentialEncryptionKeyPair,
+    host: &str,
+    port: u16,
+    username: &str,
+    command: &str,
+) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
+    let Some(encoded_payload) = request.payload_base64.as_deref() else {
+        return Ok(None);
+    };
+    let payload_bytes = BASE64
+        .decode(encoded_payload)
+        .context("SSH 加密凭据载荷 Base64 无效")?;
+    let payload: EncryptedCredentialPayload =
+        serde_json::from_slice(&payload_bytes).context("SSH 加密凭据载荷格式无效")?;
+    {
+        let mut used = runtime_state.used_credential_envelopes.lock().await;
+        if used.contains(&payload.envelope_id) {
+            bail!("SSH 加密凭据载荷已经消费，拒绝重放");
+        }
+        if used.len() >= MAX_RECENT_TASK_TERMINALS {
+            bail!("当前连接已消费的 SSH 加密凭据达到安全上限，请重新连接 Agent");
+        }
+        used.insert(payload.envelope_id);
+    }
+    let context = CredentialEncryptionContext {
+        protocol_version: PROTOCOL_VERSION,
+        agent_instance_id,
+        session_id: request.session_id,
+        envelope_id: payload.envelope_id,
+        host: host.trim().to_ascii_lowercase(),
+        port,
+        username: username.trim().to_owned(),
+        command_sha256: sha256_bytes(command.as_bytes()),
+    };
+    open_credential(credential_encryption, &context, &payload)
+        .map(Some)
+        .map_err(anyhow::Error::from)
 }
 
 fn set_structured_inventory_response(
@@ -3125,12 +3182,17 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::clone(file_uploads),
+            used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
         };
+        let agent_instance_id = AgentInstanceId::new();
+        let credential_encryption = CredentialEncryptionKeyPair::generate();
         execute_operation(
             device,
             device,
             &request,
             &runtime_state,
+            agent_instance_id,
+            &credential_encryption,
             &sender,
             &Arc::new(AtomicU64::new(1)),
         )
@@ -3329,6 +3391,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(LocalPermissionPolicy::default()),
+            Arc::new(CredentialEncryptionKeyPair::generate()),
             watch::channel(PermissionMode::ApprovalRequired).1,
             None,
             shutdown_receiver,
@@ -3494,14 +3557,18 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
+            used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let sequence = Arc::new(AtomicU64::new(1));
+        let credential_encryption = CredentialEncryptionKeyPair::generate();
         let response = execute_operation(
             &device,
             &device,
             &request,
             &runtime_state,
+            AgentInstanceId::new(),
+            &credential_encryption,
             &sender,
             &sequence,
         )
@@ -4135,6 +4202,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSshProvider {
         commands: std::sync::Mutex<Vec<String>>,
+        passwords: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait]
@@ -4144,7 +4212,7 @@ mod tests {
             _host: &str,
             _port: u16,
             _username: &str,
-            _password: Option<&str>,
+            password: Option<&str>,
             _identity_file: Option<&str>,
             _known_hosts_file: Option<&str>,
             command: &str,
@@ -4154,6 +4222,10 @@ mod tests {
                 .lock()
                 .expect("SSH 命令记录锁不应损坏")
                 .push(command.to_owned());
+            self.passwords
+                .lock()
+                .expect("SSH 密码记录锁不应损坏")
+                .push(password.map(str::to_owned));
             Ok(remoteops_device::CommandResult {
                 stdout: "ok".to_owned(),
                 stderr: String::new(),
@@ -4217,13 +4289,17 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
+            used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
+        let credential_encryption = CredentialEncryptionKeyPair::generate();
         execute_operation(
             &device,
             &ssh_provider,
             &approved,
             &runtime_state,
+            AgentInstanceId::new(),
+            &credential_encryption,
             &sender,
             &Arc::new(AtomicU64::new(1)),
         )
@@ -4259,5 +4335,95 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn encrypted_ssh_password_is_bound_and_consumed_once() {
+        let agent_instance_id = AgentInstanceId::new();
+        let session_id = SessionId::new();
+        let credential_encryption = CredentialEncryptionKeyPair::generate();
+        let operation = RemoteOperation::RunSsh {
+            host: "192.0.2.10".to_owned(),
+            port: 22,
+            username: "admin".to_owned(),
+            identity_file: None,
+            known_hosts_file: None,
+            command: "display version".to_owned(),
+            readonly: true,
+        };
+        let envelope_id = RequestId::new();
+        let context = CredentialEncryptionContext {
+            protocol_version: PROTOCOL_VERSION,
+            agent_instance_id,
+            session_id,
+            envelope_id,
+            host: "192.0.2.10".to_owned(),
+            port: 22,
+            username: "admin".to_owned(),
+            command_sha256: sha256_bytes(b"display version"),
+        };
+        let encrypted = remoteops_protocol::seal_credential(
+            credential_encryption.public_key_base64(),
+            credential_encryption.key_id(),
+            &context,
+            b"switch-secret",
+        )
+        .expect("测试密码应可加密");
+        let request = RemoteRequest {
+            request_id: RequestId::new(),
+            session_id,
+            source: EventSource::Ai,
+            operation,
+            approval_id: None,
+            payload_base64: Some(
+                BASE64.encode(serde_json::to_vec(&encrypted).expect("加密载荷应可编码")),
+            ),
+        };
+        let runtime_state = RequestRuntimeState {
+            shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
+            used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+        };
+        let transfer_root = test_state_file("encrypted-ssh").with_extension("dir");
+        let device = SystemDevice::with_transfer_root(&transfer_root).expect("应创建交换目录");
+        let ssh_provider = RecordingSshProvider::default();
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        execute_operation(
+            &device,
+            &ssh_provider,
+            &request,
+            &runtime_state,
+            agent_instance_id,
+            &credential_encryption,
+            &sender,
+            &Arc::new(AtomicU64::new(1)),
+        )
+        .await
+        .expect("Agent 应解密并执行密码 SSH");
+        assert_eq!(
+            ssh_provider
+                .passwords
+                .lock()
+                .expect("SSH 密码记录锁不应损坏")
+                .as_slice(),
+            [Some("switch-secret".to_owned())]
+        );
+        assert!(
+            execute_operation(
+                &device,
+                &ssh_provider,
+                &request,
+                &runtime_state,
+                agent_instance_id,
+                &credential_encryption,
+                &sender,
+                &Arc::new(AtomicU64::new(2)),
+            )
+            .await
+            .is_err(),
+            "同一加密载荷不得再次消费"
+        );
+        let _ = fs::remove_dir_all(transfer_root);
     }
 }
