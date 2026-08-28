@@ -27,6 +27,10 @@ if [[ -x "$BINARY" ]]; then
   version_output="$($BINARY --version 2>&1 || true)"
   [[ "$version_output" == *"$EXPECTED_VERSION"* ]] && pass "MCP 版本：$version_output" || fail "MCP 版本不正确：$version_output"
 fi
+if [[ -x "$CREDENTIAL_PROMPT" ]]; then
+  prompt_version_output="$($CREDENTIAL_PROMPT --version 2>&1 || true)"
+  [[ "$prompt_version_output" == *"$EXPECTED_VERSION"* ]] && pass "SSH 密码安全输入程序版本：$prompt_version_output" || fail "SSH 密码安全输入程序版本不正确：$prompt_version_output"
+fi
 [[ -x "$LAUNCHER" ]] && pass "Keychain 启动脚本存在。" || fail "缺少 MCP 启动脚本。"
 security find-generic-password -a "$CURRENT_USER" -s "$KEYCHAIN_SERVICE" -w >/dev/null 2>&1 && pass "Controller Token 已存在于 Keychain。" || fail "Keychain 中没有 Controller Token。"
 
@@ -34,6 +38,18 @@ if [[ -f "$CONFIG_PATH" ]] && grep -Fq '[mcp_servers.remoteops]' "$CONFIG_PATH" 
   pass "Codex MCP 配置已指向当前启动脚本。"
 else
   fail "Codex config.toml 未正确配置 remoteops。"
+fi
+if [[ -f "$CONFIG_PATH" ]] && awk '
+  $0 == "[mcp_servers.remoteops]" { in_remoteops=1; next }
+  /^\[/ { in_remoteops=0 }
+  in_remoteops && $0 ~ /^tool_timeout_sec[[:space:]]*=/ {
+    split($0, parts, "="); value=parts[2]+0; found=1
+  }
+  END { exit !(found && value >= 360) }
+' "$CONFIG_PATH"; then
+  pass "RemoteOps MCP 工具超时至少为 360 秒。"
+else
+  fail "RemoteOps MCP tool_timeout_sec 必须至少为 360 秒。"
 fi
 if [[ -f "$CONFIG_PATH" ]] && grep -Fq 'default_tools_approval_mode = "approve"' "$CONFIG_PATH" && grep -Eq '^approval_policy[[:space:]]*=[[:space:]]*\{[[:space:]]*granular[[:space:]]*=[[:space:]]*\{[^}]*mcp_elicitations[[:space:]]*=[[:space:]]*true' "$CONFIG_PATH"; then
   pass "RemoteOps MCP 交互确认已启用，且不会重复触发 Codex 静态工具审批。"

@@ -290,7 +290,7 @@ $configLines.Add(
     'env_vars = ["REMOTEOPS_CONTROLLER_TOKEN", "REMOTEOPS_CONTROLLER_OWNER_ID"]'
 )
 $configLines.Add('startup_timeout_sec = 15')
-$configLines.Add('tool_timeout_sec = 180')
+$configLines.Add('tool_timeout_sec = 360')
 $configLines.Add('enabled = true')
 $configLines.Add('required = false')
 $configLines.Add('default_tools_approval_mode = "approve"')

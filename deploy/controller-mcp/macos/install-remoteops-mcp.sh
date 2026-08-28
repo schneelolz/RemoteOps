@@ -216,7 +216,7 @@ cat >> "$TEMP_CONFIG" <<EOF
 command = "$(toml_escape "$LAUNCHER")"
 args = ["--config", "$(toml_escape "$CONNECTION_CONFIG")", "--command-mode", "$COMMAND_MODE"]
 startup_timeout_sec = 15
-tool_timeout_sec = 180
+tool_timeout_sec = 360
 enabled = true
 required = false
 default_tools_approval_mode = "approve"

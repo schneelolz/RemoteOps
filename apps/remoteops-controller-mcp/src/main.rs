@@ -313,6 +313,7 @@ struct RemoteOpsMcp {
     command_mode: CommandMode,
     full_access_grants: Arc<Mutex<BTreeMap<SessionId, FullAccessGrant>>>,
     ssh_credential_cache: Arc<Mutex<BTreeMap<SshCredentialCacheKey, CachedSshCredential>>>,
+    credential_prompt_lock: Arc<Mutex<()>>,
     credential_prompt: Arc<dyn CredentialPrompt>,
 }
 
@@ -1097,6 +1098,7 @@ impl RemoteOpsMcp {
             command_mode,
             full_access_grants: Arc::new(Mutex::new(BTreeMap::new())),
             ssh_credential_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            credential_prompt_lock: Arc::new(Mutex::new(())),
             credential_prompt: Arc::new(ProcessCredentialPrompt),
         }
     }
@@ -1106,6 +1108,15 @@ impl RemoteOpsMcp {
         key: &SshCredentialCacheKey,
         command_sha256: &str,
     ) -> Result<Zeroizing<String>, String> {
+        {
+            let mut cache = self.ssh_credential_cache.lock().await;
+            if let Some(password) = cached_ssh_password(&mut cache, key, Instant::now()) {
+                return Ok(password);
+            }
+        }
+        // Only one native credential window may be visible at a time. Recheck the
+        // cache after waiting so a concurrent request can reuse a remembered value.
+        let _prompt_guard = self.credential_prompt_lock.lock().await;
         {
             let mut cache = self.ssh_credential_cache.lock().await;
             if let Some(password) = cached_ssh_password(&mut cache, key, Instant::now()) {

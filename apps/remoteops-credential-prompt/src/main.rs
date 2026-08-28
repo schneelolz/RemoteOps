@@ -102,6 +102,7 @@ Add-Type -AssemblyName System.Drawing
 $form = New-Object Windows.Forms.Form
 $form.Text = 'RemoteOps SSH credential'
 $form.StartPosition = 'CenterScreen'
+$form.TopMost = $true
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
@@ -136,7 +137,12 @@ $cancel.Text = 'Cancel'
 $cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
 $form.CancelButton = $cancel
 $form.Controls.Add($cancel)
-$form.Add_Shown({ $password.Select() })
+$form.Add_Shown({
+  $form.Activate()
+  $form.BringToFront()
+  $password.Focus()
+  $password.Select()
+})
 $result = $form.ShowDialog()
 if ($result -ne [Windows.Forms.DialogResult]::OK) {
   [Console]::Out.Write('{"action":"cancel","password":""}')

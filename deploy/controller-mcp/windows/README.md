@@ -93,6 +93,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-RemoteOpsMcp.ps1
 codex mcp list
 ```
 
+在有交互桌面的 Windows 会话中，可额外运行可取消的凭据窗口烟测；脚本会启动窗口，
+请在 60 秒内点击 Cancel：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-RemoteOpsMcp.ps1 -CredentialPromptSmokeTest
+```
+
 安装或更新 MCP 后必须完全退出并重新打开 Codex。随后输入 `/mcp`，应看到已启用的 `remoteops`。
 
 新建任务后无需记忆工具名，可以直接说：

@@ -1,13 +1,15 @@
 [CmdletBinding()]
 param(
     [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
-    [switch]$SkipNetwork
+    [switch]$SkipNetwork,
+    [switch]$CredentialPromptSmokeTest
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $expectedVersion = '0.2.0-preview.5'
+$expectedToolTimeoutSec = 360
 $configPath = Join-Path $CodexHome 'config.toml'
 $installDirectory = Join-Path $CodexHome 'remoteops'
 $installedExecutable = $null
@@ -30,6 +32,13 @@ if (-not (Test-Path -LiteralPath $credentialPromptPath -PathType Leaf)) {
 }
 else {
     Write-Host '[通过] SSH 密码安全输入程序已安装。'
+    $promptVersionOutput = (& $credentialPromptPath --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $promptVersionOutput -notmatch [regex]::Escape($expectedVersion)) {
+        $failures.Add("SSH 密码安全输入程序版本不正确：$promptVersionOutput")
+    }
+    else {
+        Write-Host "[通过] SSH 密码安全输入程序版本：$promptVersionOutput"
+    }
 }
 
 foreach ($skillPath in @($standardSkillPath, $compatSkillPath) | Select-Object -Unique) {
@@ -115,6 +124,16 @@ else {
         }
         else {
             Write-Host '[通过] Codex MCP 配置存在，且 Token 与统一 Owner 仅通过环境变量转发。'
+        }
+        $toolTimeout = [regex]::Match(
+            $section.Groups['body'].Value,
+            '(?m)^tool_timeout_sec\s*=\s*(?<value>\d+)\s*$'
+        )
+        if (-not $toolTimeout.Success -or [int]$toolTimeout.Groups['value'].Value -lt $expectedToolTimeoutSec) {
+            $failures.Add("RemoteOps MCP tool_timeout_sec 必须至少为 $expectedToolTimeoutSec 秒。")
+        }
+        else {
+            Write-Host "[通过] RemoteOps MCP 工具超时：$($toolTimeout.Groups['value'].Value) 秒"
         }
         if (
             $section.Groups['body'].Value -notmatch
@@ -211,6 +230,36 @@ if ($failures.Count -gt 0) {
         Write-Error "[失败] $failure"
     }
     exit 1
+}
+
+if ($CredentialPromptSmokeTest) {
+    $smokeHash = 'a' * 64
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $credentialPromptPath
+    $psi.Arguments = '--host 127.0.0.1 --port 22 --username smoke-test --command-sha256 ' + $smokeHash
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $smoke = [Diagnostics.Process]::new()
+    $smoke.StartInfo = $psi
+    if (-not $smoke.Start()) {
+        throw '无法启动 SSH 密码安全输入 UI 烟测。'
+    }
+    $smoke.StandardInput.Close()
+    Write-Host '请在 60 秒内点击 RemoteOps SSH credential 窗口的 Cancel 按钮。'
+    if (-not $smoke.WaitForExit(60000)) {
+        $smoke.Kill()
+        $smoke.WaitForExit()
+        throw 'SSH 密码安全输入 UI 烟测超时；未收到 Cancel。'
+    }
+    $smokeOutput = $smoke.StandardOutput.ReadToEnd().Trim()
+    $smokeError = $smoke.StandardError.ReadToEnd().Trim()
+    if ($smoke.ExitCode -ne 0 -or $smokeOutput -notmatch '"action"\s*:\s*"cancel"') {
+        throw "SSH 密码安全输入 UI 烟测失败：$smokeOutput $smokeError"
+    }
+    Write-Host '[通过] SSH 密码安全输入 UI 可见且 Cancel 路径正常。'
 }
 
 Write-Host ''
