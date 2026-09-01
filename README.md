@@ -1,12 +1,29 @@
+<div align="center">
+
 # RemoteOps
 
-[English README](README.en.md)
+<img src="assets/remoteops-logo.png" alt="RemoteOps logo" width="760" />
+
+<img src="assets/remoteops-hero.svg" alt="RemoteOps：现场 Windows Agent、自治 Relay、本机 MCP 与人工审批组成的受控远程运维链路" width="100%" />
+
+**让 AI 协助诊断现场 Windows，同时保留连接、权限、审批和审计边界。**
+
+[中文](README.md) · [English](README.en.md)
+
+[![CI](https://github.com/schneelolz/RemoteOps/actions/workflows/ci.yml/badge.svg)](https://github.com/schneelolz/RemoteOps/actions/workflows/ci.yml)
+[![Security](https://github.com/schneelolz/RemoteOps/actions/workflows/security.yml/badge.svg)](https://github.com/schneelolz/RemoteOps/actions/workflows/security.yml)
+[![Version](https://img.shields.io/badge/version-0.2.0--preview.5-2563eb)](CHANGELOG.md)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--only-f97316)](LICENSE)
+
+</div>
 
 RemoteOps 是一个让 AI 参与远程运维的开源工具。它保留传统远程终端的连接和权限边界，但把工程师手动输入命令、读取结果、整理信息的部分交给 AI 协助完成。
 
 过去，工程师需要亲自连接现场电脑、逐条执行命令并判断结果；现在可以在本机让 AI 读取现场环境、执行受控命令、分析输出，并在需要时由人审批或接管。现场电脑只需运行 RemoteOps Agent，不需要安装 AI 客户端、配置 SSH 或开放公网入站端口。
 
 当前预览以 Windows 控制台、文件、系统、串口和 SSH 诊断为主，暂不包含屏幕采集、鼠标键盘控制等图形化操作。未来计划通过独立 Visual Provider 接入图形能力，让 AI 结合控制台和图形界面协同诊断；这不等同于把 RemoteOps 做成传统远程桌面或通用网络隧道。
+
+> 当前状态（2026-09-01）：源码候选版本为 `0.2.0-preview.5`，尚未创建公开 GitHub Release。该版本面向开发者和受控试点，不建议直接用于关键生产环境。
 
 ## 工作方式
 
@@ -28,7 +45,7 @@ flowchart LR
 
 ## 当前状态
 
-当前源码版本为 `0.2.0-preview.5`，这是准备中的首个 GitHub Technical Preview 候选。当前源码适合开发者和试点验证，不建议直接用于关键生产环境；GitHub Release 产物仍需完成独立构建和发布门禁。
+当前源码版本为 `0.2.0-preview.5`，这是准备中的首个 GitHub Technical Preview 候选。正式发布前必须从干净提交生成并复核 Windows、Linux Relay、Windows MCP 和 Apple Silicon macOS MCP 产物；本地 `artifacts` 目录不是公开下载源。
 
 - 协议版本：`v14`
 - 当前现场端：Windows x64 Agent
@@ -38,7 +55,17 @@ flowchart LR
 - AI 入口：本地 STDIO MCP（Model Context Protocol）
 - 许可证：[AGPL-3.0-only](LICENSE)
 
-已完成核心链路、权限模型、环境画像、MCP 工具、双语 GUI 和串口本地回归。以下事项仍待公开发布前或试点中验证：低权限 Windows、Windows Service、真实串口/交换机硬件、代码签名，以及 `0.2.0-preview.5` Agent GUI 和静默 MCP 调用在 Windows Server、RDP、云主机及虚拟机中的兼容性复测。
+自动化检查、核心链路、权限模型、环境画像、MCP 工具、双语 GUI 和串口核心回归已经完成。以下项目仍需在公开发布前或受控试点中验证：低权限 Windows、Windows Service、真实串口/交换机硬件、Apple Silicon Mac 的完整安装链路、Windows Server/RDP/虚拟机兼容性，以及 Windows Authenticode 和 macOS Developer ID/Notarization 策略。
+
+支持范围与验证状态：
+
+| 组件 | 首版范围 | 当前状态 |
+|---|---|---|
+| Windows Agent CLI/GUI | Windows x64 | 核心与自动化测试通过；低权限和多种现场环境仍待复测 |
+| Windows Agent Service | Windows x64 | 已实现，安装、恢复、卸载和 `LocalService` 边界待验收 |
+| Relay | Linux x64 + Docker | 核心和历史三机链路通过；正式发布资产需由 Release CI 重新生成 |
+| Controller / MCP | Windows x64、Apple Silicon macOS | 核心测试通过；Apple Silicon 实机安装和 Codex `/mcp` 待验收 |
+| 串口 / 交换机 | 受控能力已实现 | 本地串口验证通过；正式远程硬件路径待复测 |
 
 ## 它适合解决的问题
 
@@ -80,6 +107,8 @@ flowchart LR
 RemoteOps 的长期方向是让 AI 在控制台和图形界面之间协同工作：优先使用结构化的命令、日志和设备输出，在必要时调用图形能力完成只能通过桌面软件进行的操作。具体权限、审批和人工接管边界由部署策略决定。图形能力将优先通过独立 Visual Provider 或现有图形 MCP 接入，不在核心项目中重复实现视频编码、远程桌面协议和 UI 自动化引擎；方案调研见 [docs/VISUAL_PROVIDER_RESEARCH.md](docs/VISUAL_PROVIDER_RESEARCH.md)。
 
 ## 快速开始
+
+首版尚未提供共享公共 Relay 或公开下载地址。请先准备自己的 Relay，再从源码或 GitHub Release（发布后）取得匹配版本的 Agent 和 MCP 包；Agent、Relay 和 MCP 必须使用同一协议版本。
 
 如果 AI 能操作准备部署 Relay 的 Linux 主机，可以把下面的指令发给它；如果不能，直接跳到手工部署。
 
@@ -190,7 +219,7 @@ macOS 安装器会把 Token 保存到当前用户的 Keychain，通过本地启�
 
 后续操作必须使用 `list_connections` 返回的准确 `session_id`，不能根据主机名或别名猜测目标。涉及写入、重启、服务控制或串口写入时，先启动 Human Controller 并完成精确审批；MCP 不能批准自己的高风险操作。
 
-如果当前尚未有 GitHub Release，请先按下方构建命令从源码生成发布包；正式发布前不要把本地 `artifacts` 当作公开下载源。
+如果当前尚未有 GitHub Release，请先按下方构建命令从源码生成本地验证包；正式发布前不要把本地 `artifacts` 当作公开下载源。
 
 ## 构建与验证
 
@@ -210,7 +239,14 @@ cargo test --workspace --locked
 .\scripts\Build-Release.ps1
 ```
 
-GitHub Release 包含 Windows Agent/Controller、Windows MCP、Apple Silicon macOS MCP、Linux x64 Relay、项目与第三方许可证/依赖清单和 `SHA256SUMS.txt`。正式创建 Release 前，应在干净提交或 CI 中重新构建并复核哈希。Windows 产物当前未进行 Authenticode 签名，macOS MCP 当前也未进行 Developer ID 签名和 Notarization。
+GitHub Release（创建后）应包含 Windows Agent/Controller、Windows MCP、Apple Silicon macOS MCP、Linux x64 Relay、项目与第三方许可证/依赖清单和 `SHA256SUMS.txt`。正式创建 Release 前，应在干净提交或 Release CI 中重新构建并复核哈希。Windows 产物当前未进行 Authenticode 签名，macOS MCP 当前也未进行 Developer ID 签名和 Notarization；发布说明必须明确披露这一点。
+
+推荐的发布前检查顺序：
+
+1. `cargo fmt`、`cargo check`、`cargo clippy`、`cargo test` 和文档链接检查；
+2. 在 CI 中生成并检查四类发布资产及 SHA-256；
+3. 在低权限 Windows、真实 Apple Silicon Mac 和真实串口/交换机环境完成首版门禁；
+4. 确认签名策略、变更日志、Release 资产白名单和回滚说明后，再创建 `v0.2.0-preview.5` prerelease。
 
 ## 安全要点
 

@@ -1,0 +1,7 @@
+# The Relay admin prototype originally contained a deterministic SHA-256
+# display fixture. It is test data, not a credential, but older history is
+# scanned by the scheduled secret check and the generic-api-key rule flags it.
+[allowlist]
+description = "Allow the historical deterministic admin-console fingerprint fixture"
+commits = ["519ba519a91538f796c9c71e7898de9b819d5109"]
+paths = ["relay-admin-prototype/app.js"]
