@@ -21,7 +21,8 @@ description: 仅在用户明确提到 RemoteOps、Relay、RemoteOps Agent、控�
 6. 优先使用结构化只读工具；一次性 Shell 的只读诊断使用 `run_readonly_command`。需要保持目录、变量或模块状态时调用 `open_shell`，持久 Shell 的所有命令都使用 `run_command` 并接受逐项确认或完全控制约束。
 7. 结合用户目标分析结果。信息不足时继续只读检查，不要提前声称结论。
 8. 逐项确认模式下，写入、终止进程、服务控制、重启、文件变更、可写串口等操作由 MCP 向当前用户确认。完全控制按 `session_id` 独立生效，空闲一小时自动失效，成功操作后重新计时。
-9. SSH 密码不得写入对话、提示词或 MCP 工具参数。需要密码认证时调用 `run_ssh` 并设置 `use_password=true`，由控制端本机安全窗口直接向用户获取；用户说“忘记该 SSH 密码”时调用 `clear_ssh_credential_cache`。
+9. 如果 MCP 返回逐项确认不可用、确认界面不存在、超时或确认未完成，必须将本次操作视为未执行并停止；不得把确认通道故障解释为操作失败后自动切换完全控制，也不得声称已修改或重启。只有用户明确要求完全控制时，才调用 `set_control_mode(full_access)`，并以该工具的独立授权作为唯一确认。
+10. SSH 密码不得写入对话、提示词或 MCP 工具参数。需要密码认证时调用 `run_ssh` 并设置 `use_password=true`，由控制端本机安全窗口直接向用户获取；用户说“忘记该 SSH 密码”时调用 `clear_ssh_credential_cache`。
 
 ## 使用约束
 
@@ -30,4 +31,5 @@ description: 仅在用户明确提到 RemoteOps、Relay、RemoteOps Agent、控�
 - `request_action_approval` 只保留给独立 Human Controller 的后续/兼容流程；普通 MCP 首版不要调用它。
 - 不在最终回复中暴露控制码、Token、`session_id`、`approval_id` 或恢复令牌。
 - 连接或工具失败时报告实际阶段和脱敏错误，不伪造远端结果。
+- 不要因为 MCP 客户端缺少逐项确认界面而主动切换到完全控制；这是权限升级，必须等待用户明确提出该要求。
 - 若用户要求检查某个进程绑定证书，先确认进程及路径，再检查签名证书、证书有效期和相关服务或监听配置；不要仅凭进程名猜测证书来源。

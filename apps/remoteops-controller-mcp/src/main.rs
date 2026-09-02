@@ -1284,7 +1284,7 @@ impl RemoteOpsMcp {
                     BooleanSchema::new()
                         .title(title)
                         .description(
-                            "在当前 Codex 授权弹窗点击允许即表示确认；Agent 端没有授权按钮",
+                            "在当前 MCP 确认界面点击允许即表示仅确认本次操作；这不是完全控制授权。Agent 端没有授权按钮",
                         )
                         .with_default(true),
                 ),
@@ -1302,7 +1302,7 @@ impl RemoteOpsMcp {
                 Some(ELICITATION_TIMEOUT),
             )
             .await
-            .map_err(|error| format!("当前 MCP 客户端无法完成人机确认：{error}"))?;
+            .map_err(|error| elicitation_unavailable_error(error.to_string()))?;
         Ok(elicitation_accepted(&response.action))
     }
 
@@ -1327,7 +1327,9 @@ impl RemoteOpsMcp {
         if confirmed {
             Ok(())
         } else {
-            Err(format!("当前 Codex 授权弹窗未允许{direction}大文件"))
+            Err(format!(
+                "当前 MCP 确认界面未允许{direction}大文件，操作未执行；不得自动切换到完全控制"
+            ))
         }
     }
 
@@ -1452,7 +1454,7 @@ impl RemoteOpsMcp {
             .await?;
         if !confirmed {
             return Err(format!(
-                "当前 Codex 授权弹窗未允许本次操作：{action}；Agent 端没有授权按钮"
+                "当前 MCP 确认界面未允许本次操作：{action}，操作未执行；不得自动切换到完全控制；Agent 端没有授权按钮"
             ));
         }
         Ok(WriteAuthorization { approval_id: None })
@@ -1569,7 +1571,7 @@ impl RemoteOpsMcp {
     /// 更改指定 Agent 在本 MCP 进程中的控制模式。
     #[tool(
         name = "set_control_mode",
-        description = "按精确 session_id 切换控制模式。调用 full_access 时只使用 Codex 对本工具的授权，不再嵌套弹出第二次确认；Agent 端没有完全控制按钮。切回逐项确认立即生效。",
+        description = "按精确 session_id 切换控制模式。默认保持 step_by_step；不得因为逐项确认界面不可用、超时或写操作被拒绝而调用 full_access。只有用户明确要求完全控制时才调用。调用 full_access 时只使用 Codex 对本工具的授权，不再嵌套弹出第二次确认；Agent 端没有完全控制按钮。切回逐项确认立即生效。",
         annotations(
             title = "切换控制模式",
             read_only_hint = false,
@@ -3100,7 +3102,7 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
 #[tool_handler(
     name = "remoteops-controller",
     version = "0.2.0-preview.5",
-    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。配对后默认逐项确认，Agent 端没有逐项确认或完全控制按钮，绝对不要引导用户去 Agent 点击授权。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；用户明确要求完全控制时只调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制按 session_id 独立保存在 MCP 内存，空闲一小时自动失效，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
+    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。配对后默认逐项确认，Agent 端没有逐项确认或完全控制按钮，绝对不要引导用户去 Agent 点击授权。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制按 session_id 独立保存在 MCP 内存，空闲一小时自动失效，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
 )]
 impl ServerHandler for RemoteOpsMcp {}
 
@@ -3192,6 +3194,12 @@ fn parse_session_id(value: &str) -> Result<SessionId, String> {
 
 fn elicitation_accepted(action: &ElicitationAction) -> bool {
     matches!(action, ElicitationAction::Accept)
+}
+
+fn elicitation_unavailable_error(error: String) -> String {
+    format!(
+        "RemoteOps 逐项确认未完成：当前 MCP 客户端未提供可用的确认结果（可能不支持或未显示确认界面），本次操作未执行。请停止并向用户说明原因；不得将用户对具体操作的授权解释为完全控制授权，也不得自动切换控制模式。只有用户明确要求启用完全控制时，才可另行请求该模式。底层错误：{error}"
+    )
 }
 
 fn large_transfer_requires_confirmation(size: u64) -> bool {
@@ -3531,6 +3539,16 @@ mod tests {
         assert!(elicitation_accepted(&ElicitationAction::Accept));
         assert!(!elicitation_accepted(&ElicitationAction::Decline));
         assert!(!elicitation_accepted(&ElicitationAction::Cancel));
+    }
+
+    #[test]
+    fn unavailable_elicitation_explicitly_blocks_permission_escalation() {
+        let error = elicitation_unavailable_error("client_not_supported".to_owned());
+        assert!(error.contains("操作未执行"));
+        assert!(error.contains("不得将用户对具体操作的授权解释为完全控制授权"));
+        assert!(error.contains("不得自动切换控制模式"));
+        assert!(error.contains("只有用户明确要求启用完全控制时"));
+        assert!(error.contains("client_not_supported"));
     }
 
     #[test]

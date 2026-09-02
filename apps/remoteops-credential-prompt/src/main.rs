@@ -22,6 +22,9 @@ struct Args {
     username: String,
     #[arg(long)]
     command_sha256: String,
+    /// 界面语言；未指定时跟随系统语言。
+    #[arg(long, env = "REMOTEOPS_LANG")]
+    language: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,7 +70,8 @@ fn run() -> anyhow::Result<()> {
         args.host.trim(),
         args.port
     );
-    let mut platform = platform_prompt(&target, &args.command_sha256)?;
+    let language = prompt_language(args.language.as_deref());
+    let mut platform = platform_prompt(&target, &args.command_sha256, language)?;
     let action = match platform.action.as_str() {
         "use_once" => "use_once",
         "remember_10_minutes" => "remember_10_minutes",
@@ -89,8 +93,25 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn prompt_language(explicit: Option<&str>) -> &'static str {
+    let value = explicit
+        .map(str::to_owned)
+        .or_else(|| std::env::var("LC_ALL").ok())
+        .or_else(|| std::env::var("LANG").ok())
+        .unwrap_or_default();
+    if value.to_ascii_lowercase().starts_with("zh") {
+        "zh"
+    } else {
+        "en"
+    }
+}
+
 #[cfg(target_os = "windows")]
-fn platform_prompt(target: &str, command_sha256: &str) -> anyhow::Result<PlatformResponse> {
+fn platform_prompt(
+    target: &str,
+    command_sha256: &str,
+    language: &str,
+) -> anyhow::Result<PlatformResponse> {
     use std::os::windows::process::CommandExt as _;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -106,34 +127,59 @@ $form.TopMost = $true
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
-$form.ClientSize = New-Object Drawing.Size(470, 235)
+$form.ClientSize = New-Object Drawing.Size(520, 330)
+$form.Font = New-Object Drawing.Font('Segoe UI', 10)
+$form.BackColor = [Drawing.Color]::White
 $label = New-Object Windows.Forms.Label
-$label.Location = New-Object Drawing.Point(20, 18)
-$label.Size = New-Object Drawing.Size(430, 72)
-$label.Text = "Enter the SSH password for:`r`n$($inputJson.target)`r`nCommand SHA-256: $($inputJson.command_sha256.Substring(0, 16))..."
+$label.Location = New-Object Drawing.Point(28, 24)
+$label.Size = New-Object Drawing.Size(464, 32)
+$label.Font = New-Object Drawing.Font('Segoe UI Semibold', 16)
+$label.Text = if ($inputJson.language -eq 'zh') { '需要 SSH 凭据' } else { 'SSH credential required' }
 $form.Controls.Add($label)
+$description = New-Object Windows.Forms.Label
+$description.Location = New-Object Drawing.Point(28, 62)
+$description.Size = New-Object Drawing.Size(464, 24)
+$description.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
+$description.Text = if ($inputJson.language -eq 'zh') { '输入密码以建立安全连接' } else { 'Enter your password to connect securely' }
+$form.Controls.Add($description)
+$targetLabel = New-Object Windows.Forms.Label
+$targetLabel.Location = New-Object Drawing.Point(28, 102)
+$targetLabel.Size = New-Object Drawing.Size(464, 25)
+$targetLabel.Font = New-Object Drawing.Font('Consolas', 11)
+$targetLabel.Text = $inputJson.target
+$form.Controls.Add($targetLabel)
+$fingerprint = New-Object Windows.Forms.Label
+$fingerprint.Location = New-Object Drawing.Point(28, 128)
+$fingerprint.Size = New-Object Drawing.Size(464, 25)
+$fingerprint.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
+$fingerprint.Font = New-Object Drawing.Font('Consolas', 9)
+$fingerprint.Text = if ($inputJson.language -eq 'zh') { "命令指纹  $($inputJson.command_sha256.Substring(0, 16))..." } else { "Command fingerprint  $($inputJson.command_sha256.Substring(0, 16))..." }
+$form.Controls.Add($fingerprint)
 $password = New-Object Windows.Forms.TextBox
-$password.Location = New-Object Drawing.Point(20, 98)
-$password.Size = New-Object Drawing.Size(430, 28)
+$password.Location = New-Object Drawing.Point(28, 176)
+$password.Size = New-Object Drawing.Size(464, 30)
+$password.Font = New-Object Drawing.Font('Segoe UI', 11)
 $password.UseSystemPasswordChar = $true
 $form.Controls.Add($password)
 $remember = New-Object Windows.Forms.CheckBox
-$remember.Location = New-Object Drawing.Point(20, 137)
-$remember.Size = New-Object Drawing.Size(300, 26)
-$remember.Text = 'Remember in MCP memory for 10 minutes'
+$remember.Location = New-Object Drawing.Point(28, 220)
+$remember.Size = New-Object Drawing.Size(464, 26)
+$remember.Text = if ($inputJson.language -eq 'zh') { '记住 10 分钟（仅保存在内存中）' } else { 'Remember for 10 minutes (stored in memory only)' }
 $remember.Checked = $false
 $form.Controls.Add($remember)
 $ok = New-Object Windows.Forms.Button
-$ok.Location = New-Object Drawing.Point(268, 178)
-$ok.Size = New-Object Drawing.Size(87, 32)
-$ok.Text = 'Use'
+$ok.Location = New-Object Drawing.Point(390, 278)
+$ok.Size = New-Object Drawing.Size(102, 34)
+$ok.Text = if ($inputJson.language -eq 'zh') { '仅本次使用' } else { 'Use once' }
+$ok.BackColor = [Drawing.Color]::FromArgb(30, 110, 230)
+$ok.ForeColor = [Drawing.Color]::White
 $ok.DialogResult = [Windows.Forms.DialogResult]::OK
 $form.AcceptButton = $ok
 $form.Controls.Add($ok)
 $cancel = New-Object Windows.Forms.Button
-$cancel.Location = New-Object Drawing.Point(363, 178)
-$cancel.Size = New-Object Drawing.Size(87, 32)
-$cancel.Text = 'Cancel'
+$cancel.Location = New-Object Drawing.Point(278, 278)
+$cancel.Size = New-Object Drawing.Size(102, 34)
+$cancel.Text = if ($inputJson.language -eq 'zh') { '取消' } else { 'Cancel' }
 $cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
 $form.CancelButton = $cancel
 $form.Controls.Add($cancel)
@@ -156,6 +202,7 @@ $password.Clear()
     let input = serde_json::json!({
         "target": target,
         "command_sha256": command_sha256,
+        "language": language,
     });
     let mut child = Command::new("powershell.exe")
         .args([
@@ -181,26 +228,62 @@ $password.Clear()
 }
 
 #[cfg(target_os = "macos")]
-fn platform_prompt(target: &str, command_sha256: &str) -> anyhow::Result<PlatformResponse> {
+fn platform_prompt(
+    target: &str,
+    command_sha256: &str,
+    language: &str,
+) -> anyhow::Result<PlatformResponse> {
     const SCRIPT: &str = r#"
-on run argv
-  set targetName to item 1 of argv
-  set commandHash to item 2 of argv
-  try
-    set response to display dialog "Enter the SSH password for:" & return & targetName & return & "Command SHA-256: " & text 1 thru 16 of commandHash & "..." default answer "" with hidden answer buttons {"Cancel", "Use once", "Remember 10 minutes"} default button "Use once" cancel button "Cancel" with title "RemoteOps SSH credential"
-    set selectedButton to button returned of response
-    set secretText to text returned of response
-    if selectedButton is "Remember 10 minutes" then
-      return "remember_10_minutes" & linefeed & secretText
-    end if
-    return "use_once" & linefeed & secretText
-  on error number -128
-    return "cancel" & linefeed
-  end try
-end run
+ObjC.import('Cocoa')
+
+function run(argv) {
+  const targetName = argv[0]
+  const commandHash = argv[1]
+  const chinese = argv[2] === 'zh'
+  const alert = $.NSAlert.alloc.init
+  const title = chinese ? '需要 SSH 凭据' : 'SSH credential required'
+  const description = chinese ? '输入密码以建立安全连接' : 'Enter your password to connect securely'
+  const fingerprint = chinese ? '命令指纹  ' : 'Command fingerprint  '
+  const placeholder = chinese ? '输入 SSH 密码' : 'Enter SSH password'
+  const rememberTitle = chinese ? '记住 10 分钟（仅保存在内存中）' : 'Remember for 10 minutes (stored in memory only)'
+  const useTitle = chinese ? '仅本次使用' : 'Use once'
+  const cancelTitle = chinese ? '取消' : 'Cancel'
+
+  alert.setMessageText($(title))
+  alert.setInformativeText($(description + '\n' + targetName + '\n' + fingerprint + commandHash.slice(0, 16) + '…'))
+  alert.addButtonWithTitle($(useTitle))
+  alert.addButtonWithTitle($(cancelTitle))
+
+  const accessory = $.NSView.alloc.initWithFrame($.NSMakeRect(0, 0, 360, 72))
+  const password = $.NSSecureTextField.alloc.initWithFrame($.NSMakeRect(0, 40, 360, 28))
+  password.setPlaceholderString($(placeholder))
+  const remember = $.NSButton.alloc.initWithFrame($.NSMakeRect(0, 8, 360, 24))
+  remember.setButtonType($.NSSwitchButton)
+  remember.setTitle($(rememberTitle))
+  accessory.addSubview(password)
+  accessory.addSubview(remember)
+  alert.setAccessoryView(accessory)
+  alert.window.setInitialFirstResponder(password)
+
+  const result = alert.runModal
+  if (result == $.NSAlertSecondButtonReturn) return 'cancel\n'
+  const action = remember.state == $.NSControlStateValueOn ? 'remember_10_minutes' : 'use_once'
+  const secret = password.stringValue.js
+  password.setStringValue($(''))
+  return action + '\n' + secret
+}
 "#;
     let output = Command::new("osascript")
-        .args(["-e", SCRIPT, "--", target, command_sha256])
+        .args([
+            "-l",
+            "JavaScript",
+            "-e",
+            SCRIPT,
+            "--",
+            target,
+            command_sha256,
+            language,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -228,7 +311,11 @@ end run
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn platform_prompt(_target: &str, _command_sha256: &str) -> anyhow::Result<PlatformResponse> {
+fn platform_prompt(
+    _target: &str,
+    _command_sha256: &str,
+    _language: &str,
+) -> anyhow::Result<PlatformResponse> {
     bail!("SSH 密码安全输入仅支持 Windows 和 macOS Controller")
 }
 
