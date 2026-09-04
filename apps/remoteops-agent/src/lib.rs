@@ -897,7 +897,9 @@ pub async fn run_agent_with_permission_control(
     );
     let environment = detect_environment_profile(device.as_ref()).await;
     let capabilities = capabilities_from_environment(&environment);
-    let hostname = local_hostname();
+    let host_identity = remoteops_host_identity::collect();
+    let hostname = host_identity.hostname;
+    let mac_address = host_identity.mac_address;
     let operating_system = environment.os_version.clone().map_or_else(
         || format!("{} {}", environment.os_family, environment.architecture),
         |version| format!("{version} {}", environment.architecture),
@@ -958,6 +960,7 @@ pub async fn run_agent_with_permission_control(
             resume_token.clone(),
             config.state_file.clone(),
             hostname.clone(),
+            mac_address.clone(),
             operating_system.clone(),
             capabilities.clone(),
             environment.clone(),
@@ -1011,6 +1014,7 @@ async fn run_connection<S>(
     resume_token_state: Arc<Mutex<Option<String>>>,
     state_file: PathBuf,
     hostname: String,
+    mac_address: Option<String>,
     operating_system: String,
     capabilities: CapabilitySet,
     environment: EnvironmentProfile,
@@ -1037,6 +1041,7 @@ where
         environment,
         credential_encryption_public_key: credential_encryption.public_key_base64().to_owned(),
         credential_encryption_key_id: credential_encryption.key_id().to_owned(),
+        mac_address,
     }));
     write_frame(&mut stream, &hello).await?;
     let welcome = match read_frame::<WireMessage, _>(&mut stream).await? {
@@ -2882,12 +2887,6 @@ fn background_command(executable: impl AsRef<std::ffi::OsStr>) -> std::process::
     }
 }
 
-fn local_hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown-host".to_owned())
-}
-
 fn default_transfer_root() -> PathBuf {
     default_agent_data_root().join("transfers")
 }
@@ -3383,6 +3382,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             state_file.clone(),
             "test-host".to_owned(),
+            None,
             "test-os".to_owned(),
             CapabilitySet::new([Capability::Cmd]),
             EnvironmentProfile::empty(),

@@ -24,6 +24,7 @@ clap.workspace = true
 remoteops-audit = { path = "../../crates/remoteops-audit" }
 remoteops-device = { path = "../../crates/remoteops-device" }
 remoteops-domain = { path = "../../crates/remoteops-domain" }
+remoteops-host-identity = { path = "../../crates/remoteops-host-identity" }
 remoteops-policy = { path = "../../crates/remoteops-policy" }
 remoteops-protocol = { path = "../../crates/remoteops-protocol" }
 remoteops-serial = { path = "../../crates/remoteops-serial" }

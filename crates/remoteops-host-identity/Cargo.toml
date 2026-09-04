@@ -1,0 +1,15 @@
+[package]
+name = "remoteops-host-identity"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hostname.workspace = true
+network-interface.workspace = true
+
+[lints]
+workspace = true

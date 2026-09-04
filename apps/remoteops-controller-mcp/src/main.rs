@@ -26,10 +26,11 @@ use remoteops_domain::{
 use remoteops_protocol::{CredentialEncryptionContext, PROTOCOL_VERSION, seal_credential};
 use rmcp::{
     Json, RoleServer, ServerHandler, ServiceExt,
+    handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
     model::{
         BooleanSchema, ElicitRequestParams, ElicitationAction, ElicitationSchema,
-        PrimitiveSchemaDefinition,
+        PrimitiveSchemaDefinition, StringSchema,
     },
     schemars,
     service::RequestContext,
@@ -98,6 +99,9 @@ struct Args {
         default_value = "agent-controlled"
     )]
     command_mode: CommandMode,
+    /// Enables local-only MCP UI diagnostics when explicitly requested.
+    #[arg(long, env = "REMOTEOPS_ENABLE_TEST_UI", default_value_t = false)]
+    enable_test_ui: bool,
     /// 启动时配对，格式 CODE 或 CODE=别名；环境变量用分号分隔。
     #[arg(
         long = "pair",
@@ -137,6 +141,7 @@ struct ResolvedArgs {
     owner_id: ControllerOwnerId,
     permission_mode: PermissionMode,
     command_mode: CommandMode,
+    enable_test_ui: bool,
     pairs: Vec<PairSpec>,
     reconnect_seconds: u64,
 }
@@ -218,6 +223,7 @@ impl Args {
             owner_id,
             permission_mode: self.command_mode.into(),
             command_mode: self.command_mode,
+            enable_test_ui: self.enable_test_ui,
             pairs: self.pairs,
             reconnect_seconds,
         })
@@ -311,6 +317,7 @@ struct RemoteOpsMcp {
     shells: Arc<Mutex<BTreeMap<ShellId, ShellHandle>>>,
     transfer_root: Arc<PathBuf>,
     command_mode: CommandMode,
+    enable_test_ui: bool,
     full_access_grants: Arc<Mutex<BTreeMap<SessionId, FullAccessGrant>>>,
     ssh_credential_cache: Arc<Mutex<BTreeMap<SshCredentialCacheKey, CachedSshCredential>>>,
     credential_prompt_lock: Arc<Mutex<()>>,
@@ -362,6 +369,23 @@ struct ControlModeOutput {
     mode: String,
     idle_timeout_seconds: Option<u64>,
     message: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TestPromptInput {
+    title: String,
+    message: String,
+    default_value: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct TestPromptOutput {
+    submitted: bool,
+    action: String,
+    value: Option<String>,
+    value_length: usize,
+    sha256: Option<String>,
 }
 
 #[derive(Clone)]
@@ -923,6 +947,7 @@ struct ConnectionOutput {
     session_id: String,
     agent_instance_id: String,
     hostname: String,
+    mac_address: Option<String>,
     operating_system: String,
     environment: serde_json::Value,
     state: String,
@@ -1088,19 +1113,163 @@ fn validate_ssh_prompt_target(host: &str, username: &str) -> Result<(), String> 
     Ok(())
 }
 
+fn validate_test_prompt(input: &TestPromptInput) -> Result<(), String> {
+    let title = input.title.trim();
+    let message = input.message.trim();
+    if title.is_empty() || title.chars().count() > 120 {
+        return Err("测试窗体标题必须包含 1 到 120 个字符".to_owned());
+    }
+    if message.is_empty() || message.chars().count() > 2_000 {
+        return Err("测试窗体说明必须包含 1 到 2000 个字符".to_owned());
+    }
+    if input
+        .default_value
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 4_096)
+    {
+        return Err("测试默认值不能超过 4096 个字符".to_owned());
+    }
+    Ok(())
+}
+
+fn configured_tool_router(enable_test_ui: bool) -> ToolRouter<RemoteOpsMcp> {
+    let mut router = RemoteOpsMcp::tool_router();
+    if !enable_test_ui {
+        router.remove_route("test_prompt_text");
+        router.remove_route("test_prompt_password");
+    }
+    router
+}
+
 #[tool_router]
 impl RemoteOpsMcp {
-    fn new(client: RelayClient, transfer_root: PathBuf, command_mode: CommandMode) -> Self {
+    fn new(
+        client: RelayClient,
+        transfer_root: PathBuf,
+        command_mode: CommandMode,
+        enable_test_ui: bool,
+    ) -> Self {
         Self {
             client,
             shells: Arc::new(Mutex::new(BTreeMap::new())),
             transfer_root: Arc::new(transfer_root),
             command_mode,
+            enable_test_ui,
             full_access_grants: Arc::new(Mutex::new(BTreeMap::new())),
             ssh_credential_cache: Arc::new(Mutex::new(BTreeMap::new())),
             credential_prompt_lock: Arc::new(Mutex::new(())),
             credential_prompt: Arc::new(ProcessCredentialPrompt),
         }
+    }
+
+    fn runtime_tool_router(&self) -> ToolRouter<Self> {
+        configured_tool_router(self.enable_test_ui)
+    }
+
+    async fn run_test_prompt(
+        &self,
+        context: &RequestContext<RoleServer>,
+        input: TestPromptInput,
+        password: bool,
+    ) -> Result<TestPromptOutput, String> {
+        validate_test_prompt(&input)?;
+        let mut field = StringSchema::new()
+            .title(input.title)
+            .description(if password {
+                "测试密码只用于验证输入界面，不会返回明文或写入日志"
+            } else {
+                "输入测试文本并提交"
+            })
+            .max_length(4_096);
+        if !password {
+            field = field.with_default(input.default_value.unwrap_or_default());
+        }
+        let property_name = if password { "password" } else { "value" };
+        let schema = ElicitationSchema::builder()
+            .required_property(property_name, PrimitiveSchemaDefinition::String(field))
+            .build()
+            .map_err(str::to_owned)?;
+        let response = context
+            .peer
+            .create_elicitation_with_timeout(
+                ElicitRequestParams::FormElicitationParams {
+                    meta: None,
+                    message: input.message,
+                    requested_schema: schema,
+                },
+                Some(ELICITATION_TIMEOUT),
+            )
+            .await
+            .map_err(|error| elicitation_unavailable_error(&error.to_string()))?;
+
+        if response.action != ElicitationAction::Accept {
+            return Ok(TestPromptOutput {
+                submitted: false,
+                action: match response.action {
+                    ElicitationAction::Decline => "decline",
+                    ElicitationAction::Cancel => "cancel",
+                    _ => "unknown",
+                }
+                .to_owned(),
+                value: None,
+                value_length: 0,
+                sha256: None,
+            });
+        }
+        let value = response
+            .content
+            .as_ref()
+            .and_then(|content| content.get(property_name))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "测试输入结果缺少 value 字段".to_owned())?;
+        let mut value = Zeroizing::new(value.to_owned());
+        let output = TestPromptOutput {
+            submitted: true,
+            action: "accept".to_owned(),
+            value: (!password).then(|| value.to_string()),
+            value_length: value.chars().count(),
+            sha256: Some(sha256_bytes(value.as_bytes())),
+        };
+        value.zeroize();
+        Ok(output)
+    }
+
+    #[tool(
+        name = "test_prompt_text",
+        description = "仅在显式启用测试 UI 时可见。弹出 MCP 标准普通文本输入表单并返回测试内容、长度和 SHA-256。不得用于收集真实敏感信息。",
+        annotations(
+            title = "测试普通文本输入",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn test_prompt_text(
+        &self,
+        Parameters(input): Parameters<TestPromptInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<TestPromptOutput>, String> {
+        Ok(Json(self.run_test_prompt(&context, input, false).await?))
+    }
+
+    #[tool(
+        name = "test_prompt_password",
+        description = "仅在显式启用测试 UI 时可见。弹出 MCP 标准密码测试表单；只返回是否提交、长度和 SHA-256，绝不返回密码明文。",
+        annotations(
+            title = "测试密码输入",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn test_prompt_password(
+        &self,
+        Parameters(input): Parameters<TestPromptInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<TestPromptOutput>, String> {
+        Ok(Json(self.run_test_prompt(&context, input, true).await?))
     }
 
     async fn ssh_password(
@@ -1302,7 +1471,7 @@ impl RemoteOpsMcp {
                 Some(ELICITATION_TIMEOUT),
             )
             .await
-            .map_err(|error| elicitation_unavailable_error(error.to_string()))?;
+            .map_err(|error| elicitation_unavailable_error(&error.to_string()))?;
         Ok(elicitation_accepted(&response.action))
     }
 
@@ -3100,6 +3269,7 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
 #[allow(unknown_lints)]
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(
+    router = self.runtime_tool_router(),
     name = "remoteops-controller",
     version = "0.2.0-preview.5",
     instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。配对后默认逐项确认，Agent 端没有逐项确认或完全控制按钮，绝对不要引导用户去 Agent 点击授权。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制按 session_id 独立保存在 MCP 内存，空闲一小时自动失效，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
@@ -3168,10 +3338,15 @@ async fn run_mcp() -> anyhow::Result<()> {
         }
     }
 
-    let service = RemoteOpsMcp::new(client, transfer_root, args.command_mode)
-        .serve(stdio())
-        .await
-        .context("启动 STDIO MCP 服务失败")?;
+    let service = RemoteOpsMcp::new(
+        client,
+        transfer_root,
+        args.command_mode,
+        args.enable_test_ui,
+    )
+    .serve(stdio())
+    .await
+    .context("启动 STDIO MCP 服务失败")?;
     service.waiting().await?;
     Ok(())
 }
@@ -3196,7 +3371,7 @@ fn elicitation_accepted(action: &ElicitationAction) -> bool {
     matches!(action, ElicitationAction::Accept)
 }
 
-fn elicitation_unavailable_error(error: String) -> String {
+fn elicitation_unavailable_error(error: &str) -> String {
     format!(
         "RemoteOps 逐项确认未完成：当前 MCP 客户端未提供可用的确认结果（可能不支持或未显示确认界面），本次操作未执行。请停止并向用户说明原因；不得将用户对具体操作的授权解释为完全控制授权，也不得自动切换控制模式。只有用户明确要求启用完全控制时，才可另行请求该模式。底层错误：{error}"
     )
@@ -3454,6 +3629,7 @@ fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> Conn
         session_id: connection.session_id.to_string(),
         agent_instance_id: connection.agent_instance_id.to_string(),
         hostname: connection.hostname,
+        mac_address: connection.mac_address,
         operating_system: connection.operating_system,
         environment: serde_json::to_value(connection.environment)
             .unwrap_or_else(|_| serde_json::json!({})),
@@ -3543,7 +3719,7 @@ mod tests {
 
     #[test]
     fn unavailable_elicitation_explicitly_blocks_permission_escalation() {
-        let error = elicitation_unavailable_error("client_not_supported".to_owned());
+        let error = elicitation_unavailable_error("client_not_supported");
         assert!(error.contains("操作未执行"));
         assert!(error.contains("不得将用户对具体操作的授权解释为完全控制授权"));
         assert!(error.contains("不得自动切换控制模式"));
@@ -3575,6 +3751,59 @@ mod tests {
         assert!(validate_ssh_prompt_target("192.0.2.10", "admin").is_ok());
         assert!(validate_ssh_prompt_target("-oProxyCommand=calc", "admin").is_err());
         assert!(validate_ssh_prompt_target("192.0.2.10", "bad@user").is_err());
+    }
+
+    #[test]
+    fn test_prompt_input_is_bounded_and_has_no_password_field() {
+        let input = TestPromptInput {
+            title: "输入测试信息".to_owned(),
+            message: "请填写测试内容".to_owned(),
+            default_value: Some("default".to_owned()),
+        };
+        assert!(validate_test_prompt(&input).is_ok());
+
+        let schema = serde_json::to_value(schemars::schema_for!(TestPromptInput))
+            .expect("测试窗体输入架构应可序列化");
+        assert!(schema["properties"].get("password").is_none());
+        assert!(schema["properties"].get("message").is_some());
+        assert!(schema["properties"].get("default_value").is_some());
+    }
+
+    #[test]
+    fn test_prompt_input_rejects_oversized_copy() {
+        let input = TestPromptInput {
+            title: "标题".to_owned(),
+            message: "说明".to_owned(),
+            default_value: Some("x".repeat(4_097)),
+        };
+        assert!(validate_test_prompt(&input).is_err());
+    }
+
+    #[test]
+    fn password_prompt_result_never_serializes_secret_value() {
+        let output = TestPromptOutput {
+            submitted: true,
+            action: "accept".to_owned(),
+            value: None,
+            value_length: 12,
+            sha256: Some("a".repeat(64)),
+        };
+        let serialized = serde_json::to_string(&output).expect("测试结果应可序列化");
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("secret"));
+        assert!(serialized.contains("value_length"));
+        assert!(serialized.contains("sha256"));
+    }
+
+    #[test]
+    fn test_prompt_tools_are_hidden_by_default_and_enabled_explicitly() {
+        let disabled = configured_tool_router(false);
+        assert!(!disabled.has_route("test_prompt_text"));
+        assert!(!disabled.has_route("test_prompt_password"));
+
+        let enabled = configured_tool_router(true);
+        assert!(enabled.has_route("test_prompt_text"));
+        assert!(enabled.has_route("test_prompt_password"));
     }
 
     #[test]
@@ -3644,6 +3873,7 @@ mod tests {
             controller_token: None,
             owner_id: None,
             command_mode: CommandMode::Approval,
+            enable_test_ui: false,
             pairs: Vec::new(),
         }
     }

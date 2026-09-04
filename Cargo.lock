@@ -1987,6 +1987,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link 0.2.1",
+]
+
+[[package]]
 name = "hpke"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2720,6 +2731,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "network-interface"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ddcb8865ad3d9950f22f42ffa0ef0aecbfbf191867b3122413602b0a360b2a6"
+dependencies = [
+ "cc",
+ "libc",
+ "thiserror 2.0.20",
+ "winapi",
 ]
 
 [[package]]
@@ -3704,6 +3727,7 @@ dependencies = [
  "remoteops-audit",
  "remoteops-device",
  "remoteops-domain",
+ "remoteops-host-identity",
  "remoteops-policy",
  "remoteops-protocol",
  "remoteops-serial",
@@ -3777,6 +3801,7 @@ dependencies = [
  "clap",
  "remoteops-audit",
  "remoteops-domain",
+ "remoteops-host-identity",
  "remoteops-policy",
  "remoteops-protocol",
  "remoteops-session",
@@ -3915,6 +3940,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "remoteops-host-identity"
+version = "0.2.0-preview.5"
+dependencies = [
+ "hostname",
+ "network-interface",
 ]
 
 [[package]]

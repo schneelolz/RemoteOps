@@ -212,6 +212,7 @@ mod tests {
             display_index: 0,
             alias: None,
             hostname: "test-host".to_owned(),
+            mac_address: None,
             operating_system: "Windows".to_owned(),
             capabilities: CapabilitySet::default(),
             environment: remoteops_domain::EnvironmentProfile::empty(),

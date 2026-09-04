@@ -63,10 +63,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use remoteops_domain::{ControllerInstanceId, ControllerOwnerId};
+    use remoteops_domain::{AgentInstanceId, ControllerInstanceId, ControllerOwnerId};
     use tokio::io::duplex;
 
-    use crate::{ClientHello, ControllerHello, ControllerKind, PROTOCOL_VERSION, WireMessage};
+    use crate::{
+        AgentHello, ClientHello, ControllerHello, ControllerKind, PROTOCOL_VERSION, WireMessage,
+    };
 
     use super::*;
 
@@ -78,6 +80,8 @@ mod tests {
             owner_id: ControllerOwnerId::new(),
             kind: ControllerKind::Human,
             auth_token: "test-controller-token".to_owned(),
+            hostname: None,
+            mac_address: None,
         }));
         let (mut client, mut server) = duplex(4096);
 
@@ -91,5 +95,50 @@ mod tests {
         writer.await.expect("写入任务不应失败");
 
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn legacy_controller_hello_defaults_new_identity_fields() {
+        let value = serde_json::json!({
+            "role": "controller",
+            "protocol_version": PROTOCOL_VERSION,
+            "controller_instance_id": "00000000-0000-0000-0000-000000000001",
+            "owner_id": "00000000-0000-0000-0000-000000000002",
+            "kind": "ai",
+            "auth_token": "legacy-controller-token"
+        });
+        let hello: ClientHello =
+            serde_json::from_value(value).expect("旧 Controller Hello 应可解析");
+        let ClientHello::Controller(hello) = hello else {
+            panic!("应解析为 Controller Hello");
+        };
+        assert_eq!(hello.hostname, None);
+        assert_eq!(hello.mac_address, None);
+    }
+
+    #[test]
+    fn legacy_agent_hello_defaults_mac_address() {
+        let mut value = serde_json::to_value(ClientHello::Agent(AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_instance_id: AgentInstanceId::new(),
+            resume_token: None,
+            hostname: "legacy-agent".to_owned(),
+            operating_system: "Windows".to_owned(),
+            capabilities: remoteops_domain::CapabilitySet::default(),
+            environment: remoteops_domain::EnvironmentProfile::empty(),
+            credential_encryption_public_key: String::new(),
+            credential_encryption_key_id: String::new(),
+            mac_address: None,
+        }))
+        .expect("Agent Hello 应可序列化");
+        value
+            .as_object_mut()
+            .expect("Agent Hello 应为对象")
+            .remove("mac_address");
+        let hello: ClientHello = serde_json::from_value(value).expect("旧 Agent Hello 应可解析");
+        let ClientHello::Agent(hello) = hello else {
+            panic!("应解析为 Agent Hello");
+        };
+        assert_eq!(hello.mac_address, None);
     }
 }

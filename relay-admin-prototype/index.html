@@ -3,9 +3,19 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RemoteOps Relay Admin - 运维管理控制台</title>
-  <meta name="description" content="RemoteOps Relay 内部运维管理控制台" />
+  <title>RemoteOps Relay Admin - 内部运维管理控制台</title>
+  <meta name="description" content="RemoteOps Relay 内部运维管理控制台 - 集群监控、会话管理、Agent 拓扑与安全审计" />
+  <meta name="theme-color" content="#080c14" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563EB'/%3E%3Cpath d='M10 24V8h7a5 5 0 0 1 0 10h-4l5 6h-3.5l-4.5-6H13v6h-3z' fill='white'/%3E%3C/svg%3E" type="image/svg+xml" />
   <link rel="stylesheet" href="style.css" />
+  <script>
+    (function() {
+      try {
+        const savedTheme = localStorage.getItem('remoteops-theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+      } catch (_) {}
+    })();
+  </script>
 </head>
 <body>
   <!-- App Root Mount -->

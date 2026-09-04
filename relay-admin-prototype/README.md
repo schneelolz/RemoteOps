@@ -25,6 +25,8 @@ python3 -m http.server 8080
 ```
 并在浏览器访问 `http://localhost:8080`（注：需配合运行中的 Relay 实例进行 API 交互）。
 
+直接双击打开 `index.html` 时会进入本地静态模式，自动加载本地数据，不需要输入密码，也不会请求任何 Relay API。通过 Relay 管理地址访问时，页面仍使用真实的管理员用户名和密码登录。
+
 ---
 
 ## 🧭 功能模块与界面规范
@@ -47,7 +49,7 @@ python3 -m http.server 8080
   - **🛑 紧急停止 (Emergency Stop)**：向 `/api/admin/sessions/{session_id}/emergency-stop` 发送强制停止信号，需手动输入 `STOP` 解锁高危确认。
 
 ### 4. Agent 节点管理 (`/agents`)
-- **节点拓扑看板**：展示已注册的 Agent 实例 ID、主机名、操作系统、绑定 Session、控制码状态、最近心跳及就绪状态。
+- **节点拓扑看板**：展示已注册的 Agent 实例 ID、计算机名、MAC 地址、操作系统、绑定 Session、控制码状态、最近心跳及就绪状态。
 
 ### 5. Relay 身份与凭据 (`/identity`)
 - **双列响应式布局**：宽屏下并排展示，窄屏 (`<= 1024px`) 自动折叠为单列。

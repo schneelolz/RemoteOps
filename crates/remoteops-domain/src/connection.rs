@@ -63,6 +63,9 @@ pub struct ConnectionDescriptor {
     pub permission_mode: PermissionMode,
     /// 最近一次状态更新时间。
     pub updated_at: DateTime<Utc>,
+    /// Agent 主机的高置信度 MAC 地址；无法可靠判断时为空。
+    #[serde(default)]
+    pub mac_address: Option<String>,
 }
 
 impl ConnectionDescriptor {

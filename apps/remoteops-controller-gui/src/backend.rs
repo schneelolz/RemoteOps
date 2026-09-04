@@ -2131,6 +2131,7 @@ fn demo_connection(index: u32, alias: &str, hostname: &str) -> ConnectionDescrip
         display_index: index,
         alias: Some(alias.to_owned()),
         hostname: hostname.to_owned(),
+        mac_address: None,
         operating_system: "Windows 11".to_owned(),
         capabilities: CapabilitySet::default(),
         environment: remoteops_domain::EnvironmentProfile::empty(),

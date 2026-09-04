@@ -51,6 +51,9 @@ pub struct AgentHello {
     pub credential_encryption_public_key: String,
     /// 当前 HPKE 公钥的 SHA-256 标识。
     pub credential_encryption_key_id: String,
+    /// Agent 主机的高置信度 MAC 地址；无法可靠判断时为空。
+    #[serde(default)]
+    pub mac_address: Option<String>,
 }
 
 /// Controller 建立传输连接时的身份声明。
@@ -66,6 +69,12 @@ pub struct ControllerHello {
     pub kind: ControllerKind,
     /// Relay 独立配置的控制端认证令牌。
     pub auth_token: String,
+    /// Controller 所在计算机名；旧客户端未提供时为空。
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Controller 主机的高置信度 MAC 地址；旧客户端未提供时为空。
+    #[serde(default)]
+    pub mac_address: Option<String>,
 }
 
 /// 客户端发出的第一条消息。

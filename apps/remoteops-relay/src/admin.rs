@@ -81,6 +81,7 @@ pub(crate) struct AdminAgent {
     pub agent_instance_id: AgentInstanceId,
     pub session_id: SessionId,
     pub hostname: String,
+    pub mac_address: Option<String>,
     pub operating_system: String,
     pub state: String,
     pub pairing_code_configured: bool,
@@ -99,6 +100,8 @@ pub(crate) struct AdminController {
     pub owner_id: ControllerOwnerId,
     pub connection_generation: u64,
     pub session_ids: Vec<SessionId>,
+    pub hostname: Option<String>,
+    pub mac_address: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -107,6 +110,8 @@ pub(crate) struct AdminControllerBinding {
     pub kind: String,
     pub owner_id: ControllerOwnerId,
     pub permission_mode: PermissionMode,
+    pub controller_hostname: Option<String>,
+    pub controller_mac_address: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,6 +119,7 @@ pub(crate) struct AdminSession {
     pub session_id: SessionId,
     pub agent_instance_id: AgentInstanceId,
     pub hostname: String,
+    pub mac_address: Option<String>,
     pub operating_system: String,
     pub state: String,
     pub role: String,

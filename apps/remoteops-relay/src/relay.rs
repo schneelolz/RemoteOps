@@ -131,6 +131,8 @@ struct ControllerRecord {
     owner_id: ControllerOwnerId,
     kind: ControllerKind,
     connection_generation: u64,
+    hostname: Option<String>,
+    mac_address: Option<String>,
 }
 
 #[derive(Clone)]
@@ -414,6 +416,7 @@ impl Relay {
                 agent_instance_id: agent.hello.agent_instance_id,
                 session_id: agent.session_id,
                 hostname: agent.hello.hostname.clone(),
+                mac_address: agent.hello.mac_address.clone(),
                 operating_system: agent.hello.operating_system.clone(),
                 state: if agent.ready && agent.sender.is_some() {
                     "online"
@@ -441,6 +444,8 @@ impl Relay {
                 owner_id: controller.owner_id,
                 connection_generation: controller.connection_generation,
                 session_ids: controller.sessions.iter().copied().collect(),
+                hostname: controller.hostname.clone(),
+                mac_address: controller.mac_address.clone(),
             })
             .collect::<Vec<_>>();
         let sessions = state
@@ -458,6 +463,14 @@ impl Relay {
                                 owner_id: binding.owner_id,
                                 permission_mode: bindings
                                     .permission_mode_for(binding.controller_kind),
+                                controller_hostname: state
+                                    .controllers
+                                    .get(&binding.controller_id)
+                                    .and_then(|controller| controller.hostname.clone()),
+                                controller_mac_address: state
+                                    .controllers
+                                    .get(&binding.controller_id)
+                                    .and_then(|controller| controller.mac_address.clone()),
                             })
                             .collect::<Vec<_>>()
                     })
@@ -466,6 +479,7 @@ impl Relay {
                     session_id: agent.session_id,
                     agent_instance_id: agent.hello.agent_instance_id,
                     hostname: agent.hello.hostname.clone(),
+                    mac_address: agent.hello.mac_address.clone(),
                     operating_system: agent.hello.operating_system.clone(),
                     state: if agent.ready && agent.sender.is_some() {
                         "online"
@@ -1129,7 +1143,14 @@ impl Relay {
         let owner_id = hello.owner_id;
         let controller_kind = hello.kind;
         let connection_generation = self
-            .register_controller(controller_id, owner_id, controller_kind, sender.clone())
+            .register_controller(
+                controller_id,
+                owner_id,
+                controller_kind,
+                hello.hostname.clone(),
+                hello.mac_address.clone(),
+                sender.clone(),
+            )
             .await?;
         sender
             .send(WireMessage::ControllerWelcome {
@@ -1227,6 +1248,8 @@ impl Relay {
         controller_id: ControllerInstanceId,
         owner_id: ControllerOwnerId,
         kind: ControllerKind,
+        hostname: Option<String>,
+        mac_address: Option<String>,
         sender: Sender,
     ) -> anyhow::Result<u64> {
         let mut state = self.state.lock().await;
@@ -1246,6 +1269,8 @@ impl Relay {
                 owner_id,
                 kind,
                 connection_generation,
+                hostname,
+                mac_address,
             },
         );
         Ok(connection_generation)
@@ -3208,6 +3233,7 @@ fn descriptor(agent: &AgentRecord, state: ConnectionState) -> ConnectionDescript
         environment: agent.hello.environment.clone(),
         credential_encryption_public_key: agent.hello.credential_encryption_public_key.clone(),
         credential_encryption_key_id: agent.hello.credential_encryption_key_id.clone(),
+        mac_address: agent.hello.mac_address.clone(),
         state,
         role: SessionRole::HumanControl,
         permission_mode: agent.permission_mode,
@@ -3366,6 +3392,7 @@ mod tests {
             environment: remoteops_domain::EnvironmentProfile::empty(),
             credential_encryption_public_key: "test-public-key".to_owned(),
             credential_encryption_key_id: "test-key-id".to_owned(),
+            mac_address: Some("00:11:22:33:44:55".to_owned()),
         }
     }
 
@@ -3405,6 +3432,40 @@ mod tests {
         assert!(relay.register_agent(invalid, invalid_sender).await.is_err());
     }
 
+    #[tokio::test]
+    async fn admin_snapshot_includes_agent_and_controller_host_identity() {
+        let relay = relay(Duration::minutes(10));
+        let agent_id = AgentInstanceId::new();
+        let (_registration, _receiver, _session_id) = ready_agent(&relay, agent_id, None).await;
+        let controller_id = ControllerInstanceId::new();
+        let (sender, _receiver) = test_channel();
+        relay
+            .register_controller(
+                controller_id,
+                test_owner_id(),
+                ControllerKind::Ai,
+                Some("MCP-CONSOLE-01".to_owned()),
+                Some("00:AA:BB:CC:DD:EE".to_owned()),
+                sender,
+            )
+            .await
+            .expect("Controller 注册应成功");
+
+        let snapshot = relay.admin_snapshot().await;
+        assert_eq!(
+            snapshot.agents[0].mac_address.as_deref(),
+            Some("00:11:22:33:44:55")
+        );
+        assert_eq!(
+            snapshot.controllers[0].hostname.as_deref(),
+            Some("MCP-CONSOLE-01")
+        );
+        assert_eq!(
+            snapshot.controllers[0].mac_address.as_deref(),
+            Some("00:AA:BB:CC:DD:EE")
+        );
+    }
+
     async fn register_controller(
         relay: &Relay,
         kind: ControllerKind,
@@ -3420,7 +3481,7 @@ mod tests {
         let controller_id = ControllerInstanceId::new();
         let (sender, receiver) = test_channel();
         let generation = relay
-            .register_controller(controller_id, owner_id, kind, sender)
+            .register_controller(controller_id, owner_id, kind, None, None, sender)
             .await
             .expect("Controller 注册应成功");
         (controller_id, generation, receiver)
@@ -4047,6 +4108,8 @@ mod tests {
                     owner_id: test_owner_id(),
                     kind: ControllerKind::Human,
                     auth_token: HUMAN_TOKEN.to_owned(),
+                    hostname: None,
+                    mac_address: None,
                 })
                 .is_ok()
         );
@@ -4058,6 +4121,8 @@ mod tests {
                     owner_id: test_owner_id(),
                     kind: ControllerKind::Ai,
                     auth_token: HUMAN_TOKEN.to_owned(),
+                    hostname: None,
+                    mac_address: None,
                 })
                 .is_err()
         );
@@ -4069,6 +4134,8 @@ mod tests {
                     owner_id: test_owner_id(),
                     kind: ControllerKind::Human,
                     auth_token: AI_TOKEN.to_owned(),
+                    hostname: None,
+                    mac_address: None,
                 })
                 .is_err()
         );
@@ -4080,6 +4147,8 @@ mod tests {
                     owner_id: test_owner_id(),
                     kind: ControllerKind::Ai,
                     auth_token: AI_TOKEN.to_owned(),
+                    hostname: None,
+                    mac_address: None,
                 })
                 .is_ok()
         );
@@ -4091,6 +4160,8 @@ mod tests {
                     owner_id: other_owner_id(),
                     kind: ControllerKind::Human,
                     auth_token: HUMAN_TOKEN.to_owned(),
+                    hostname: None,
+                    mac_address: None,
                 })
                 .is_err()
         );
@@ -4759,6 +4830,8 @@ mod tests {
                 controller_id,
                 test_owner_id(),
                 ControllerKind::Human,
+                None,
+                None,
                 sender,
             )
             .await
@@ -4771,6 +4844,8 @@ mod tests {
                     controller_id,
                     test_owner_id(),
                     ControllerKind::Human,
+                    None,
+                    None,
                     sender
                 )
                 .await
@@ -4788,6 +4863,8 @@ mod tests {
                 controller_id,
                 test_owner_id(),
                 ControllerKind::Human,
+                None,
+                None,
                 sender,
             )
             .await
@@ -4801,6 +4878,8 @@ mod tests {
                 controller_id,
                 test_owner_id(),
                 ControllerKind::Human,
+                None,
+                None,
                 sender,
             )
             .await

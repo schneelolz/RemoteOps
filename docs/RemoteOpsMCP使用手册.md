@@ -87,7 +87,7 @@ Relay 临时中断或长时间停机时保持 Agent 运行即可。只要 `agent
 然后输入：
 
 ```text
-使用 RemoteOps 列出远程连接，并告诉我主机名、操作系统和可用 Shell。
+使用 RemoteOps 列出远程连接，并告诉我主机名、MAC 地址、操作系统和可用 Shell。
 ```
 
 Codex 会依次调用：
@@ -175,6 +175,10 @@ Get-NetIPAddress -AddressFamily IPv4
 - 切回逐项确认或 TTL 过期后，新写操作立即再次询问；
 - `request_action_approval` 仅用于显式 `--command-mode approval` 或独立 Human Controller 兼容流程，普通首版 MCP 不依赖它；
 - MCP 不能通过自然语言提升 Agent 本地 FullAccess，也不能绕过 Relay/Agent 的结构化校验。
+
+### MCP 本地输入界面测试
+
+需要验证当前 MCP 客户端是否支持输入表单时，可临时使用 `--enable-test-ui` 或设置 `REMOTEOPS_ENABLE_TEST_UI=true` 启动 MCP。该开关只注册 `test_prompt_text` 和 `test_prompt_password` 两个本地测试工具，不访问 Relay、不操作 Agent；默认关闭。密码测试结果只返回提交状态、长度和 SHA-256，不返回密码明文，也不会写入日志。
 
 可以对 Codex 说：
 

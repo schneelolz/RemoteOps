@@ -83,10 +83,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .to_string_lossy()
         .replace('\\', "/");
-    let readonly_client = start_mcp(&args, &transfer_root, None).await?;
+    let readonly_client = start_mcp(&args, &transfer_root, None, false).await?;
     assert_remoteops_discovery_guidance(&readonly_client)?;
     let readonly_tools = readonly_client.list_all_tools().await?;
     assert_pairing_tool_guidance(&readonly_tools)?;
+    for name in ["test_prompt_text", "test_prompt_password"] {
+        if readonly_tools.iter().any(|tool| tool.name.as_ref() == name) {
+            bail!("未启用测试 UI 时不应注册 MCP 工具：{name}");
+        }
+    }
     let readonly_run_command = readonly_tools
         .iter()
         .find(|tool| tool.name.as_ref() == "run_command")
@@ -114,7 +119,16 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     readonly_client.cancel().await?;
 
-    let client = start_mcp(&args, &transfer_root, Some("approval")).await?;
+    let test_ui_client = start_mcp(&args, &transfer_root, Some("approval"), true).await?;
+    let test_ui_tools = test_ui_client.list_all_tools().await?;
+    for name in ["test_prompt_text", "test_prompt_password"] {
+        if !test_ui_tools.iter().any(|tool| tool.name.as_ref() == name) {
+            bail!("启用测试 UI 后缺少 MCP 工具：{name}");
+        }
+    }
+    test_ui_client.cancel().await?;
+
+    let client = start_mcp(&args, &transfer_root, Some("approval"), false).await?;
 
     let tools = client.list_all_tools().await?;
     let tool_names: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
@@ -707,7 +721,7 @@ async fn main() -> anyhow::Result<()> {
     }
     client.cancel().await?;
 
-    let agent_controlled_client = start_mcp(&args, &transfer_root, None).await?;
+    let agent_controlled_client = start_mcp(&args, &transfer_root, None, false).await?;
     let first_pair = args.pair.first().context("缺少接管测试配对码")?;
     let (pairing_code, alias) = first_pair
         .split_once('=')
@@ -799,7 +813,7 @@ async fn main() -> anyhow::Result<()> {
         bail!("完全控制未能直接执行持久 Shell 命令：{full_access_result}");
     }
 
-    let takeover_client = start_mcp(&args, &transfer_root, None).await?;
+    let takeover_client = start_mcp(&args, &transfer_root, None, false).await?;
     let takeover_pair = call(
         &takeover_client,
         "pair_connection",
@@ -907,6 +921,7 @@ async fn start_mcp(
     args: &Args,
     transfer_root: &std::path::Path,
     command_mode: Option<&str>,
+    enable_test_ui: bool,
 ) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ()>> {
     let executable = args.mcp_executable.clone();
     let client = ()
@@ -930,6 +945,9 @@ async fn start_mcp(
                     .env("REMOTEOPS_CONTROLLER_TOKEN", &args.controller_token);
                 if let Some(command_mode) = command_mode {
                     command.arg("--command-mode").arg(command_mode);
+                }
+                if enable_test_ui {
+                    command.arg("--enable-test-ui");
                 }
             }),
         )?)
