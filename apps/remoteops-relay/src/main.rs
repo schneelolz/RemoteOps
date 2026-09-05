@@ -1,3 +1,8 @@
+//! RemoteOps Relay 的服务入口。
+//!
+//! 网络监听和宿主生命周期在这里处理；配对、Owner、审批、租约和转发规则
+//! 由 `relay` 模块统一维护，入口代码不自行决定权限。
+
 mod admin;
 mod relay;
 

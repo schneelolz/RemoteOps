@@ -1,3 +1,9 @@
+//! 现场 Agent 的运行时实现。
+//!
+//! 该模块负责主动连接 Relay、验证远程请求、调用设备适配器并维护 Agent
+//! 状态。GUI 和 Windows Service 只负责宿主生命周期与展示，不能绕过这里的
+//! 权限、Session 和操作校验。
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,

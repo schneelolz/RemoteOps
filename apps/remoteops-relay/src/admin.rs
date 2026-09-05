@@ -204,6 +204,10 @@ pub(crate) async fn serve(
         .route("/api/admin/identity", get(identity))
         .route("/api/admin/agents", get(agents))
         .route("/api/admin/sessions", get(sessions))
+        .route(
+            "/api/admin/sessions/closed/clear",
+            post(clear_closed_sessions),
+        )
         .route("/api/admin/sessions/{session_id}", get(session_detail))
         .route(
             "/api/admin/sessions/{session_id}/close",
@@ -433,6 +437,16 @@ async fn close_session(
             .relay
             .admin_close_session(session_id, "admin_api")
             .await,
+    ))
+}
+
+async fn clear_closed_sessions(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminActionOutcome>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers).await?;
+    Ok(Json(
+        state.relay.admin_purge_closed_sessions("admin_api").await,
     ))
 }
 

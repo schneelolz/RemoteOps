@@ -12,7 +12,7 @@ const state = {
   adminUser: '',
   activeDrawerSession: null,
   activeDrawerAgent: null,
-  activeModal: null, // 'terminateSession', 'emergencyStop'
+  activeModal: null, // 'terminateSession', 'emergencyStop', 'purgeClosedSessions'
   modalTargetData: null,
   stopInputText: '',
   filters: {
@@ -305,7 +305,8 @@ function applyApiData(overview, identity, rawAgents, rawSessions, rawAudit) {
       inflightRequests: session.in_flight_requests || 0,
       generation: session.connection_generation || 0,
       leaseExpire: formatApiDate(session.lease_expires_at),
-      status: session.state === 'online' ? 'ACTIVE' : 'DEGRADED'
+      isClosed: bindings.length === 0,
+      status: bindings.length === 0 ? 'CLOSED' : (session.state === 'online' ? 'ACTIVE' : 'DEGRADED')
     };
   });
 
@@ -712,10 +713,22 @@ async function confirmTerminateSession() {
   try {
     if (!state.demoMode) {
       await apiFetch(`/api/admin/sessions/${encodeURIComponent(sessionId)}/close`, { method: 'POST' });
+      await refreshRealData();
+    } else {
+      const session = sessions.find(item => item.id === sessionId);
+      if (session) {
+        session.isClosed = true;
+        session.status = 'CLOSED';
+        session.controllerType = 'None';
+        session.controllerHostname = '-';
+        session.controllerInstanceId = '-';
+        session.humanController = 'None';
+        session.pendingApprovals = 0;
+        session.inflightRequests = 0;
+      }
     }
     showToast(`会话 ${truncate(sessionId, 6, 4)} 已安全关闭`, 'success');
     closeDrawer();
-    await refreshRealData();
     renderApp();
   } catch (error) {
     showToast(`关闭会话失败：${error.message}`, 'error');
@@ -736,6 +749,29 @@ async function confirmEmergencyStop() {
     renderApp();
   } catch (error) {
     showToast(`紧急停止失败：${error.message}`, 'error');
+  }
+}
+
+async function confirmPurgeClosedSessions() {
+  const clearable = sessions.filter(session => session.isClosed && session.agentStatus !== 'online');
+  if (clearable.length === 0) {
+    closeModal();
+    showToast('没有可清除的已关闭会话', 'info');
+    return;
+  }
+
+  closeModal();
+  try {
+    if (state.demoMode) {
+      sessions = sessions.filter(session => !clearable.includes(session));
+    } else {
+      await apiFetch('/api/admin/sessions/closed/clear', { method: 'POST' });
+      await refreshRealData();
+    }
+    showToast(`已清除 ${clearable.length} 条已关闭会话记录`, 'success');
+    renderApp();
+  } catch (error) {
+    showToast(`清除已关闭会话失败：${error.message}`, 'error');
   }
 }
 
@@ -1024,6 +1060,9 @@ function renderSessionsView() {
   }
 
   const isFiltered = state.filters.keyword || state.filters.status !== 'ALL' || state.filters.controllerType !== 'ALL' || state.filters.permissionMode !== 'ALL';
+  const activeCount = sessions.filter(session => session.status === 'ACTIVE').length;
+  const closedCount = sessions.filter(session => session.isClosed).length;
+  const clearableClosedCount = sessions.filter(session => session.isClosed && session.agentStatus !== 'online').length;
 
   return `
     <div class="content-container">
@@ -1036,7 +1075,7 @@ function renderSessionsView() {
           </h1>
           <div class="page-desc">查看实时会话拓扑、权限控制模式、租约心跳，执行会话关闭与紧急停止</div>
         </div>
-        <div style="display:flex; gap:8px; align-items:center;">
+        <div class="page-header-actions">
           ${renderColumnPicker('sessions', sessionColumnDefinitions)}
           <button class="btn btn-secondary btn-sm" onclick="handleManualRefresh()">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
@@ -1046,7 +1085,7 @@ function renderSessionsView() {
       </div>
 
       <!-- Filter Toolbar -->
-      <div class="filter-toolbar">
+      <div class="filter-toolbar session-filter-toolbar">
         <div class="filter-left">
           <div class="search-input-wrap">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -1064,6 +1103,7 @@ function renderSessionsView() {
             <option value="ALL" ${state.filters.status === 'ALL' ? 'selected' : ''}>全部会话状态</option>
             <option value="ACTIVE" ${state.filters.status === 'ACTIVE' ? 'selected' : ''}>活跃 (Active)</option>
             <option value="DEGRADED" ${state.filters.status === 'DEGRADED' ? 'selected' : ''}>异常 / 降级</option>
+            <option value="CLOSED" ${state.filters.status === 'CLOSED' ? 'selected' : ''}>已关闭</option>
           </select>
 
           <select class="select" onchange="state.filters.controllerType = this.value; renderApp();">
@@ -1086,8 +1126,14 @@ function renderSessionsView() {
           ` : ''}
         </div>
 
-        <div style="font-size:12.5px; color:var(--text-muted);">
-          共计 <span class="font-mono" style="color:var(--text-primary); font-weight:600;">${filteredSessions.length}</span> 个会话
+        <div class="session-toolbar-summary">
+          <span>活跃 <strong class="font-mono">${activeCount}</strong></span>
+          <span>已关闭 <strong class="font-mono">${closedCount}</strong></span>
+          <button class="btn btn-danger btn-sm" onclick="openModal('purgeClosedSessions')" ${clearableClosedCount === 0 ? 'disabled' : ''} title="清除长期离线且已无 Controller 绑定的记录">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6m3 0V4h8v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+            清除已关闭 (${clearableClosedCount})
+          </button>
+          <span class="session-result-count">当前显示 <strong class="font-mono">${filteredSessions.length}</strong></span>
         </div>
       </div>
 
@@ -1102,7 +1148,7 @@ function renderSessionsView() {
 // Session Table Component
 function renderSessionTable(tableSessions, scope = 'sessions') {
   if (!tableSessions || tableSessions.length === 0) {
-    return renderEmptyState('暂无活跃会话', '当前 Relay 没有正在运行的 Session 记录');
+    return renderEmptyState('暂无匹配会话', '当前筛选条件下没有 Session 记录');
   }
 
   const visible = state.visibleColumns[scope] || [];
@@ -1133,11 +1179,11 @@ function renderSessionTable(tableSessions, scope = 'sessions') {
           ${tableSessions.map(s => {
             const isOnline = s.agentStatus === 'online';
             return `
-              <tr onclick="openSessionDrawer(${eventValue(s.id)})">
+              <tr class="${s.isClosed ? 'session-row-closed' : ''}" onclick="openSessionDrawer(${eventValue(s.id)})">
                 ${hasColumn('connectionStatus') ? `<td>
-                  <span class="badge ${isOnline ? 'badge-online' : 'badge-offline'}">
+                  <span class="badge ${s.isClosed ? 'badge-offline' : (isOnline ? 'badge-online' : 'badge-offline')} ">
                     <span class="badge-dot"></span>
-                    ${isOnline ? '在线' : '离线'}
+                    ${s.isClosed ? '已关闭' : (isOnline ? '在线' : '离线')}
                   </span>
                 </td>` : ''}
                 ${hasColumn('agentHostname') ? `<td>
@@ -1183,8 +1229,10 @@ function renderSessionTable(tableSessions, scope = 'sessions') {
                 <td style="text-align:right;" onclick="event.stopPropagation();">
                   <div class="btn-action-group">
                     <button class="btn btn-secondary btn-sm" onclick="openSessionDrawer(${eventValue(s.id)})">详情</button>
-                    <button class="btn btn-warning btn-sm" onclick="openModal('terminateSession', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })">关闭</button>
-                    <button class="btn btn-danger btn-sm" onclick="openModal('emergencyStop', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })" title="强制切断会话并发送紧急停止">🛑 停止</button>
+                    ${s.isClosed ? '<span class="table-muted-text session-closed-label">已关闭</span>' : `
+                      <button class="btn btn-warning btn-sm" onclick="openModal('terminateSession', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })">关闭</button>
+                      ${s.status === 'ACTIVE' ? `<button class="btn btn-danger btn-sm" onclick="openModal('emergencyStop', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })" title="强制切断会话并发送紧急停止">停止</button>` : ''}
+                    `}
                   </div>
                 </td>
               </tr>
@@ -1640,12 +1688,19 @@ function renderLoginView() {
         <div class="login-brand">
           <div class="brand-badge" style="width:38px; height:38px; font-size:18px;">R</div>
           <div>
-            <h1>RemoteOps Relay Admin</h1>
-            <p>内部运维管理控制台</p>
+            <div class="login-kicker">REMOTEOPS RELAY</div>
+            <h1>管理控制台</h1>
+            <p>安全登录以查看 Relay 运行状态</p>
           </div>
         </div>
 
-        <form onsubmit="handleLogin(event)" style="display:flex; flex-direction:column; gap:14px;">
+        <div class="login-security-note">
+          <span class="pulse-dot"></span>
+          <span>管理端连接已就绪</span>
+          <span class="login-security-meta">同源会话 · HTTPS</span>
+        </div>
+
+        <form class="login-form" onsubmit="handleLogin(event)">
           <div class="input-group">
             <label class="input-label" for="login-username">管理员账号 (Username)</label>
             <input type="text" id="login-username" class="input font-mono" autocomplete="username" value="admin" required />
@@ -1659,18 +1714,20 @@ function renderLoginView() {
               </button>
             </div>
             <input type="password" id="login-password" class="input font-mono" autocomplete="current-password" placeholder="输入管理员密码" required />
-            <span style="font-size:11.5px; color:var(--text-muted);">使用同源 HTTPS 登录，浏览器不持久化明文凭据。</span>
+            <span class="login-field-note">浏览器不会持久化明文凭据。</span>
           </div>
 
-          <div id="login-error-box" style="display:none; padding:10px 12px; background:var(--status-danger-bg); border:1px solid var(--status-danger-border); border-radius:var(--radius-md); color:var(--status-danger-text); font-size:12.5px;"></div>
+          <div id="login-error-box" class="login-error-box"></div>
 
-          <button type="submit" id="login-submit-btn" class="btn btn-primary" style="margin-top:6px; height:38px; font-size:13.5px;">
-            进入管理控制台
+          <button type="submit" id="login-submit-btn" class="btn btn-primary login-submit-btn">
+            <span>登录管理控制台</span>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg>
           </button>
         </form>
 
-        <div style="border-top:1px solid var(--border-subtle); padding-top:10px; font-size:11.5px; color:var(--text-muted); text-align:center;">
-          RemoteOps Relay 内部服务
+        <div class="login-footer">
+          <span>RemoteOps Relay</span>
+          <span class="font-mono">ADMIN ACCESS</span>
         </div>
       </div>
     </div>
@@ -1698,7 +1755,7 @@ async function handleLogin(e) {
   const password = document.getElementById('login-password').value;
 
   btn.disabled = true;
-  btn.innerText = '正在验证管理凭据...';
+  btn.innerHTML = '<span>正在验证管理凭据...</span>';
   errBox.style.display = 'none';
 
   state.api.baseUrl = window.location.origin;
@@ -1712,7 +1769,7 @@ async function handleLogin(e) {
     state.adminUser = result.username || username;
     await refreshRealData();
     btn.disabled = false;
-    btn.innerText = '进入管理控制台';
+    btn.innerHTML = '<span>登录管理控制台</span><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg>';
     state.isLoggedIn = true;
     state.currentTab = 'overview';
     window.history.replaceState(null, '', '#tab=overview');
@@ -1720,7 +1777,7 @@ async function handleLogin(e) {
     renderApp();
   } catch (error) {
     btn.disabled = false;
-    btn.innerText = '进入管理控制台';
+    btn.innerHTML = '<span>登录管理控制台</span><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg>';
     errBox.style.display = 'block';
     errBox.innerText = `登录失败：${error.message}`;
   }
@@ -2135,6 +2192,30 @@ function renderModal() {
           <button id="emg-stop-btn" class="btn btn-danger btn-sm" disabled onclick="confirmEmergencyStop()">
             🛑 确认紧急停止
           </button>
+        </div>
+      </div>
+    `;
+  } else if (mType === 'purgeClosedSessions') {
+    const clearableCount = sessions.filter(session => session.isClosed && session.agentStatus !== 'online').length;
+    modalContent = `
+      <div class="modal" style="border-color:var(--status-danger-border);">
+        <div class="modal-header">
+          <div class="modal-title" style="color:var(--status-danger-text);">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6m3 0V4h8v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+            <span>清除已关闭会话</span>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="closeModal()" aria-label="关闭">✕</button>
+        </div>
+        <div class="modal-body">
+          <p>将清除 <strong style="color:var(--text-primary);">${clearableCount}</strong> 条长期离线且已无 Controller 绑定的 Session 记录。</p>
+          <div class="token-management-note">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            <span>仍在线的 Agent 身份不会被删除；清理后这些离线记录将不再出现在会话列表中。</span>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary btn-sm" onclick="closeModal()">取消</button>
+          <button class="btn btn-danger btn-sm" onclick="confirmPurgeClosedSessions()">确认清除</button>
         </div>
       </div>
     `;

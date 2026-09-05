@@ -1,4 +1,8 @@
 //! Controller、Agent 和 Relay 壳子共用的应用服务。
+//!
+//! 这里编排连接、Session、权限、审批、事件和审计，但不依赖 GUI、CLI 或
+//! MCP 的具体交互方式。入口程序应把用户输入转换为这里的用例请求，再把
+//! 结果转换成自己的界面事件。
 #![allow(clippy::missing_errors_doc)]
 
 use std::{
@@ -366,6 +370,11 @@ impl RelayClient {
     }
 
     /// 使用配对码绑定一个 Agent。
+    ///
+    /// # Errors
+    ///
+    /// 配对码无效、Relay 拒绝配对、连接超时或返回不完整连接信息时失败。
+    /// 成功后才会把连接加入当前 Controller 的 Session 列表。
     pub async fn pair(
         &self,
         pairing_code: remoteops_domain::PairingCode,
@@ -433,6 +442,11 @@ impl RelayClient {
     }
 
     /// 向 Relay 申请一项与 `session_id` 和完整操作绑定的审批。
+    ///
+    /// # Errors
+    ///
+    /// 目标无法解析、Relay 不可用或审批响应超时都会返回错误。该方法只创建
+    /// 审批请求，不代表操作已经获批。
     pub async fn request_approval(
         &self,
         target: &str,
@@ -468,6 +482,11 @@ impl RelayClient {
     }
 
     /// 由已认证的人工 Controller 批准或拒绝一项精确操作。
+    ///
+    /// # Errors
+    ///
+    /// AI Controller 调用此方法会被拒绝；Session、审批 ID 或操作内容不匹配
+    /// 时 Relay 也会拒绝该决定。审批决定通过后仍由 Agent 执行最终校验。
     pub async fn decide_approval(
         &self,
         session_id: SessionId,
@@ -598,6 +617,11 @@ impl RelayClient {
     }
 
     /// 根据目标字符串和策略执行远程操作。
+    ///
+    /// # Errors
+    ///
+    /// 当目标不存在、策略拒绝、需要审批、传输失败或远程操作超时时返回
+    /// [`ApplicationError`]。`secret` 不允许用于传递远端凭据。
     pub async fn execute(
         &self,
         target: &str,
@@ -626,6 +650,11 @@ impl RelayClient {
     }
 
     /// 发送远程操作并立即返回可取消的请求句柄。
+    ///
+    /// # Errors
+    ///
+    /// 在请求进入传输队列前会完成目标解析、权限策略和审批状态检查；任一
+    /// 检查失败都会返回错误并写入脱敏审计记录。
     pub async fn start_execute(
         &self,
         target: &str,
@@ -693,6 +722,11 @@ impl RelayClient {
     }
 
     /// 立即中止指定会话中的全部在途任务并关闭交互资源。
+    ///
+    /// # Errors
+    ///
+    /// 当目标不存在、Relay 不可用或远端拒绝停止请求时返回错误。已经提交
+    /// 的终态不会被取消结果覆盖。
     pub async fn emergency_stop(&self, target: &str) -> Result<OperationResult, ApplicationError> {
         self.execute(
             target,

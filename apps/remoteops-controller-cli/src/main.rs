@@ -1,3 +1,8 @@
+//! RemoteOps Controller 的命令行壳。
+//!
+//! CLI 只负责参数解析、终端输入输出和人工确认；连接、权限、审批、审计
+//! 和远程操作通过 `remoteops-application` 复用。
+
 use std::{
     io::{self, Write},
     path::PathBuf,

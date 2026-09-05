@@ -689,6 +689,45 @@ impl Relay {
         }
     }
 
+    /// 清理已关闭且长期离线的 Agent 身份记录；在线 Agent 身份始终保留。
+    pub async fn admin_purge_closed_sessions(&self, source: &str) -> AdminActionOutcome {
+        let mut state = self.state.lock().await;
+        let removable_ids = state
+            .agents
+            .iter()
+            .filter(|(_, agent)| {
+                agent.lease_expired
+                    && agent.sender.is_none()
+                    && !state.session_bindings.contains_key(&agent.session_id)
+            })
+            .map(|(agent_id, _)| *agent_id)
+            .collect::<Vec<_>>();
+        let removed = removable_ids.len();
+        for agent_id in removable_ids {
+            if let Some(agent) = state.agents.remove(&agent_id) {
+                state.pairing_index.remove(&agent.lease.pairing_code);
+            }
+        }
+        append_audit(
+            &mut state,
+            "session_purge_closed",
+            None,
+            true,
+            source,
+            &format!("清理 {removed} 条已关闭且离线的 Session 记录"),
+        );
+        if removed > 0 {
+            if let Err(error) = self.persist_state_locked(&state) {
+                warn!(error = %error, "无法持久化已关闭 Session 清理结果");
+            }
+        }
+        AdminActionOutcome {
+            success: true,
+            changed: removed > 0,
+            message: format!("已清理 {removed} 条已关闭 Session 记录"),
+        }
+    }
+
     /// 管理员请求 Agent 紧急停止当前任务。
     #[allow(clippy::too_many_lines)]
     pub async fn admin_emergency_stop(

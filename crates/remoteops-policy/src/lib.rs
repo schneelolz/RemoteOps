@@ -143,12 +143,18 @@ impl Default for DefaultPolicy {
 
 impl DefaultPolicy {
     /// 评估远程操作是否可以立即执行。
+    ///
+    /// 返回值只描述策略结果，不执行操作，也不代表网络端已经接受请求。调用
+    /// 方仍需使用 Session、Owner 和 Relay 的认证结果完成后续校验。
     #[must_use]
     pub fn evaluate(&self, source: EventSource, operation: &RemoteOperation) -> PolicyDecision {
         self.evaluate_with_mode(PermissionMode::ApprovalRequired, source, operation)
     }
 
     /// 按会话权限模式评估远程操作。
+    ///
+    /// 只读声明会重新根据具体命令计算；命令与白名单不匹配时，即使调用方
+    /// 声明 `readonly` 也会被拒绝。高风险操作通常返回需要审批的决定。
     #[must_use]
     pub fn evaluate_with_mode(
         &self,
