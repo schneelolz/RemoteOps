@@ -71,8 +71,8 @@
     <circle cx="715" cy="225" r="5" fill="#A78BFA"/>
     <circle cx="735" cy="225" r="5" fill="#A78BFA" opacity="0.7"/>
     <circle cx="755" cy="225" r="5" fill="#A78BFA" opacity="0.4"/>
-    <text x="650" y="438" fill="#F5F3FF" font-family="Inter,Segoe UI,sans-serif" font-size="21" font-weight="700">SELF-HOSTED RELAY</text>
-    <text x="650" y="462" fill="#C4B5FD" font-family="Inter,Segoe UI,sans-serif" font-size="14">TLS · pairing · sessions · policy</text>
+    <text x="800" y="420" text-anchor="middle" fill="#F5F3FF" font-family="Inter,Segoe UI,sans-serif" font-size="21" font-weight="700">SELF-HOSTED RELAY</text>
+    <text x="800" y="444" text-anchor="middle" fill="#C4B5FD" font-family="Inter,Segoe UI,sans-serif" font-size="14">TLS · pairing · sessions · policy</text>
   </g>
 
   <!-- MCP card -->
@@ -88,14 +88,14 @@
   </g>
 
   <!-- Approval and audit rail -->
-  <path d="M260 548C540 500 1060 500 1340 548" stroke="#334155" stroke-width="2" stroke-dasharray="5 10"/>
-  <g transform="translate(470 505)">
+  <path d="M260 570C540 522 1060 522 1340 570" stroke="#334155" stroke-width="2" stroke-dasharray="5 10"/>
+  <g transform="translate(470 527)">
     <path d="M70 0L124 20V64C124 101 98 126 70 138C42 126 16 101 16 64V20L70 0Z" fill="#172554" stroke="#60A5FA" stroke-width="2"/>
     <path d="M46 67L62 83L94 48" stroke="#93C5FD" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
     <text x="160" y="54" fill="#E2E8F0" font-family="Inter,Segoe UI,sans-serif" font-size="20" font-weight="700">HUMAN APPROVAL</text>
     <text x="160" y="82" fill="#94A3B8" font-family="Inter,Segoe UI,sans-serif" font-size="15">session-bound · auditable · interruptible</text>
   </g>
-  <g transform="translate(1000 505)">
+  <g transform="translate(1000 527)">
     <rect x="0" y="18" width="74" height="74" rx="14" fill="#172554" stroke="#A78BFA" stroke-width="2"/>
     <path d="M20 42H54M20 57H54M20 72H43" stroke="#C4B5FD" stroke-width="6" stroke-linecap="round"/>
     <text x="100" y="54" fill="#E2E8F0" font-family="Inter,Segoe UI,sans-serif" font-size="20" font-weight="700">SANITIZED AUDIT</text>

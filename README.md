@@ -4,7 +4,7 @@
 
 <img src="assets/remoteops-logo.png" alt="RemoteOps logo" width="760" />
 
-<img src="assets/remoteops-hero.svg" alt="RemoteOps：现场 Windows Agent、自托管 Relay、本机 MCP 与人工审批组成的受控远程运维链路" width="100%" />
+<img src="assets/remoteops-hero.zh.svg" alt="RemoteOps：现场 Windows Agent、自托管 Relay、本机 MCP 与人工审批组成的受控远程运维链路" width="100%" />
 
 **让 AI 协助诊断和处理现场 Windows，同时保留连接、权限、审批和审计边界。**
 

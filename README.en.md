@@ -4,7 +4,7 @@
 
 <img src="assets/remoteops-logo.png" alt="RemoteOps logo" width="760" />
 
-<img src="assets/remoteops-hero.svg" alt="RemoteOps: a controlled operations path from a field Windows Agent through a self-hosted Relay to local MCP control" width="100%" />
+<img src="assets/remoteops-hero.en.svg" alt="RemoteOps: a controlled operations path from a field Windows Agent through a self-hosted Relay to local MCP control" width="100%" />
 
 **AI-assisted field diagnostics and controlled operations with explicit connection, permission, approval, and audit boundaries.**
 
