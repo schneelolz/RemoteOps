@@ -716,10 +716,10 @@ impl Relay {
             source,
             &format!("清理 {removed} 条已关闭且离线的 Session 记录"),
         );
-        if removed > 0 {
-            if let Err(error) = self.persist_state_locked(&state) {
-                warn!(error = %error, "无法持久化已关闭 Session 清理结果");
-            }
+        if removed > 0
+            && let Err(error) = self.persist_state_locked(&state)
+        {
+            warn!(error = %error, "无法持久化已关闭 Session 清理结果");
         }
         AdminActionOutcome {
             success: true,
