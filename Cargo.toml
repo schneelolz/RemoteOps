@@ -65,7 +65,7 @@ network-interface = "2.0.5"
 hostname = "0.4.2"
 zeroize = "1.9"
 winresource = "0.1.31"
-eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "persistence", "wgpu"] }
+eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "persistence", "wgpu"] }
 egui-phosphor = "0.13.0"
 
 [workspace.lints.rust]
