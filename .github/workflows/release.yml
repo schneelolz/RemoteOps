@@ -34,9 +34,9 @@ jobs:
             throw "CHANGELOG.md does not contain version $version"
           }
       - run: cargo fmt --all -- --check
-      - run: cargo check --workspace --exclude remoteops-agent-gui --exclude remoteops-agent-service --exclude remoteops-controller-gui --locked
-      - run: cargo clippy --workspace --exclude remoteops-agent-gui --exclude remoteops-agent-service --exclude remoteops-controller-gui --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --exclude remoteops-agent-gui --exclude remoteops-agent-service --exclude remoteops-controller-gui --locked
+      - run: cargo check --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --locked
+      - run: cargo clippy --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --locked
       - name: Check documentation
         shell: pwsh
         run: ./scripts/Test-Documentation.ps1
@@ -73,6 +73,8 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Build Linux Agent package
+        run: bash scripts/Build-LinuxAgent.sh release/linux-agent
       - name: Build Linux Relay
         run: |
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/remoteops --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME=/user"
@@ -143,6 +145,7 @@ jobs:
           cp "$mcp_zip" "assets/RemoteOps-MCP-Windows-x64-$version.zip"
           cp "$macos_mcp" "assets/RemoteOps-MCP-macOS-arm64-$version.tar.gz"
           tar -C "$(dirname "$relay_bin")" -czf "assets/RemoteOps-Relay-Linux-x64-$version.tar.gz" remoteops-relay LICENSE THIRD_PARTY_LICENSES.txt DEPENDENCIES.json
+          find release -name 'RemoteOps-Agent-linux-x64-*.tar.gz' -exec cp {} assets/ \;
           (cd assets && sha256sum RemoteOps-* > SHA256SUMS.txt)
       - name: Validate final release assets
         shell: pwsh

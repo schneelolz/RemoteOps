@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::{
     path::{Path, PathBuf},
@@ -6,47 +6,72 @@ use std::{
 };
 
 #[cfg(windows)]
-use std::{ffi::OsString, fs, sync::mpsc};
+use std::ffi::OsString;
+use std::{fs, io::Write, sync::mpsc};
 
 use anyhow::Context;
-#[cfg(windows)]
 use chrono::{DateTime, Utc};
 use clap::Parser;
-#[cfg(windows)]
 use remoteops_agent::AgentEvent;
 use remoteops_agent::{AgentConfig, run_agent};
-#[cfg(windows)]
 use remoteops_domain::AgentInstanceId;
-#[cfg(windows)]
 use serde::Serialize;
 use tokio::sync::watch;
+
+#[cfg(windows)]
+const DEFAULT_CONFIG: &str = r"C:\ProgramData\RemoteOps\Agent\agent-config.json";
+#[cfg(not(windows))]
+const DEFAULT_CONFIG: &str = "/etc/remoteops/agent-config.json";
+#[cfg(windows)]
+const DEFAULT_STATUS: &str = r"C:\ProgramData\RemoteOps\Agent\runtime-status.json";
+#[cfg(not(windows))]
+const DEFAULT_STATUS: &str = "/run/remoteops-agent/runtime-status.json";
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = interrupt.recv() => {},
+        _ = terminate.recv() => {},
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
 
 #[cfg(windows)]
 const SERVICE_NAME: &str = "RemoteOpsAgent";
 
 /// `RemoteOps` Agent 服务宿主参数。
 #[derive(Debug, Parser)]
-#[command(version, about = "RemoteOps 可选 Windows Agent 服务")]
+#[command(version, about = "RemoteOps Agent service host")]
 struct Args {
     /// Agent 配置文件；服务安装脚本会写入机器级目录。
     #[arg(
         long,
-        default_value = r"C:\ProgramData\RemoteOps\Agent\agent-config.json"
+        default_value = DEFAULT_CONFIG
     )]
     config: PathBuf,
     /// 服务运行状态文件；停止服务后自动删除。
     #[arg(
         long,
-        default_value = r"C:\ProgramData\RemoteOps\Agent\runtime-status.json"
+        default_value = DEFAULT_STATUS
     )]
     status_file: PathBuf,
     /// 在前台运行，用于安装前验证配置，不注册 SCM 服务。
     #[arg(long)]
     console: bool,
+    /// Validate config, TLS files and writable directories without connecting.
+    #[arg(long)]
+    check_config: bool,
 }
 
 /// 仅供本机服务管理使用的短期状态。
-#[cfg(windows)]
 #[derive(Debug, Default, Serialize)]
 struct RuntimeStatus {
     /// 当前服务状态。
@@ -68,27 +93,39 @@ fn load_config(path: &Path) -> anyhow::Result<AgentConfig> {
     config.normalize_and_validate()
 }
 
-#[cfg(windows)]
 fn write_status(path: &Path, status: &RuntimeStatus) {
-    let Ok(contents) = serde_json::to_vec_pretty(status) else {
-        return;
-    };
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let temporary = path.with_extension("json.tmp");
-    if fs::write(&temporary, contents).is_ok() {
-        if path.exists() {
-            let _ = fs::remove_file(path);
+    let result = (|| -> anyhow::Result<()> {
+        let contents = serde_json::to_vec_pretty(status)?;
+        let parent = path.parent().context("Status path has no parent")?;
+        fs::create_dir_all(parent)?;
+        let temporary = path.with_extension("json.tmp");
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        let _ = fs::rename(temporary, path);
+        // The service owns its runtime directory. Recover a leftover temp file
+        // after a previous process was killed while publishing status.
+        if temporary.exists() {
+            fs::remove_file(&temporary)?;
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("Cannot publish Agent runtime status: {error}");
     }
 }
 
-#[cfg(windows)]
 fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: AgentEvent) {
     match event {
         AgentEvent::Started {
@@ -295,34 +332,113 @@ mod windows_host {
     }
 }
 
-#[cfg(not(windows))]
-mod windows_host {
-    pub fn start() -> anyhow::Result<()> {
-        anyhow::bail!("remoteops-agent-service 仅支持 Windows")
-    }
+async fn run_foreground(args: &Args) -> anyhow::Result<()> {
+    let config = load_config(&args.config)?;
+    let (event_sender, event_receiver) = mpsc::channel();
+    let status_file = args.status_file.clone();
+    let status_thread = std::thread::spawn(move || {
+        let mut status = RuntimeStatus {
+            status: "starting".to_owned(),
+            ..RuntimeStatus::default()
+        };
+        write_status(&status_file, &status);
+        while let Ok(event) = event_receiver.recv() {
+            let previous = status.status.clone();
+            update_status_from_event(&status_file, &mut status, event);
+            if previous != status.status {
+                eprintln!("Agent state: {}", status.status);
+            }
+        }
+        let _ = fs::remove_file(status_file);
+    });
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let mut task = tokio::spawn(run_agent(config, Some(event_sender), shutdown_receiver));
+    let result = tokio::select! {
+        result = &mut task => result.context("Agent Service task failed")?,
+        signal = shutdown_signal() => {
+            signal.context("Cannot listen for shutdown signals")?;
+            let _ = shutdown_sender.send(true);
+            if let Ok(result) = tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+                result.context("Agent Service shutdown task failed")?
+            } else {
+                task.abort();
+                let _ = task.await;
+                Err(anyhow::anyhow!("Agent Service shutdown timed out"))
+            }
+        }
+    };
+    let _ = status_thread.join();
+    result
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    if args.console {
+    remoteops_agent::initialize_tracing();
+    if args.check_config {
         let config = load_config(&args.config)?;
-        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-        let mut task = tokio::spawn(run_agent(config, None, shutdown_receiver));
-        return tokio::select! {
-            result = &mut task => result.context("Agent Service 前台任务异常结束")?,
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("无法监听 Ctrl+C")?;
-                let _ = shutdown_sender.send(true);
-                if let Ok(result) = tokio::time::timeout(Duration::from_secs(10), &mut task).await {
-                    result.context("Agent Service 前台停止任务异常结束")?
-                } else {
-                    task.abort();
-                    let _ = task.await;
-                    Ok(())
-                }
-            }
-        };
+        if config.relay.contains("example.com") {
+            anyhow::bail!("Replace the example Relay address before starting the service");
+        }
+        if let Some(ca) = config.ca_cert.as_deref() {
+            fs::File::open(ca).context("Cannot read configured CA certificate")?;
+        }
+        fs::create_dir_all(&config.transfer_root)?;
+        let parent = config
+            .state_file
+            .parent()
+            .context("State path has no parent")?;
+        fs::create_dir_all(parent)?;
+        println!("Agent configuration validated");
+        return Ok(());
     }
-    windows_host::start()
+    if args.console || cfg!(not(windows)) {
+        return run_foreground(&args).await;
+    }
+    #[cfg(windows)]
+    {
+        windows_host::start()
+    }
+    #[cfg(not(windows))]
+    {
+        unreachable!()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn service_status_is_private_and_clears_expired_pairing() {
+        let dir = std::env::temp_dir().join(format!("remoteops-status-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("status.json");
+        let mut status = RuntimeStatus::default();
+        update_status_from_event(
+            &path,
+            &mut status,
+            AgentEvent::Connected {
+                pairing_code: "123-456-789".into(),
+                lease_expires_at: Utc::now(),
+            },
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        update_status_from_event(
+            &path,
+            &mut status,
+            AgentEvent::Reconnecting {
+                message: "offline".into(),
+                retry_seconds: 1,
+            },
+        );
+        let data: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(data["pairing_code"].is_null());
+        assert_eq!(data["status"], "reconnecting");
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

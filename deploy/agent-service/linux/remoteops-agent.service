@@ -1,0 +1,31 @@
+[Unit]
+Description=RemoteOps Headless Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=remoteops
+Group=remoteops
+ExecStart=/usr/lib/remoteops/remoteops-agent-service --config /etc/remoteops/agent-config.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+RuntimeDirectory=remoteops-agent
+RuntimeDirectoryMode=0700
+StateDirectory=remoteops
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/remoteops
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/remoteops /run/remoteops-agent
+
+[Install]
+WantedBy=multi-user.target

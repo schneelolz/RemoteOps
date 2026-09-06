@@ -2,6 +2,14 @@
 
 本变更日志只记录实际公开发布的版本。GitHub Release 发布前的内部构建、现场复测和修复不会递增公开版本号；必要的技术过程记录在项目状态和测试资料中。
 
+## [0.2.0-preview.6] - 待发布候选
+
+- 增加 Ubuntu 24.04 x86_64 Headless Agent、systemd 宿主、安装/卸载/状态脚本和带许可证、哈希清单的发布包。
+- Linux 进程与服务查询使用结构化输出，支持 POSIX Shell、低权限运行、SIGTERM/SIGINT 清理和安全的短期配对状态文件。
+- Controller 事件历史游标在 Agent 重启后保持单调，避免增量输出丢失；线协议保持 v14。
+- macOS MCP 安装器修复 JSON/plutil 写入，并保留现有全局审批配置。
+- 此版本为本地验收候选；未创建公开 Release。详见 Linux 验收报告。
+
 ## [未发布]
 
 - 准备首个 GitHub Technical Preview。

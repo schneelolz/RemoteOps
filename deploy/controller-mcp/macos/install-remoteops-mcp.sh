@@ -149,7 +149,14 @@ if [[ -n "$CA_CERT" ]]; then
   install -m 600 "$CA_CERT" "$INSTALLED_CA"
 fi
 
-plutil -create json "$CONNECTION_CONFIG"
+# macOS 13's plutil cannot mutate a JSON file directly.  Build a tiny XML
+# property list, apply mutations, then convert it to the JSON config expected
+# by the Rust MCP.
+cat > "$CONNECTION_CONFIG" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict/></plist>
+PLIST
 plutil -insert relay -string "$RELAY_ADDRESS" "$CONNECTION_CONFIG"
 plutil -insert server_name -string "$SERVER_NAME" "$CONNECTION_CONFIG"
 plutil -insert reconnect_seconds -integer 2 "$CONNECTION_CONFIG"
@@ -160,6 +167,8 @@ fi
 if [[ -n "$TLS_FINGERPRINT" ]]; then
   plutil -insert tls_fingerprint -string "$TLS_FINGERPRINT" "$CONNECTION_CONFIG"
 fi
+plutil -convert json -o "$CONNECTION_CONFIG.json" "$CONNECTION_CONFIG"
+mv "$CONNECTION_CONFIG.json" "$CONNECTION_CONFIG"
 chmod 600 "$CONNECTION_CONFIG"
 
 cat > "$LAUNCHER" <<EOF
@@ -195,16 +204,12 @@ else
 fi
 TEMP_CONFIG="$(mktemp "${TMPDIR:-/tmp}/remoteops-config.XXXXXX")"
 awk '
-  BEGIN {
-    print "approval_policy = { granular = { sandbox_approval = true, rules = true, mcp_elicitations = true, request_permissions = false, skill_approval = false } }"
-  }
   /^\[/ {
-    skip=($0 == "[approval_policy.granular]" || $0 ~ /^\[mcp_servers\.remoteops(\.|\])/)
+    skip=($0 ~ /^\[mcp_servers\.remoteops(\.|\])/)
     if (!skip) print
     next
   }
   skip { next }
-  /^[[:space:]]*approval_policy[[:space:]]*=/ { next }
   { print }
 ' "$CONFIG_PATH" > "$TEMP_CONFIG"
 while [[ -s "$TEMP_CONFIG" && -z "$(tail -n 1 "$TEMP_CONFIG" | tr -d '[:space:]')" ]]; do

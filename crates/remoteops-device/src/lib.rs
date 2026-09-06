@@ -86,6 +86,8 @@ struct ManagedChild {
 #[derive(Clone, Copy, Debug)]
 enum ProcessOutputEncoding {
     Utf8,
+    #[cfg(not(windows))]
+    PlainUtf8,
     #[cfg(windows)]
     WindowsCmdAuto,
     #[cfg(windows)]
@@ -99,6 +101,9 @@ impl ProcessOutputEncoding {
             return Self::WindowsCmdAuto;
         }
         let _ = shell;
+        #[cfg(not(windows))]
+        return Self::PlainUtf8;
+        #[cfg(windows)]
         Self::Utf8
     }
 
@@ -108,6 +113,9 @@ impl ProcessOutputEncoding {
             return Self::WindowsOem;
         }
         let _ = shell;
+        #[cfg(not(windows))]
+        return Self::PlainUtf8;
+        #[cfg(windows)]
         Self::Utf8
     }
 }
@@ -116,6 +124,8 @@ impl ProcessOutputEncoding {
 struct ProcessOutputDecoder {
     encoding: ProcessOutputEncoding,
     pending: Vec<u8>,
+    #[cfg(not(windows))]
+    terminal: TerminalEscapeFilter,
 }
 
 impl ProcessOutputDecoder {
@@ -123,6 +133,8 @@ impl ProcessOutputDecoder {
         Self {
             encoding,
             pending: Vec::new(),
+            #[cfg(not(windows))]
+            terminal: TerminalEscapeFilter::default(),
         }
     }
 
@@ -130,6 +142,10 @@ impl ProcessOutputDecoder {
         self.pending.extend_from_slice(bytes);
         match self.encoding {
             ProcessOutputEncoding::Utf8 => decode_utf8_incremental(&mut self.pending, final_chunk),
+            #[cfg(not(windows))]
+            ProcessOutputEncoding::PlainUtf8 => self
+                .terminal
+                .push(&decode_utf8_incremental(&mut self.pending, final_chunk)),
             #[cfg(windows)]
             ProcessOutputEncoding::WindowsCmdAuto => {
                 decode_windows_cmd_incremental(&mut self.pending, final_chunk)
@@ -141,6 +157,45 @@ impl ProcessOutputDecoder {
                 final_chunk,
             ),
         }
+    }
+}
+
+#[cfg(not(windows))]
+#[derive(Debug, Default)]
+enum TerminalEscapeFilter {
+    #[default]
+    Text,
+    Escape,
+    Csi,
+    String,
+    StringEscape,
+}
+
+#[cfg(not(windows))]
+impl TerminalEscapeFilter {
+    fn push(&mut self, text: &str) -> String {
+        let mut clean = String::with_capacity(text.len());
+        for ch in text.chars() {
+            match self {
+                Self::Text if ch == '\u{1b}' => *self = Self::Escape,
+                Self::Text => clean.push(ch),
+                Self::Escape => {
+                    *self = match ch {
+                        '[' => Self::Csi,
+                        ']' | 'P' | '^' | '_' => Self::String,
+                        _ => Self::Text,
+                    };
+                }
+                Self::Csi if ('@'..='~').contains(&ch) => *self = Self::Text,
+                Self::String if ch == '\u{7}' => *self = Self::Text,
+                Self::String if ch == '\u{1b}' => *self = Self::StringEscape,
+                Self::Csi | Self::String => {}
+                Self::StringEscape => {
+                    *self = if ch == '\\' { Self::Text } else { Self::String };
+                }
+            }
+        }
+        clean
     }
 }
 
@@ -1319,8 +1374,18 @@ impl SystemDevice {
         #[cfg(not(windows))]
         {
             let executable = match shell {
-                ShellKind::Cmd | ShellKind::System => "sh",
-                ShellKind::WindowsPowerShell | ShellKind::PowerShell => {
+                ShellKind::System => "/bin/sh",
+                ShellKind::Cmd => {
+                    return Err(DeviceError::Unsupported(
+                        "CMD is only available on Windows".to_owned(),
+                    ));
+                }
+                ShellKind::WindowsPowerShell => {
+                    return Err(DeviceError::Unsupported(
+                        "Windows PowerShell is not available on Unix".to_owned(),
+                    ));
+                }
+                ShellKind::PowerShell => {
                     if command_exists("pwsh") {
                         "pwsh"
                     } else {
@@ -1380,8 +1445,14 @@ impl SystemDevice {
         #[cfg(not(windows))]
         {
             match shell {
-                ShellKind::Cmd | ShellKind::System => Ok(("sh".to_owned(), Vec::new())),
-                ShellKind::WindowsPowerShell | ShellKind::PowerShell => {
+                ShellKind::System => Ok(("/bin/sh".to_owned(), Vec::new())),
+                ShellKind::Cmd => Err(DeviceError::Unsupported(
+                    "CMD is only available on Windows".to_owned(),
+                )),
+                ShellKind::WindowsPowerShell => Err(DeviceError::Unsupported(
+                    "Windows PowerShell is not available on Unix".to_owned(),
+                )),
+                ShellKind::PowerShell => {
                     if command_exists("pwsh") {
                         Ok((
                             "pwsh".to_owned(),
@@ -1566,7 +1637,9 @@ impl ShellProvider for SystemDevice {
         }
         #[cfg(not(windows))]
         {
-            shells.push(ShellKind::System);
+            if command_exists("/bin/sh") {
+                shells.push(ShellKind::System);
+            }
             if command_exists("pwsh") {
                 shells.push(ShellKind::PowerShell);
             }
@@ -1837,6 +1910,58 @@ impl TcpExchangeProvider for SystemDevice {
     }
 }
 
+#[cfg(not(windows))]
+fn require_systemd() -> Result<(), DeviceError> {
+    if !std::path::Path::new("/run/systemd/system").is_dir() || !command_exists("systemctl") {
+        return Err(DeviceError::Unsupported(
+            "systemd system service manager is unavailable".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn normalize_unix_inventory(result: &mut CommandResult, services: bool) -> Result<(), DeviceError> {
+    if result.exit_code != Some(0) {
+        return Err(DeviceError::Operation(format!(
+            "Inventory command failed (exit {:?}): {}",
+            result.exit_code,
+            result.stderr.trim()
+        )));
+    }
+    let mut items = Vec::new();
+    for line in result
+        .stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(512)
+    {
+        let mut rest = line.trim();
+        let mut columns = Vec::new();
+        for _ in 0..if services { 4 } else { 2 } {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            columns.push(&rest[..end]);
+            rest = rest[end..].trim_start();
+        }
+        let item = if services {
+            if columns.iter().any(|column| column.is_empty()) {
+                return Err(DeviceError::Operation(
+                    "Invalid systemctl inventory row".to_owned(),
+                ));
+            }
+            serde_json::json!({"Name":columns[0],"DisplayName":rest,"Status":columns[2],"LoadState":columns[1],"SubState":columns[3]})
+        } else {
+            let pid = columns[0]
+                .parse::<u32>()
+                .map_err(|_| DeviceError::Operation("Invalid process inventory PID".to_owned()))?;
+            serde_json::json!({"Id":pid,"ProcessName":columns[1],"CommandLine":rest})
+        };
+        items.push(item);
+    }
+    result.stdout = serde_json::json!({"returned":items.len(),"items":items}).to_string();
+    Ok(())
+}
+
 #[async_trait]
 impl SystemProvider for SystemDevice {
     async fn list_processes(&self) -> Result<CommandResult, DeviceError> {
@@ -1851,11 +1976,21 @@ impl SystemProvider for SystemDevice {
             .await;
         }
         #[cfg(not(windows))]
-        ShellProvider::run(self, ShellKind::System, "ps -eo pid,comm,args", 30).await
+        {
+            let mut result = ShellProvider::run(
+                self,
+                ShellKind::System,
+                "LC_ALL=C ps -eo pid=,comm=,args=",
+                30,
+            )
+            .await?;
+            normalize_unix_inventory(&mut result, false)?;
+            Ok(result)
+        }
     }
 
     async fn terminate_process(&self, process_id: u32) -> Result<CommandResult, DeviceError> {
-        if process_id == 0 || process_id == std::process::id() {
+        if process_id <= 1 || process_id == std::process::id() {
             return Err(DeviceError::InvalidInput(
                 "不能终止系统空闲进程或当前 Agent 进程".to_owned(),
             ));
@@ -1892,13 +2027,18 @@ impl SystemProvider for SystemDevice {
             .await;
         }
         #[cfg(not(windows))]
-        ShellProvider::run(
-            self,
-            ShellKind::System,
-            "systemctl list-units --type=service --all --no-pager",
-            45,
-        )
-        .await
+        {
+            require_systemd()?;
+            let mut result = ShellProvider::run(
+                self,
+                ShellKind::System,
+                "LC_ALL=C systemctl list-units --type=service --all --no-pager --plain --no-legend",
+                45,
+            )
+            .await?;
+            normalize_unix_inventory(&mut result, true)?;
+            Ok(result)
+        }
     }
 
     async fn control_service(
@@ -1937,6 +2077,7 @@ impl SystemProvider for SystemDevice {
         }
         #[cfg(not(windows))]
         {
+            require_systemd()?;
             let action = match action {
                 ServiceAction::Start => "start",
                 ServiceAction::Stop => "stop",
@@ -1945,7 +2086,7 @@ impl SystemProvider for SystemDevice {
             ShellProvider::run(
                 self,
                 ShellKind::System,
-                &format!("systemctl {action} {service_name}"),
+                &format!("systemctl --no-ask-password {action} -- {service_name}"),
                 60,
             )
             .await
@@ -1967,7 +2108,21 @@ impl SystemProvider for SystemDevice {
                 )
                 .await;
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            require_systemd()?;
+            ShellProvider::run(
+                self,
+                ShellKind::System,
+                match action {
+                    PowerAction::Restart => "systemctl --no-ask-password reboot",
+                    PowerAction::Shutdown => "systemctl --no-ask-password poweroff",
+                },
+                30,
+            )
+            .await
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         ShellProvider::run(
             self,
             ShellKind::System,
@@ -3884,5 +4039,70 @@ mod tests {
             }
             session.close().await.expect("应关闭静默 PowerShell");
         }
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod unix_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_filter_preserves_split_utf8_and_removes_csi_and_osc() {
+        let mut decoder = ProcessOutputDecoder::new(ProcessOutputEncoding::PlainUtf8);
+        let input = "\u{1b}[31m中文\u{1b}[0m\u{1b}]0;hidden title\u{7}text\n";
+        let clean: String = input
+            .as_bytes()
+            .iter()
+            .map(|byte| decoder.push(&[*byte], false))
+            .collect();
+        assert_eq!(clean, "中文text\n");
+    }
+
+    #[test]
+    fn inventory_preserves_text_and_limits_reported_count() {
+        let mut result = CommandResult {
+            stdout: "42 myproc /usr/bin/myproc --name \"中文  text\"\n".repeat(600),
+            stderr: String::new(),
+            exit_code: Some(0),
+        };
+        normalize_unix_inventory(&mut result, false).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(data["returned"], 512);
+        assert_eq!(data["items"].as_array().unwrap().len(), 512);
+        assert_eq!(
+            data["items"][0]["CommandLine"],
+            "/usr/bin/myproc --name \"中文  text\""
+        );
+        let mut result = CommandResult {
+            stdout: "test@a.service loaded active running A service with spaces\n".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+        };
+        normalize_unix_inventory(&mut result, true).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(data["items"][0]["DisplayName"], "A service with spaces");
+        assert_eq!(data["items"][0]["Status"], "active");
+    }
+
+    #[test]
+    fn inventory_does_not_mask_command_failure() {
+        let mut result = CommandResult {
+            stdout: String::new(),
+            stderr: "permission denied".into(),
+            exit_code: Some(1),
+        };
+        assert!(normalize_unix_inventory(&mut result, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn actual_unix_process_inventory_is_json() {
+        let device = SystemDevice::default();
+        let result = device.list_processes().await.unwrap();
+        let data: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        let items = data["items"].as_array().unwrap();
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|item| item["Id"].as_u64().is_some()));
+        assert_eq!(data["returned"], items.len());
+        assert!(device.run(ShellKind::Cmd, "echo wrong", 5).await.is_err());
     }
 }

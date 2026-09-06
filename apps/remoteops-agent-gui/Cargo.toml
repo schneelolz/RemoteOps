@@ -37,6 +37,9 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 [build-dependencies]
 winresource.workspace = true
 
+# Allow workspace checks on Linux; the Linux release still ships headless only.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { workspace = true, features = ["x11"] }
+
 [lints]
 workspace = true
-

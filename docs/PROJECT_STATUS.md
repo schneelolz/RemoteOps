@@ -69,3 +69,7 @@
 ## 判断
 
 RemoteOps 已具备公开 Technical Preview 的产品形态。macOS MCP 可以明显降低 Mac 上 Codex 用户的试用门槛，但在 GitHub macOS arm64 CI 和真实 Apple Silicon Mac 安装验收完成前，仍应表述为“已实现、待实机验收”，不能宣称已经完成生产兼容。
+
+## Linux Headless 候选构建（2026-09-06）
+
+Ubuntu 24.04 x86_64 的 Agent/Service 为 `0.2.0-preview.6`，使用原有 v14 协议；Relay/MCP 仍为 preview.5。构建入口 `scripts/Build-LinuxAgent.sh`，部署与权限见 [Linux 服务说明](../deploy/agent-service/linux/README.md)，实测范围、证据及剩余门禁见 [Linux 验收报告](LinuxHeadless验收报告.md)。此记录不表示已经发布公开 GitHub Release。

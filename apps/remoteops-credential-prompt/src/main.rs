@@ -233,7 +233,7 @@ fn platform_prompt(
     command_sha256: &str,
     language: &str,
 ) -> anyhow::Result<PlatformResponse> {
-    const SCRIPT: &str = r#"
+    const SCRIPT: &str = r"
 ObjC.import('Cocoa')
 
 function run(argv) {
@@ -272,7 +272,7 @@ function run(argv) {
   password.setStringValue($(''))
   return action + '\n' + secret
 }
-"#;
+";
     let output = Command::new("osascript")
         .args([
             "-l",

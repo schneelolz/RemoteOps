@@ -13,6 +13,7 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 - [Relay 部署说明](Relay部署说明.md)
 - [现场被控端 GUI 使用说明](现场被控端GUI使用说明.md)
 - [Agent Windows Service 部署说明](../deploy/agent-service/windows/README.md)
+- Linux Headless Agent：`deploy/agent-service/linux`（Ubuntu 24.04 x86_64，systemd）
 - [RemoteOps MCP 使用手册](RemoteOpsMCP使用手册.md)
 - [Codex MCP 接入说明](CodexMCP接入说明.md)
 - [macOS MCP 接入说明](macOSMCP接入说明.md)

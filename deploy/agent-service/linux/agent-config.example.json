@@ -1,0 +1,8 @@
+{
+  "relay": "relay.example.com:7443",
+  "server_name": "relay.example.com",
+  "ca_cert": null,
+  "transfer_root": "/var/lib/remoteops/transfers",
+  "state_file": "/var/lib/remoteops/agent-state.json",
+  "retry_seconds": 3
+}

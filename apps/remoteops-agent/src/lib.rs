@@ -735,7 +735,7 @@ enum CancelTaskOutcome {
 
 const MAX_RECENT_TASK_TERMINALS: usize = 1_024;
 
-/// Windows 现场 Agent。
+/// `RemoteOps` 现场 Agent（Windows / Linux）。
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
@@ -819,6 +819,23 @@ pub fn initialize_tracing() {
         .try_init();
 }
 
+/// Wait for Ctrl+C or the Unix service stop signal.
+///
+/// # Errors
+/// Returns an error if signal registration fails.
+pub async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! { result = tokio::signal::ctrl_c() => result, _ = term.recv() => Ok(()) }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 /// 运行传统命令行 Agent。
 ///
 /// # Errors
@@ -837,7 +854,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
     let mut task = tokio::spawn(run_agent(config, Some(event_sender), shutdown_receiver));
     let result = tokio::select! {
         result = &mut task => result.context("Agent 运行任务异常结束")?,
-        signal = tokio::signal::ctrl_c() => {
+        signal = shutdown_signal() => {
             signal.context("无法监听 Ctrl+C")?;
             let _ = shutdown_sender.send(true);
             if let Ok(result) = tokio::time::timeout(Duration::from_secs(5), &mut task).await {
@@ -2720,11 +2737,24 @@ async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile
         architecture: std::env::consts::ARCH.to_owned(),
         elevated: detect_elevated(),
         shells,
-        tools: vec![ToolProfile {
-            name: "ssh".to_owned(),
-            available: ssh_available,
-            version: ssh_available.then(ssh_version).flatten(),
-        }],
+        tools: {
+            #[allow(unused_mut)]
+            let mut tools = vec![ToolProfile {
+                name: "ssh".to_owned(),
+                available: ssh_available,
+                version: ssh_available.then(ssh_version).flatten(),
+            }];
+            #[cfg(target_os = "linux")]
+            for name in ["systemctl", "journalctl", "apt-get", "dnf"] {
+                tools.push(ToolProfile {
+                    name: name.to_owned(),
+                    available: command_exists(name)
+                        && (name != "systemctl" || Path::new("/run/systemd/system").is_dir()),
+                    version: None,
+                });
+            }
+            tools
+        },
     }
 }
 
@@ -2757,12 +2787,18 @@ fn shell_executable(kind: ShellKind) -> &'static str {
     match kind {
         ShellKind::Cmd => "cmd.exe",
         ShellKind::WindowsPowerShell => "powershell.exe",
-        ShellKind::PowerShell => "pwsh.exe",
+        ShellKind::PowerShell => {
+            if cfg!(windows) {
+                "pwsh.exe"
+            } else {
+                "pwsh"
+            }
+        }
         ShellKind::System => {
             if cfg!(windows) {
                 "cmd.exe"
             } else {
-                "sh"
+                "/bin/sh"
             }
         }
     }
@@ -2799,7 +2835,15 @@ fn operating_system_version() -> Option<String> {
     if cfg!(windows) {
         windows_cmd_version()
     } else {
-        command_summary_line("uname", &["-sr"])
+        fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|text| {
+                text.lines().find_map(|line| {
+                    line.strip_prefix("PRETTY_NAME=")
+                        .map(|value| value.trim_matches('"').to_owned())
+                })
+            })
+            .or_else(|| command_summary_line("uname", &["-sr"]))
     }
 }
 
@@ -2923,7 +2967,7 @@ fn default_state_file() -> PathBuf {
                         },
                     )
                 },
-                PathBuf::from,
+                |path| PathBuf::from(path).join("RemoteOps"),
             )
             .join("agent-state.json")
     }
@@ -2938,7 +2982,22 @@ fn default_agent_data_root() -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        std::env::temp_dir().join("RemoteOps")
+        // Keep CLI runs user-writable while allowing the packaged service to
+        // override this with /var/lib/remoteops through its config file.
+        std::env::var_os("XDG_DATA_HOME").map_or_else(
+            || {
+                std::env::var_os("HOME").map_or_else(
+                    || std::env::temp_dir().join("RemoteOps"),
+                    |home| {
+                        PathBuf::from(home)
+                            .join(".local")
+                            .join("share")
+                            .join("RemoteOps")
+                    },
+                )
+            },
+            |path| PathBuf::from(path).join("RemoteOps"),
+        )
     }
 }
 
@@ -2989,9 +3048,14 @@ fn persist_agent_state(path: &std::path::Path, state: &AgentState) -> anyhow::Re
     ));
     let contents = serde_json::to_vec_pretty(&state)?;
     {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&temporary_path)
             .with_context(|| format!("无法创建 Agent 状态临时文件 {}", temporary_path.display()))?;
         file.write_all(&contents)?;
@@ -3003,6 +3067,7 @@ fn persist_agent_state(path: &std::path::Path, state: &AgentState) -> anyhow::Re
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(windows)]
     if path.exists() {
         std::fs::remove_file(path)
             .with_context(|| format!("无法替换 Agent 状态文件 {}", path.display()))?;

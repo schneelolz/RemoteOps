@@ -1333,7 +1333,7 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
             };
             let _ = sender.send(result);
         }
-        WireMessage::RemoteEvent(event) => {
+        WireMessage::RemoteEvent(mut event) => {
             if let Some(store) = &inner.audit {
                 let _ = store.append(&AuditEvent {
                     session_id: event.session_id,
@@ -1349,6 +1349,10 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
                 });
             }
             let mut history = inner.event_history.lock().await;
+            // Agent wire sequences restart with the process. The controller's
+            // history cursor must remain monotonic across transport recovery.
+            event.sequence =
+                next_history_sequence(history.back().map(|e| e.sequence), event.sequence);
             if history.len() >= 2048 {
                 history.pop_front();
             }
@@ -1533,6 +1537,10 @@ fn audit_response(response: &RemoteResponse) -> String {
     )
 }
 
+fn next_history_sequence(previous: Option<u64>, received: u64) -> u64 {
+    previous.map_or(received, |last| received.max(last.saturating_add(1)))
+}
+
 fn audit_event_payload(payload: &EventPayload) -> String {
     match payload {
         EventPayload::OperationRequested { operation } => {
@@ -1561,6 +1569,14 @@ fn audit_event_payload(payload: &EventPayload) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn history_cursor_survives_agent_sequence_reset() {
+        let before_restart = super::next_history_sequence(None, 42);
+        let after_restart = super::next_history_sequence(Some(before_restart), 1);
+        assert!(after_restart > before_restart);
+        assert_eq!(super::next_history_sequence(Some(after_restart), 2), 44);
+        assert_eq!(super::next_history_sequence(Some(44), 100), 100);
+    }
     use chrono::Utc;
     use remoteops_domain::{
         AgentInstanceId, CapabilitySet, ConnectionState, ControllerInstanceId, ControllerOwnerId,

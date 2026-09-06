@@ -46,6 +46,9 @@ keyring-core = "1.0"
 [build-dependencies]
 winresource.workspace = true
 
+# Supply winit's platform backend for Linux workspace checks.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { workspace = true, features = ["x11"] }
+
 [lints]
 workspace = true
-
