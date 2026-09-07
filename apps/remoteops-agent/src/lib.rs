@@ -1065,6 +1065,7 @@ where
         credential_encryption_public_key: credential_encryption.public_key_base64().to_owned(),
         credential_encryption_key_id: credential_encryption.key_id().to_owned(),
         mac_address,
+        supports_agent_shutdown: true,
     }));
     write_frame(&mut stream, &hello).await?;
     let welcome = match read_frame::<WireMessage, _>(&mut stream).await? {
@@ -1152,6 +1153,7 @@ where
             if heartbeat_sender
                 .send(WireMessage::Heartbeat {
                     sent_at: Utc::now(),
+                    controller_modes: Vec::new(),
                 })
                 .is_err()
             {
@@ -1160,6 +1162,7 @@ where
         }
     });
 
+    let mut graceful_shutdown = false;
     let connection_error = loop {
         let incoming = tokio::select! {
             result = read_frame::<WireMessage, _>(&mut reader) => Some(result),
@@ -1232,6 +1235,34 @@ where
                         &local_permission_policy,
                     );
                 }
+            }
+            Ok(WireMessage::AgentShutdownRequest(request)) => {
+                if request.agent_instance_id != agent_instance_id
+                    || request.connection_generation != welcome.connection_generation
+                {
+                    let _ = sender.send(WireMessage::AgentShutdownResult(
+                        remoteops_protocol::AgentShutdownResult {
+                            request_id: request.request_id,
+                            agent_instance_id,
+                            success: false,
+                            message: "Agent 关闭请求身份或连接代次不匹配".to_owned(),
+                        },
+                    ));
+                    continue;
+                }
+                abort_pending_tasks(&tasks).await;
+                close_agent_resources(&shell_sessions, &serial_sessions).await;
+                close_file_uploads(&file_uploads).await;
+                let _ = sender.send(WireMessage::AgentShutdownResult(
+                    remoteops_protocol::AgentShutdownResult {
+                        request_id: request.request_id,
+                        agent_instance_id,
+                        success: true,
+                        message: "Agent 已清理在途任务、Shell、串口和文件传输资源".to_owned(),
+                    },
+                ));
+                graceful_shutdown = true;
+                break None;
             }
             Ok(WireMessage::AuthorizedRemoteRequest(authorized)) => {
                 let request_id = authorized.request.request_id;
@@ -1425,7 +1456,12 @@ where
         }
     };
     heartbeat_task.abort();
-    writer_task.abort();
+    if graceful_shutdown {
+        drop(sender);
+        let _ = tokio::time::timeout(Duration::from_secs(2), writer_task).await;
+    } else {
+        writer_task.abort();
+    }
     abort_pending_tasks(&tasks).await;
     close_file_uploads(&file_uploads).await;
     local_permission_policy.set_active_owner(None);

@@ -164,3 +164,39 @@ docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml l
 - 发布前必须独立复核 Token、TLS 私钥、Owner UUID、控制码和状态卷备份策略。
 
 更完整的安全说明见 [安全模型](安全模型.md) 和 [发布与产物说明](发布与产物说明.md)。
+
+## 八、已验证的 SSH 远程更新流程
+
+以下流程已在 WireGuard 内网 Relay 主机上验证通过，适用于本项目后续版本更新：
+
+1. 使用 SSH 直连部署主机，不通过浏览器或 Agent 控制链路执行部署：
+
+   ```bash
+   ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes root@<relay 内网地址>
+   ```
+
+2. 在 `/opt/remoteops/release` 更新源码文件；保留服务器现有的 `deploy/relay/.env` 和 Docker 数据卷。
+3. 更新前在服务器创建带日期的源码备份，然后执行：
+
+   ```bash
+   cd /opt/remoteops/release/deploy/relay
+   docker compose --env-file .env -f docker-compose.yml config --quiet
+   ```
+
+4. 使用服务器 Docker 构建镜像。若服务器访问 crates.io 索引不稳定，将依赖 vendored 目录放入 Docker 构建上下文并使用 Cargo 离线模式；这只影响构建阶段，不改变 Relay 运行架构。
+5. 仅重建 Relay 服务，不删除数据卷：
+
+   ```bash
+   docker compose --env-file .env -f docker-compose.yml \
+     up -d --force-recreate --no-build remoteops-relay
+   ```
+
+6. 验收容器状态、健康接口和管理端口：
+
+   ```bash
+   docker ps --filter name=remoteops-relay
+   curl --fail http://127.0.0.1:18080/health
+   curl --fail -I http://127.0.0.1:18081/
+   ```
+
+禁止使用 `docker compose down -v`，也不要删除 `remoteops-relay-data`。该卷保存 Agent 恢复状态、控制码、会话绑定和审计数据。

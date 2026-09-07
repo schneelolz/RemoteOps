@@ -12,8 +12,9 @@ pub use credential::{
 };
 pub use message::{
     AgentHello, AgentLeaseRenewed, AgentPermissionModeChanged, AgentResumeCommitAck,
-    AgentResumeCommitted, AgentWelcome, AgentWelcomeAck, ApprovalDecision, ApprovalRequest,
-    ApprovalResult, AuthorizedRemoteRequest, ClientHello, ControllerBinding, ControllerHello,
+    AgentResumeCommitted, AgentShutdownRequest, AgentShutdownResult, AgentWelcome, AgentWelcomeAck,
+    ApprovalDecision, ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest, ClientHello,
+    ControllerBinding, ControllerControlMode, ControllerControlModeUpdate, ControllerHello,
     ControllerKind, PROTOCOL_VERSION, PairRequest, PairResult, RelayAuthorization,
     ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest, RemoteResponse, WireMessage,
 };

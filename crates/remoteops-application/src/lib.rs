@@ -24,10 +24,10 @@ use remoteops_domain::{
 use remoteops_policy::{DefaultPolicy, PolicyDecision};
 pub use remoteops_protocol::ControllerKind;
 use remoteops_protocol::{
-    ApprovalDecision, ApprovalRequest, ApprovalResult, ClientHello, ControllerHello,
-    PROTOCOL_VERSION, PairResult, ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest,
-    RemoteResponse, WireMessage, connect_tls, load_client_config, load_native_client_config,
-    load_pinned_client_config, read_frame, write_frame,
+    ApprovalDecision, ApprovalRequest, ApprovalResult, ClientHello, ControllerControlModeUpdate,
+    ControllerHello, PROTOCOL_VERSION, PairResult, ReleaseSessionRequest, ReleaseSessionResult,
+    RemoteRequest, RemoteResponse, WireMessage, connect_tls, load_client_config,
+    load_native_client_config, load_pinned_client_config, read_frame, write_frame,
 };
 use remoteops_session::ConnectionRegistry;
 use thiserror::Error;
@@ -246,6 +246,7 @@ struct ClientInner {
     pair_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<PairResult>>>,
     release_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ReleaseSessionResult>>>,
     approval_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ApprovalResult>>>,
+    controller_modes: Mutex<Vec<ControllerControlModeUpdate>>,
     known_pairings: Mutex<BTreeMap<PairingCode, Option<SessionId>>>,
     automatic_pair_pending: Mutex<BTreeMap<RequestId, PairingCode>>,
     events: broadcast::Sender<RemoteEvent>,
@@ -317,6 +318,7 @@ impl RelayClient {
             pair_pending: Mutex::new(BTreeMap::new()),
             release_pending: Mutex::new(BTreeMap::new()),
             approval_pending: Mutex::new(BTreeMap::new()),
+            controller_modes: Mutex::new(Vec::new()),
             known_pairings: Mutex::new(BTreeMap::new()),
             automatic_pair_pending: Mutex::new(BTreeMap::new()),
             events,
@@ -532,6 +534,19 @@ impl RelayClient {
     /// 返回当前连接列表。
     pub async fn list_connections(&self) -> Vec<ConnectionDescriptor> {
         self.inner.core.lock().await.list_connections()
+    }
+
+    /// 向 Relay 上报 MCP 本地控制模式，仅用于管理界面展示。
+    pub async fn report_controller_control_modes(
+        &self,
+        controller_modes: Vec<ControllerControlModeUpdate>,
+    ) -> Result<(), ApplicationError> {
+        *self.inner.controller_modes.lock().await = controller_modes.clone();
+        self.send_wire(WireMessage::Heartbeat {
+            sent_at: Utc::now(),
+            controller_modes,
+        })
+        .await
     }
 
     /// 使用 `session_id`、默认连接编号或唯一别名解析目标。
@@ -996,6 +1011,13 @@ async fn run_transport(
         });
     }
     set_connected(&inner.connected, true);
+    let initial_controller_modes = inner.controller_modes.lock().await.clone();
+    if !initial_controller_modes.is_empty() {
+        let _ = sender.send(WireMessage::Heartbeat {
+            sent_at: Utc::now(),
+            controller_modes: initial_controller_modes,
+        });
+    }
     if let Some(sender) = initial_sender {
         let _ = sender.send(Ok(()));
     }
@@ -1018,14 +1040,17 @@ async fn run_transport(
     });
 
     let heartbeat_sender = sender.clone();
+    let heartbeat_inner = inner.clone();
     let heartbeat_task = tokio::spawn(async move {
         let mut heartbeat = interval(TokioDuration::from_secs(15));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             heartbeat.tick().await;
+            let controller_modes = heartbeat_inner.controller_modes.lock().await.clone();
             if heartbeat_sender
                 .send(WireMessage::Heartbeat {
                     sent_at: Utc::now(),
+                    controller_modes,
                 })
                 .is_err()
             {
@@ -1640,6 +1665,7 @@ mod tests {
             pair_pending: Mutex::new(BTreeMap::new()),
             release_pending: Mutex::new(BTreeMap::new()),
             approval_pending: Mutex::new(BTreeMap::new()),
+            controller_modes: Mutex::new(Vec::new()),
             known_pairings: Mutex::new(BTreeMap::new()),
             automatic_pair_pending: Mutex::new(BTreeMap::new()),
             events,
@@ -1931,6 +1957,7 @@ mod tests {
         outgoing_sender
             .send(WireMessage::Heartbeat {
                 sent_at: Utc::now(),
+                controller_modes: Vec::new(),
             })
             .expect("并发发送应进入写队列");
         let outbound = timeout(

@@ -23,7 +23,10 @@ use remoteops_domain::{
     SerialLineEnding, SerialParity, SerialSettings, SerialStopBits, SerialTerminalProfile,
     ServiceAction, SessionId, ShellId, ShellKind,
 };
-use remoteops_protocol::{CredentialEncryptionContext, PROTOCOL_VERSION, seal_credential};
+use remoteops_protocol::{
+    ControllerControlMode, ControllerControlModeUpdate, CredentialEncryptionContext,
+    PROTOCOL_VERSION, seal_credential,
+};
 use rmcp::{
     Json, RoleServer, ServerHandler, ServiceExt,
     handler::server::router::tool::ToolRouter,
@@ -319,6 +322,7 @@ struct RemoteOpsMcp {
     command_mode: CommandMode,
     enable_test_ui: bool,
     full_access_grants: Arc<Mutex<BTreeMap<SessionId, FullAccessGrant>>>,
+    control_modes: Arc<Mutex<BTreeMap<SessionId, ControllerControlMode>>>,
     ssh_credential_cache: Arc<Mutex<BTreeMap<SshCredentialCacheKey, CachedSshCredential>>>,
     credential_prompt_lock: Arc<Mutex<()>>,
     credential_prompt: Arc<dyn CredentialPrompt>,
@@ -1149,17 +1153,67 @@ impl RemoteOpsMcp {
         command_mode: CommandMode,
         enable_test_ui: bool,
     ) -> Self {
-        Self {
+        let mcp = Self {
             client,
             shells: Arc::new(Mutex::new(BTreeMap::new())),
             transfer_root: Arc::new(transfer_root),
             command_mode,
             enable_test_ui,
             full_access_grants: Arc::new(Mutex::new(BTreeMap::new())),
+            control_modes: Arc::new(Mutex::new(BTreeMap::new())),
             ssh_credential_cache: Arc::new(Mutex::new(BTreeMap::new())),
             credential_prompt_lock: Arc::new(Mutex::new(())),
             credential_prompt: Arc::new(ProcessCredentialPrompt),
+        };
+        let reporter = mcp.clone();
+        tokio::spawn(async move { reporter.control_mode_reporter().await });
+        mcp
+    }
+
+    async fn control_mode_reporter(&self) {
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            ticker.tick().await;
+            self.report_current_control_modes().await;
         }
+    }
+
+    async fn report_current_control_modes(&self) {
+        let connections = self.client.list_connections().await;
+        let now = Instant::now();
+        let expired = {
+            let mut grants = self.full_access_grants.lock().await;
+            let expired = grants
+                .iter()
+                .filter_map(|(session_id, grant)| (!grant.is_active_at(now)).then_some(*session_id))
+                .collect::<Vec<_>>();
+            for session_id in &expired {
+                grants.remove(session_id);
+            }
+            expired
+        };
+        if !expired.is_empty() {
+            let mut modes = self.control_modes.lock().await;
+            for session_id in expired {
+                modes.insert(session_id, ControllerControlMode::Expired);
+            }
+        }
+        let modes = self.control_modes.lock().await;
+        let fallback = match self.command_mode {
+            CommandMode::Readonly => ControllerControlMode::ReadOnly,
+            CommandMode::Approval => ControllerControlMode::ExternalApproval,
+            CommandMode::FullAccess => ControllerControlMode::FullAccess,
+            CommandMode::AgentControlled => ControllerControlMode::StepByStep,
+        };
+        let updates = connections
+            .into_iter()
+            .map(|connection| {
+                let session_id = connection.session_id;
+                let mode = modes.get(&session_id).copied().unwrap_or(fallback);
+                ControllerControlModeUpdate { session_id, mode }
+            })
+            .collect();
+        let _ = self.client.report_controller_control_modes(updates).await;
     }
 
     fn runtime_tool_router(&self) -> ToolRouter<Self> {
@@ -1399,6 +1453,10 @@ impl RemoteOpsMcp {
         };
         if !grant.is_active_at(Instant::now()) {
             grants.remove(&session_id);
+            self.control_modes
+                .lock()
+                .await
+                .insert(session_id, ControllerControlMode::Expired);
             return false;
         }
         true
@@ -1669,6 +1727,7 @@ impl RemoteOpsMcp {
             output.control_mode = self.control_mode_name(session_id).await.to_owned();
             connections.push(output);
         }
+        self.report_current_control_modes().await;
         Json(ConnectionsOutput { connections })
     }
 
@@ -1710,6 +1769,11 @@ impl RemoteOpsMcp {
             .ok_or_else(|| "配对成功后未找到连接".to_owned())?;
         let session_id = connection.session_id;
         self.full_access_grants.lock().await.remove(&session_id);
+        self.control_modes
+            .lock()
+            .await
+            .insert(session_id, ControllerControlMode::StepByStep);
+        self.report_current_control_modes().await;
         let mut output = connection_output(connection);
         output.transfer_root = self.transfer_root.display().to_string();
         output.control_mode = self.control_mode_name(session_id).await.to_owned();
@@ -1769,6 +1833,10 @@ impl RemoteOpsMcp {
         match input.mode {
             McpControlMode::StepByStep => {
                 self.full_access_grants.lock().await.remove(&session_id);
+                self.control_modes
+                    .lock()
+                    .await
+                    .insert(session_id, ControllerControlMode::StepByStep);
             }
             McpControlMode::FullAccess => {
                 self.full_access_grants.lock().await.insert(
@@ -1777,8 +1845,13 @@ impl RemoteOpsMcp {
                         last_successful_use: Instant::now(),
                     },
                 );
+                self.control_modes
+                    .lock()
+                    .await
+                    .insert(session_id, ControllerControlMode::FullAccess);
             }
         }
+        self.report_current_control_modes().await;
         Ok(Json(self.control_mode_output(session_id).await))
     }
 
@@ -2965,6 +3038,8 @@ impl RemoteOpsMcp {
             .await
             .retain(|_, handle| handle.session_id != session_id);
         self.full_access_grants.lock().await.remove(&session_id);
+        self.control_modes.lock().await.remove(&session_id);
+        self.report_current_control_modes().await;
         self.clear_cached_ssh_credentials_for_session(session_id)
             .await;
         Ok(Json(action_output(session_id, result)))

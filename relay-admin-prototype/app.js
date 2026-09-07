@@ -12,7 +12,7 @@ const state = {
   adminUser: '',
   activeDrawerSession: null,
   activeDrawerAgent: null,
-  activeModal: null, // 'terminateSession', 'emergencyStop', 'purgeClosedSessions'
+  activeModal: null, // 'terminateSession', 'emergencyStop', 'shutdownAgent', 'purgeClosedSessions'
   modalTargetData: null,
   stopInputText: '',
   filters: {
@@ -133,7 +133,24 @@ function truncate(str, head = 8, tail = 6) {
 }
 
 function permissionLabel(value) {
-  return value === 'full_access' ? '完全控制' : '只读';
+  const labels = {
+    full_access: '完全控制',
+    read_only: '只读',
+    approval_required: '需审批',
+    controller_approved: 'Controller 已批准',
+  };
+  return labels[value] || '未知';
+}
+
+function mcpControlModeLabel(value) {
+  const labels = {
+    full_access: '完全控制',
+    step_by_step: '逐项确认',
+    read_only: '只读',
+    external_approval: '外部审批',
+    expired: '已过期',
+  };
+  return labels[value] || '未知/已失联';
 }
 
 // Column Definitions
@@ -272,7 +289,11 @@ function applyApiData(overview, identity, rawAgents, rawSessions, rawAudit) {
     everPaired: Boolean(agent.ever_paired),
     ready: Boolean(agent.ready),
     permissionMode: agent.permission_mode,
-    permissionLabel: escapeHtml(permissionLabel(agent.permission_mode))
+    permissionLabel: escapeHtml(permissionLabel(agent.permission_mode)),
+    mcpControlMode: agent.mcp_control_mode || null,
+    mcpControlLabel: escapeHtml(mcpControlModeLabel(agent.mcp_control_mode)),
+    supportsAgentShutdown: Boolean(agent.supports_agent_shutdown),
+    generation: agent.connection_generation || 0
   })));
 
   sessions = (rawSessions || []).map(session => {
@@ -299,6 +320,11 @@ function applyApiData(overview, identity, rawAgents, rawSessions, rawAudit) {
       ownerUuid: escapeHtml(session.owner_id ? String(session.owner_id) : relayInfo.ownerUuid),
       permissionMode,
       permissionLabel: escapeHtml(permissionLabel(permissionMode)),
+      relayPermissionLabel: escapeHtml(permissionLabel(permissionMode)),
+      mcpControlMode: session.mcp_control_mode || ai?.mcp_control_mode || null,
+      mcpControlLabel: escapeHtml(mcpControlModeLabel(session.mcp_control_mode || ai?.mcp_control_mode)),
+      supportsAgentShutdown: Boolean(agent?.supports_agent_shutdown),
+      agentGeneration: agent?.connection_generation || session.connection_generation || 0,
       connectTime: formatApiDate(session.last_seen),
       lastHeartbeat: formatApiDate(session.last_seen),
       pendingApprovals: session.pending_approvals || 0,
@@ -752,6 +778,34 @@ async function confirmEmergencyStop() {
   }
 }
 
+async function confirmShutdownAgent() {
+  if (!state.modalTargetData?.id) return;
+  const agentId = state.modalTargetData.id;
+  const agentName = state.modalTargetData.agentName || '';
+  const generation = Number(state.modalTargetData.generation || 0);
+  closeModal();
+  try {
+    if (!state.demoMode) {
+      await apiFetch(`/api/admin/agents/${encodeURIComponent(agentId)}/shutdown`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent_instance_id: agentId, connection_generation: generation })
+      });
+      await refreshRealData();
+    } else {
+      const agent = agents.find(item => item.id === agentId);
+      if (agent) agent.status = 'offline';
+      const session = sessions.find(item => item.agentId === agentId);
+      if (session) session.agentStatus = 'offline';
+    }
+    showToast(`Agent ${agentName} 已优雅退出`, 'success');
+    closeDrawer();
+    renderApp();
+  } catch (error) {
+    showToast(`关闭 Agent 失败：${error.message}`, 'error');
+  }
+}
+
 async function confirmPurgeClosedSessions() {
   const clearable = sessions.filter(session => session.isClosed && session.agentStatus !== 'online');
   if (clearable.length === 0) {
@@ -1201,9 +1255,8 @@ function renderSessionTable(tableSessions, scope = 'sessions') {
                 </td>` : ''}
                 ${hasColumn('controllerMacAddress') ? `<td><span class="font-mono table-secondary-text">${escapeHtml(s.controllerMacAddress === '-' ? '未提供' : s.controllerMacAddress)}</span></td>` : ''}
                 ${hasColumn('controlMode') ? `<td>
-                  <span class="control-mode control-mode-${s.permissionMode === 'full_access' ? 'full' : 'readonly'}">
-                    <span class="control-mode-dot"></span>${escapeHtml(s.permissionLabel)}
-                  </span>
+                  <div><span class="table-secondary-text">Relay：</span>${escapeHtml(s.permissionLabel)}</div>
+                  <div><span class="table-secondary-text">MCP：</span>${escapeHtml(s.mcpControlLabel)}</div>
                 </td>` : ''}
                 ${hasColumn('lastHeartbeat') ? `<td><span class="font-mono table-secondary-text">${escapeHtml(s.lastHeartbeat)}</span></td>` : ''}
                 ${hasColumn('sessionId') ? `<td>
@@ -1339,7 +1392,7 @@ function renderAgentsView() {
                       ${hasColumn('macAddress') ? `<td><span class="font-mono table-secondary-text">${escapeHtml(agt.macAddress === '-' ? '未提供' : agt.macAddress)}</span></td>` : ''}
                       ${hasColumn('controlCode') ? `<td><div class="control-code-cell control-code-cell-${isCodeActive ? 'active' : 'inactive'}"><span class="control-code-status">${isCodeActive ? '可用' : agt.codeConfigured ? '已到期' : '未生成'}</span><span class="table-secondary-text font-mono">${agt.codeConfigured ? escapeHtml(formatLeaseRemaining(agt.leaseExpiresAt)) : '等待生成'}</span></div></td>` : ''}
                       ${hasColumn('session') ? `<td>${agt.sessionId !== 'None' ? `<span class="copyable-text" onclick="event.stopPropagation(); copyToClipboard(${eventValue(agt.sessionId)}, 'Session ID', this)">${escapeHtml(truncate(agt.sessionId, 8, 6))}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span>` : '<span class="table-muted-text">暂无会话</span>'}</td>` : ''}
-                      ${hasColumn('controlMode') ? `<td><span class="control-mode control-mode-${agt.permissionMode === 'full_access' ? 'full' : 'readonly'}"><span class="control-mode-dot"></span>${escapeHtml(agt.permissionLabel)}</span></td>` : ''}
+                      ${hasColumn('controlMode') ? `<td><div><span class="table-secondary-text">上限：</span>${escapeHtml(agt.permissionLabel)}</div><div><span class="table-secondary-text">MCP：</span>${escapeHtml(agt.mcpControlLabel)}</div></td>` : ''}
                       ${hasColumn('lastHeartbeat') ? `<td><span class="font-mono table-secondary-text">${escapeHtml(agt.heartbeat)}</span></td>` : ''}
                       ${hasColumn('ready') ? `<td><span class="ready-status ready-status-${agt.ready ? 'yes' : 'no'}"><span class="ready-status-dot"></span>${agt.ready ? '就绪可控' : '未就绪'}</span></td>` : ''}
                       ${hasColumn('agentId') ? `<td><span class="font-mono table-secondary-text">${escapeHtml(truncate(agt.id, 8, 6))}</span></td>` : ''}
@@ -1937,10 +1990,18 @@ function renderDrawer() {
               <span class="kv-value font-mono">${escapeHtml(s.controllerMacAddress === '-' ? '未提供' : s.controllerMacAddress)}</span>
             </div>
             <div class="kv-item">
-              <span class="kv-label">控制权限模式</span>
+              <span class="kv-label">Relay 有效远程权限</span>
               <span class="kv-value">
                 <span class="control-mode control-mode-${s.permissionMode === 'full_access' ? 'full' : 'readonly'}">
                   <span class="control-mode-dot"></span>${escapeHtml(s.permissionLabel)}
+                </span>
+              </span>
+            </div>
+            <div class="kv-item">
+              <span class="kv-label">MCP 当前本地模式</span>
+              <span class="kv-value">
+                <span class="control-mode control-mode-${s.mcpControlMode === 'full_access' ? 'full' : 'readonly'}">
+                  <span class="control-mode-dot"></span>${escapeHtml(s.mcpControlLabel)}
                 </span>
               </span>
             </div>
@@ -2000,6 +2061,13 @@ function renderDrawer() {
               </div>
               <button class="btn btn-danger btn-sm" onclick="openModal('emergencyStop', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })">紧急停止</button>
             </div>
+            ${s.supportsAgentShutdown ? `<div style="display:flex; justify-content:space-between; align-items:center; border-top:1px solid rgba(239,68,68,0.2); padding-top:10px;">
+              <div>
+                <div style="font-size:13px; font-weight:600; color:var(--status-danger-text);">关闭 Agent</div>
+                <div style="font-size:11.5px; color:var(--text-muted);">优雅清理资源并退出 Agent 进程（不关机）</div>
+              </div>
+              <button class="btn btn-danger btn-sm" onclick="openModal('shutdownAgent', { id: ${eventValue(s.agentId)}, agentName: ${eventValue(s.agentName)}, generation: ${s.agentGeneration} })">关闭 Agent</button>
+            </div>` : ''}
           </div>
         </div>
       </div>
@@ -2056,10 +2124,18 @@ function renderDrawer() {
               <span class="kv-value">${escapeHtml(a.os)}</span>
             </div>
             <div class="kv-item">
-              <span class="kv-label">控制权限模式</span>
+              <span class="kv-label">Agent 权限上限</span>
               <span class="kv-value">
                 <span class="control-mode control-mode-${a.permissionMode === 'full_access' ? 'full' : 'readonly'}">
                   <span class="control-mode-dot"></span>${escapeHtml(a.permissionLabel)}
+                </span>
+              </span>
+            </div>
+            <div class="kv-item">
+              <span class="kv-label">MCP 当前本地模式</span>
+              <span class="kv-value">
+                <span class="control-mode control-mode-${a.mcpControlMode === 'full_access' ? 'full' : 'readonly'}">
+                  <span class="control-mode-dot"></span>${escapeHtml(a.mcpControlLabel)}
                 </span>
               </span>
             </div>
@@ -2100,6 +2176,11 @@ function renderDrawer() {
             `}
           </div>
         </div>
+        ${a.supportsAgentShutdown ? `<div class="danger-zone" style="margin-top:16px;">
+          <div class="danger-zone-title"><span>关闭 Agent</span></div>
+          <p style="font-size:12px; color:var(--text-secondary); line-height:1.4;">发送优雅退出指令，清理在途任务和持久资源后结束 Agent 进程；不会关闭操作系统。</p>
+          <button class="btn btn-danger btn-sm" ${isOnline ? '' : 'disabled'} onclick="openModal('shutdownAgent', { id: ${eventValue(a.id)}, agentName: ${eventValue(a.hostname)}, generation: ${a.generation} })">关闭 Agent</button>
+        </div>` : ''}
       </div>
     `;
   }
@@ -2195,6 +2276,30 @@ function renderModal() {
         </div>
       </div>
     `;
+  } else if (mType === 'shutdownAgent') {
+    const expected = String(data?.agentName || '').trim();
+    modalContent = `
+      <div class="modal" style="border-color:var(--status-danger-border);">
+        <div class="modal-header" style="background:rgba(239,68,68,0.08);">
+          <div class="modal-title" style="color:var(--status-danger-text);"><span>⚠️ 确认关闭 Agent</span></div>
+          <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+        </div>
+        <div class="modal-body">
+          <div style="padding:10px 12px; background:var(--status-danger-bg); border:1px solid var(--status-danger-border); border-radius:var(--radius-md); color:var(--status-danger-text); font-size:12.5px; line-height:1.5;">
+            这是高风险管理操作。Agent 将中止在途任务、关闭持久 Shell/串口/文件资源并退出进程；不会关闭整台电脑。
+          </div>
+          <div style="font-size:13px; margin-top:12px;">目标主机：<strong>${escapeHtml(expected)}</strong></div>
+          <div class="input-group">
+            <label class="input-label" for="shutdown-agent-confirmation" style="color:var(--status-danger-text); font-weight:600;">请输入上面的完整主机名以确认：</label>
+            <input id="shutdown-agent-confirmation" type="text" class="input font-mono" placeholder="输入主机名" oninput="document.getElementById('shutdown-agent-btn').disabled = (this.value.trim() !== ${eventValue(expected)});" onkeydown="if (event.key === 'Enter' && this.value.trim() === ${eventValue(expected)}) confirmShutdownAgent();" autofocus />
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary btn-sm" onclick="closeModal()">取消</button>
+          <button id="shutdown-agent-btn" class="btn btn-danger btn-sm" disabled onclick="confirmShutdownAgent()">确认关闭 Agent</button>
+        </div>
+      </div>
+    `;
   } else if (mType === 'purgeClosedSessions') {
     const clearableCount = sessions.filter(session => session.isClosed && session.agentStatus !== 'online').length;
     modalContent = `
@@ -2224,7 +2329,7 @@ function renderModal() {
   backdrop.innerHTML = modalContent;
   setTimeout(() => {
     backdrop.classList.add('open');
-    const input = document.getElementById('emergency-stop-confirmation');
+    const input = document.getElementById('emergency-stop-confirmation') || document.getElementById('shutdown-agent-confirmation');
     if (input) input.focus();
   }, 10);
 }

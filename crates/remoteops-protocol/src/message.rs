@@ -54,6 +54,9 @@ pub struct AgentHello {
     /// Agent 主机的高置信度 MAC 地址；无法可靠判断时为空。
     #[serde(default)]
     pub mac_address: Option<String>,
+    /// 是否支持由 Relay 管理员远程请求 Agent 优雅退出。
+    #[serde(default)]
+    pub supports_agent_shutdown: bool,
 }
 
 /// Controller 建立传输连接时的身份声明。
@@ -136,6 +139,42 @@ pub struct AgentLeaseRenewed {
 pub struct AgentPermissionModeChanged {
     /// Agent 本地选择的权限模式。
     pub permission_mode: PermissionMode,
+}
+
+/// MCP 在本机维护的会话控制模式，仅用于 Relay 状态展示。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerControlMode {
+    StepByStep,
+    FullAccess,
+    ReadOnly,
+    ExternalApproval,
+    Expired,
+}
+
+/// Controller 向 Relay 上报一个会话的本地控制模式。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ControllerControlModeUpdate {
+    pub session_id: SessionId,
+    pub mode: ControllerControlMode,
+}
+
+/// Relay 管理员请求 Agent 优雅退出。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentShutdownRequest {
+    pub request_id: RequestId,
+    pub agent_instance_id: AgentInstanceId,
+    pub connection_generation: u64,
+    pub reason: String,
+}
+
+/// Agent 确认已开始优雅退出。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentShutdownResult {
+    pub request_id: RequestId,
+    pub agent_instance_id: AgentInstanceId,
+    pub success: bool,
+    pub message: String,
 }
 
 /// Controller 请求配对 Agent。
@@ -347,6 +386,9 @@ pub enum WireMessage {
     Heartbeat {
         /// 发送时间。
         sent_at: DateTime<Utc>,
+        /// Controller 本地会话控制模式；Agent 心跳保持为空。
+        #[serde(default)]
+        controller_modes: Vec<ControllerControlModeUpdate>,
     },
     /// Agent 通知 Relay 本地用户选择的权限模式。
     AgentPermissionModeChanged(AgentPermissionModeChanged),
@@ -381,6 +423,10 @@ pub enum WireMessage {
         /// 被撤销的绑定令牌。
         binding_token: String,
     },
+    /// Relay 管理员请求 Agent 优雅退出。
+    AgentShutdownRequest(AgentShutdownRequest),
+    /// Agent 返回优雅退出请求的确认。
+    AgentShutdownResult(AgentShutdownResult),
     /// 对端发生协议或业务错误。
     Error {
         /// 稳定错误码。
@@ -460,6 +506,48 @@ mod tests {
         let json = serde_json::to_vec(&message).expect("续租消息应可编码");
         let decoded: WireMessage = serde_json::from_slice(&json).expect("续租消息应可解码");
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn legacy_heartbeat_defaults_controller_modes_to_empty() {
+        let json = serde_json::json!({
+            "type": "heartbeat",
+            "payload": { "sent_at": Utc::now() }
+        });
+        let decoded: WireMessage = serde_json::from_value(json).expect("旧心跳应保持兼容");
+        assert!(matches!(
+            decoded,
+            WireMessage::Heartbeat { controller_modes, .. } if controller_modes.is_empty()
+        ));
+    }
+
+    #[test]
+    fn agent_shutdown_messages_round_trip_json() {
+        let agent_instance_id = AgentInstanceId::new();
+        let request_id = RequestId::new();
+        let request = WireMessage::AgentShutdownRequest(AgentShutdownRequest {
+            request_id,
+            agent_instance_id,
+            connection_generation: 7,
+            reason: "管理测试".to_owned(),
+        });
+        let encoded = serde_json::to_vec(&request).expect("关闭请求应可编码");
+        assert_eq!(
+            serde_json::from_slice::<WireMessage>(&encoded).expect("关闭请求应可解码"),
+            request
+        );
+
+        let result = WireMessage::AgentShutdownResult(AgentShutdownResult {
+            request_id,
+            agent_instance_id,
+            success: true,
+            message: "已退出".to_owned(),
+        });
+        let encoded = serde_json::to_vec(&result).expect("关闭结果应可编码");
+        assert_eq!(
+            serde_json::from_slice::<WireMessage>(&encoded).expect("关闭结果应可解码"),
+            result
+        );
     }
 
     #[test]

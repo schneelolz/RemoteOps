@@ -1,5 +1,9 @@
 FROM rust:1.95-bookworm AS builder
 
+# Use the sparse crates.io index so clean server builds do not block on the
+# legacy full git index fetch.
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
 WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./

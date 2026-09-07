@@ -129,6 +129,7 @@ mod tests {
             credential_encryption_public_key: String::new(),
             credential_encryption_key_id: String::new(),
             mac_address: None,
+            supports_agent_shutdown: false,
         }))
         .expect("Agent Hello 应可序列化");
         value

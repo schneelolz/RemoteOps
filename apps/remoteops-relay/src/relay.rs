@@ -19,15 +19,15 @@ use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel, approval_operat
 use remoteops_protocol::{
     AgentHello, AgentLeaseRenewed, AgentResumeCommitted, AgentWelcome, ApprovalDecision,
     ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest, ClientHello, ControllerBinding,
-    ControllerHello, ControllerKind, PROTOCOL_VERSION, PairRequest, PairResult, RelayAuthorization,
-    ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest, WireMessage, read_frame,
-    write_frame,
+    ControllerControlMode, ControllerControlModeUpdate, ControllerHello, ControllerKind,
+    PROTOCOL_VERSION, PairRequest, PairResult, RelayAuthorization, ReleaseSessionRequest,
+    ReleaseSessionResult, RemoteRequest, WireMessage, read_frame, write_frame,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{Mutex, Notify, mpsc},
+    sync::{Mutex, Notify, mpsc, oneshot},
     time,
 };
 use tracing::{info, warn};
@@ -144,6 +144,8 @@ struct SessionBinding {
     /// 当前角色请求的最高权限，由 Agent 权限上限进一步裁剪。
     permission_mode: PermissionMode,
     binding_token: String,
+    /// MCP 本地控制模式，仅用于管理界面展示。
+    controller_control_mode: Option<ControllerControlMode>,
 }
 
 #[derive(Default)]
@@ -363,6 +365,13 @@ struct PersistedRelayState {
 }
 
 /// Relay 的并发安全业务入口。
+type ShutdownWaiter = (
+    AgentInstanceId,
+    u64,
+    oneshot::Sender<remoteops_protocol::AgentShutdownResult>,
+);
+type ShutdownWaiters = Arc<Mutex<BTreeMap<RequestId, ShutdownWaiter>>>;
+
 pub struct Relay {
     state: Arc<Mutex<RelayState>>,
     state_path: Option<PathBuf>,
@@ -374,6 +383,7 @@ pub struct Relay {
     ai_controller_token: String,
     policy: DefaultPolicy,
     started_at: DateTime<Utc>,
+    shutdown_waiters: ShutdownWaiters,
 }
 
 impl Relay {
@@ -401,6 +411,7 @@ impl Relay {
             ai_controller_token,
             policy: DefaultPolicy::default(),
             started_at: Utc::now(),
+            shutdown_waiters: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -412,27 +423,36 @@ impl Relay {
         let agents = state
             .agents
             .values()
-            .map(|agent| AdminAgent {
-                agent_instance_id: agent.hello.agent_instance_id,
-                session_id: agent.session_id,
-                hostname: agent.hello.hostname.clone(),
-                mac_address: agent.hello.mac_address.clone(),
-                operating_system: agent.hello.operating_system.clone(),
-                state: if agent.ready && agent.sender.is_some() {
-                    "online"
-                } else if agent.lease.is_valid_at(now) {
-                    "reconnecting"
-                } else {
-                    "offline"
+            .map(|agent| {
+                let mcp_control_mode = state
+                    .session_bindings
+                    .get(&agent.session_id)
+                    .and_then(|bindings| bindings.ai.as_ref())
+                    .and_then(|binding| binding.controller_control_mode);
+                AdminAgent {
+                    agent_instance_id: agent.hello.agent_instance_id,
+                    session_id: agent.session_id,
+                    hostname: agent.hello.hostname.clone(),
+                    mac_address: agent.hello.mac_address.clone(),
+                    operating_system: agent.hello.operating_system.clone(),
+                    state: if agent.ready && agent.sender.is_some() {
+                        "online"
+                    } else if agent.lease.is_valid_at(now) {
+                        "reconnecting"
+                    } else {
+                        "offline"
+                    }
+                    .to_owned(),
+                    pairing_code_configured: agent.lease.is_valid_at(now),
+                    lease_expires_at: agent.lease.expires_at,
+                    last_seen: agent.last_seen,
+                    connection_generation: agent.connection_generation,
+                    ready: agent.ready,
+                    ever_paired: agent.ever_paired,
+                    permission_mode: agent.permission_mode,
+                    mcp_control_mode,
+                    supports_agent_shutdown: agent.hello.supports_agent_shutdown,
                 }
-                .to_owned(),
-                pairing_code_configured: agent.lease.is_valid_at(now),
-                lease_expires_at: agent.lease.expires_at,
-                last_seen: agent.last_seen,
-                connection_generation: agent.connection_generation,
-                ready: agent.ready,
-                ever_paired: agent.ever_paired,
-                permission_mode: agent.permission_mode,
             })
             .collect::<Vec<_>>();
         let controllers = state
@@ -463,6 +483,7 @@ impl Relay {
                                 owner_id: binding.owner_id,
                                 permission_mode: bindings
                                     .permission_mode_for(binding.controller_kind),
+                                mcp_control_mode: binding.controller_control_mode,
                                 controller_hostname: state
                                     .controllers
                                     .get(&binding.controller_id)
@@ -494,6 +515,9 @@ impl Relay {
                     }),
                     permission_mode: bindings
                         .map_or(agent.permission_mode, SessionBindings::permission_mode),
+                    mcp_control_mode: bindings
+                        .and_then(|value| value.ai.as_ref())
+                        .and_then(|binding| binding.controller_control_mode),
                     owner_id: bindings.and_then(|value| value.owner_id),
                     controller_bindings,
                     pending_approvals: state
@@ -846,6 +870,197 @@ impl Relay {
         }
     }
 
+    /// 管理员请求指定 Agent 优雅退出，并等待 Agent 清理资源后的确认。
+    #[allow(clippy::too_many_lines)]
+    pub async fn admin_shutdown_agent(
+        &self,
+        agent_id: AgentInstanceId,
+        expected_generation: u64,
+        source: &str,
+    ) -> AdminActionOutcome {
+        let (sender, generation, request_id, receiver) = {
+            let mut state = self.state.lock().await;
+            let Some(agent) = state.agents.get(&agent_id).cloned() else {
+                append_audit(
+                    &mut state,
+                    "agent_shutdown",
+                    Some(agent_id.to_string()),
+                    false,
+                    source,
+                    "Agent 不存在",
+                );
+                return AdminActionOutcome {
+                    success: false,
+                    changed: false,
+                    message: "Agent 不存在".to_owned(),
+                };
+            };
+            if !agent.ready || agent.sender.is_none() {
+                append_audit(
+                    &mut state,
+                    "agent_shutdown",
+                    Some(agent_id.to_string()),
+                    false,
+                    source,
+                    "Agent 不在线",
+                );
+                return AdminActionOutcome {
+                    success: false,
+                    changed: false,
+                    message: "Agent 不在线".to_owned(),
+                };
+            }
+            if agent.connection_generation != expected_generation {
+                append_audit(
+                    &mut state,
+                    "agent_shutdown",
+                    Some(agent_id.to_string()),
+                    false,
+                    source,
+                    "Agent 连接代次已变化，请刷新后重试",
+                );
+                return AdminActionOutcome {
+                    success: false,
+                    changed: false,
+                    message: "Agent 连接代次已变化，请刷新页面后重试".to_owned(),
+                };
+            }
+            if !agent.hello.supports_agent_shutdown {
+                append_audit(
+                    &mut state,
+                    "agent_shutdown",
+                    Some(agent_id.to_string()),
+                    false,
+                    source,
+                    "Agent 版本不支持优雅退出",
+                );
+                return AdminActionOutcome {
+                    success: false,
+                    changed: false,
+                    message: "该 Agent 版本不支持关闭指令".to_owned(),
+                };
+            }
+            let sender = agent.sender.clone().expect("在线 Agent 必须有发送器");
+            let request_id = RequestId::new();
+            let (tx, rx) = oneshot::channel();
+            self.shutdown_waiters
+                .lock()
+                .await
+                .insert(request_id, (agent_id, agent.connection_generation, tx));
+            append_audit(
+                &mut state,
+                "agent_shutdown",
+                Some(agent_id.to_string()),
+                true,
+                source,
+                "已发送 Agent 优雅退出请求",
+            );
+            let _ = self.persist_state_locked(&state);
+            (sender, agent.connection_generation, request_id, rx)
+        };
+
+        let sent = sender
+            .send(WireMessage::AgentShutdownRequest(
+                remoteops_protocol::AgentShutdownRequest {
+                    request_id,
+                    agent_instance_id: agent_id,
+                    connection_generation: generation,
+                    reason: "管理员请求关闭 Agent".to_owned(),
+                },
+            ))
+            .is_ok();
+        if !sent {
+            self.shutdown_waiters.lock().await.remove(&request_id);
+            let mut state = self.state.lock().await;
+            append_audit(
+                &mut state,
+                "agent_shutdown",
+                Some(agent_id.to_string()),
+                false,
+                source,
+                "无法发送 Agent 关闭指令",
+            );
+            let _ = self.persist_state_locked(&state);
+            return AdminActionOutcome {
+                success: false,
+                changed: false,
+                message: "无法发送 Agent 关闭指令".to_owned(),
+            };
+        }
+        let result = time::timeout(time::Duration::from_secs(10), receiver).await;
+        match result {
+            Ok(Ok(result)) if result.success => {
+                let session_id = {
+                    let state = self.state.lock().await;
+                    state.agents.get(&agent_id).map(|agent| agent.session_id)
+                };
+                self.mark_agent_disconnected(agent_id, generation).await;
+                {
+                    let mut state = self.state.lock().await;
+                    if let Some(agent) = state.agents.get_mut(&agent_id)
+                        && agent.connection_generation == generation
+                    {
+                        agent.lease.expires_at = Utc::now();
+                        agent.lease_expired = true;
+                    }
+                }
+                if let Some(session_id) = session_id {
+                    let _ = self.admin_close_session(session_id, source).await;
+                }
+                let mut state = self.state.lock().await;
+                append_audit(
+                    &mut state,
+                    "agent_shutdown",
+                    Some(agent_id.to_string()),
+                    true,
+                    source,
+                    "Agent 已确认优雅退出",
+                );
+                let _ = self.persist_state_locked(&state);
+                AdminActionOutcome {
+                    success: true,
+                    changed: true,
+                    message: "Agent 已优雅退出".to_owned(),
+                }
+            }
+            Ok(Ok(result)) => {
+                let mut state = self.state.lock().await;
+                append_audit(
+                    &mut state,
+                    "agent_shutdown",
+                    Some(agent_id.to_string()),
+                    false,
+                    source,
+                    &format!("Agent 拒绝关闭：{}", result.message),
+                );
+                let _ = self.persist_state_locked(&state);
+                AdminActionOutcome {
+                    success: false,
+                    changed: false,
+                    message: result.message,
+                }
+            }
+            _ => {
+                self.shutdown_waiters.lock().await.remove(&request_id);
+                let mut state = self.state.lock().await;
+                append_audit(
+                    &mut state,
+                    "agent_shutdown",
+                    Some(agent_id.to_string()),
+                    false,
+                    source,
+                    "等待 Agent 关闭确认超时",
+                );
+                let _ = self.persist_state_locked(&state);
+                AdminActionOutcome {
+                    success: false,
+                    changed: false,
+                    message: "等待 Agent 关闭确认超时，未确认 Agent 已退出".to_owned(),
+                }
+            }
+        }
+    }
+
     /// 创建带有持久化状态文件的 Relay。
     ///
     /// 只持久化 Agent 身份、控制码租约、逻辑 `session_id` 和恢复令牌；
@@ -1128,6 +1343,11 @@ impl Relay {
                     )
                     .await;
                 }
+                Ok(WireMessage::AgentShutdownResult(result)) => {
+                    self.complete_agent_shutdown(result, connection_generation)
+                        .await;
+                    break;
+                }
                 Ok(message @ (WireMessage::RemoteEvent(_) | WireMessage::RemoteResponse(_))) => {
                     self.forward_agent_message(agent_id, connection_generation, message)
                         .await;
@@ -1164,6 +1384,26 @@ impl Relay {
         Ok(())
     }
 
+    async fn complete_agent_shutdown(
+        &self,
+        result: remoteops_protocol::AgentShutdownResult,
+        connection_generation: u64,
+    ) {
+        let waiter = self
+            .shutdown_waiters
+            .lock()
+            .await
+            .remove(&result.request_id);
+        let Some((agent_id, expected_generation, sender)) = waiter else {
+            return;
+        };
+        if agent_id != result.agent_instance_id || expected_generation != connection_generation {
+            return;
+        }
+        let _ = sender.send(result);
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn handle_controller<R>(
         &self,
         hello: ControllerHello,
@@ -1247,7 +1487,15 @@ impl Relay {
                     )
                     .await;
                 }
-                Ok(WireMessage::Heartbeat { .. }) => {
+                Ok(WireMessage::Heartbeat {
+                    controller_modes, ..
+                }) => {
+                    self.update_controller_control_modes(
+                        controller_id,
+                        connection_generation,
+                        controller_modes,
+                    )
+                    .await;
                     let _ = sender.send(WireMessage::HeartbeatAck {
                         received_at: Utc::now(),
                     });
@@ -1935,6 +2183,7 @@ impl Relay {
                     controller_generation,
                     permission_mode: request.permission_mode,
                     binding_token: new_secret_token(),
+                    controller_control_mode: None,
                 });
             } else if let Some(binding) = bindings.get_mut(controller_kind) {
                 binding.permission_mode = request.permission_mode;
@@ -2160,6 +2409,36 @@ impl Relay {
         }
         for controller_sender in controller_senders {
             let _ = controller_sender.send(WireMessage::ConnectionUpdated(update.clone()));
+        }
+    }
+
+    async fn update_controller_control_modes(
+        &self,
+        controller_id: ControllerInstanceId,
+        connection_generation: u64,
+        updates: Vec<ControllerControlModeUpdate>,
+    ) {
+        let mut state = self.state.lock().await;
+        let Some(controller) = state.controllers.get(&controller_id) else {
+            return;
+        };
+        if controller.connection_generation != connection_generation
+            || controller.kind != ControllerKind::Ai
+        {
+            return;
+        }
+        for update in updates {
+            let Some(bindings) = state.session_bindings.get_mut(&update.session_id) else {
+                continue;
+            };
+            let Some(binding) = bindings.ai.as_mut() else {
+                continue;
+            };
+            if binding.controller_id == controller_id
+                && binding.controller_generation == connection_generation
+            {
+                binding.controller_control_mode = Some(update.mode);
+            }
         }
     }
 
@@ -2678,17 +2957,24 @@ impl Relay {
     async fn mark_agent_disconnected(&self, agent_id: AgentInstanceId, connection_generation: u64) {
         let (update, failures) = {
             let mut state = self.state.lock().await;
-            let update = state.agents.get_mut(&agent_id).and_then(|agent| {
-                if agent.connection_generation != connection_generation {
-                    return None;
+            let update = if let Some(agent) = state.agents.get_mut(&agent_id) {
+                if agent.connection_generation == connection_generation {
+                    agent.sender = None;
+                    agent.ready = false;
+                    let session_id = agent.session_id;
+                    let update = descriptor(agent, ConnectionState::Reconnecting);
+                    if let Some(bindings) = state.session_bindings.get_mut(&session_id)
+                        && let Some(binding) = bindings.ai.as_mut()
+                    {
+                        binding.controller_control_mode = None;
+                    }
+                    Some((session_id, update))
+                } else {
+                    None
                 }
-                agent.sender = None;
-                agent.ready = false;
-                Some((
-                    agent.session_id,
-                    descriptor(agent, ConnectionState::Reconnecting),
-                ))
-            });
+            } else {
+                None
+            };
             let update = update.map(|(session_id, mut update)| {
                 if let Some(bindings) = state.session_bindings.get(&session_id) {
                     apply_session_bindings(&mut update, bindings);
@@ -2822,6 +3108,11 @@ impl Relay {
                 }) else {
                     continue;
                 };
+                if let Some(bindings) = state.session_bindings.get_mut(&session_id)
+                    && let Some(binding) = bindings.ai.as_mut()
+                {
+                    binding.controller_control_mode = None;
+                }
                 if let Some(bindings) = state.session_bindings.get(&session_id) {
                     apply_session_bindings(&mut update, bindings);
                     for binding in bindings.all() {
@@ -3432,6 +3723,7 @@ mod tests {
             credential_encryption_public_key: "test-public-key".to_owned(),
             credential_encryption_key_id: "test-key-id".to_owned(),
             mac_address: Some("00:11:22:33:44:55".to_owned()),
+            supports_agent_shutdown: true,
         }
     }
 
@@ -3638,13 +3930,15 @@ mod tests {
             sender
                 .send(WireMessage::Heartbeat {
                     sent_at: Utc::now(),
+                    controller_modes: Vec::new(),
                 })
                 .expect("容量内消息应入队");
         }
         assert!(
             sender
                 .send(WireMessage::Heartbeat {
-                    sent_at: Utc::now()
+                    sent_at: Utc::now(),
+                    controller_modes: Vec::new(),
                 })
                 .is_err(),
             "队列满时必须拒绝继续增长"

@@ -1534,6 +1534,10 @@ impl eframe::App for RemoteOpsAgentApp {
             return;
         }
         self.receive_events();
+        if matches!(self.status, UiStatus::Stopped) && !self.allow_close {
+            self.allow_close = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
         if ctx.input(|input| input.viewport().close_requested()) && !self.allow_close {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             if matches!(self.status, UiStatus::Stopped | UiStatus::Failed(_)) {

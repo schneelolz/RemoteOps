@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use remoteops_domain::{
     AgentInstanceId, ControllerInstanceId, ControllerOwnerId, PermissionMode, SessionId,
 };
+use remoteops_protocol::ControllerControlMode;
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::Mutex};
 use uuid::Uuid;
@@ -76,6 +77,7 @@ pub(crate) struct AdminIdentity {
     pub ai_token_fingerprint: Option<String>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct AdminAgent {
     pub agent_instance_id: AgentInstanceId,
@@ -91,6 +93,8 @@ pub(crate) struct AdminAgent {
     pub ready: bool,
     pub ever_paired: bool,
     pub permission_mode: PermissionMode,
+    pub mcp_control_mode: Option<ControllerControlMode>,
+    pub supports_agent_shutdown: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -112,6 +116,7 @@ pub(crate) struct AdminControllerBinding {
     pub permission_mode: PermissionMode,
     pub controller_hostname: Option<String>,
     pub controller_mac_address: Option<String>,
+    pub mcp_control_mode: Option<ControllerControlMode>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -124,6 +129,7 @@ pub(crate) struct AdminSession {
     pub state: String,
     pub role: String,
     pub permission_mode: PermissionMode,
+    pub mcp_control_mode: Option<ControllerControlMode>,
     pub owner_id: Option<ControllerOwnerId>,
     pub controller_bindings: Vec<AdminControllerBinding>,
     pub pending_approvals: usize,
@@ -178,6 +184,12 @@ pub(crate) struct AuditQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ShutdownAgentRequest {
+    pub agent_instance_id: AgentInstanceId,
+    pub connection_generation: u64,
+}
+
 pub(crate) async fn serve(
     listener: TcpListener,
     relay: Arc<Relay>,
@@ -216,6 +228,10 @@ pub(crate) async fn serve(
         .route(
             "/api/admin/sessions/{session_id}/emergency-stop",
             post(emergency_stop),
+        )
+        .route(
+            "/api/admin/agents/{agent_id}/shutdown",
+            post(shutdown_agent),
         )
         .route("/api/admin/audit", get(audit))
         .route("/", get(index))
@@ -463,6 +479,48 @@ async fn emergency_stop(
             .admin_emergency_stop(session_id, "admin_api")
             .await,
     ))
+}
+
+async fn shutdown_agent(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    ExtractJson(request): ExtractJson<ShutdownAgentRequest>,
+) -> Result<Json<AdminActionOutcome>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers).await?;
+    let agent_id = agent_id.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Agent ID 格式无效".to_owned(),
+            }),
+        )
+    })?;
+    if request.agent_instance_id != agent_id {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "Agent 实例已变化，请刷新页面后重试".to_owned(),
+            }),
+        ));
+    }
+    let outcome = state
+        .relay
+        .admin_shutdown_agent(agent_id, request.connection_generation, "admin_api")
+        .await;
+    if !outcome.success {
+        return Err((
+            if outcome.message.contains("超时") {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::CONFLICT
+            },
+            Json(ErrorResponse {
+                error: outcome.message,
+            }),
+        ));
+    }
+    Ok(Json(outcome))
 }
 
 async fn audit(
