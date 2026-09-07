@@ -44,13 +44,19 @@ $env:CXXFLAGS = [string]::Join(' ', @(
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 ))
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $manifestText = Get-Content -LiteralPath (Join-Path $workspaceRoot 'Cargo.toml') -Raw
-    $versionMatch = [regex]::Match(
-        $manifestText,
-        '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"(?<version>[^"]+)"'
-    )
+    Push-Location $workspaceRoot
+    try {
+        $packageId = (& cargo pkgid --locked -p remoteops-agent 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) {
+            throw '无法读取 remoteops-agent 发布版本。'
+        }
+    }
+    finally {
+        Pop-Location
+    }
+    $versionMatch = [regex]::Match($packageId, '#(?:[^@#]+@)?(?<version>[^#\s]+)$')
     if (-not $versionMatch.Success) {
-        throw '无法从 Cargo.toml 读取 Workspace 版本。'
+        throw '无法从 Cargo 包标识读取 remoteops-agent 发布版本。'
     }
     $OutputDirectory = Join-Path $workspaceRoot (
         'artifacts\release\{0}\windows-x64' -f $versionMatch.Groups['version'].Value

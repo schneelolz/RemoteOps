@@ -34,7 +34,7 @@
 - MCP 与 CLI 使用 1 MiB 分块上传和下载，单文件上限为 16 GiB；超过 1 GiB 时必须在读取、哈希和发送前单独确认。上传和本地下载覆盖使用同目录临时文件、分块与完整 SHA-256 校验和可恢复原子提交，失败时保留原文件。
 - Relay 分别保存 Human 与 AI 权限，Human 配对不再覆盖 AI 的 `ControllerApproved`；人工接管期间 AI 临时只读，释放后恢复。Agent GUI、Controller GUI、CLI 和 MCP 使用或显示同一有效权限来源。
 - MCP 与随包 `remoteops` skill 支持自然语言路由，RemoteOps 控制码会优先进入配对和受控远程诊断流程。
-- Agent GUI 已移除控制模式选择和 SSH 凭据管理入口；控制模式统一由使用者侧 MCP 管理。SSH 密码只在控制端本机安全窗口输入，可单次使用或在 MCP 内存固定缓存十分钟，并通过 HPKE 绑定精确请求发送；Agent 不建立密码仓库。运行页采用 `520 × 410` 固定紧凑窗口，突出会随在线心跳刷新的控制码租约倒计时、工程师连接状态和能力摘要，并保留停止确认和屏幕工作区居中。
+- Agent GUI 已移除控制模式选择和 SSH 凭据管理入口；控制模式统一由使用者侧 MCP 管理。SSH 密码只在控制端本机安全窗口输入，可单次使用或在 MCP 内存固定缓存十分钟，并通过 HPKE 绑定精确请求发送；Agent 不建立密码仓库。运行页采用 `520 × 440` 固定窗口，突出会随在线心跳刷新的控制码租约倒计时、工程师连接状态和能力摘要，并保留停止确认和屏幕工作区居中。
 - Apple Silicon macOS MCP 已加入源码适配、Keychain Token、标准 macOS 数据目录、安装/检测/卸载脚本和 GitHub Actions 构建链路。
 - Relay 恢复后，Agent 可使用有效状态和恢复令牌重新认证；同一 MCP 进程会重试已知配对。审批和在途写操作不会自动重放。
 - 本地 MCP 编译和单元测试已通过；Windows、Linux 和 macOS 的完整首发产物仍需由干净 CI 生成并复核。
@@ -73,3 +73,7 @@ RemoteOps 已具备公开 Technical Preview 的产品形态。macOS MCP 可以�
 ## Linux Headless 候选构建（2026-09-06）
 
 Ubuntu 24.04 x86_64 的 Agent/Service 为 `0.2.0-preview.6`，使用原有 v14 协议；Relay/MCP 仍为 preview.5。构建入口 `scripts/Build-LinuxAgent.sh`，部署与权限见 [Linux 服务说明](../deploy/agent-service/linux/README.md)，实测范围、证据及剩余门禁见 [Linux 验收报告](LinuxHeadless验收报告.md)。此记录不表示已经发布公开 GitHub Release。
+
+## Agent 日志抽屉候选（2026-09-08）
+
+Agent GUI 源码升级为 `0.2.0-preview.8`，Agent 运行层及 Service 宿主升级为 `0.2.0-preview.7`。本地操作日志复用现有 v14 操作事件，右侧抽屉默认隐藏并覆盖主界面显示，不改变窗口宽度。命令、输出和结果通过脱敏与容量限制后展示，历史记录仅保存在当前 GUI 进程中。此项为本地改造与验收，未执行远端部署或公开发布。验证结果和截图见根目录 `design-qa.md`。

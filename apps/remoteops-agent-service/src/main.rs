@@ -158,6 +158,8 @@ fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: Agen
             };
         }
         AgentEvent::ControllerBindingsChanged { .. } => {}
+        // 操作日志不改变服务状态，避免按输出行重复写入状态文件。
+        AgentEvent::OperationLog(_) => return,
         AgentEvent::Reconnecting { .. } => {
             "reconnecting".clone_into(&mut status.status);
             status.active_connections = 0;
@@ -440,5 +442,36 @@ mod tests {
         assert!(data["pairing_code"].is_null());
         assert_eq!(data["status"], "reconnecting");
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod operation_log_tests {
+    use super::*;
+    use remoteops_agent::{AgentLogLevel, AgentOperationLog};
+
+    /// 日志事件不产生服务状态文件，也不改变当前运行状态。
+    #[test]
+    fn operation_log_does_not_publish_runtime_status() {
+        let path = std::env::temp_dir().join(format!(
+            "remoteops-log-status-{}.json",
+            remoteops_domain::RequestId::new()
+        ));
+        let mut status = RuntimeStatus {
+            status: "controlled".to_owned(),
+            ..RuntimeStatus::default()
+        };
+        update_status_from_event(
+            &path,
+            &mut status,
+            AgentEvent::OperationLog(AgentOperationLog {
+                request_id: None,
+                occurred_at: Utc::now(),
+                level: AgentLogLevel::Info,
+                message: "example command output".to_owned(),
+            }),
+        );
+        assert_eq!(status.status, "controlled");
+        assert!(!path.exists());
     }
 }

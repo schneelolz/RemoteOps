@@ -4,6 +4,7 @@
 
 ## [0.2.0-preview.6] - 待发布候选
 
+- 重做 Windows Agent GUI 品牌与运行页：新增 RemoteOps Shield + Terminal 标识、Windows 应用图标、连接详情入口、可用能力状态和按连接状态变化的退出/停止文案。
 - 增加 Ubuntu 24.04 x86_64 Headless Agent、systemd 宿主、安装/卸载/状态脚本和带许可证、哈希清单的发布包。
 - Linux 进程与服务查询使用结构化输出，支持 POSIX Shell、低权限运行、SIGTERM/SIGINT 清理和安全的短期配对状态文件。
 - Controller 事件历史游标在 Agent 重启后保持单调，避免增量输出丢失；线协议保持 v14。
@@ -13,7 +14,7 @@
 ## [未发布]
 
 - 准备首个 GitHub Technical Preview。
-- 当前源码候选版本为 `0.2.0-preview.5`，尚未创建公开 Release；此前内部构建和现场复测不构成公开版本历史。
+- 当前源码候选版本为 `0.2.0-preview.6`，尚未创建公开 Release；此前内部构建和现场复测不构成公开版本历史。
 - 重做 Windows Agent GUI 日常运行页：采用 `520 × 410` 紧凑窗口，突出服务状态、临时控制码倒计时、工程师连接状态和能力摘要；技术运行信息移入高级设置，SSH 密码入口从 Agent GUI 移除。
 - 线协议先升级到 v9，增加短时单次 Agent 入网码、可确认的 Controller 会话释放和同 Owner 新实例接管通知；随后升级到 v10，取消普通 Agent 首次连接所需的入网码和部署级注册 Token；v11 增加有状态分块文件传输、下载覆盖授权和完整文件校验；v13 增加 Agent 租约续期事件；当前 v14 将 SSH 密码改为控制端本机安全窗口输入和端到端加密。
 - 公网 CA Agent 继续零证书配置；未知自签名证书由 GUI 在发送 RemoteOps 凭据前展示 SHA-256 指纹，经独立渠道核对后可仅本次继续或固定保存，无界面 CLI/Service 仍需预置 CA 或已核对指纹。

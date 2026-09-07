@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">RemoteOps mark</title>
+  <desc id="desc">A blue shield containing a white terminal prompt.</desc>
+  <path
+    d="M128 18 218 51v68c0 59-36 101-90 120-54-19-90-61-90-120V51z"
+    fill="#2563EB"
+    stroke="#0F1B3A"
+    stroke-width="14"
+    stroke-linejoin="round"
+  />
+  <path
+    d="m82 92 43 36-43 36M140 166h42"
+    fill="none"
+    stroke="#FFF"
+    stroke-width="18"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

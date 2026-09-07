@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 256" role="img" aria-labelledby="title desc">
+  <title id="title">RemoteOps</title>
+  <desc id="desc">RemoteOps shield and terminal mark with wordmark.</desc>
+  <g transform="translate(0 0)">
+    <path
+      d="M128 18 218 51v68c0 59-36 101-90 120-54-19-90-61-90-120V51z"
+      fill="#2563EB"
+      stroke="#0F1B3A"
+      stroke-width="14"
+      stroke-linejoin="round"
+    />
+    <path
+      d="m82 92 43 36-43 36M140 166h42"
+      fill="none"
+      stroke="#FFF"
+      stroke-width="18"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+  </g>
+  <text x="286" y="151" font-family="Segoe UI, Arial, sans-serif" font-size="86" font-weight="700" letter-spacing="-2" fill="#0F1B3A">
+    Remote<tspan fill="#2563EB">Ops</tspan>
+  </text>
+</svg>

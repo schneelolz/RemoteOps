@@ -2,7 +2,7 @@
 
 # RemoteOps
 
-<img src="assets/remoteops-logo.png" alt="RemoteOps logo" width="760" />
+<img src="assets/brand/remoteops-logo.svg" alt="RemoteOps logo" width="760" />
 
 <img src="assets/remoteops-hero.en.svg" alt="RemoteOps: a controlled operations path from a field Windows Agent through a self-hosted Relay to local MCP control" width="100%" />
 
@@ -56,7 +56,7 @@ It does not currently provide screen capture, mouse or keyboard control, RDP/VNC
 | Controller/MCP | Windows x64 and Apple Silicon macOS | Mac MCP installation and Linux connection verified; native Windows CI remains |
 | Device access | Windows, Linux, SSH, and serial | Local regression and Linux PTY serial tests pass; real hardware validation remains |
 
-The Agent CLI / Service candidate is `0.2.0-preview.6`; Relay, MCP, and GUI remain at `0.2.0-preview.5`. They share protocol `v14`. No public GitHub Release exists yet. It is intended for developers and controlled pilots, not critical production use. See [project status](docs/PROJECT_STATUS.md).
+The Agent CLI / Service / GUI / SSH askpass candidate is `0.2.0-preview.6`; Relay and MCP remain at `0.2.0-preview.5`. They share protocol `v14`. No public GitHub Release exists yet. It is intended for developers and controlled pilots, not critical production use. See [project status](docs/PROJECT_STATUS.md).
 
 ## Quick start
 

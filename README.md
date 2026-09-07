@@ -2,7 +2,7 @@
 
 # RemoteOps
 
-<img src="assets/remoteops-logo.png" alt="RemoteOps logo" width="760" />
+<img src="assets/brand/remoteops-logo.svg" alt="RemoteOps logo" width="760" />
 
 <img src="assets/remoteops-hero.zh.svg" alt="RemoteOps：现场 Windows Agent、自托管 Relay、本机 MCP 与人工审批组成的受控远程运维链路" width="100%" />
 
@@ -56,7 +56,7 @@ flowchart LR
 | Controller/MCP | Windows x64、Apple Silicon macOS | Mac 本机 MCP 安装及 Linux 连接已验证；Windows 由原生 CI 验证 |
 | 设备能力 | Windows、Linux、SSH、串口 | 本地回归与 Linux PTY 串口测试通过；真实硬件路径仍需复测 |
 
-Agent CLI / Service 候选版本为 `0.2.0-preview.6`；Relay、MCP 与 GUI 仍为 `0.2.0-preview.5`，共用 `v14` 协议。尚未创建公开 GitHub Release。它面向开发者和受控试点，不建议直接用于关键生产环境。发布状态和门禁见 [项目状态](docs/PROJECT_STATUS.md)。
+Agent CLI / Service / GUI / SSH askpass 候选版本为 `0.2.0-preview.6`；Relay 与 MCP 仍为 `0.2.0-preview.5`，共用 `v14` 协议。尚未创建公开 GitHub Release。它面向开发者和受控试点，不建议直接用于关键生产环境。发布状态和门禁见 [项目状态](docs/PROJECT_STATUS.md)。
 
 ## 快速开始
 

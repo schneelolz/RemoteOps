@@ -2,6 +2,7 @@
 
 use std::{
     backtrace::Backtrace,
+    collections::VecDeque,
     env,
     fmt::Write as _,
     io::Write as _,
@@ -11,19 +12,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use eframe::egui::{
     self, Align, Align2, Color32, FontDefinitions, FontFamily, FontId, Frame, Grid, Layout, Margin,
-    RichText, Stroke, TextStyle, Vec2, ViewportCommand,
+    Order, RichText, Stroke, TextStyle, Vec2, ViewportCommand,
 };
 use egui_phosphor::regular as icons;
 use remoteops_agent::{
-    AgentConfig, AgentControllerBinding, AgentEvent, AgentEventSender, AgentPermissionControl,
-    active_agent_config_path, default_agent_config_path, initialize_tracing,
-    legacy_agent_config_path, run_agent_with_permission_control,
+    AgentConfig, AgentControllerBinding, AgentEvent, AgentEventSender, AgentLogLevel,
+    AgentOperationLog, AgentPermissionControl, active_agent_config_path, default_agent_config_path,
+    initialize_tracing, legacy_agent_config_path, run_agent_with_permission_control,
 };
-use remoteops_domain::{AgentInstanceId, Capability, CapabilitySet};
+use remoteops_domain::{AgentInstanceId, Capability, CapabilitySet, RequestId};
 use remoteops_i18n::{Language, Translator};
 use remoteops_protocol::{
     connect_tls, load_native_client_config, load_pinned_client_config, probe_server_certificate,
@@ -34,7 +35,7 @@ use tokio::sync::watch;
 /// 首次设置页使用的固定窗口内部尺寸。
 const SETUP_WINDOW_SIZE: Vec2 = Vec2::new(640.0, 330.0);
 /// 日常运行页使用的固定窗口内部尺寸。
-const RUNNING_WINDOW_SIZE: Vec2 = Vec2::new(520.0, 410.0);
+const RUNNING_WINDOW_SIZE: Vec2 = Vec2::new(520.0, 440.0);
 /// Windows 后台进程创建标志，避免权限探测弹出控制台窗口。
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -42,6 +43,33 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const PAIRING_CODE_ROW_HEIGHT: f32 = 40.0;
 /// 复制控制码图标按钮的固定边长。
 const COPY_CODE_BUTTON_SIZE: f32 = 36.0;
+/// 日志在内存中保留的最大条目数。
+const MAX_OPERATION_LOGS: usize = 1_000;
+/// 每帧最多消费的后台事件数，避免大量输出阻塞界面。
+const MAX_EVENTS_PER_FRAME: usize = 200;
+/// 日志覆盖抽屉宽度。
+const LOG_DRAWER_WIDTH: f32 = 360.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogFilter {
+    All,
+    Running,
+    Success,
+    Error,
+    Info,
+}
+
+impl LogFilter {
+    fn matches(self, level: AgentLogLevel) -> bool {
+        match self {
+            Self::All => true,
+            Self::Running => level == AgentLogLevel::Running,
+            Self::Success => level == AgentLogLevel::Success,
+            Self::Error => level == AgentLogLevel::Error,
+            Self::Info => level == AgentLogLevel::Info,
+        }
+    }
+}
 
 /// 根据当前内容宽度返回控制码行的有界尺寸。
 fn pairing_code_row_size(available_width: f32) -> Vec2 {
@@ -57,6 +85,22 @@ fn pairing_code_left_padding(available_width: f32, code_width: f32, item_spacing
 /// 计算一组内容在指定宽度内水平居中所需的左侧留白。
 fn centered_left_padding(available_width: f32, content_width: f32) -> f32 {
     ((available_width - content_width) / 2.0).max(0.0)
+}
+
+/// 将日志写入有界内存视图，并在抽屉关闭时累计未读数量。
+fn store_operation_log(
+    logs: &mut VecDeque<AgentOperationLog>,
+    log: AgentOperationLog,
+    drawer_open: bool,
+    unread: &mut usize,
+) {
+    if logs.len() >= MAX_OPERATION_LOGS {
+        logs.pop_front();
+    }
+    logs.push_back(log);
+    if !drawer_open {
+        *unread = unread.saturating_add(1);
+    }
 }
 
 /// 固定复制按钮的交互样式，避免悬停或按下触发可见重绘动画。
@@ -297,19 +341,6 @@ enum UiStatus {
 }
 
 impl UiStatus {
-    /// 返回主状态文字。
-    fn label(&self, translator: &Translator) -> String {
-        match self {
-            Self::Starting => translator.text("status.starting"),
-            Self::Connecting => translator.text("status.connecting"),
-            Self::Waiting => translator.text("status.waiting"),
-            Self::Controlled => translator.text("status.controlled"),
-            Self::Reconnecting(_) => translator.text("status.reconnecting"),
-            Self::Stopped => translator.text("status.stopped"),
-            Self::Failed(_) => translator.text("status.failed"),
-        }
-    }
-
     /// 返回状态辅助说明。
     fn detail(&self) -> Option<&str> {
         match self {
@@ -317,18 +348,16 @@ impl UiStatus {
             _ => None,
         }
     }
+}
 
-    /// 返回状态指示色。
-    const fn color(&self) -> Color32 {
-        match self {
-            Self::Waiting | Self::Controlled => Color32::from_rgb(30, 185, 105),
-            Self::Starting | Self::Connecting | Self::Reconnecting(_) => {
-                Color32::from_rgb(37, 112, 232)
-            }
-            Self::Stopped => Color32::from_rgb(115, 126, 145),
-            Self::Failed(_) => Color32::from_rgb(220, 55, 62),
-        }
-    }
+/// 将请求标识压缩为末尾短串，便于并发日志快速区分。
+fn short_request_id(request_id: &RequestId) -> String {
+    let value = request_id.as_uuid().simple().to_string();
+    value.chars().skip(value.len().saturating_sub(8)).collect()
+}
+
+fn log_drawer_left(screen_left: f32, screen_width: f32, width: f32, progress: f32) -> f32 {
+    screen_left + screen_width - width * progress
 }
 
 /// 被控端窗口状态。
@@ -375,6 +404,14 @@ struct RemoteOpsAgentApp {
     active_connections: usize,
     /// 当前 Owner、Controller 类型和权限绑定。
     controller_bindings: Vec<AgentControllerBinding>,
+    /// 最近的远程操作日志，按时间顺序保留有限条目。
+    operation_logs: VecDeque<AgentOperationLog>,
+    /// 是否打开右侧日志覆盖抽屉。
+    log_drawer_open: bool,
+    /// 日志抽屉当前筛选级别。
+    log_filter: LogFilter,
+    /// 抽屉关闭期间新增的日志数量。
+    log_unread: usize,
     /// 与后台运行时共享的 Agent 本地权限控制器。
     permission_control: AgentPermissionControl,
     /// 当前进程是否已提升权限。
@@ -470,6 +507,10 @@ impl RemoteOpsAgentApp {
             pairing_code_expires_at: None,
             active_connections: 0,
             controller_bindings: Vec::new(),
+            operation_logs: VecDeque::new(),
+            log_drawer_open: false,
+            log_filter: LogFilter::All,
+            log_unread: 0,
             permission_control: AgentPermissionControl::default(),
             elevated: detect_elevated(),
             translator,
@@ -562,11 +603,17 @@ impl RemoteOpsAgentApp {
     }
 
     /// 将后台事件归并到当前界面快照。
-    fn receive_events(&mut self) {
+    fn receive_events(&mut self) -> bool {
         self.receive_trust_events();
-        while let Ok(event) = self.events.try_recv() {
+        let mut processed = 0;
+        for _ in 0..MAX_EVENTS_PER_FRAME {
+            let Ok(event) = self.events.try_recv() else {
+                break;
+            };
             self.apply_event(event);
+            processed += 1;
         }
+        processed == MAX_EVENTS_PER_FRAME
     }
 
     /// 应用单个 Agent 生命周期事件。
@@ -612,6 +659,14 @@ impl RemoteOpsAgentApp {
             }
             AgentEvent::ControllerBindingsChanged { bindings } => {
                 self.controller_bindings = bindings;
+            }
+            AgentEvent::OperationLog(log) => {
+                store_operation_log(
+                    &mut self.operation_logs,
+                    log,
+                    self.log_drawer_open,
+                    &mut self.log_unread,
+                );
             }
             AgentEvent::Reconnecting { message, .. } => {
                 self.diagnostics.record("agent_reconnecting");
@@ -869,102 +924,94 @@ impl RemoteOpsAgentApp {
     }
 
     /// 渲染当前服务状态、控制码和工程师连接状态。
+    #[allow(clippy::too_many_lines)]
     fn render_status_card(&mut self, ui: &mut egui::Ui) {
         Frame::new()
             .fill(Color32::WHITE)
-            .inner_margin(Margin::symmetric(20, 5))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+            .corner_radius(12.0)
+            .inner_margin(Margin::symmetric(20, 10))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.vertical_centered(|ui| {
-                    ui.horizontal(|ui| {
-                        let content_width = 24.0
-                            + ui.spacing().item_spacing.x
-                            + ui.painter()
-                                .layout_no_wrap(
-                                    self.primary_status_label(),
-                                    FontId::proportional(16.0),
-                                    self.status.color(),
-                                )
-                                .size()
-                                .x;
-                        ui.add_space(centered_left_padding(ui.available_width(), content_width));
-                        ui.label(
-                            RichText::new(icons::CHECK_CIRCLE)
-                                .color(self.status.color())
-                                .size(21.0),
-                        );
-                        ui.label(
-                            RichText::new(self.primary_status_label())
-                                .color(self.status.color())
-                                .strong()
-                                .size(16.0),
-                        );
-                    });
+                    ui.label(
+                        RichText::new(self.translator.text("agent.local_ready"))
+                            .strong()
+                            .size(17.0)
+                            .color(Color32::from_rgb(15, 23, 42)),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(self.translator.text("agent.pairing_code"))
+                            .size(11.0)
+                            .color(Color32::from_rgb(100, 116, 139)),
+                    );
                 });
                 if let Some(detail) = self.status.detail() {
+                    ui.add_space(2.0);
                     ui.vertical_centered(|ui| {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(detail)
                                     .color(Color32::from_rgb(100, 116, 139))
-                                    .size(11.0),
+                                    .size(11.5),
                             )
                             .truncate(),
                         )
                         .on_hover_text(detail);
                     });
                 }
-                ui.add_space(3.0);
+                ui.add_space(4.0);
                 ui.vertical_centered(|ui| {
                     self.render_pairing_code_row(ui);
-                    ui.label(
-                        RichText::new(self.pairing_code_expiry_label())
-                            .color(Color32::from_rgb(71, 85, 105))
-                            .size(12.0),
-                    );
-                });
-                ui.add_space(3.0);
-                ui.separator();
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    let label = self.controller_status_label();
-                    let content_width = 21.0
+                    ui.add_space(2.0);
+                    let expiry = self.pairing_code_expiry_label();
+                    let content_width = 16.0
                         + ui.spacing().item_spacing.x
                         + ui.painter()
                             .layout_no_wrap(
-                                label.clone(),
-                                FontId::proportional(14.0),
-                                Color32::from_rgb(30, 64, 108),
+                                expiry.clone(),
+                                FontId::proportional(12.0),
+                                Color32::from_rgb(100, 116, 139),
                             )
                             .size()
                             .x;
+                    ui.horizontal(|ui| {
+                        ui.add_space(centered_left_padding(ui.available_width(), content_width));
+                        ui.label(
+                            RichText::new(icons::TIMER)
+                                .color(Color32::from_rgb(100, 116, 139))
+                                .size(13.0),
+                        );
+                        ui.label(
+                            RichText::new(expiry)
+                                .color(Color32::from_rgb(100, 116, 139))
+                                .size(12.0),
+                        );
+                    });
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let label = self.controller_status_label();
+                    let is_controlled = self.active_connections > 0;
+                    let (color, icon) = if is_controlled {
+                        (Color32::from_rgb(14, 116, 144), icons::USER_CHECK)
+                    } else {
+                        (Color32::from_rgb(51, 65, 85), icons::USERS)
+                    };
+                    let content_width = 20.0
+                        + ui.spacing().item_spacing.x
+                        + ui.painter()
+                            .layout_no_wrap(label.clone(), FontId::proportional(13.5), color)
+                            .size()
+                            .x;
                     ui.add_space(centered_left_padding(ui.available_width(), content_width));
-                    ui.label(
-                        RichText::new(if self.active_connections > 0 {
-                            icons::USER_CHECK
-                        } else {
-                            icons::USERS
-                        })
-                        .color(Color32::from_rgb(30, 64, 108))
-                        .size(19.0),
-                    );
-                    ui.label(
-                        RichText::new(label)
-                            .color(Color32::from_rgb(30, 64, 108))
-                            .strong()
-                            .size(14.0),
-                    );
+                    ui.label(RichText::new(icon).color(color).size(17.0));
+                    ui.label(RichText::new(label).color(color).strong().size(13.5));
                 });
             });
-    }
-
-    /// 返回主状态区使用的简短文案。
-    fn primary_status_label(&self) -> String {
-        if matches!(self.status, UiStatus::Waiting | UiStatus::Controlled) {
-            self.translator.text("agent.status.ready")
-        } else {
-            self.status.label(&self.translator)
-        }
     }
 
     /// 返回当前控制码的租约倒计时文案。
@@ -1004,13 +1051,13 @@ impl RemoteOpsAgentApp {
                     .map_or_else(|| "--- --- ---".to_owned(), display_pairing_code);
                 let code_active = self.pairing_code_is_active();
                 let code_color = if code_active {
-                    Color32::from_rgb(30, 41, 59)
+                    Color32::from_rgb(15, 23, 42)
                 } else {
                     Color32::from_rgb(148, 163, 184)
                 };
                 let code_width = ui
                     .painter()
-                    .layout_no_wrap(code.clone(), FontId::monospace(36.0), code_color)
+                    .layout_no_wrap(code.clone(), FontId::monospace(34.0), code_color)
                     .size()
                     .x;
                 ui.add_space(pairing_code_left_padding(
@@ -1018,29 +1065,43 @@ impl RemoteOpsAgentApp {
                     code_width,
                     ui.spacing().item_spacing.x,
                 ));
-                ui.label(RichText::new(code).color(code_color).size(32.0).monospace());
+                ui.label(
+                    RichText::new(code)
+                        .color(code_color)
+                        .size(34.0)
+                        .monospace()
+                        .strong(),
+                );
                 let copied = self
                     .copied_until
                     .is_some_and(|deadline| deadline > Instant::now());
-                let icon = if copied { icons::CHECK } else { icons::COPY };
+                let (icon, icon_color, tooltip_key) = if copied {
+                    (
+                        icons::CHECK,
+                        Color32::from_rgb(22, 163, 74),
+                        "agent.action.copied",
+                    )
+                } else {
+                    (
+                        icons::COPY,
+                        Color32::from_rgb(51, 65, 85),
+                        "agent.action.copy",
+                    )
+                };
                 let response = ui
                     .scope(|ui| {
                         stabilize_copy_button_style(ui.style_mut());
                         ui.add_enabled(
                             code_active,
-                            egui::Button::new(
-                                RichText::new(icon)
-                                    .color(Color32::from_rgb(51, 65, 85))
-                                    .size(18.0),
-                            )
-                            .fill(Color32::from_rgb(248, 250, 252))
-                            .stroke(Stroke::new(1.0, Color32::from_rgb(203, 213, 225)))
-                            .corner_radius(4.0)
-                            .min_size(Vec2::splat(COPY_CODE_BUTTON_SIZE)),
+                            egui::Button::new(RichText::new(icon).color(icon_color).size(18.0))
+                                .fill(Color32::from_rgb(248, 250, 252))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(203, 213, 225)))
+                                .corner_radius(6.0)
+                                .min_size(Vec2::splat(COPY_CODE_BUTTON_SIZE)),
                         )
                     })
                     .inner
-                    .on_hover_text(self.translator.text("agent.action.copy"));
+                    .on_hover_text(self.translator.text(tooltip_key));
                 if response.clicked()
                     && let Some(pairing_code) = &self.pairing_code
                 {
@@ -1060,38 +1121,292 @@ impl RemoteOpsAgentApp {
     }
 
     /// 渲染紧凑的能力可用性摘要。
-    fn render_capabilities(&self, ui: &mut egui::Ui) {
+    fn render_capabilities(&mut self, ui: &mut egui::Ui) {
         Frame::new()
             .fill(Color32::WHITE)
-            .inner_margin(Margin::symmetric(20, 4))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+            .corner_radius(12.0)
+            .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
-                ui.columns(4, |columns| {
-                    self.render_capability(
-                        &mut columns[0],
+                let capabilities = [
+                    (
                         icons::TERMINAL_WINDOW,
-                        &self.translator.text("agent.capability.command_short"),
+                        self.translator.text("agent.capability.command_short"),
                         self.has_shell_capability(),
-                    );
-                    self.render_capability(
-                        &mut columns[1],
+                    ),
+                    (
                         icons::FOLDER_OPEN,
-                        &self.translator.text("agent.capability.file_short"),
+                        self.translator.text("agent.capability.file_short"),
                         self.capabilities.contains(Capability::FileTransfer),
-                    );
-                    self.render_capability(
-                        &mut columns[2],
+                    ),
+                    (
                         icons::DESKTOP,
-                        &self.translator.text("agent.capability.ssh_short"),
+                        self.translator.text("agent.capability.ssh_short"),
                         self.capabilities.contains(Capability::Ssh),
-                    );
-                    self.render_capability(
-                        &mut columns[3],
+                    ),
+                    (
                         icons::PLUGS_CONNECTED,
-                        &self.translator.text("agent.capability.serial_short"),
+                        self.translator.text("agent.capability.serial_short"),
                         self.capabilities.contains(Capability::Serial),
+                    ),
+                ];
+                let log_width = 112.0;
+                let capability_width =
+                    (ui.available_width() - log_width - 2.0 * ui.spacing().item_spacing.x).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(capability_width, 28.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.set_min_width(capability_width);
+                            for (icon, label, enabled) in capabilities {
+                                self.render_capability_text(ui, icon, &label, enabled);
+                            }
+                        },
+                    );
+                    ui.add_space(8.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(log_width, 28.0),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            let unread = if self.log_unread > 0 {
+                                format!("{} {}", icons::BELL, self.log_unread.min(99))
+                            } else {
+                                icons::LIST_BULLETS.to_owned()
+                            };
+                            let button = egui::Button::new(
+                                RichText::new(format!(
+                                    "{}  {}",
+                                    unread,
+                                    self.translator.text("agent.log.entry")
+                                ))
+                                .color(Color32::from_rgb(15, 103, 232))
+                                .size(12.0)
+                                .strong(),
+                            )
+                            .fill(Color32::from_rgb(239, 246, 255))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(191, 219, 254)))
+                            .corner_radius(6.0)
+                            .min_size(Vec2::new(88.0, 28.0));
+                            if ui.add(button).clicked() {
+                                self.log_drawer_open = true;
+                                self.log_unread = 0;
+                            }
+                        },
                     );
                 });
             });
+    }
+
+    /// 渲染紧凑的能力标签，减少能力区对主界面的占用。
+    fn render_capability_text(&self, ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool) {
+        let color = if enabled {
+            Color32::from_rgb(30, 41, 59)
+        } else {
+            Color32::from_rgb(148, 163, 184)
+        };
+        let response = ui.label(
+            RichText::new(format!("{icon} {label}"))
+                .size(11.0)
+                .color(color),
+        );
+        response.on_hover_text(if enabled {
+            self.translator.text("agent.capability.enabled")
+        } else {
+            self.translator.text("agent.capability.disabled")
+        });
+    }
+
+    /// 渲染右侧覆盖式日志抽屉。抽屉打开时覆盖底层内容而不改变窗口尺寸。
+    #[allow(clippy::too_many_lines)]
+    fn render_log_drawer(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.log_drawer_open = false;
+        }
+        let target = self.log_drawer_open;
+        let progress = ctx.animate_bool(egui::Id::new("agent-log-drawer-animation"), target);
+        if progress <= 0.001 {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let backdrop = egui::Area::new(egui::Id::new("agent-log-backdrop"))
+            .order(Order::Foreground)
+            .fixed_pos(screen.min);
+        backdrop.show(ctx, |ui| {
+            let response = ui.allocate_rect(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, screen.size()),
+                egui::Sense::click(),
+            );
+            if response.clicked() {
+                self.log_drawer_open = false;
+            }
+        });
+        let left = log_drawer_left(screen.left(), screen.width(), LOG_DRAWER_WIDTH, progress);
+        egui::Area::new(egui::Id::new("agent-log-drawer"))
+            .order(Order::Foreground)
+            .constrain(false)
+            .fixed_pos(egui::pos2(left, screen.top()))
+            .show(ctx, |ui| {
+                ui.set_height(screen.height());
+                ui.set_min_width(LOG_DRAWER_WIDTH);
+                ui.set_max_width(LOG_DRAWER_WIDTH);
+                ui.set_width(LOG_DRAWER_WIDTH);
+                Frame::new()
+                    .fill(Color32::WHITE)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+                    .inner_margin(Margin::symmetric(16, 14))
+                    .shadow(egui::Shadow {
+                        offset: [-8, 0],
+                        blur: 24,
+                        spread: 2,
+                        color: Color32::from_black_alpha(42),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(LOG_DRAWER_WIDTH - 34.0);
+                        ui.set_max_width(LOG_DRAWER_WIDTH - 34.0);
+                        ui.set_height((screen.height() - 30.0).max(0.0));
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(icons::LIST_BULLETS)
+                                    .size(18.0)
+                                    .color(Color32::from_rgb(15, 103, 232)),
+                            );
+                            ui.label(
+                                RichText::new(self.translator.text("agent.log.title"))
+                                    .strong()
+                                    .size(17.0),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button(RichText::new(icons::X).size(16.0)).clicked() {
+                                    self.log_drawer_open = false;
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for (filter, key) in [
+                                (LogFilter::All, "agent.log.filter_all"),
+                                (LogFilter::Running, "agent.log.filter_running"),
+                                (LogFilter::Success, "agent.log.filter_success"),
+                                (LogFilter::Error, "agent.log.filter_error"),
+                                (LogFilter::Info, "agent.log.filter_info"),
+                            ] {
+                                let selected = self.log_filter == filter;
+                                if ui
+                                    .selectable_label(
+                                        selected,
+                                        RichText::new(self.translator.text(key)).size(12.0),
+                                    )
+                                    .clicked()
+                                {
+                                    self.log_filter = filter;
+                                }
+                            }
+                        });
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(self.translator.text_with(
+                                    "agent.log.count",
+                                    &[("count", &self.operation_logs.len().to_string())],
+                                ))
+                                .size(11.0)
+                                .color(Color32::from_rgb(100, 116, 139)),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .small_button(self.translator.text("agent.log.clear"))
+                                    .clicked()
+                                {
+                                    self.operation_logs.clear();
+                                    self.log_unread = 0;
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("agent-operation-logs")
+                            .auto_shrink([false, false])
+                            .max_height(ui.available_height())
+                            .show(ui, |ui| {
+                                let mut shown = false;
+                                for log in self
+                                    .operation_logs
+                                    .iter()
+                                    .filter(|log| self.log_filter.matches(log.level))
+                                {
+                                    shown = true;
+                                    let (icon, color) = match log.level {
+                                        AgentLogLevel::Running => {
+                                            (icons::ARROW_CLOCKWISE, Color32::from_rgb(29, 78, 216))
+                                        }
+                                        AgentLogLevel::Success => {
+                                            (icons::CHECK_CIRCLE, Color32::from_rgb(22, 128, 61))
+                                        }
+                                        AgentLogLevel::Error => {
+                                            (icons::X_CIRCLE, Color32::from_rgb(185, 28, 28))
+                                        }
+                                        AgentLogLevel::Info => {
+                                            (icons::INFO, Color32::from_rgb(71, 85, 105))
+                                        }
+                                    };
+                                    ui.horizontal_top(|ui| {
+                                        ui.label(RichText::new(icon).color(color).size(14.0));
+                                        ui.vertical(|ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(log.message.clone())
+                                                        .size(12.0)
+                                                        .color(Color32::from_rgb(30, 41, 59))
+                                                        .text_style(egui::TextStyle::Body),
+                                                )
+                                                .selectable(true),
+                                            );
+                                            ui.label(
+                                                RichText::new(
+                                                    log.occurred_at
+                                                        .with_timezone(&Local)
+                                                        .format("%H:%M:%S")
+                                                        .to_string(),
+                                                )
+                                                .size(10.0)
+                                                .color(Color32::from_rgb(148, 163, 184)),
+                                            );
+                                            if let Some(request_id) = &log.request_id {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        " · {}",
+                                                        short_request_id(request_id)
+                                                    ))
+                                                    .size(10.0)
+                                                    .color(Color32::from_rgb(148, 163, 184)),
+                                                );
+                                            }
+                                        });
+                                    });
+                                    ui.add_space(6.0);
+                                }
+                                if !shown {
+                                    ui.vertical_centered(|ui| {
+                                        let key = if self.operation_logs.is_empty() {
+                                            "agent.log.empty"
+                                        } else {
+                                            "agent.log.filter_empty"
+                                        };
+                                        ui.add_space(24.0);
+                                        ui.label(
+                                            RichText::new(self.translator.text(key))
+                                                .size(12.0)
+                                                .color(Color32::from_rgb(148, 163, 184)),
+                                        );
+                                    });
+                                }
+                            });
+                    });
+            });
+        if progress < 0.999 {
+            ctx.request_repaint();
+        }
     }
 
     /// 渲染只读运行信息；SSH 密码只在控制端 MCP 的本机安全窗口录入。
@@ -1185,26 +1500,6 @@ impl RemoteOpsAgentApp {
         });
     }
 
-    /// 渲染单个能力项。
-    fn render_capability(&self, ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool) {
-        let color = if enabled {
-            Color32::from_rgb(30, 41, 59)
-        } else {
-            Color32::from_rgb(148, 163, 184)
-        };
-        let status = if enabled {
-            self.translator.text("agent.capability.enabled")
-        } else {
-            self.translator.text("agent.capability.disabled")
-        };
-        ui.vertical_centered(|ui| {
-            ui.label(RichText::new(icon).size(20.0).color(color))
-                .on_hover_text(&status);
-            ui.label(RichText::new(label).strong().size(11.0).color(color))
-                .on_hover_text(status);
-        });
-    }
-
     /// 判断是否存在任一命令 Shell 能力。
     fn has_shell_capability(&self) -> bool {
         [
@@ -1216,38 +1511,53 @@ impl RemoteOpsAgentApp {
         .any(|capability| self.capabilities.contains(capability))
     }
 
-    /// 渲染高级设置与停止协助操作栏。
+    /// 渲染连接详情与停止协助操作栏。
     fn render_action_bar(&mut self, ui: &mut egui::Ui) {
         Frame::new()
             .fill(Color32::WHITE)
-            .inner_margin(Margin::symmetric(16, 10))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+            .inner_margin(Margin {
+                left: 16,
+                right: 16,
+                top: 10,
+                bottom: 12,
+            })
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    if ui
-                        .button(format!(
+                    let details = egui::Button::new(
+                        RichText::new(format!(
                             "{}  {}",
-                            icons::GEAR,
+                            icons::INFO,
                             self.translator.text("agent.action.advanced_settings")
                         ))
-                        .clicked()
-                    {
+                        .color(Color32::from_rgb(51, 65, 85))
+                        .size(13.5)
+                        .strong(),
+                    )
+                    .fill(Color32::from_rgb(248, 250, 252))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(203, 213, 225)))
+                    .corner_radius(6.0)
+                    .min_size(Vec2::new(148.0, 36.0));
+                    if ui.add(details).clicked() {
                         self.show_advanced_settings = true;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let stop_label = if self.active_connections > 0 {
+                            self.translator.text("agent.action.stop_remote")
+                        } else {
+                            self.translator.text("agent.action.exit_agent")
+                        };
                         let stop = egui::Button::new(
-                            RichText::new(format!(
-                                "{}  {}",
-                                icons::STOP_CIRCLE,
-                                self.translator.text("agent.action.stop_remote")
-                            ))
-                            .color(Color32::from_rgb(220, 38, 38))
-                            .strong(),
+                            RichText::new(format!("{}  {}", icons::STOP_CIRCLE, stop_label))
+                                .color(Color32::from_rgb(220, 38, 38))
+                                .size(13.5)
+                                .strong(),
                         )
-                        .fill(Color32::WHITE)
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(239, 68, 68)))
+                        .fill(Color32::from_rgb(254, 242, 242))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(252, 165, 165)))
                         .corner_radius(6.0)
-                        .min_size(Vec2::new(190.0, 38.0));
+                        .min_size(Vec2::new(148.0, 36.0));
                         if ui.add(stop).clicked() {
                             self.show_stop_confirmation = true;
                         }
@@ -1257,6 +1567,7 @@ impl RemoteOpsAgentApp {
     }
 
     /// 渲染停止确认框。
+    #[allow(clippy::too_many_lines)]
     fn render_stop_confirmation(&mut self, ctx: &egui::Context) {
         if !self.show_stop_confirmation {
             return;
@@ -1277,6 +1588,11 @@ impl RemoteOpsAgentApp {
                     }),
             );
         let response = modal.show(ctx, |ui| {
+            let key_prefix = if self.active_connections > 0 {
+                "agent.stop"
+            } else {
+                "agent.exit"
+            };
             ui.set_min_width(380.0);
             ui.set_max_width(400.0);
             ui.horizontal(|ui| {
@@ -1291,14 +1607,14 @@ impl RemoteOpsAgentApp {
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.label(
-                        RichText::new(self.translator.text("agent.stop.title"))
+                        RichText::new(self.translator.text(&format!("{key_prefix}.title")))
                             .size(20.0)
                             .strong()
                             .color(Color32::from_rgb(15, 23, 42)),
                     );
                     ui.add_space(3.0);
                     ui.label(
-                        RichText::new(self.translator.text("agent.stop.subtitle"))
+                        RichText::new(self.translator.text(&format!("{key_prefix}.subtitle")))
                             .size(13.0)
                             .color(Color32::from_rgb(100, 116, 139)),
                     );
@@ -1312,7 +1628,7 @@ impl RemoteOpsAgentApp {
                 .inner_margin(Margin::symmetric(14, 12))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new(self.translator.text("agent.stop.message"))
+                        RichText::new(self.translator.text(&format!("{key_prefix}.message")))
                             .size(14.0)
                             .color(Color32::from_rgb(51, 65, 85)),
                     );
@@ -1323,7 +1639,7 @@ impl RemoteOpsAgentApp {
                     .add_sized(
                         [128.0, 40.0],
                         egui::Button::new(
-                            RichText::new(self.translator.text("agent.stop.confirm"))
+                            RichText::new(self.translator.text(&format!("{key_prefix}.confirm")))
                                 .color(Color32::WHITE)
                                 .strong(),
                         )
@@ -1533,7 +1849,9 @@ impl eframe::App for RemoteOpsAgentApp {
             ctx.request_repaint_after(Duration::from_millis(250));
             return;
         }
-        self.receive_events();
+        if self.receive_events() {
+            ctx.request_repaint();
+        }
         if matches!(self.status, UiStatus::Stopped) && !self.allow_close {
             self.allow_close = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -1548,65 +1866,119 @@ impl eframe::App for RemoteOpsAgentApp {
             }
         }
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(Color32::WHITE).inner_margin(Margin::ZERO))
-            .show(ui, |ui| {
+            .frame(
                 Frame::new()
-                    .fill(Color32::WHITE)
-                    .inner_margin(Margin::symmetric(14, 5))
+                    .fill(Color32::from_rgb(246, 248, 250))
+                    .inner_margin(Margin::ZERO),
+            )
+            .show(ui, |ui| {
+                // 底部操作栏独立占位，避免内容增高时被裁切。
+                egui::Panel::bottom("agent-action-bar")
+                    .frame(Frame::new().fill(Color32::WHITE))
+                    .show(ui, |ui| self.render_action_bar(ui));
+                egui::Panel::top("agent-header")
+                    .frame(Frame::new().fill(Color32::WHITE))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(icons::SHIELD_CHECK)
-                                    .color(Color32::from_rgb(13, 110, 253))
-                                    .size(19.0),
-                            );
-                            ui.label(
-                                RichText::new(self.translator.text("app.agent_title"))
-                                    .strong()
-                                    .size(15.0),
-                            );
-                            let language_width = ui.available_width();
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(language_width, 24.0),
-                                Layout::right_to_left(Align::Center),
-                                |ui| {
-                                    for (index, language) in
-                                        [Language::EnUs, Language::ZhCn].into_iter().enumerate()
-                                    {
-                                        let selected = self.translator.language() == language;
-                                        if ui
-                                            .selectable_label(
-                                                selected,
-                                                self.translator.text(&format!(
-                                                    "language.{}.short",
-                                                    language.code()
-                                                )),
-                                            )
-                                            .on_hover_text(
-                                                self.translator.text("language.switch_hint"),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.set_language(language, &ctx);
-                                        }
-                                        if index == 0 {
-                                            ui.label(
-                                                RichText::new("|")
-                                                    .color(Color32::from_rgb(148, 163, 184)),
-                                            );
-                                        }
-                                    }
-                                },
-                            );
-                        });
+                        Frame::new()
+                            .fill(Color32::WHITE)
+                            .inner_margin(Margin::symmetric(16, 9))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(icons::SHIELD_CHECK)
+                                            .color(Color32::from_rgb(13, 110, 253))
+                                            .size(19.0),
+                                    );
+                                    ui.label(
+                                        RichText::new(self.translator.text("app.agent_brand"))
+                                            .strong()
+                                            .size(15.0),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.scope(|ui| {
+                                            ui.style_mut().animation_time = 0.0;
+                                            Frame::new()
+                                                .fill(Color32::from_rgb(241, 245, 249))
+                                                .stroke(Stroke::new(
+                                                    1.0,
+                                                    Color32::from_rgb(226, 232, 240),
+                                                ))
+                                                .corner_radius(6.0)
+                                                .inner_margin(Margin::symmetric(2, 2))
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        for language in
+                                                            [Language::ZhCn, Language::EnUs]
+                                                        {
+                                                            let selected =
+                                                                self.translator.language()
+                                                                    == language;
+                                                            let fill = if selected {
+                                                                Color32::WHITE
+                                                            } else {
+                                                                Color32::TRANSPARENT
+                                                            };
+                                                            let text_color = if selected {
+                                                                Color32::from_rgb(15, 103, 232)
+                                                            } else {
+                                                                Color32::from_rgb(100, 116, 139)
+                                                            };
+                                                            let stroke = if selected {
+                                                                Stroke::new(
+                                                                    1.0,
+                                                                    Color32::from_rgb(
+                                                                        203, 213, 225,
+                                                                    ),
+                                                                )
+                                                            } else {
+                                                                Stroke::NONE
+                                                            };
+                                                            let button = egui::Button::new(
+                                                                RichText::new(
+                                                                    self.translator.text(&format!(
+                                                                        "language.{}.short",
+                                                                        language.code()
+                                                                    )),
+                                                                )
+                                                                .color(text_color)
+                                                                .size(12.0),
+                                                            )
+                                                            .fill(fill)
+                                                            .stroke(stroke)
+                                                            .corner_radius(4.0)
+                                                            .min_size(Vec2::new(42.0, 22.0));
+                                                            if ui.add(button).clicked() {
+                                                                self.set_language(language, &ctx);
+                                                            }
+                                                        }
+                                                    });
+                                                });
+                                        });
+                                    });
+                                });
+                            });
+                        ui.separator();
                     });
-                ui.separator();
-                self.render_status_card(ui);
-                ui.separator();
-                self.render_capabilities(ui);
-                ui.separator();
-                self.render_action_bar(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("agent-main-content")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        Frame::new()
+                            .inner_margin(Margin {
+                                left: 16,
+                                right: 16,
+                                top: 10,
+                                bottom: 8,
+                            })
+                            .show(ui, |ui| {
+                                self.render_status_card(ui);
+                                ui.add_space(8.0);
+                                self.render_capabilities(ui);
+                            });
+                    });
             });
+        self.render_log_drawer(&ctx);
         self.render_stop_confirmation(&ctx);
         self.render_advanced_settings(&ctx);
         self.render_certificate_confirmation(&ctx);
@@ -1773,7 +2145,7 @@ fn spawn_live(
 fn spawn_demo(
     event_sender: AgentEventSender,
     config: AgentConfig,
-    _shutdown_receiver: watch::Receiver<bool>,
+    shutdown_receiver: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("remoteops-agent-demo".to_owned())
@@ -1797,6 +2169,32 @@ fn spawn_demo(
             let _ = event_sender.send(AgentEvent::ControllerCountChanged {
                 active_connections: 0,
             });
+            let mut request_id = RequestId::new();
+            for index in 0..30 {
+                if *shutdown_receiver.borrow() {
+                    break;
+                }
+                let level = match index % 3 {
+                    0 => AgentLogLevel::Running,
+                    2 => AgentLogLevel::Success,
+                    _ => AgentLogLevel::Info,
+                };
+                if index % 3 == 0 {
+                    request_id = RequestId::new();
+                }
+                let message = match index % 3 {
+                    0 => "发送模拟命令：echo RemoteOps ready".to_owned(),
+                    1 => "模拟输出：RemoteOps ready".to_owned(),
+                    _ => format!("模拟命令执行完成（检查 #{:02}）", index + 1),
+                };
+                let _ = event_sender.send(AgentEvent::OperationLog(AgentOperationLog {
+                    request_id: Some(request_id),
+                    occurred_at: Utc::now(),
+                    level,
+                    message,
+                }));
+                std::thread::sleep(Duration::from_secs(2));
+            }
         })
         .expect("应能启动 Agent 演示线程")
 }
@@ -2198,7 +2596,7 @@ mod tests {
         assert!(options.run_and_return);
         assert!(!options.persist_window);
         assert!(options.centered);
-        assert_eq!(RUNNING_WINDOW_SIZE, Vec2::new(520.0, 410.0));
+        assert_eq!(RUNNING_WINDOW_SIZE, Vec2::new(520.0, 440.0));
         assert_eq!(options.viewport.inner_size, Some(RUNNING_WINDOW_SIZE));
         assert_eq!(options.viewport.min_inner_size, Some(RUNNING_WINDOW_SIZE));
         assert_eq!(options.viewport.max_inner_size, Some(RUNNING_WINDOW_SIZE));
@@ -2232,6 +2630,54 @@ mod tests {
         let future = now + chrono::Duration::seconds(90);
         assert_eq!(pairing_code_remaining_seconds(&future, &now), Some(90));
         assert_eq!(pairing_code_remaining_seconds(&now, &now), None);
+    }
+
+    #[test]
+    fn operation_log_view_is_bounded_and_tracks_unread() {
+        let mut logs = VecDeque::new();
+        let mut unread = 0;
+        for index in 0..(MAX_OPERATION_LOGS + 3) {
+            store_operation_log(
+                &mut logs,
+                AgentOperationLog {
+                    request_id: None,
+                    occurred_at: Utc::now(),
+                    level: AgentLogLevel::Info,
+                    message: index.to_string(),
+                },
+                false,
+                &mut unread,
+            );
+        }
+        assert_eq!(logs.len(), MAX_OPERATION_LOGS);
+        assert_eq!(unread, MAX_OPERATION_LOGS + 3);
+        assert_eq!(logs.front().map(|log| log.message.as_str()), Some("3"));
+        store_operation_log(
+            &mut logs,
+            AgentOperationLog {
+                request_id: None,
+                occurred_at: Utc::now(),
+                level: AgentLogLevel::Success,
+                message: "drawer-open".to_owned(),
+            },
+            true,
+            &mut unread,
+        );
+        assert_eq!(unread, MAX_OPERATION_LOGS + 3);
+    }
+
+    #[test]
+    fn log_filter_matches_only_requested_level() {
+        assert!(LogFilter::All.matches(AgentLogLevel::Info));
+        assert!(LogFilter::Running.matches(AgentLogLevel::Running));
+        assert!(!LogFilter::Running.matches(AgentLogLevel::Success));
+        assert!(LogFilter::Error.matches(AgentLogLevel::Error));
+    }
+
+    #[test]
+    fn log_drawer_geometry_keeps_fixed_overlay_width() {
+        assert!((log_drawer_left(0.0, 520.0, 360.0, 1.0) - 160.0).abs() < f32::EPSILON);
+        assert!((log_drawer_left(0.0, 520.0, 360.0, 0.0) - 520.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -2434,6 +2880,10 @@ mod tests {
             pairing_code_expires_at: None,
             active_connections: 1,
             controller_bindings: Vec::new(),
+            operation_logs: VecDeque::new(),
+            log_drawer_open: false,
+            log_filter: LogFilter::All,
+            log_unread: 0,
             permission_control: AgentPermissionControl::default(),
             elevated: Some(true),
             translator: Translator::new(remoteops_i18n::Language::ZhCn),

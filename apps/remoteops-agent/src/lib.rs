@@ -4,6 +4,8 @@
 //! 状态。GUI 和 Windows Service 只负责宿主生命周期与展示，不能绕过这里的
 //! 权限、Session 和操作校验。
 
+mod operation_log;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -394,6 +396,8 @@ pub enum AgentEvent {
         /// 当前活动 Controller 绑定快照。
         bindings: Vec<AgentControllerBinding>,
     },
+    /// 远程操作的本地展示日志。
+    OperationLog(AgentOperationLog),
     /// 连接中断，等待自动重试。
     Reconnecting {
         /// 面向现场人员的简短原因。
@@ -408,6 +412,32 @@ pub enum AgentEvent {
         /// 可用于现场排查的脱敏错误信息。
         message: String,
     },
+}
+
+/// GUI 中显示的远程操作日志级别。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentLogLevel {
+    /// 操作正在执行。
+    Running,
+    /// 操作已成功完成。
+    Success,
+    /// 操作执行失败或被中断。
+    Error,
+    /// 普通状态信息。
+    Info,
+}
+
+/// 一条供本地 GUI 展示的远程操作日志。
+#[derive(Clone, Debug)]
+pub struct AgentOperationLog {
+    /// 对应远程请求，便于区分并发操作。
+    pub request_id: Option<RequestId>,
+    /// 日志发生时间。
+    pub occurred_at: DateTime<Utc>,
+    /// 日志级别。
+    pub level: AgentLogLevel,
+    /// 已脱敏的日志内容。
+    pub message: String,
 }
 
 /// Agent 向本地表现层公开的 Controller 绑定摘要。
@@ -1125,8 +1155,15 @@ where
             permission_mode: *permission_mode_updates.borrow_and_update(),
         },
     ));
+    let log_observer = Arc::new(std::sync::Mutex::new(operation_log::LogObserver::new(
+        event_sender.cloned(),
+    )));
+    let writer_logs = log_observer.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(message) = receiver.recv().await {
+            if let Ok(mut logs) = writer_logs.lock() {
+                logs.observe(&message);
+            }
             match write_frame(&mut writer, &message).await {
                 Ok(()) => {}
                 Err(error) => {
@@ -1250,7 +1287,7 @@ where
                     ));
                     continue;
                 }
-                abort_pending_tasks(&tasks).await;
+                abort_pending_tasks(&tasks, Some(&log_observer), "Agent 关闭时操作已中断").await;
                 close_agent_resources(&shell_sessions, &serial_sessions).await;
                 close_file_uploads(&file_uploads).await;
                 let _ = sender.send(WireMessage::AgentShutdownResult(
@@ -1287,6 +1324,7 @@ where
                         continue;
                     }
                 };
+                operation_log::record_request(event_sender, &request);
                 if let RemoteOperation::CancelRequest {
                     request_id: target_request_id,
                 } = &request.operation
@@ -1331,7 +1369,7 @@ where
                     continue;
                 }
                 if matches!(request.operation, RemoteOperation::EmergencyStop) {
-                    abort_pending_tasks(&tasks).await;
+                    abort_pending_tasks(&tasks, Some(&log_observer), "紧急停止，操作已中断").await;
                     close_agent_resources(&shell_sessions, &serial_sessions).await;
                     close_file_uploads(&file_uploads).await;
                     send_event(
@@ -1462,7 +1500,7 @@ where
     } else {
         writer_task.abort();
     }
-    abort_pending_tasks(&tasks).await;
+    abort_pending_tasks(&tasks, Some(&log_observer), "连接已断开，操作已中断").await;
     close_file_uploads(&file_uploads).await;
     local_permission_policy.set_active_owner(None);
     emit_agent_event(
@@ -2497,20 +2535,29 @@ fn spawn_command_output_forwarder(
     })
 }
 
-async fn abort_pending_tasks(tasks: &Arc<Mutex<BTreeMap<RequestId, PendingTask>>>) {
+async fn abort_pending_tasks(
+    tasks: &Arc<Mutex<BTreeMap<RequestId, PendingTask>>>,
+    log_observer: Option<&Arc<std::sync::Mutex<operation_log::LogObserver>>>,
+    message: &str,
+) {
     let pending: Vec<_> = {
         let mut tasks = tasks.lock().await;
-        std::mem::take(&mut *tasks).into_values().collect()
+        std::mem::take(&mut *tasks).into_iter().collect()
     };
-    for pending in pending {
+    for (request_id, pending) in pending {
         let PendingTask {
-            session_id: _,
+            session_id,
             task,
             terminal,
             interactive_shell,
         } = pending;
         match terminal.try_commit(TaskTerminal::Aborted) {
             Ok(()) => {
+                if let Some(observer) = log_observer
+                    && let Ok(mut observer) = observer.lock()
+                {
+                    observer.interrupt(session_id, request_id, Utc::now(), message);
+                }
                 if let Some(shell) = interactive_shell {
                     let _ = shell.interrupt().await;
                 }
@@ -3228,6 +3275,9 @@ fn print_agent_event(event: &AgentEvent) {
                 );
             }
         }
+        AgentEvent::OperationLog(log) => {
+            println!("{}：{}", log.occurred_at.to_rfc3339(), log.message);
+        }
         AgentEvent::Reconnecting {
             message,
             retry_seconds,
@@ -3482,27 +3532,32 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&state_file);
         let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
-        let connection_task = tokio::spawn(run_connection(
-            agent_stream,
-            agent_instance_id,
-            None,
-            Arc::new(Mutex::new(None)),
-            state_file.clone(),
-            "test-host".to_owned(),
-            None,
-            "test-os".to_owned(),
-            CapabilitySet::new([Capability::Cmd]),
-            EnvironmentProfile::empty(),
-            Arc::new(SystemDevice::new()),
-            Arc::new(AtomicU64::new(1)),
-            Arc::new(Mutex::new(BTreeMap::new())),
-            Arc::new(Mutex::new(BTreeMap::new())),
-            Arc::new(LocalPermissionPolicy::default()),
-            Arc::new(CredentialEncryptionKeyPair::generate()),
-            watch::channel(PermissionMode::ApprovalRequired).1,
-            None,
-            shutdown_receiver,
-        ));
+        let (log_sender, log_receiver) = std_mpsc::channel();
+        let connection_state_file = state_file.clone();
+        let connection_task = tokio::spawn(async move {
+            run_connection(
+                agent_stream,
+                agent_instance_id,
+                None,
+                Arc::new(Mutex::new(None)),
+                connection_state_file,
+                "test-host".to_owned(),
+                None,
+                "test-os".to_owned(),
+                CapabilitySet::new([Capability::Cmd]),
+                EnvironmentProfile::empty(),
+                Arc::new(SystemDevice::new()),
+                Arc::new(AtomicU64::new(1)),
+                Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(LocalPermissionPolicy::default()),
+                Arc::new(CredentialEncryptionKeyPair::generate()),
+                watch::channel(PermissionMode::ApprovalRequired).1,
+                Some(&log_sender),
+                shutdown_receiver,
+            )
+            .await
+        });
 
         let hello: WireMessage = read_frame(&mut relay_stream)
             .await
@@ -3629,6 +3684,30 @@ mod tests {
         .expect("Agent 应在超时前返回命令结果");
         assert_eq!(response.exit_code, Some(0));
         assert!(response.summary.contains("REMOTEOPS_AGENT_TRANSPORT"));
+
+        let logs: Vec<_> = log_receiver
+            .try_iter()
+            .filter_map(|event| {
+                if let AgentEvent::OperationLog(log) = event {
+                    Some(log)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            logs.iter()
+                .any(|log| log.message.contains("echo REMOTEOPS_AGENT_TRANSPORT"))
+        );
+        assert!(
+            logs.iter()
+                .any(|log| log.message == "REMOTEOPS_AGENT_TRANSPORT")
+        );
+        assert!(
+            logs.iter()
+                .any(|log| log.request_id == Some(response_request_id)
+                    && log.level == AgentLogLevel::Success)
+        );
 
         drop(relay_stream);
         let connection_result = timeout(Duration::from_secs(2), connection_task)
@@ -3916,9 +3995,12 @@ mod tests {
             );
         }
 
-        timeout(Duration::from_secs(1), abort_pending_tasks(&tasks))
-            .await
-            .expect("断线清理不应阻塞");
+        timeout(
+            Duration::from_secs(1),
+            abort_pending_tasks(&tasks, None, "连接已断开，操作已中断"),
+        )
+        .await
+        .expect("断线清理不应阻塞");
 
         assert_eq!(running.load(), TaskTerminal::Aborted);
         assert_eq!(completed.load(), TaskTerminal::Completed);
