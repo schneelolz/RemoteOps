@@ -18,6 +18,7 @@ if (-not (Test-Path -LiteralPath $resolvedAssetRoot -PathType Container)) {
 
 $expectedNames = @(
     "RemoteOps-Windows-x64-$Version.zip",
+    "RemoteOps-Agent-linux-x64-$Version.tar.gz",
     "RemoteOps-MCP-Windows-x64-$Version.zip",
     "RemoteOps-MCP-macOS-arm64-$Version.tar.gz",
     "RemoteOps-Relay-Linux-x64-$Version.tar.gz",
