@@ -122,11 +122,21 @@ if (Test-Path -LiteralPath $agentGui -PathType Leaf) {
         ) {
             throw "manifest.json 中的 Windows 文件版本不匹配：$requiredExecutable"
         }
-    }
-    $guiVersion = (Get-Item -LiteralPath $agentGui).VersionInfo.ProductVersion
-    $askpassVersion = (Get-Item -LiteralPath $askpass).VersionInfo.ProductVersion
-    if ($guiVersion -cne $askpassVersion) {
-        throw 'Agent GUI 与 SSH askpass 的产品版本不一致。'
+        # GUI 和 askpass 独立发布；分别匹配自己的 Cargo 版本。
+        $cargoVersion = [string]$entry.CargoVersion
+        if ([string]::IsNullOrWhiteSpace($cargoVersion)) {
+            throw "manifest.json 中缺少 Cargo 版本：$requiredExecutable"
+        }
+        $baseVersion = ($cargoVersion -split '-', 2)[0]
+        $versionPattern = '^(?:{0}|{1}(?:\.0)?)$' -f `
+            [regex]::Escape($cargoVersion),
+            [regex]::Escape($baseVersion)
+        if (
+            $item.VersionInfo.FileVersion -cnotmatch $versionPattern -or
+            $item.VersionInfo.ProductVersion -cnotmatch $versionPattern
+        ) {
+            throw "Windows 文件版本与自身 Cargo 版本不匹配：$requiredExecutable"
+        }
     }
 }
 
