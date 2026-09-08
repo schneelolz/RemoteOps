@@ -4059,23 +4059,16 @@ mod tests {
 
     #[test]
     fn full_access_grant_expires_after_one_hour_of_inactivity() {
-        let now = Instant::now();
-        assert!(
-            FullAccessGrant {
-                last_successful_use: now
-                    .checked_sub(Duration::from_secs(3_599))
-                    .expect("测试时间应可回退"),
-            }
-            .is_active_at(now)
-        );
-        assert!(
-            !FullAccessGrant {
-                last_successful_use: now
-                    .checked_sub(Duration::from_hours(1))
-                    .expect("测试时间应可回退"),
-            }
-            .is_active_at(now)
-        );
+        let started = Instant::now();
+        let grant = FullAccessGrant {
+            last_successful_use: started,
+        };
+        // Windows 新启动的 runner 不一定支持将 Instant 向过去回退一小时。
+        // 从授权时间向未来推进，避免测试依赖宿主机已运行多久。
+        assert!(grant.is_active_at(started));
+        assert!(grant.is_active_at(started + Duration::from_secs(3_599)));
+        assert!(!grant.is_active_at(started + Duration::from_hours(1)));
+        assert!(!grant.is_active_at(started + Duration::from_secs(3_601)));
     }
 
     #[test]
