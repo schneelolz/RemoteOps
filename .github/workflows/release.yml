@@ -135,31 +135,18 @@ jobs:
           path: release
           merge-multiple: true
       - name: Assemble release assets
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          windows_dir="$(find release -type d -name windows-x64 -print -quit)"
-          mcp_zip="$(find release -type f -name 'RemoteOps-MCP-Windows-x64-*.zip' -print -quit)"
-          macos_mcp="$(find release -type f -name 'RemoteOps-MCP-macOS-arm64-*.tar.gz' -print -quit)"
-          relay_bin="$(find release -type f -path '*/linux-x64/remoteops-relay' -print -quit)"
-          test -n "$windows_dir"
-          test -n "$mcp_zip"
-          test -n "$macos_mcp"
-          test -n "$relay_bin"
-          mkdir -p assets
-          (cd "$windows_dir" && zip -9 -r "$GITHUB_WORKSPACE/assets/RemoteOps-Windows-x64-$version.zip" .)
-          cp "$mcp_zip" "assets/RemoteOps-MCP-Windows-x64-$version.zip"
-          cp "$macos_mcp" "assets/RemoteOps-MCP-macOS-arm64-$version.tar.gz"
-          tar -C "$(dirname "$relay_bin")" -czf "assets/RemoteOps-Relay-Linux-x64-$version.tar.gz" remoteops-relay LICENSE THIRD_PARTY_LICENSES.txt DEPENDENCIES.json
-          find release -name 'RemoteOps-Agent-linux-x64-*.tar.gz' -exec cp {} assets/ \;
-          (cd assets && sha256sum RemoteOps-* > SHA256SUMS.txt)
+          bash scripts/Assemble-GitHubReleaseAssets.sh release "${RELEASE_VERSION#v}" "$RUNNER_TEMP/remoteops-release-assets"
       - name: Validate final release assets
         shell: pwsh
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
-        run: ./scripts/Test-GitHubReleaseAssets.ps1 -AssetRoot ./assets -Version $env:RELEASE_VERSION.Substring(1)
+          RELEASE_ASSET_ROOT: ${{ runner.temp }}/remoteops-release-assets
+        run: ./scripts/Test-GitHubReleaseAssets.ps1 -AssetRoot $env:RELEASE_ASSET_ROOT -Version $env:RELEASE_VERSION.Substring(1)
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           prerelease: true
-          files: assets/*
+          files: ${{ runner.temp }}/remoteops-release-assets/*
