@@ -1,5 +1,7 @@
 target/
 artifacts/
+outputs/
+work/
 
 # The repository-wide build scripts are source files. Keep them visible even
 # when a developer has a global build/ ignore rule.
@@ -50,4 +52,3 @@ config.local.json
 *.suo
 Thumbs.db
 .DS_Store
-
