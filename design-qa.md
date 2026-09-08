@@ -1,64 +1,54 @@
 # Agent GUI 设计验收
 
-## 范围与结论
+## 验收结论
 
-2026-09-08 本地 Windows 原生界面验收，目标客户区为 `520 × 440`；100% 缩放下原生外框为 `536 × 479`。本次实现使用原有 Rust/egui 界面与 Agent 运行层，未增加前端框架，也未改变 v14 远程协议。
+2026-09-08 在 Windows 原生窗口完成 `0.2.0-preview.9` 的视觉与交互验收。目标客户区为 `520 × 440`，100% 缩放下原生外框为 `536 × 479`。本次修正保持固定窗口尺寸和既有日志覆盖抽屉，不改变 v14 协议。
 
-采用此前确认的白底设计方向：居中主状态与控制码、紧凑能力摘要、分开的底部操作，以及从右侧覆盖主界面的日志抽屉。保留真实九位控制码格式；参考图中的六位数字只属于视觉占位。界面标题采用“本机已就绪”。
+三张用户参考图均作为视觉事实来源，并与同状态实现截图并排对照：
 
-主界面与中英文日志抽屉已在 Windows 原生窗口完成操作验收。截图使用 `--demo` 的虚构控制码、请求 ID 和模拟日志，不代表连接真实 Relay。真实命令到日志事件的链路由本地双向流集成测试验证。
+- 初始状态：`C:\Users\ywb\AppData\Local\Temp\codex-clipboard-bb178db7-78f6-4282-90bc-ad2ac6f2cff3.png`，`522 × 474`。
+- 标题与图标：`C:\Users\ywb\AppData\Local\Temp\codex-clipboard-92e6ad2f-4b02-46e5-80f8-f28348088c3d.png`，`527 × 476`。
+- 连接详情：`C:\Users\ywb\AppData\Local\Temp\codex-clipboard-c937b8fc-8887-4dd3-96df-cd727e6a32b3.png`，`520 × 470`。
 
-## 行为验收
+## 逐项结果
 
-| 检查项 | 结果 |
-| --- | --- |
-| 中文、英文主界面完整显示控制码、四项能力、日志入口和底部按钮 | 通过；主界面无需滚动 |
-| 日志默认隐藏，点击入口显示 | 通过；未读计数关闭时增加，打开后清零 |
-| 抽屉从右侧覆盖底层，不增加窗口宽度、不挤压主界面 | 通过；抽屉宽 360，窗口尺寸始终相同 |
-| 关闭按钮、Esc、抽屉外部点击 | 通过；外部点击不会同时触发底层连接详情 |
-| 历史记录与独立滚动 | 通过；可滚至历史和末尾，收起再打开保留记录 |
-| 新日志到达时查看历史 | 通过；不会强制跳到末尾 |
-| 筛选与空状态 | 通过；无匹配记录显示筛选空提示 |
-| 清空日志 | 通过；记录数归零，只清理当前界面的内存 |
-| 原有连接详情和退出确认 | 通过；详情不包含 SSH 密码入口 |
-| 控制码、能力区及底部按钮对齐 | 通过；能力区用文字图标，日志入口固定在右侧 |
+| 检查项 | 实现结果 | 验收结果 |
+| --- | --- | --- |
+| 初始界面缺少等待反馈 | 控制码尚未取得时显示蓝色旋转动画，并显示“正在获取临时控制码” | 通过；加载过程不改变布局，不显示伪控制码 |
+| 原生标题和应用内标题重复 | 原生标题保留本地化产品名称，应用内标题改为 `RemoteOps Agent` | 通过；两个层级职责清楚 |
+| 左上角仍显示旧图标 | 原生窗口和应用内标题均加载 `assets/brand/remoteops-mark.png` | 通过；两处均显示蓝色盾牌品牌图标 |
+| 标题缺少程序版本 | 使用编译时 `CARGO_PKG_VERSION` 生成原生标题 | 通过；中英文标题均显示 `v0.2.0-preview.9`，没有硬编码版本文案 |
+| 传输目录显示不全 | 去除 `\\?\` 扩展前缀，路径和右侧图标均可点击，悬停显示完整路径 | 通过；实测资源管理器打开 `C:\Users\ywb\AppData\Local\RemoteOps\transfers` |
 
-历史最多保留当前进程最近 1000 条记录。日志按完整行合并并复用现有脱敏规则；超长行和超过每流展示上限的输出会省略，仍显示执行终态。这是现场诊断视图，不替代完整审计，也不跨进程保存历史。
-
-## 迭代修正
-
-1. 第一轮实机检查发现抽屉被 egui 默认区域约束撑成整窗，已明确宽度及覆盖位置，并对框体边距和滚动区域高度计算可用空间。
-2. 英文能力区曾挤掉串口或日志入口，已移除重复标题和小卡片背景，按可用宽度分配能力区与日志入口。
-3. 复核补齐紧急停止、Agent 关闭和断线时在途操作的日志终态；输出省略后依然展示结果。
-4. 新增跨协议分片的凭据与 PEM 边界测试，超长行采用有界滚动上下文，避免截断破坏脱敏边界。
-5. 共享运行层的新事件已适配 Service；服务忽略操作日志，不按输出行重写状态文件。
+参考图中的 Relay、权限和用户目录属于运行数据。验收截图使用 `--demo`，因此显示 `demo.invalid`、当前用户目录和未提升权限；这些差异不属于布局或交互偏差。
 
 ## 截图证据
 
-- [中文主界面](docs/assets/agent-gui/runtime-zh.png)
-- [英文主界面](docs/assets/agent-gui/runtime-en.png)
-- [中文覆盖抽屉](docs/assets/agent-gui/drawer-zh.png)
-- [英文覆盖抽屉](docs/assets/agent-gui/drawer-en.png)
-- [连接详情](docs/assets/agent-gui/advanced-settings-zh.png)
-- [退出确认](docs/assets/agent-gui/stop-confirmation-zh.png)
+- [中文初始等待状态](docs/assets/agent-gui/initial-loading-zh.png)
+- [中文就绪状态](docs/assets/agent-gui/runtime-zh.png)
+- [英文就绪状态](docs/assets/agent-gui/runtime-en.png)
+- [可点击传输目录](docs/assets/agent-gui/advanced-settings-zh.png)
+- [中文覆盖日志抽屉](docs/assets/agent-gui/drawer-zh.png)
+- [英文覆盖日志抽屉](docs/assets/agent-gui/drawer-en.png)
 
-交互过程截图及验收辅助脚本保存在 Git 忽略的 `artifacts/ui-audit/20260908-log-drawer`。图片只包含本地演示数据。
+对照过程覆盖完整主窗口、初始加载局部、标题局部和连接详情局部。最终复核未发现 P0、P1 或 P2 视觉问题，也未发现滚动条、文字裁切、元素重叠或点击目标过小的问题。
 
 ## 自动化验证与版本
 
-以下命令均已通过。相关测试共 65 项（Agent 41、GUI 20、Service 1、语言包 3）；Clippy 无警告；Debug/Release 六个 EXE 均已通过 Windows 文件版本与产品版本字段核对。
+以下验证均已通过：
 
-- `cargo test -p remoteops-agent -p remoteops-agent-gui -p remoteops-agent-service -p remoteops-i18n`
-- `cargo clippy -p remoteops-agent -p remoteops-agent-gui -p remoteops-agent-service -p remoteops-i18n --all-targets -- -D warnings`
-- `cargo check --workspace --all-targets`
-- `cargo fmt --all -- --check`
-- `cargo build -p remoteops-agent-gui -p remoteops-agent -p remoteops-agent-service`
-- `cargo build --release -p remoteops-agent-gui -p remoteops-agent -p remoteops-agent-service`
-- `./scripts/Test-Documentation.ps1`
-- `git diff --check`
+- `cargo test -p remoteops-agent-gui -p remoteops-i18n`：25 项通过。
+- `cargo clippy -p remoteops-agent-gui -p remoteops-i18n --all-targets -- -D warnings`：通过，无警告。
+- `cargo check --workspace --all-targets`：通过。
+- `cargo fmt --all -- --check`：通过。
+- `cargo build -p remoteops-agent-gui`：Debug 构建通过。
+- `cargo build --release -p remoteops-agent-gui`：Release 构建通过。
+- `./scripts/Test-Documentation.ps1`：44 个 Markdown 文件链接检查通过。
 
-GUI 版本 `0.2.0-preview.8`；Agent 与 Service 版本 `0.2.0-preview.7`。遵循当前 Technical Preview 的独立预览序号约定。Windows 数字文件版本同步为 GUI `0.2.0.8`、Agent/Service `0.2.0.7`，避免预览序号只出现在字符串版本中。
+Debug 与 Release 的 `remoteops-agent-gui.exe` 字符串版本均为 `0.2.0-preview.9`，Windows 数字文件版本均为 `0.2.0.9`。
 
 ## 验证边界
 
-本次没有连接外部 Relay，也未操作真实 SSH 或串口硬件；未验证不同 DPI、RDP 或全新低权限 Windows 账户。截图在 Windows 100% 缩放环境完成，不代表其他缩放比例已经验收。当前改造是本地候选，未部署、未提交、未推送或公开发布。
+本次没有连接外部 Relay，也未操作真实 SSH 或串口硬件。不同 DPI、RDP 和全新低权限 Windows 账户未复测。原生视觉检查在 Windows 100% 缩放环境完成；本地候选未部署、未提交、未推送或公开发布。
+
+final result: passed
