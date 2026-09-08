@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: 'Release run whose validate, Windows, Linux and macOS jobs all succeeded'
+        description: 'Successful tagged Release run ID'
         required: true
         type: string
       release_tag:
