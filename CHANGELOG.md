@@ -2,6 +2,12 @@
 
 本变更日志只记录实际公开发布的版本。GitHub Release 发布前的内部构建、现场复测和修复不会递增公开版本号；必要的技术过程记录在项目状态和测试资料中。
 
+## [0.2.0-preview.7] - Technical Preview
+
+- 发布 Windows Agent CLI、Service、GUI、SSH askpass、Linux Agent/Service、Linux Relay、Windows MCP 和 macOS MCP 产物。
+- Windows Agent GUI 使用 `0.2.0-preview.9` 内部 GUI 版本，协议保持 `v14`。
+- 本版本面向开发者和受控试点，不建议用于关键生产环境。
+
 ## [0.2.0-preview.6] - 待发布候选
 
 - 重做 Windows Agent GUI 品牌与运行页：新增 RemoteOps Shield + Terminal 标识、Windows 应用图标、连接详情入口、可用能力状态和按连接状态变化的退出/停止文案。
