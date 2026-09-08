@@ -5,15 +5,15 @@
 ## 当前基线
 
 - 项目：RemoteOps
-- 当前源码版本：`0.2.0-preview.5`
-- 首个计划公开版本：`0.2.0-preview.5`
+- 当前源码版本：Agent `0.2.0-preview.7`，GUI `0.2.0-preview.9`，Relay/MCP `0.2.0-preview.5`
+- 首个计划公开版本：`0.2.0-preview.7`
 - 当前协议版本：`v14`
 - 发布阶段：GitHub Technical Preview 准备中，尚未创建首个 GitHub Release
 - 现场端：Windows x64 Agent
 - Relay：Linux x64 + Docker
 - Codex MCP：Windows x64、Apple Silicon macOS
 
-公开版本以实际 GitHub Release 为准，当前源码候选版本为 `0.2.0-preview.5`，尚未创建首个公开 Release。迁移前的 `4.x` 只代表内部开发和验收历史，不属于公开版本序列。v9 完成 Controller 会话释放、同 Owner 新实例接管和 MCP 授权修复；v10 取消普通 Agent 首次连接所需的入网码和部署级注册 Token；v11 增加大文件分块传输、权限状态修复、持久 Shell 显式关闭及完整 Windows 隐藏进程回归；v13 增加 Agent 租约续期事件；v14 将 SSH 密码改为控制端本机安全窗口输入和 MCP 到 Agent 的 HPKE 单次加密载荷。Agent、Relay 和 Controller 必须使用同一协议版本。
+公开版本以实际 GitHub Release 为准，当前源码候选版本为 Agent `0.2.0-preview.7`、GUI `0.2.0-preview.9`、Relay/MCP `0.2.0-preview.5`，尚未创建首个公开 Release。迁移前的 `4.x` 只代表内部开发和验收历史，不属于公开版本序列。v9 完成 Controller 会话释放、同 Owner 新实例接管和 MCP 授权修复；v10 取消普通 Agent 首次连接所需的入网码和部署级注册 Token；v11 增加大文件分块传输、权限状态修复、持久 Shell 显式关闭及完整 Windows 隐藏进程回归；v13 增加 Agent 租约续期事件；v14 将 SSH 密码改为控制端本机安全窗口输入和 MCP 到 Agent 的 HPKE 单次加密载荷。Agent、Relay 和 Controller 必须使用同一协议版本。
 
 ## 已完成
 

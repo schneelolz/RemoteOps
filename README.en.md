@@ -12,7 +12,7 @@
 
 [![CI](https://github.com/schneelolz/RemoteOps/actions/workflows/ci.yml/badge.svg)](https://github.com/schneelolz/RemoteOps/actions/workflows/ci.yml)
 [![Security](https://github.com/schneelolz/RemoteOps/actions/workflows/security.yml/badge.svg)](https://github.com/schneelolz/RemoteOps/actions/workflows/security.yml)
-[![Agent candidate](https://img.shields.io/badge/Agent_candidate-0.2.0--preview.6-2563eb)](CHANGELOG.md)
+[![Agent candidate](https://img.shields.io/badge/Agent_candidate-0.2.0--preview.7-2563eb)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-f97316)](LICENSE)
 
 </div>
@@ -56,7 +56,7 @@ It does not currently provide screen capture, mouse or keyboard control, RDP/VNC
 | Controller/MCP | Windows x64 and Apple Silicon macOS | Mac MCP installation and Linux connection verified; native Windows CI remains |
 | Device access | Windows, Linux, SSH, and serial | Local regression and Linux PTY serial tests pass; real hardware validation remains |
 
-The Agent CLI / Service / GUI / SSH askpass candidate is `0.2.0-preview.6`; Relay and MCP remain at `0.2.0-preview.5`. They share protocol `v14`. No public GitHub Release exists yet. It is intended for developers and controlled pilots, not critical production use. See [project status](docs/PROJECT_STATUS.md).
+The Agent CLI / Service candidate is `0.2.0-preview.7`, the Agent GUI is `0.2.0-preview.9`, and SSH askpass is `0.2.0-preview.6`; Relay and MCP remain at `0.2.0-preview.5`. They share protocol `v14`. No public GitHub Release exists yet. It is intended for developers and controlled pilots, not critical production use. See [project status](docs/PROJECT_STATUS.md).
 
 ## Quick start
 
@@ -144,7 +144,7 @@ cargo build --locked -p remoteops-relay -p remoteops-controller-mcp
 python3 scripts/Test-LinuxAgentE2E.py --output artifacts/acceptance/linux-e2e.json
 ```
 
-Run the end-to-end script as a regular user; it uses an isolated local Relay. Artifacts appear in `artifacts/release/0.2.0-preview.6/linux-x64/`: Agent and Service binaries, a systemd unit, install/uninstall/status scripts, sample configuration, third-party licenses, and SHA-256 manifests.
+Run the end-to-end script as a regular user; it uses an isolated local Relay. Artifacts appear in `artifacts/release/0.2.0-preview.7/linux-x64/`: Agent and Service binaries, a systemd unit, install/uninstall/status scripts, sample configuration, third-party licenses, and SHA-256 manifests.
 
 Recorded validation: 262 macOS workspace tests, Linux workspace checks, and 50 isolated Linux end-to-end checks pass. Native Windows regression and a full VM snapshot remain outstanding. See [Linux acceptance](docs/LinuxHeadless验收报告.md) for coverage and [release requirements](docs/发布与产物说明.md) for platform gates.
 

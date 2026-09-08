@@ -12,7 +12,7 @@
 
 [![CI](https://github.com/schneelolz/RemoteOps/actions/workflows/ci.yml/badge.svg)](https://github.com/schneelolz/RemoteOps/actions/workflows/ci.yml)
 [![Security](https://github.com/schneelolz/RemoteOps/actions/workflows/security.yml/badge.svg)](https://github.com/schneelolz/RemoteOps/actions/workflows/security.yml)
-[![Agent candidate](https://img.shields.io/badge/Agent_candidate-0.2.0--preview.6-2563eb)](CHANGELOG.md)
+[![Agent candidate](https://img.shields.io/badge/Agent_candidate-0.2.0--preview.7-2563eb)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-f97316)](LICENSE)
 
 </div>
@@ -56,7 +56,7 @@ flowchart LR
 | Controller/MCP | Windows x64、Apple Silicon macOS | Mac 本机 MCP 安装及 Linux 连接已验证；Windows 由原生 CI 验证 |
 | 设备能力 | Windows、Linux、SSH、串口 | 本地回归与 Linux PTY 串口测试通过；真实硬件路径仍需复测 |
 
-Agent CLI / Service / GUI / SSH askpass 候选版本为 `0.2.0-preview.6`；Relay 与 MCP 仍为 `0.2.0-preview.5`，共用 `v14` 协议。尚未创建公开 GitHub Release。它面向开发者和受控试点，不建议直接用于关键生产环境。发布状态和门禁见 [项目状态](docs/PROJECT_STATUS.md)。
+Agent CLI / Service 为 `0.2.0-preview.7`，Agent GUI 为 `0.2.0-preview.9`，SSH askpass 为 `0.2.0-preview.6`；Relay 与 MCP 仍为 `0.2.0-preview.5`，共用 `v14` 协议。尚未创建公开 GitHub Release。它面向开发者和受控试点，不建议直接用于关键生产环境。发布状态和门禁见 [项目状态](docs/PROJECT_STATUS.md)。
 
 ## 快速开始
 
@@ -144,7 +144,7 @@ cargo build --locked -p remoteops-relay -p remoteops-controller-mcp
 python3 scripts/Test-LinuxAgentE2E.py --output artifacts/acceptance/linux-e2e.json
 ```
 
-全链路脚本以普通用户运行，使用本机隔离 Relay。产物位于 `artifacts/release/0.2.0-preview.6/linux-x64/`，包括 Agent、Service、systemd unit、安装/卸载/状态脚本、配置示例、第三方许可证和 SHA-256 清单。
+全链路脚本以普通用户运行，使用本机隔离 Relay。产物位于 `artifacts/release/0.2.0-preview.7/linux-x64/`，包括 Agent、Service、systemd unit、安装/卸载/状态脚本、配置示例、第三方许可证和 SHA-256 清单。
 
 已记录的验收结果：macOS 工作区测试 262 项通过，Linux 工作区检查通过，Linux 隔离全链路 50 项通过；Windows 原生回归和虚拟机整机快照尚未完成。详细范围见 [Linux 验收报告](docs/LinuxHeadless验收报告.md)，各平台发布要求见 [发布与产物说明](docs/发布与产物说明.md)。
 
