@@ -6,7 +6,7 @@ use std::{
     env,
     fmt::Write as _,
     io::Write as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -49,6 +49,42 @@ const MAX_OPERATION_LOGS: usize = 1_000;
 const MAX_EVENTS_PER_FRAME: usize = 200;
 /// 日志覆盖抽屉宽度。
 const LOG_DRAWER_WIDTH: f32 = 360.0;
+/// 原生窗口和界面标题使用的 `RemoteOps` 品牌图标。
+const BRAND_ICON_PNG: &[u8] = include_bytes!("../../../assets/brand/remoteops-mark.png");
+
+/// 使用编译时包版本生成原生窗口标题，避免版本文案与产物脱节。
+fn agent_window_title(translator: &Translator) -> String {
+    format!(
+        "{} · v{}",
+        translator.text("app.agent_title"),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// 从仓库品牌资源加载原生窗口图标。
+fn brand_icon_data() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(BRAND_ICON_PNG).expect("RemoteOps 品牌图标必须是有效 PNG")
+}
+
+/// 清理 Windows 扩展路径前缀，便于在有限空间中向用户展示。
+fn display_transfer_path(path: &Path) -> String {
+    let value = path.display().to_string();
+    value.strip_prefix(r"\\?\UNC\").map_or_else(
+        || value.strip_prefix(r"\\?\").unwrap_or(&value).to_owned(),
+        |unc| format!(r"\\{unc}"),
+    )
+}
+
+/// 使用当前系统的文件管理器打开传输目录。
+fn open_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(path).spawn().map(|_| ())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogFilter {
@@ -418,12 +454,16 @@ struct RemoteOpsAgentApp {
     elevated: Option<bool>,
     /// 共享界面翻译器。
     translator: Translator,
+    /// 应用内标题使用的实际品牌图标纹理。
+    brand_texture: Option<egui::TextureHandle>,
     /// 外部语言包路径。
     language_file: Option<PathBuf>,
     /// 是否展示停止确认框。
     show_stop_confirmation: bool,
     /// 是否展示高级设置框。
     show_advanced_settings: bool,
+    /// 最近一次打开传输目录时的错误。
+    transfer_root_open_error: Option<String>,
     /// 是否允许本次窗口关闭请求直接执行。
     allow_close: bool,
     /// 复制成功提示的截止时间。
@@ -482,7 +522,13 @@ impl RemoteOpsAgentApp {
             let _ = translator.overlay_file(path);
         }
         cc.egui_ctx
-            .send_viewport_cmd(ViewportCommand::Title(translator.text("app.agent_title")));
+            .send_viewport_cmd(ViewportCommand::Title(agent_window_title(&translator)));
+        let brand_icon = brand_icon_data();
+        let brand_texture = Some(cc.egui_ctx.load_texture(
+            "remoteops-brand-mark",
+            egui::ColorImage::from(&brand_icon),
+            egui::TextureOptions::LINEAR,
+        ));
         let (event_sender, events) = mpsc::channel();
         let (trust_sender, trust_events) = mpsc::channel();
         let (shutdown, _) = watch::channel(false);
@@ -514,9 +560,11 @@ impl RemoteOpsAgentApp {
             permission_control: AgentPermissionControl::default(),
             elevated: detect_elevated(),
             translator,
+            brand_texture,
             language_file,
             show_stop_confirmation: false,
             show_advanced_settings: false,
+            transfer_root_open_error: None,
             allow_close: false,
             copied_until: None,
             layout_is_setup: None,
@@ -698,9 +746,7 @@ impl RemoteOpsAgentApp {
         if let Some(path) = &self.language_file {
             let _ = self.translator.overlay_file(path);
         }
-        ctx.send_viewport_cmd(ViewportCommand::Title(
-            self.translator.text("app.agent_title"),
-        ));
+        ctx.send_viewport_cmd(ViewportCommand::Title(agent_window_title(&self.translator)));
     }
 
     /// 保存首次配置并开始 TLS 预检。
@@ -1016,6 +1062,9 @@ impl RemoteOpsAgentApp {
 
     /// 返回当前控制码的租约倒计时文案。
     fn pairing_code_expiry_label(&self) -> String {
+        if self.pairing_code.is_none() {
+            return self.translator.text("agent.pairing_code.loading");
+        }
         let Some(expires_at) = self.pairing_code_expires_at.as_ref() else {
             return self.translator.text("status.pairing_code_ephemeral");
         };
@@ -1045,10 +1094,17 @@ impl RemoteOpsAgentApp {
             pairing_code_row_size(ui.available_width()),
             Layout::left_to_right(Align::Center),
             |ui| {
-                let code = self
-                    .pairing_code
-                    .as_deref()
-                    .map_or_else(|| "--- --- ---".to_owned(), display_pairing_code);
+                let Some(pairing_code) = self.pairing_code.as_deref() else {
+                    let spinner_size = 24.0;
+                    ui.add_space(centered_left_padding(ui.available_width(), spinner_size));
+                    ui.add(
+                        egui::Spinner::new()
+                            .size(spinner_size)
+                            .color(Color32::from_rgb(37, 99, 235)),
+                    );
+                    return;
+                };
+                let code = display_pairing_code(pairing_code);
                 let code_active = self.pairing_code_is_active();
                 let code_color = if code_active {
                     Color32::from_rgb(15, 23, 42)
@@ -1471,14 +1527,40 @@ impl RemoteOpsAgentApp {
             );
             let transfer_root = self.transfer_root.as_ref().map_or_else(
                 || self.translator.text("agent.advanced.not_initialized"),
-                |path| path.display().to_string(),
+                |path| display_transfer_path(path),
             );
-            Self::render_detail_line(
-                ui,
-                icons::FOLDER_OPEN,
-                &self.translator.text("agent.advanced.transfer_root"),
-                transfer_root,
-            );
+            if let Some(path) = self.transfer_root.clone() {
+                let clicked = Self::render_clickable_detail_line(
+                    ui,
+                    icons::FOLDER_OPEN,
+                    &self.translator.text("agent.advanced.transfer_root"),
+                    &transfer_root,
+                    &self.translator.text("agent.advanced.open_transfer_root"),
+                );
+                if clicked {
+                    self.transfer_root_open_error = open_directory(&path).err().map(|error| {
+                        self.translator.text_with(
+                            "agent.advanced.open_transfer_root_failed",
+                            &[("error", &error.to_string())],
+                        )
+                    });
+                }
+            } else {
+                Self::render_detail_line(
+                    ui,
+                    icons::FOLDER_OPEN,
+                    &self.translator.text("agent.advanced.transfer_root"),
+                    transfer_root,
+                );
+            }
+            if let Some(error) = &self.transfer_root_open_error {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(error)
+                        .size(11.0)
+                        .color(Color32::from_rgb(185, 28, 28)),
+                );
+            }
         });
     }
 
@@ -1498,6 +1580,62 @@ impl RemoteOpsAgentApp {
             ui.add(egui::Label::new(RichText::new(&value).size(12.0)).truncate())
                 .on_hover_text(value);
         });
+    }
+
+    /// 渲染可点击的路径详情，保留右侧打开图标并截断过长路径。
+    fn render_clickable_detail_line(
+        ui: &mut egui::Ui,
+        icon: &str,
+        label: &str,
+        value: &str,
+        tooltip: &str,
+    ) -> bool {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(icon)
+                    .size(14.0)
+                    .color(Color32::from_rgb(71, 85, 105)),
+            );
+            ui.label(
+                RichText::new(format!("{label}:"))
+                    .size(12.0)
+                    .color(Color32::from_rgb(71, 85, 105)),
+            );
+            let available_width = ui.available_width();
+            ui.allocate_ui_with_layout(
+                Vec2::new(available_width, 18.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    let hint = format!("{tooltip}\n{value}");
+                    let open = ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new(icons::ARROW_SQUARE_OUT)
+                                    .size(14.0)
+                                    .color(Color32::from_rgb(15, 103, 232)),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(&hint);
+                    let path = ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new(value)
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(15, 103, 232)),
+                            )
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(hint);
+                    open.clicked() || path.clicked()
+                },
+            )
+            .inner
+        })
+        .inner
     }
 
     /// 判断是否存在任一命令 Shell 能力。
@@ -1884,11 +2022,9 @@ impl eframe::App for RemoteOpsAgentApp {
                             .inner_margin(Margin::symmetric(16, 9))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(icons::SHIELD_CHECK)
-                                            .color(Color32::from_rgb(13, 110, 253))
-                                            .size(19.0),
-                                    );
+                                    if let Some(texture) = &self.brand_texture {
+                                        ui.image((texture.id(), Vec2::splat(20.0)));
+                                    }
                                     ui.label(
                                         RichText::new(self.translator.text("app.agent_brand"))
                                             .strong()
@@ -2161,7 +2297,8 @@ fn spawn_demo(
                     Capability::FileTransfer,
                 ]),
             });
-            std::thread::sleep(Duration::from_millis(450));
+            // 演示模式保留短暂加载阶段，便于验收控制码获取动画。
+            std::thread::sleep(Duration::from_secs(2));
             let _ = event_sender.send(AgentEvent::Connected {
                 pairing_code: "482-915-307".to_owned(),
                 lease_expires_at: Utc::now() + chrono::Duration::minutes(10),
@@ -2472,6 +2609,7 @@ fn agent_native_options(renderer: eframe::Renderer, initial_setup: bool) -> efra
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("remoteops-agent-gui")
+            .with_icon(brand_icon_data())
             .with_inner_size(initial_size)
             .with_min_inner_size(initial_size)
             .with_max_inner_size(initial_size)
@@ -2512,7 +2650,7 @@ fn run_gui(args: Args, diagnostics: &StartupDiagnostics) -> std::process::ExitCo
     if let Ok(path) = std::env::var("REMOTEOPS_LANG_FILE") {
         let _ = translator.overlay_file(path);
     }
-    let title = translator.text("app.agent_title");
+    let title = agent_window_title(&translator);
     let app_diagnostics = diagnostics.clone();
     diagnostics.record("starting_native_window");
     let result = eframe::run_native(
@@ -2602,8 +2740,32 @@ mod tests {
         assert_eq!(options.viewport.max_inner_size, Some(RUNNING_WINDOW_SIZE));
         assert_eq!(options.viewport.resizable, Some(false));
         assert_eq!(options.viewport.maximize_button, Some(false));
+        let icon = options.viewport.icon.expect("原生窗口应显式加载品牌图标");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert!(!icon.rgba.is_empty());
         #[cfg(target_os = "windows")]
         assert!(options.event_loop_builder.is_some());
+    }
+
+    #[test]
+    fn native_window_title_uses_compiled_package_version() {
+        let translator = Translator::new(Language::ZhCn);
+        assert_eq!(
+            agent_window_title(&translator),
+            format!("RemoteOps 远程协助 · v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn transfer_path_display_hides_windows_extended_prefix() {
+        assert_eq!(
+            display_transfer_path(Path::new(r"\\?\C:\Users\Field\RemoteOps\transfers")),
+            r"C:\Users\Field\RemoteOps\transfers"
+        );
+        assert_eq!(
+            display_transfer_path(Path::new(r"\\?\UNC\server\share\transfers")),
+            r"\\server\share\transfers"
+        );
     }
 
     #[test]
@@ -2887,9 +3049,11 @@ mod tests {
             permission_control: AgentPermissionControl::default(),
             elevated: Some(true),
             translator: Translator::new(remoteops_i18n::Language::ZhCn),
+            brand_texture: None,
             language_file: None,
             show_stop_confirmation: false,
             show_advanced_settings: false,
+            transfer_root_open_error: None,
             allow_close: false,
             copied_until: None,
             layout_is_setup: None,

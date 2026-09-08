@@ -1,6 +1,6 @@
 # RemoteOps 品牌资源
 
-`remoteops-mark.svg` 是程序图标、系统托盘和小尺寸场景使用的独立图形标志；`remoteops-logo.svg` 是文档和项目主页使用的图形加字标版本。
+`remoteops-mark.svg` 是程序图标、系统托盘和小尺寸场景使用的独立图形标志；`remoteops-mark.png` 是原生窗口运行时加载的同款图标；`remoteops-logo.svg` 是文档和项目主页使用的图形加字标版本。
 
 图形由盾牌和终端提示符组成：盾牌表示连接、权限、审批和审计边界，`>_` 表示远程 Shell 与运维操作。小尺寸场景应使用独立图形，不要缩放完整字标。
 
