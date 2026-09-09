@@ -17,11 +17,11 @@
 
 </div>
 
-## 这是什么
+## 项目简介
 
-RemoteOps 是一个自托管的 AI 辅助远程运维工具。现场 Windows 电脑或 Ubuntu 无界面主机运行 Agent，工程师本机运行 Controller 或本地 MCP，双方通过自己部署的 Relay 连接。AI 可以读取环境、执行受控的只读诊断、查看文件和日志，并在需要时提出由人工确认的修改操作。
+RemoteOps 是一个自托管的 AI 辅助远程运维工具。受控 Windows 电脑或 Ubuntu 无界面主机运行 Agent，运维人员本机运行 Controller 或 MCP 服务，通过自托管 Relay 建立远程运维连接。AI 客户端可通过 MCP 查询系统环境、执行策略约束下的只读诊断、查看文件和日志，并为修改操作请求人工审批。
 
-Agent 只主动连接 Relay，现场不需要开放公网入站端口；AI 客户端和凭据也不需要安装在现场电脑上。
+Agent 只主动连接 Relay，现场不需要开放公网入站端口；AI 客户端及其凭据保留在运维人员本机，无需配置到受控主机。
 
 ```mermaid
 flowchart LR
@@ -35,14 +35,14 @@ flowchart LR
 
 图中从左到右是一次操作请求的方向：Codex 通过本机 MCP 请求 Relay，再由 Agent 在现场执行。虚线表示网络连接的建立方向：Agent 主动连接 Relay，因此现场不需要开放公网入站端口。
 
-## 能做什么
+## 核心功能
 
 - 查看 Windows / Ubuntu Headless 系统、网络、进程、服务、日志和环境能力。
 - 在 Windows 使用 CMD、Windows PowerShell、PowerShell 7，在 Linux 使用 `/bin/sh` 执行一次性或持久 Shell 命令，支持实时输出和 UTF-8。
-- 在受限目录内安全上传、下载和校验文件。
+- 在受限目录内上传、下载文件，并校验文件完整性。
 - 连接 SSH 设备和串口设备，支持结构化只读查询及逐项审批写入。
 - 通过本地 STDIO MCP 接入 Codex 等 AI 客户端，也可使用 CLI 或 GUI。
-- 使用 Session、Owner、权限模式、人工审批、TLS 信任和脱敏审计控制操作边界。
+- 通过会话绑定（Session）、所有者隔离（Owner）、权限模式、人工审批、TLS 信任验证和脱敏审计约束远程操作。
 
 当前不包含屏幕采集、鼠标键盘控制、RDP/VNC、任意端口转发、SOCKS、网段扫描、共享公共 Relay 或 macOS 被控端、Linux 桌面控制。
 
@@ -56,13 +56,13 @@ flowchart LR
 | Controller/MCP | Windows x64、Apple Silicon macOS | Mac 本机 MCP 安装及 Linux 连接已验证；Windows 由原生 CI 验证 |
 | 设备能力 | Windows、Linux、SSH、串口 | 本地回归与 Linux PTY 串口测试通过；真实硬件路径仍需复测 |
 
-Agent CLI / Service 为 `0.2.0-preview.7`，Agent GUI 为 `0.2.0-preview.9`，SSH askpass 为 `0.2.0-preview.6`；Relay 与 MCP 仍为 `0.2.0-preview.5`，共用 `v14` 协议。尚未创建公开 GitHub Release。它面向开发者和受控试点，不建议直接用于关键生产环境。发布状态和门禁见 [项目状态](docs/PROJECT_STATUS.md)。
+Agent CLI / Service 为 `0.2.0-preview.7`，Agent GUI 为 `0.2.0-preview.9`，SSH askpass 为 `0.2.0-preview.6`；Relay 与 MCP 仍为 `0.2.0-preview.5`，共用 `v14` 协议。尚未创建公开 GitHub Release。它面向开发者和受控试点，不建议直接用于关键生产环境。发布状态和验收要求见 [项目状态](docs/PROJECT_STATUS.md)。
 
 ## 快速开始
 
-完整参数、证书、备份和排障步骤见 [文档中心](docs/README.md)。最短路径如下：
+以下步骤概述 Relay 部署、Agent 接入和 MCP 配置流程。完整参数、证书配置、备份和排障步骤见 [文档中心](docs/README.md)。
 
-### 1. 部署自己的 Relay
+### 1. 部署 Relay
 
 Relay 需要 Linux x64、Docker 和一个 Agent 与工程师本机都能访问的地址。复制配置模板并填写 Token、Owner UUID 和 TLS SAN：
 
@@ -102,7 +102,7 @@ sudo ./status-remoteops-agent.sh --pairing
 
 Windows 和 Apple Silicon macOS 的安装器、Token 保存方式和卸载步骤见：[RemoteOps MCP 使用手册](docs/RemoteOpsMCP使用手册.md)、[macOS MCP 接入说明](docs/macOSMCP接入说明.md)。安装后重新启动 Codex，并确认 `/mcp` 中的 `remoteops` 已连接。
 
-### 4. 先做只读验证
+### 4. 验证连接与只读操作
 
 ```text
 使用 RemoteOps 配对现场客户机，控制码是 Agent 窗口或 Linux 状态脚本当前显示的控制码。
@@ -116,7 +116,18 @@ Windows 和 Apple Silicon macOS 的安装器、Token 保存方式和卸载步骤
 
 ## 设计与代码结构
 
-项目按“核心类库 + 多种壳子”组织：领域、策略、协议、设备、会话、审计和应用用例位于 `crates`；GUI、CLI、MCP、Service 和 Relay 位于 `apps`。壳子负责参数、交互和宿主生命周期，核心类库负责可复用规则。架构边界见 [架构说明](docs/ARCHITECTURE.md)，审查结果和后续重构路径见 [代码审查报告](docs/CODE_REVIEW.md)。
+项目采用 Rust workspace 管理共享库与应用程序。共享库提供领域模型、通信协议、权限策略和操作编排等能力；应用程序提供用户交互、AI 客户端接入及后台服务。
+
+| 目录 | 职责 |
+|---|---|
+| `crates/` | 共享库：领域模型、协议、会话、策略、审计、设备与串口访问、应用用例、AI 接入、国际化和主机标识 |
+| `apps/` | 应用与服务：Agent、Controller GUI/CLI、MCP 服务、Agent 系统服务、Relay 及辅助工具 |
+| `deploy/` | 部署配置、容器编排和平台安装资源 |
+| `scripts/` | 构建、打包与验证脚本 |
+| `tests/` | 独立测试项目，包括 MCP 冒烟测试；各模块的单元测试随源码维护 |
+| `docs/` | 架构、部署、安全、验收和维护文档 |
+
+架构目标是让各应用入口复用共享的策略与操作逻辑。目前，部分 Agent 运行逻辑和 Controller GUI 操作编排仍位于应用项目中，后续计划继续提取为共享库。模块职责与依赖边界见 [架构说明](docs/ARCHITECTURE.md)，维护性改进计划见 [代码审查报告](docs/CODE_REVIEW.md)。
 
 ## 构建与验证
 
