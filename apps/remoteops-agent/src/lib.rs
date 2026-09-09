@@ -49,7 +49,7 @@ use remoteops_serial::{
     SerialDirection, SerialObservedChunk, SerialQueryError, SerialQueryPlan, SerialQueryRunner,
     SerialQueryTransport, SerialTranscript,
 };
-use remoteops_visual::{UnavailableVisualProvider, VisualProvider};
+use remoteops_visual::{VisualProvider, default_visual_provider};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -1436,7 +1436,7 @@ where
                     serial_sessions: serial_sessions.clone(),
                     file_uploads: file_uploads.clone(),
                     used_credential_envelopes: used_credential_envelopes.clone(),
-                    visual_provider: Arc::new(UnavailableVisualProvider),
+                    visual_provider: default_visual_provider(),
                 };
                 let terminal = Arc::new(AtomicTaskTerminal::running());
                 let interactive_shell = pending_interactive_shell(&request, &shell_sessions).await;
@@ -3418,7 +3418,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::clone(file_uploads),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
-            visual_provider: Arc::new(UnavailableVisualProvider),
+            visual_provider: default_visual_provider(),
         };
         let agent_instance_id = AgentInstanceId::new();
         let credential_encryption = CredentialEncryptionKeyPair::generate();
@@ -3824,7 +3824,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
-            visual_provider: Arc::new(UnavailableVisualProvider),
+            visual_provider: default_visual_provider(),
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let sequence = Arc::new(AtomicU64::new(1));
@@ -4560,7 +4560,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
-            visual_provider: Arc::new(UnavailableVisualProvider),
+            visual_provider: default_visual_provider(),
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let credential_encryption = CredentialEncryptionKeyPair::generate();
@@ -4655,7 +4655,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
-            visual_provider: Arc::new(UnavailableVisualProvider),
+            visual_provider: default_visual_provider(),
         };
         let transfer_root = test_state_file("encrypted-ssh").with_extension("dir");
         let device = SystemDevice::with_transfer_root(&transfer_root).expect("应创建交换目录");

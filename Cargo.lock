@@ -3736,7 +3736,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.7"
+version = "0.2.0-preview.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4108,9 +4108,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tracing",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

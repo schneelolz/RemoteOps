@@ -80,6 +80,173 @@ pub trait VisualProvider: Send + Sync {
 #[derive(Default)]
 pub struct UnavailableVisualProvider;
 
+/// Windows 交互式桌面的最小真实 Provider。
+///
+/// 通过用户 Session 中的 Windows PowerShell 获取屏幕和截图；Agent Service
+/// 不直接访问桌面。UIA/输入动作在 Windows-MCP 接入前明确拒绝，避免伪造成功。
+#[cfg(windows)]
+#[derive(Default)]
+pub struct WindowsVisualProvider;
+
+#[cfg(windows)]
+impl WindowsVisualProvider {
+    async fn observe_desktop(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        include_screenshot: bool,
+        include_ui_tree: bool,
+    ) -> Result<VisualObservation, VisualProviderError> {
+        let script = r"
+Add-Type -AssemblyName System.Windows.Forms
+if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1') { Add-Type -AssemblyName System.Drawing }
+$screens = [System.Windows.Forms.Screen]::AllScreens
+$displays = @($screens | ForEach-Object {
+  [pscustomobject]@{ display_id=$_.DeviceName; physical_width=$_.Bounds.Width; physical_height=$_.Bounds.Height; logical_width=$_.Bounds.Width; logical_height=$_.Bounds.Height; dpi=96; scale_percent=100; origin_x=$_.Bounds.X; origin_y=$_.Bounds.Y }
+})
+$shot = $null; $w = $null; $h = $null
+if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
+  $b = $screens[0].Bounds; $w=$b.Width; $h=$b.Height
+  $bmp = New-Object System.Drawing.Bitmap($w,$h); $g=[System.Drawing.Graphics]::FromImage($bmp)
+  $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $ms=New-Object System.IO.MemoryStream
+  $bmp.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png); $shot=[Convert]::ToBase64String($ms.ToArray()); $g.Dispose(); $bmp.Dispose(); $ms.Dispose()
+}
+[pscustomobject]@{ displays=$displays; screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; ui_tree=$(if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1') { '{}' } else { '$null' }) } | ConvertTo-Json -Compress -Depth 5
+";
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ]);
+        command.env(
+            "REMOTEOPS_INCLUDE_SCREENSHOT",
+            if include_screenshot { "1" } else { "0" },
+        );
+        command.env(
+            "REMOTEOPS_INCLUDE_UI_TREE",
+            if include_ui_tree { "1" } else { "0" },
+        );
+        let output = command
+            .output()
+            .await
+            .map_err(|e| VisualProviderError::Protocol(format!("启动桌面采集失败：{e}")))?;
+        if !output.status.success() {
+            return Err(VisualProviderError::Protocol(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| VisualProviderError::Protocol(format!("桌面采集结果无效：{e}")))?;
+        let displays = serde_json::from_value(value.get("displays").cloned().unwrap_or_default())
+            .unwrap_or_default();
+        let screenshot_base64 = value
+            .get("screenshot_base64")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let screenshot_width = value
+            .get("screenshot_width")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok());
+        let screenshot_height = value
+            .get("screenshot_height")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok());
+        Ok(VisualObservation {
+            request_id,
+            session_id,
+            provider_instance_id: "windows-powershell-desktop".into(),
+            state: remoteops_domain::VisualSessionState::Ready,
+            windows: Vec::new(),
+            displays,
+            active_window_fingerprint: None,
+            ui_tree: include_ui_tree
+                .then(|| serde_json::json!({"provider":"windows-powershell","available":false})),
+            screenshot_base64,
+            screenshot_width,
+            screenshot_height,
+            redacted: false,
+        })
+    }
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl VisualProvider for WindowsVisualProvider {
+    async fn observe(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        include_screenshot: bool,
+        include_ui_tree: bool,
+    ) -> Result<VisualObservation, VisualProviderError> {
+        self.observe_desktop(request_id, session_id, include_screenshot, include_ui_tree)
+            .await
+    }
+    async fn wait_for(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        _condition: &str,
+        _timeout_millis: u64,
+    ) -> Result<VisualObservation, VisualProviderError> {
+        self.observe_desktop(request_id, session_id, false, true)
+            .await
+    }
+    async fn invoke(
+        &self,
+        _request_id: RequestId,
+        _session_id: SessionId,
+        _target: &VisualTarget,
+        _action: &str,
+    ) -> Result<VisualActionResult, VisualProviderError> {
+        Err(VisualProviderError::Rejected(
+            "UI Automation Provider 尚未连接；拒绝伪造控件动作".into(),
+        ))
+    }
+    async fn type_text(
+        &self,
+        _request_id: RequestId,
+        _session_id: SessionId,
+        _target: &VisualTarget,
+        _text: &str,
+    ) -> Result<VisualActionResult, VisualProviderError> {
+        Err(VisualProviderError::Rejected(
+            "UI Automation Provider 尚未连接；拒绝输入".into(),
+        ))
+    }
+    async fn send_input(
+        &self,
+        _request_id: RequestId,
+        _session_id: SessionId,
+        _target: &VisualTarget,
+        _input: &str,
+    ) -> Result<VisualActionResult, VisualProviderError> {
+        Err(VisualProviderError::Rejected(
+            "UI Automation Provider 尚未连接；拒绝坐标输入".into(),
+        ))
+    }
+    async fn stop(&self, _session_id: SessionId) -> Result<(), VisualProviderError> {
+        Ok(())
+    }
+}
+
+/// 创建当前宿主的默认图形 Provider。
+#[must_use]
+pub fn default_visual_provider() -> std::sync::Arc<dyn VisualProvider> {
+    #[cfg(windows)]
+    {
+        std::sync::Arc::new(WindowsVisualProvider)
+    }
+    #[cfg(not(windows))]
+    {
+        std::sync::Arc::new(UnavailableVisualProvider)
+    }
+}
+
 #[async_trait]
 impl VisualProvider for UnavailableVisualProvider {
     async fn observe(
