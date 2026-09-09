@@ -954,32 +954,43 @@ pub async fn run_agent_with_permission_control(
     let environment = detect_environment_profile(device.as_ref()).await;
     // Provider 必须跨请求复用，外部 Windows-MCP 的子进程和 Named Pipe
     // 生命周期不能随着每个请求重新创建。
-    let visual_provider = default_visual_provider();
-    let visual_ready = match tokio::time::timeout(
-        Duration::from_secs(5),
-        visual_provider.observe(RequestId::new(), SessionId::new(), false, true),
-    )
-    .await
-    {
-        Ok(Ok(observation)) => {
-            let ready = matches!(
-                observation.state,
-                remoteops_domain::VisualSessionState::Ready
-            ) && !observation.windows.is_empty()
-                && observation.active_window_fingerprint.is_some();
-            if !ready {
-                warn!(state = ?observation.state, windows = observation.windows.len(), "图形 Provider 未通过启动探测");
+    let visual_enabled = cfg!(windows)
+        && env::var("REMOTEOPS_VISUAL_PROVIDER_ENABLED")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let visual_provider: Arc<dyn VisualProvider> = if visual_enabled {
+        default_visual_provider()
+    } else {
+        Arc::new(remoteops_visual::UnavailableVisualProvider)
+    };
+    let visual_ready = if visual_enabled {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            visual_provider.observe(RequestId::new(), SessionId::new(), false, true),
+        )
+        .await
+        {
+            Ok(Ok(observation)) => {
+                let ready = matches!(
+                    observation.state,
+                    remoteops_domain::VisualSessionState::Ready
+                ) && !observation.windows.is_empty()
+                    && observation.active_window_fingerprint.is_some();
+                if !ready {
+                    warn!(state = ?observation.state, windows = observation.windows.len(), "图形 Provider 未通过启动探测");
+                }
+                ready
             }
-            ready
+            Ok(Err(error)) => {
+                warn!(%error, "图形 Provider 启动探测失败");
+                false
+            }
+            Err(_) => {
+                warn!("图形 Provider 启动探测超时");
+                false
+            }
         }
-        Ok(Err(error)) => {
-            warn!(%error, "图形 Provider 启动探测失败");
-            false
-        }
-        Err(_) => {
-            warn!("图形 Provider 启动探测超时");
-            false
-        }
+    } else {
+        false
     };
     let capabilities = capabilities_from_environment(&environment, visual_ready);
     let host_identity = remoteops_host_identity::collect();
@@ -2970,11 +2981,7 @@ fn capabilities_from_environment(
     {
         capabilities.push(Capability::Ssh);
     }
-    if cfg!(windows)
-        && env::var("REMOTEOPS_VISUAL_PROVIDER_ENABLED")
-            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        && visual_ready
-    {
+    if visual_ready {
         capabilities.push(Capability::Visual);
     }
     CapabilitySet::new(capabilities)
@@ -3404,6 +3411,18 @@ fn print_agent_event(event: &AgentEvent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visual_capability_requires_successful_provider_initialization() {
+        let environment = remoteops_domain::EnvironmentProfile::empty();
+        assert!(
+            !super::capabilities_from_environment(&environment, false)
+                .contains(remoteops_domain::Capability::Visual)
+        );
+        assert!(
+            super::capabilities_from_environment(&environment, true)
+                .contains(remoteops_domain::Capability::Visual)
+        );
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use remoteops_domain::{

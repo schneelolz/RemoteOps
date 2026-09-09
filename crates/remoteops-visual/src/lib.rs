@@ -7,6 +7,37 @@ use thiserror::Error;
 #[cfg(windows)]
 pub mod windows_provider;
 
+/// 在实际执行 UIA 的子进程中重新校验窗口，避免前置观察与输入之间切换了前台。
+#[cfg(windows)]
+const TARGET_WINDOW_GUARD: &str = r#"
+Add-Type @'
+using System; using System.Text; using System.Runtime.InteropServices;
+public static class RemoteOpsTarget {
+ [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+ [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
+ [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+ [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder text, int count);
+ [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT rect);
+ [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+}
+'@
+function Assert-RemoteOpsTarget {
+ $handle=[RemoteOpsTarget]::GetForegroundWindow()
+ if($handle -eq [IntPtr]::Zero){throw 'foreground_window_unavailable'}
+ $handle=[RemoteOpsTarget]::GetAncestor($handle,2)
+ $windowPid=[uint32]0; [void][RemoteOpsTarget]::GetWindowThreadProcessId($handle,[ref]$windowPid)
+ $owner=Get-Process -Id $windowPid -ErrorAction Stop
+ if($owner.SessionId -eq 0 -or $owner.SessionId -ne (Get-Process -Id $PID).SessionId){throw 'interactive_session_mismatch'}
+ $title=New-Object Text.StringBuilder 512; [void][RemoteOpsTarget]::GetWindowText($handle,$title,$title.Capacity)
+ $rect=New-Object RemoteOpsTarget+RECT
+ if(-not [RemoteOpsTarget]::GetWindowRect($handle,[ref]$rect)){throw 'target_window_unavailable'}
+ $hash=[Security.Cryptography.SHA256]::Create()
+ try{$actual=[BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes("$windowPid|$($title.ToString())|$($rect.Left)|$($rect.Top)|$($rect.Right)|$($rect.Bottom)"))).Replace('-','').ToLowerInvariant()}finally{$hash.Dispose()}
+ if($actual -cne $env:REMOTEOPS_WINDOW_FINGERPRINT){throw 'foreground_target_changed'}
+ return $handle
+}
+"#;
+
 #[cfg(windows)]
 fn hidden_powershell_command() -> tokio::process::Command {
     let mut command = tokio::process::Command::new("powershell.exe");
@@ -221,7 +252,7 @@ impl WindowsVisualProvider {
             } => window_fingerprint,
         };
         let observation = self
-            .observe_desktop(request_id, session_id, false, false)
+            .observe_desktop(request_id, session_id, false, true)
             .await?;
         if observation.active_window_fingerprint.as_deref() != Some(expected.as_str()) {
             return Err(VisualProviderError::Rejected(
@@ -237,6 +268,7 @@ impl WindowsVisualProvider {
         action: &str,
     ) -> Result<(), VisualProviderError> {
         let VisualTarget::Control {
+            window_fingerprint,
             automation_id,
             name,
             control_type,
@@ -266,16 +298,23 @@ using System; using System.Runtime.InteropServices;
 public static class RemoteOpsUser32 { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }
 '@ }
 $comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2); if ($comResult -lt 0) { throw 'UIA COM initialization failed' }
-$root=[System.Windows.Automation.AutomationElement]::FromHandle([RemoteOpsUser32]::GetForegroundWindow())
+$targetHandle=Assert-RemoteOpsTarget
+$root=[System.Windows.Automation.AutomationElement]::FromHandle($targetHandle)
 if($null -eq $root){ throw '没有可验证的前台窗口' }
-$conditions=@(); if($env:REMOTEOPS_AUTOMATION_ID){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty,$env:REMOTEOPS_AUTOMATION_ID)}; if($env:REMOTEOPS_NAME){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$env:REMOTEOPS_NAME)}
-if($conditions.Count -eq 0){throw 'UIA 目标缺少 automation_id 或 name'}
-$condition=if($conditions.Count -eq 1){$conditions[0]}else{[System.Windows.Automation.AndCondition]::new($conditions)}
-$element=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
-if($null -eq $element){$element=[System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)}
+function Find-RemoteOpsControl([System.Windows.Automation.AutomationElement]$node,[int]$depth) {
+  if($null -eq $node -or $depth -gt 8){return $null}
+  $id=[string]$node.Current.AutomationId; $nodeName=[string]$node.Current.Name
+  if(((-not $env:REMOTEOPS_AUTOMATION_ID) -or $id -eq $env:REMOTEOPS_AUTOMATION_ID) -and ((-not $env:REMOTEOPS_NAME) -or $nodeName -eq $env:REMOTEOPS_NAME)){return $node}
+  $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $child=$walker.GetFirstChild($node)
+  while($null -ne $child){$found=Find-RemoteOpsControl $child ($depth+1); if($null -ne $found){return $found}; $child=$walker.GetNextSibling($child)}
+  return $null
+}
+if(-not $env:REMOTEOPS_AUTOMATION_ID -and -not $env:REMOTEOPS_NAME){throw 'UIA 目标缺少 automation_id 或 name'}
+$element=Find-RemoteOpsControl $root 0
 if($null -eq $element){throw '前台窗口中未找到 UIA 目标'}
-$pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $pattern.Invoke(); if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+$pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); [void](Assert-RemoteOpsTarget); $pattern.Invoke(); if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
+        let script = format!("{TARGET_WINDOW_GUARD}\n{script}");
         let mut command = hidden_powershell_command();
         command.args([
             "-NoProfile",
@@ -286,8 +325,9 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::P
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            script,
+            &script,
         ]);
+        command.env("REMOTEOPS_WINDOW_FINGERPRINT", window_fingerprint);
         command.env(
             "REMOTEOPS_AUTOMATION_ID",
             automation_id.as_deref().unwrap_or_default(),
@@ -312,6 +352,7 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::P
         text: &str,
     ) -> Result<(), VisualProviderError> {
         let VisualTarget::Control {
+            window_fingerprint,
             automation_id,
             name,
             ..
@@ -340,15 +381,22 @@ using System; using System.Runtime.InteropServices;
 public static class RemoteOpsUser32 { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }
 '@ }
 $comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2); if ($comResult -lt 0) { throw 'UIA COM initialization failed' }
-$root=[System.Windows.Automation.AutomationElement]::FromHandle([RemoteOpsUser32]::GetForegroundWindow())
+$targetHandle=Assert-RemoteOpsTarget
+$root=[System.Windows.Automation.AutomationElement]::FromHandle($targetHandle)
 if($null -eq $root){ throw '没有可验证的前台窗口' }
-$conditions=@(); if($env:REMOTEOPS_AUTOMATION_ID){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty,$env:REMOTEOPS_AUTOMATION_ID)}; if($env:REMOTEOPS_NAME){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$env:REMOTEOPS_NAME)}
-$condition=if($conditions.Count -eq 1){$conditions[0]}else{[System.Windows.Automation.AndCondition]::new($conditions)}
-$element=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
-if($null -eq $element){$element=[System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)}
+function Find-RemoteOpsControl([System.Windows.Automation.AutomationElement]$node,[int]$depth) {
+  if($null -eq $node -or $depth -gt 8){return $null}
+  $id=[string]$node.Current.AutomationId; $nodeName=[string]$node.Current.Name
+  if(((-not $env:REMOTEOPS_AUTOMATION_ID) -or $id -eq $env:REMOTEOPS_AUTOMATION_ID) -and ((-not $env:REMOTEOPS_NAME) -or $nodeName -eq $env:REMOTEOPS_NAME)){return $node}
+  $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $child=$walker.GetFirstChild($node)
+  while($null -ne $child){$found=Find-RemoteOpsControl $child ($depth+1); if($null -ne $found){return $found}; $child=$walker.GetNextSibling($child)}
+  return $null
+}
+$element=Find-RemoteOpsControl $root 0
 if($null -eq $element){throw '前台窗口中未找到 UIA 文本目标'}
-$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if($pattern.Current.IsReadOnly){throw 'UIA 文本控件为只读'}; $pattern.SetValue($env:REMOTEOPS_TEXT); if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if($pattern.Current.IsReadOnly){throw 'UIA 文本控件为只读'}; [void](Assert-RemoteOpsTarget); $pattern.SetValue($env:REMOTEOPS_TEXT); if($pattern.Current.Value -cne $env:REMOTEOPS_TEXT){throw 'UIA value verification failed'}; if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
+        let script = format!("{TARGET_WINDOW_GUARD}\n{script}");
         let mut command = hidden_powershell_command();
         command.args([
             "-NoProfile",
@@ -359,8 +407,9 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pa
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            script,
+            &script,
         ]);
+        command.env("REMOTEOPS_WINDOW_FINGERPRINT", window_fingerprint);
         command.env(
             "REMOTEOPS_AUTOMATION_ID",
             automation_id.as_deref().unwrap_or_default(),
@@ -471,6 +520,7 @@ public static class RemoteOpsUser32 {
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr p);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
@@ -484,6 +534,7 @@ $displays = @($screens | ForEach-Object {
   [pscustomobject]@{ display_id=$_.DeviceName; physical_width=$_.Bounds.Width; physical_height=$_.Bounds.Height; logical_width=$_.Bounds.Width; logical_height=$_.Bounds.Height; dpi=96; scale_percent=100; origin_x=$_.Bounds.X; origin_y=$_.Bounds.Y }
 })
 $windows = [System.Collections.Generic.List[object]]::new(); $foreground = [RemoteOpsUser32]::GetForegroundWindow(); $activeFingerprint = $null
+if($foreground -ne [IntPtr]::Zero){$foreground=[RemoteOpsUser32]::GetAncestor($foreground,2)}
 $callback = [RemoteOpsUser32+EnumWindowsProc]{ param($handle,$unused)
   if (-not [RemoteOpsUser32]::IsWindowVisible($handle)) { return $true }
   $text = New-Object Text.StringBuilder 512; [void][RemoteOpsUser32]::GetWindowText($handle,$text,$text.Capacity)
@@ -627,7 +678,8 @@ impl VisualProvider for WindowsVisualProvider {
         target: &VisualTarget,
         action: &str,
     ) -> Result<VisualActionResult, VisualProviderError> {
-        self.verify_foreground_target(request_id, session_id, target)
+        let before = self
+            .verify_foreground_target(request_id, session_id, target)
             .await?;
         self.invoke_uia(target, action).await?;
         let observation = self
@@ -637,10 +689,10 @@ impl VisualProvider for WindowsVisualProvider {
             request_id,
             session_id,
             action_sent: true,
-            effect_verified: true,
+            effect_verified: observed_uia_change(&before, &observation),
             observation: Some(observation),
             error_code: None,
-            message: "UIA Invoke 已发送并完成后置观察".into(),
+            message: "UIA Invoke 已发送；效果状态依据同一前台窗口的 UIA 变化判定".into(),
         })
     }
     async fn type_text(
@@ -719,6 +771,23 @@ impl VisualProvider for WindowsVisualProvider {
     async fn stop(&self, _session_id: SessionId) -> Result<(), VisualProviderError> {
         Ok(())
     }
+}
+
+/// 仅将同一前台窗口中可见的 UIA 变化作为动作效果证据。
+#[cfg(windows)]
+fn observed_uia_change(before: &VisualObservation, after: &VisualObservation) -> bool {
+    after.state == remoteops_domain::VisualSessionState::Ready
+        && before.active_window_fingerprint.is_some()
+        && before.active_window_fingerprint == after.active_window_fingerprint
+        && before
+            .ui_tree
+            .as_ref()
+            .is_some_and(|tree| tree.get("available") == Some(&serde_json::Value::Bool(true)))
+        && after
+            .ui_tree
+            .as_ref()
+            .is_some_and(|tree| tree.get("available") == Some(&serde_json::Value::Bool(true)))
+        && before.ui_tree != after.ui_tree
 }
 
 /// 创建当前宿主的默认图形 Provider。
@@ -873,6 +942,28 @@ impl VisualProvider for MockVisualProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn effect_verification_rejects_noop_failed_tree_and_changed_window() {
+        let mut before = MockVisualProvider
+            .observe(RequestId::new(), SessionId::new(), false, true)
+            .await
+            .expect("测试观察应成功");
+        before.active_window_fingerprint = Some("target".into());
+        before.ui_tree = Some(serde_json::json!({"available":true,"children":[]}));
+        assert!(!observed_uia_change(&before, &before));
+        let mut after = before.clone();
+        after.ui_tree = Some(serde_json::json!({"available":true,"children":[{"name":"menu"}]}));
+        assert!(observed_uia_change(&before, &after));
+        after.active_window_fingerprint = Some("different-window".into());
+        assert!(!observed_uia_change(&before, &after));
+        after
+            .active_window_fingerprint
+            .clone_from(&before.active_window_fingerprint);
+        after.ui_tree = Some(serde_json::json!({"available":false,"reason":"timeout"}));
+        assert!(!observed_uia_change(&before, &after));
+    }
 
     #[tokio::test]
     async fn mock_provider_returns_redacted_observation_and_verified_action() {
