@@ -10,9 +10,30 @@ pub mod windows_provider;
 #[cfg(windows)]
 fn hidden_powershell_command() -> tokio::process::Command {
     let mut command = tokio::process::Command::new("powershell.exe");
-    // CREATE_NO_WINDOW prevents the child from briefly becoming the RDP foreground console.
+    // 后台采集进程不能弹出控制台或抢占 RDP 前台窗口。
     command.creation_flags(0x0800_0000);
+    command.kill_on_drop(true);
     command
+}
+
+/// 限制桌面调用时长，超时后回收子进程并记录明确错误。
+#[cfg(windows)]
+async fn run_desktop_command(
+    mut command: tokio::process::Command,
+) -> Result<std::process::Output, VisualProviderError> {
+    if let Ok(result) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), command.output()).await
+    {
+        result.map_err(|error| {
+            tracing::error!(%error, "visual provider process failed");
+            VisualProviderError::Protocol(format!("桌面子进程执行失败：{error}"))
+        })
+    } else {
+        tracing::error!("visual provider process timed out after 30 seconds");
+        Err(VisualProviderError::Protocol(
+            "桌面子进程超时（30 秒），已请求终止".into(),
+        ))
+    }
 }
 
 /// Provider 运行错误。
@@ -167,6 +188,8 @@ impl WindowsVisualProvider {
             )));
         }
         let script = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 if (-not ('RemoteOpsCom' -as [type])) { Add-Type @'
@@ -177,7 +200,7 @@ if (-not ('RemoteOpsUser32' -as [type])) { Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class RemoteOpsUser32 { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }
 '@ }
-$comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2)
+$comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2); if ($comResult -lt 0) { throw 'UIA COM initialization failed' }
 $root=[System.Windows.Automation.AutomationElement]::FromHandle([RemoteOpsUser32]::GetForegroundWindow())
 if($null -eq $root){ throw '没有可验证的前台窗口' }
 $conditions=@(); if($env:REMOTEOPS_AUTOMATION_ID){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty,$env:REMOTEOPS_AUTOMATION_ID)}; if($env:REMOTEOPS_NAME){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$env:REMOTEOPS_NAME)}
@@ -186,7 +209,7 @@ $condition=if($conditions.Count -eq 1){$conditions[0]}else{[System.Windows.Autom
 $element=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
 if($null -eq $element){$element=[System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)}
 if($null -eq $element){throw '前台窗口中未找到 UIA 目标'}
-$pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $pattern.Invoke(); if($comResult -eq 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+$pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $pattern.Invoke(); if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
         let mut command = hidden_powershell_command();
         command.args([
@@ -209,10 +232,7 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::P
             "REMOTEOPS_CONTROL_TYPE",
             control_type.as_deref().unwrap_or_default(),
         );
-        let output = command
-            .output()
-            .await
-            .map_err(|e| VisualProviderError::Protocol(format!("启动 UIA 动作失败：{e}")))?;
+        let output = run_desktop_command(command).await?;
         if !output.status.success() {
             return Err(VisualProviderError::Rejected(
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -242,6 +262,8 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::P
             ));
         }
         let script = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 if (-not ('RemoteOpsCom' -as [type])) { Add-Type @'
@@ -252,7 +274,7 @@ if (-not ('RemoteOpsUser32' -as [type])) { Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class RemoteOpsUser32 { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }
 '@ }
-$comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2)
+$comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2); if ($comResult -lt 0) { throw 'UIA COM initialization failed' }
 $root=[System.Windows.Automation.AutomationElement]::FromHandle([RemoteOpsUser32]::GetForegroundWindow())
 if($null -eq $root){ throw '没有可验证的前台窗口' }
 $conditions=@(); if($env:REMOTEOPS_AUTOMATION_ID){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty,$env:REMOTEOPS_AUTOMATION_ID)}; if($env:REMOTEOPS_NAME){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$env:REMOTEOPS_NAME)}
@@ -260,7 +282,7 @@ $condition=if($conditions.Count -eq 1){$conditions[0]}else{[System.Windows.Autom
 $element=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
 if($null -eq $element){$element=[System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)}
 if($null -eq $element){throw '前台窗口中未找到 UIA 文本目标'}
-$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if($pattern.Current.IsReadOnly){throw 'UIA 文本控件为只读'}; $pattern.SetValue($env:REMOTEOPS_TEXT); if($comResult -eq 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if($pattern.Current.IsReadOnly){throw 'UIA 文本控件为只读'}; $pattern.SetValue($env:REMOTEOPS_TEXT); if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
         let mut command = hidden_powershell_command();
         command.args([
@@ -280,10 +302,7 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pa
         );
         command.env("REMOTEOPS_NAME", name.as_deref().unwrap_or_default());
         command.env("REMOTEOPS_TEXT", text);
-        let output = command
-            .output()
-            .await
-            .map_err(|e| VisualProviderError::Protocol(format!("启动 UIA 文本输入失败：{e}")))?;
+        let output = run_desktop_command(command).await?;
         if !output.status.success() {
             return Err(VisualProviderError::Rejected(
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -317,6 +336,8 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pa
             return Err(VisualProviderError::Rejected("截图缩放比例无效".into()));
         }
         let script = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 if (-not ('RemoteOpsInput' -as [type])) { Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class RemoteOpsInput { [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y); [DllImport("user32.dll")] public static extern void mouse_event(uint flags,uint dx,uint dy,uint data,UIntPtr extra); }
@@ -338,10 +359,7 @@ if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS
         ]);
         command.env("REMOTEOPS_X", x.to_string());
         command.env("REMOTEOPS_Y", y.to_string());
-        let output = command
-            .output()
-            .await
-            .map_err(|e| VisualProviderError::Protocol(format!("启动坐标输入失败：{e}")))?;
+        let output = run_desktop_command(command).await?;
         if !output.status.success() {
             return Err(VisualProviderError::Rejected(
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -359,9 +377,19 @@ if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS
         include_ui_tree: bool,
     ) -> Result<VisualObservation, VisualProviderError> {
         let script = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+if (-not ('RemoteOpsCom' -as [type])) { Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class RemoteOpsCom {
+  [DllImport("ole32.dll")] public static extern int CoInitializeEx(IntPtr p, uint f);
+  [DllImport("ole32.dll")] public static extern void CoUninitialize();
+}
+'@ }
 if (-not ('RemoteOpsUser32' -as [type])) { Add-Type @'
 using System;
 using System.Text;
@@ -412,13 +440,13 @@ if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1') {
     $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='foreground_window_unavailable'; children=@()}
   } else {
   function Convert-Uia([System.Windows.Automation.AutomationElement]$e,[int]$depth) { if($null -eq $e -or $depth -gt 3){return $null}; $n=[pscustomobject]@{name=(Safe-Text $e.Current.Name); automation_id=(Safe-Text $e.Current.AutomationId); control_type=(Safe-Text $e.Current.ControlType.ProgrammaticName); children=@()}; $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $c=$walker.GetFirstChild($e); $list=@(); while($null -ne $c -and $list.Count -lt 40){$list += Convert-Uia $c ($depth+1); $c=$walker.GetNextSibling($c)}; $n.children=$list; return $n }
-  $comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2)
+  $comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2); if ($comResult -lt 0) { throw 'UIA COM initialization failed' }
   try {
     $root=[System.Windows.Automation.AutomationElement]::FromHandle($foreground)
     if ($null -eq $root) { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='uia_root_unavailable'; children=@()} }
-    else { $ui=Convert-Uia $root 0; if ($null -eq $ui) { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='uia_tree_unavailable'; children=@()} } }
+    else { $ui=Convert-Uia $root 0; if ($null -ne $ui) { $ui | Add-Member -NotePropertyName available -NotePropertyValue $true }; if ($null -eq $ui) { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='uia_tree_unavailable'; children=@()} } }
   } catch { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason=(Safe-Text $_.Exception.Message); children=@()} }
-  finally { if ($comResult -eq 0) { [RemoteOpsCom]::CoUninitialize() } }
+  finally { if ($comResult -ge 0) { [RemoteOpsCom]::CoUninitialize() } }
   }
 }
 $shot = $null; $w = $null; $h = $null
@@ -450,10 +478,7 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
             "REMOTEOPS_INCLUDE_UI_TREE",
             if include_ui_tree { "1" } else { "0" },
         );
-        let output = command
-            .output()
-            .await
-            .map_err(|e| VisualProviderError::Protocol(format!("启动桌面采集失败：{e}")))?;
+        let output = run_desktop_command(command).await?;
         if !output.status.success() {
             return Err(VisualProviderError::Protocol(
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),

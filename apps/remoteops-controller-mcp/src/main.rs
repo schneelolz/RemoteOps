@@ -2122,9 +2122,7 @@ impl RemoteOpsMcp {
             )
             .await?;
         if let Some(observation) = output.0.details.take() {
-            let uia_available = observation
-                .get("ui_tree")
-                .is_some_and(|value| !value.is_null());
+            let uia_available = visual_uia_available(&observation);
             let interactive_desktop = observation
                 .get("state")
                 .is_some_and(|value| value == "ready");
@@ -3985,6 +3983,15 @@ async fn ensure_shell_capability(
     Ok(())
 }
 
+/// 只接受 Provider 明确确认的 UIA 可用状态，错误对象不代表成功。
+fn visual_uia_available(observation: &serde_json::Value) -> bool {
+    observation
+        .get("ui_tree")
+        .and_then(|tree| tree.get("available"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> ConnectionOutput {
     ConnectionOutput {
         display_name: connection.display_name(),
@@ -4057,6 +4064,21 @@ fn application_error(error: ApplicationError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visual_uia_requires_explicit_success() {
+        for observation in [
+            serde_json::json!({}),
+            serde_json::json!({"ui_tree": null}),
+            serde_json::json!({"ui_tree": {}}),
+            serde_json::json!({"ui_tree": {"available": false, "reason": "uia_root_unavailable"}}),
+        ] {
+            assert!(!super::visual_uia_available(&observation));
+        }
+        assert!(super::visual_uia_available(&serde_json::json!({
+            "ui_tree": {"available": true, "name": "Explorer", "children": []}
+        })));
+    }
+
     use super::*;
 
     struct FakeCredentialPrompt {

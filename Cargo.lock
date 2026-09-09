@@ -3736,7 +3736,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.8"
+version = "0.2.0-preview.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.9"
+version = "0.2.0-preview.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3784,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-service"
-version = "0.2.0-preview.8"
+version = "0.2.0-preview.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3896,7 +3896,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-mcp"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.6"
 dependencies = [
  "anyhow",
  "async-trait",

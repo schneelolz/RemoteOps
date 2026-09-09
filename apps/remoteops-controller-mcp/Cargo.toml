@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-controller-mcp"
-version.workspace = true
+version = "0.2.0-preview.6"
 publish = false
 edition.workspace = true
 license.workspace = true
