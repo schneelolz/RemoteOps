@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.11"
+version = "0.2.0-preview.12"
 dependencies = [
  "anyhow",
  "chrono",

@@ -1990,6 +1990,9 @@ impl eframe::App for RemoteOpsAgentApp {
         if self.receive_events() {
             ctx.request_repaint();
         }
+        // TLS 预检和 Agent 后台线程可能在 GUI 空闲后才发送事件；保持低频轮询，
+        // 否则没有达到 MAX_EVENTS_PER_FRAME 时事件不会触发下一帧，连接状态会卡住。
+        ctx.request_repaint_after(Duration::from_millis(250));
         if matches!(self.status, UiStatus::Stopped) && !self.allow_close {
             self.allow_close = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
