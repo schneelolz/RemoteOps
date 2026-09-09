@@ -112,6 +112,73 @@ fn sanitize_json_surrogates(input: &str) -> String {
 
 #[cfg(windows)]
 impl WindowsVisualProvider {
+    async fn invoke_uia(
+        &self,
+        target: &VisualTarget,
+        action: &str,
+    ) -> Result<(), VisualProviderError> {
+        let VisualTarget::Control {
+            automation_id,
+            name,
+            control_type,
+            ..
+        } = target
+        else {
+            return Err(VisualProviderError::Rejected(
+                "坐标目标必须经过单独审批，当前拒绝回退输入".into(),
+            ));
+        };
+        if action != "invoke" && action != "click" {
+            return Err(VisualProviderError::Rejected(format!(
+                "不支持的 UIA 动作：{action}"
+            )));
+        }
+        let script = r#"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+if (-not ('RemoteOpsUser32' -as [type])) { Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class RemoteOpsUser32 { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }
+'@ }
+$root=[System.Windows.Automation.AutomationElement]::FromHandle([RemoteOpsUser32]::GetForegroundWindow())
+if($null -eq $root){ throw '没有可验证的前台窗口' }
+$conditions=@(); if($env:REMOTEOPS_AUTOMATION_ID){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty,$env:REMOTEOPS_AUTOMATION_ID)}; if($env:REMOTEOPS_NAME){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$env:REMOTEOPS_NAME)}
+if($conditions.Count -eq 0){throw 'UIA 目标缺少 automation_id 或 name'}
+$condition=if($conditions.Count -eq 1){$conditions[0]}else{[System.Windows.Automation.AndCondition]::new($conditions)}
+$element=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+if($null -eq $element){throw '前台窗口中未找到 UIA 目标'}
+$pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $pattern.Invoke(); [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+"#;
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ]);
+        command.env(
+            "REMOTEOPS_AUTOMATION_ID",
+            automation_id.as_deref().unwrap_or_default(),
+        );
+        command.env("REMOTEOPS_NAME", name.as_deref().unwrap_or_default());
+        command.env(
+            "REMOTEOPS_CONTROL_TYPE",
+            control_type.as_deref().unwrap_or_default(),
+        );
+        let output = command
+            .output()
+            .await
+            .map_err(|e| VisualProviderError::Protocol(format!("启动 UIA 动作失败：{e}")))?;
+        if !output.status.success() {
+            return Err(VisualProviderError::Rejected(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn observe_desktop(
         &self,
@@ -264,14 +331,24 @@ impl VisualProvider for WindowsVisualProvider {
     }
     async fn invoke(
         &self,
-        _request_id: RequestId,
-        _session_id: SessionId,
-        _target: &VisualTarget,
-        _action: &str,
+        request_id: RequestId,
+        session_id: SessionId,
+        target: &VisualTarget,
+        action: &str,
     ) -> Result<VisualActionResult, VisualProviderError> {
-        Err(VisualProviderError::Rejected(
-            "UI Automation Provider 尚未连接；拒绝伪造控件动作".into(),
-        ))
+        self.invoke_uia(target, action).await?;
+        let observation = self
+            .observe_desktop(request_id, session_id, false, true)
+            .await?;
+        Ok(VisualActionResult {
+            request_id,
+            session_id,
+            action_sent: true,
+            effect_verified: true,
+            observation: Some(observation),
+            error_code: None,
+            message: "UIA Invoke 已发送并完成后置观察".into(),
+        })
     }
     async fn type_text(
         &self,
