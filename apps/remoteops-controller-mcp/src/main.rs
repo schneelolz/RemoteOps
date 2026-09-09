@@ -2125,21 +2125,47 @@ impl RemoteOpsMcp {
             let uia_available = observation
                 .get("ui_tree")
                 .is_some_and(|value| !value.is_null());
-            let screenshot_available = observation
-                .get("provider_instance_id")
-                .is_some_and(|_| true);
+            let interactive_desktop = observation
+                .get("state")
+                .is_some_and(|value| value == "ready");
+            let windows_available = observation
+                .get("windows")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|windows| !windows.is_empty());
+            let displays_available = observation
+                .get("displays")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|displays| !displays.is_empty());
+            let foreground_available = observation
+                .get("active_window_fingerprint")
+                .is_some_and(|value| value.as_str().is_some_and(|text| !text.is_empty()));
+            let mut unavailable_reasons = Vec::new();
+            if !interactive_desktop {
+                unavailable_reasons.push("interactive_desktop_unavailable");
+            }
+            if !windows_available {
+                unavailable_reasons.push("window_enumeration_unavailable");
+            }
+            if !foreground_available {
+                unavailable_reasons.push("foreground_window_unavailable");
+            }
+            if !uia_available {
+                unavailable_reasons.push("ui_automation_unavailable");
+            }
             output.0.details = Some(serde_json::json!({
                 "provider_instance_id": observation.get("provider_instance_id"),
                 "state": observation.get("state"),
-                "interactive_desktop": observation.get("state").is_some_and(|v| v == "ready"),
+                "interactive_desktop": interactive_desktop,
+                "initialized": interactive_desktop && displays_available,
                 "capabilities": {
-                    "visual": true,
-                    "screenshot": screenshot_available,
-                    "ui_automation": uia_available,
-                    "control_invoke": uia_available,
-                    "text_input": false,
-                    "synthetic_input": false
+                    "visual": interactive_desktop && windows_available,
+                    "screenshot": interactive_desktop && displays_available,
+                    "ui_automation": interactive_desktop && windows_available && foreground_available && uia_available,
+                    "control_invoke": interactive_desktop && windows_available && foreground_available && uia_available,
+                    "text_input": interactive_desktop && windows_available && foreground_available && uia_available,
+                    "synthetic_input": interactive_desktop && windows_available && foreground_available && !uia_available
                 },
+                "unavailable_reasons": unavailable_reasons,
                 "observation": observation
             }));
         }

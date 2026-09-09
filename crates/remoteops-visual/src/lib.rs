@@ -7,6 +7,14 @@ use thiserror::Error;
 #[cfg(windows)]
 pub mod windows_provider;
 
+#[cfg(windows)]
+fn hidden_powershell_command() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("powershell.exe");
+    // CREATE_NO_WINDOW prevents the child from briefly becoming the RDP foreground console.
+    command.creation_flags(0x0800_0000);
+    command
+}
+
 /// Provider 运行错误。
 #[derive(Debug, Error)]
 pub enum VisualProviderError {
@@ -161,23 +169,30 @@ impl WindowsVisualProvider {
         let script = r#"
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+if (-not ('RemoteOpsCom' -as [type])) { Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class RemoteOpsCom { [DllImport("ole32.dll")] public static extern int CoInitializeEx(IntPtr p, uint f); [DllImport("ole32.dll")] public static extern void CoUninitialize(); }
+'@ }
 if (-not ('RemoteOpsUser32' -as [type])) { Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class RemoteOpsUser32 { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }
 '@ }
+$comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2)
 $root=[System.Windows.Automation.AutomationElement]::FromHandle([RemoteOpsUser32]::GetForegroundWindow())
 if($null -eq $root){ throw '没有可验证的前台窗口' }
 $conditions=@(); if($env:REMOTEOPS_AUTOMATION_ID){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty,$env:REMOTEOPS_AUTOMATION_ID)}; if($env:REMOTEOPS_NAME){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$env:REMOTEOPS_NAME)}
 if($conditions.Count -eq 0){throw 'UIA 目标缺少 automation_id 或 name'}
 $condition=if($conditions.Count -eq 1){$conditions[0]}else{[System.Windows.Automation.AndCondition]::new($conditions)}
 $element=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+if($null -eq $element){$element=[System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)}
 if($null -eq $element){throw '前台窗口中未找到 UIA 目标'}
-$pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $pattern.Invoke(); [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+$pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $pattern.Invoke(); if($comResult -eq 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
-        let mut command = tokio::process::Command::new("powershell.exe");
+        let mut command = hidden_powershell_command();
         command.args([
             "-NoProfile",
             "-NonInteractive",
+            "-STA",
             "-WindowStyle",
             "Hidden",
             "-ExecutionPolicy",
@@ -229,22 +244,29 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::P
         let script = r#"
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+if (-not ('RemoteOpsCom' -as [type])) { Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class RemoteOpsCom { [DllImport("ole32.dll")] public static extern int CoInitializeEx(IntPtr p, uint f); [DllImport("ole32.dll")] public static extern void CoUninitialize(); }
+'@ }
 if (-not ('RemoteOpsUser32' -as [type])) { Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class RemoteOpsUser32 { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }
 '@ }
+$comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2)
 $root=[System.Windows.Automation.AutomationElement]::FromHandle([RemoteOpsUser32]::GetForegroundWindow())
 if($null -eq $root){ throw '没有可验证的前台窗口' }
 $conditions=@(); if($env:REMOTEOPS_AUTOMATION_ID){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty,$env:REMOTEOPS_AUTOMATION_ID)}; if($env:REMOTEOPS_NAME){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$env:REMOTEOPS_NAME)}
 $condition=if($conditions.Count -eq 1){$conditions[0]}else{[System.Windows.Automation.AndCondition]::new($conditions)}
 $element=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+if($null -eq $element){$element=[System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)}
 if($null -eq $element){throw '前台窗口中未找到 UIA 文本目标'}
-$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if($pattern.Current.IsReadOnly){throw 'UIA 文本控件为只读'}; $pattern.SetValue($env:REMOTEOPS_TEXT); [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if($pattern.Current.IsReadOnly){throw 'UIA 文本控件为只读'}; $pattern.SetValue($env:REMOTEOPS_TEXT); if($comResult -eq 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
-        let mut command = tokio::process::Command::new("powershell.exe");
+        let mut command = hidden_powershell_command();
         command.args([
             "-NoProfile",
             "-NonInteractive",
+            "-STA",
             "-WindowStyle",
             "Hidden",
             "-ExecutionPolicy",
@@ -302,10 +324,11 @@ public static class RemoteOpsInput { [DllImport("user32.dll")] public static ext
 if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS_Y)){throw '无法定位鼠标'}
 [RemoteOpsInput]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero); [RemoteOpsInput]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero); [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
-        let mut command = tokio::process::Command::new("powershell.exe");
+        let mut command = hidden_powershell_command();
         command.args([
             "-NoProfile",
             "-NonInteractive",
+            "-STA",
             "-WindowStyle",
             "Hidden",
             "-ExecutionPolicy",
@@ -360,7 +383,7 @@ function Safe-Text([string]$s) { if ($null -eq $s) { return '' }; return -join (
 $displays = @($screens | ForEach-Object {
   [pscustomobject]@{ display_id=$_.DeviceName; physical_width=$_.Bounds.Width; physical_height=$_.Bounds.Height; logical_width=$_.Bounds.Width; logical_height=$_.Bounds.Height; dpi=96; scale_percent=100; origin_x=$_.Bounds.X; origin_y=$_.Bounds.Y }
 })
-$windows = [System.Collections.Generic.List[object]]::new(); $foreground = [RemoteOpsUser32]::GetForegroundWindow()
+$windows = [System.Collections.Generic.List[object]]::new(); $foreground = [RemoteOpsUser32]::GetForegroundWindow(); $activeFingerprint = $null
 $callback = [RemoteOpsUser32+EnumWindowsProc]{ param($handle,$unused)
   if (-not [RemoteOpsUser32]::IsWindowVisible($handle)) { return $true }
   $text = New-Object Text.StringBuilder 512; [void][RemoteOpsUser32]::GetWindowText($handle,$text,$text.Capacity)
@@ -369,14 +392,34 @@ $callback = [RemoteOpsUser32+EnumWindowsProc]{ param($handle,$unused)
   if (-not [RemoteOpsUser32]::GetWindowRect($handle,[ref]$rect)) { return $true }
   $proc=Get-Process -Id $windowPid -ErrorAction SilentlyContinue; $name=if($proc){$proc.ProcessName}else{'unknown'}
   $fingerprint=[BitConverter]::ToString(([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("$windowPid|$($text.ToString())|$($rect.Left)|$($rect.Top)|$($rect.Right)|$($rect.Bottom)")))).Replace('-','').ToLowerInvariant()
+  if ($handle -eq $foreground) { $script:activeFingerprint = $fingerprint }
   $pobj=Get-Process -Id $windowPid -ErrorAction SilentlyContinue; $sid=if($pobj){[string]$pobj.SessionId}else{'-1'}
   $windows.Add([pscustomobject]@{ window_id="0x$('{0:x}' -f $handle.ToInt64())"; process_id=$windowPid; process_name=(Safe-Text $name); title=(Safe-Text $text.ToString()); automation_id=$null; session_id=$sid; left=$rect.Left; top=$rect.Top; width=[math]::Max(0,$rect.Right-$rect.Left); height=[math]::Max(0,$rect.Bottom-$rect.Top); fingerprint=$fingerprint })
   return $true
 }; [void][RemoteOpsUser32]::EnumWindows($callback,[IntPtr]::Zero)
+if ($foreground -ne [IntPtr]::Zero -and [string]::IsNullOrEmpty($script:activeFingerprint)) {
+  $activeText = New-Object Text.StringBuilder 512
+  [void][RemoteOpsUser32]::GetWindowText($foreground,$activeText,$activeText.Capacity)
+  $activePid=[uint32]0; [void][RemoteOpsUser32]::GetWindowThreadProcessId($foreground,[ref]$activePid)
+  $activeRect=New-Object RemoteOpsUser32+RECT
+  if ($activeText.Length -gt 0 -and [RemoteOpsUser32]::GetWindowRect($foreground,[ref]$activeRect)) {
+    $script:activeFingerprint=[BitConverter]::ToString(([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("$activePid|$($activeText.ToString())|$($activeRect.Left)|$($activeRect.Top)|$($activeRect.Right)|$($activeRect.Bottom)")))).Replace('-','').ToLowerInvariant()
+  }
+}
 $ui = $null
-if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1' -and $foreground -ne [IntPtr]::Zero) {
+if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1') {
+  if ($foreground -eq [IntPtr]::Zero) {
+    $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='foreground_window_unavailable'; children=@()}
+  } else {
   function Convert-Uia([System.Windows.Automation.AutomationElement]$e,[int]$depth) { if($null -eq $e -or $depth -gt 3){return $null}; $n=[pscustomobject]@{name=(Safe-Text $e.Current.Name); automation_id=(Safe-Text $e.Current.AutomationId); control_type=(Safe-Text $e.Current.ControlType.ProgrammaticName); children=@()}; $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $c=$walker.GetFirstChild($e); $list=@(); while($null -ne $c -and $list.Count -lt 40){$list += Convert-Uia $c ($depth+1); $c=$walker.GetNextSibling($c)}; $n.children=$list; return $n }
-  try { $ui=Convert-Uia ([System.Windows.Automation.AutomationElement]::FromHandle($foreground)) 0 } catch { $ui=$null }
+  $comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2)
+  try {
+    $root=[System.Windows.Automation.AutomationElement]::FromHandle($foreground)
+    if ($null -eq $root) { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='uia_root_unavailable'; children=@()} }
+    else { $ui=Convert-Uia $root 0; if ($null -eq $ui) { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='uia_tree_unavailable'; children=@()} } }
+  } catch { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason=(Safe-Text $_.Exception.Message); children=@()} }
+  finally { if ($comResult -eq 0) { [RemoteOpsCom]::CoUninitialize() } }
+  }
 }
 $shot = $null; $w = $null; $h = $null
 if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
@@ -385,12 +428,13 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
   $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $ms=New-Object System.IO.MemoryStream
   $bmp.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png); $shot=[Convert]::ToBase64String($ms.ToArray()); $g.Dispose(); $bmp.Dispose(); $ms.Dispose()
 }
-[pscustomobject]@{ displays=$displays; windows=$windows; active_window_fingerprint=($windows | Where-Object { $_.window_id -eq "0x$('{0:x}' -f $foreground.ToInt64())" } | Select-Object -First 1 -ExpandProperty fingerprint); screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; ui_tree=$ui } | ConvertTo-Json -Compress -Depth 8
+[pscustomobject]@{ displays=$displays; windows=$windows; active_window_fingerprint=$script:activeFingerprint; screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; ui_tree=$ui } | ConvertTo-Json -Compress -Depth 8
 "#;
-        let mut command = tokio::process::Command::new("powershell.exe");
+        let mut command = hidden_powershell_command();
         command.args([
             "-NoProfile",
             "-NonInteractive",
+            "-STA",
             "-WindowStyle",
             "Hidden",
             "-ExecutionPolicy",
