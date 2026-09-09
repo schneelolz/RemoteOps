@@ -952,7 +952,36 @@ pub async fn run_agent_with_permission_control(
         })?,
     );
     let environment = detect_environment_profile(device.as_ref()).await;
-    let capabilities = capabilities_from_environment(&environment);
+    // Provider 必须跨请求复用，外部 Windows-MCP 的子进程和 Named Pipe
+    // 生命周期不能随着每个请求重新创建。
+    let visual_provider = default_visual_provider();
+    let visual_ready = match tokio::time::timeout(
+        Duration::from_secs(5),
+        visual_provider.observe(RequestId::new(), SessionId::new(), false, true),
+    )
+    .await
+    {
+        Ok(Ok(observation)) => {
+            let ready = matches!(
+                observation.state,
+                remoteops_domain::VisualSessionState::Ready
+            ) && !observation.windows.is_empty()
+                && observation.active_window_fingerprint.is_some();
+            if !ready {
+                warn!(state = ?observation.state, windows = observation.windows.len(), "图形 Provider 未通过启动探测");
+            }
+            ready
+        }
+        Ok(Err(error)) => {
+            warn!(%error, "图形 Provider 启动探测失败");
+            false
+        }
+        Err(_) => {
+            warn!("图形 Provider 启动探测超时");
+            false
+        }
+    };
+    let capabilities = capabilities_from_environment(&environment, visual_ready);
     let host_identity = remoteops_host_identity::collect();
     let hostname = host_identity.hostname;
     let mac_address = host_identity.mac_address;
@@ -1020,6 +1049,7 @@ pub async fn run_agent_with_permission_control(
             operating_system.clone(),
             capabilities.clone(),
             environment.clone(),
+            visual_provider.clone(),
             device.clone(),
             sequence.clone(),
             shell_sessions.clone(),
@@ -1074,6 +1104,7 @@ async fn run_connection<S>(
     operating_system: String,
     capabilities: CapabilitySet,
     environment: EnvironmentProfile,
+    visual_provider: Arc<dyn VisualProvider>,
     device: Arc<SystemDevice>,
     sequence: Arc<AtomicU64>,
     shell_sessions: Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
@@ -1436,7 +1467,7 @@ where
                     serial_sessions: serial_sessions.clone(),
                     file_uploads: file_uploads.clone(),
                     used_credential_envelopes: used_credential_envelopes.clone(),
-                    visual_provider: default_visual_provider(),
+                    visual_provider: visual_provider.clone(),
                 };
                 let terminal = Arc::new(AtomicTaskTerminal::running());
                 let interactive_shell = pending_interactive_shell(&request, &shell_sessions).await;
@@ -2914,7 +2945,10 @@ async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile
     }
 }
 
-fn capabilities_from_environment(environment: &EnvironmentProfile) -> CapabilitySet {
+fn capabilities_from_environment(
+    environment: &EnvironmentProfile,
+    visual_ready: bool,
+) -> CapabilitySet {
     let mut capabilities = vec![
         Capability::PortProbe,
         Capability::TcpExchange,
@@ -2939,6 +2973,7 @@ fn capabilities_from_environment(environment: &EnvironmentProfile) -> Capability
     if cfg!(windows)
         && env::var("REMOTEOPS_VISUAL_PROVIDER_ENABLED")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        && visual_ready
     {
         capabilities.push(Capability::Visual);
     }
@@ -3626,6 +3661,7 @@ mod tests {
                 "test-os".to_owned(),
                 CapabilitySet::new([Capability::Cmd]),
                 EnvironmentProfile::empty(),
+                default_visual_provider(),
                 Arc::new(SystemDevice::new()),
                 Arc::new(AtomicU64::new(1)),
                 Arc::new(Mutex::new(BTreeMap::new())),
