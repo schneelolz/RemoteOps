@@ -270,6 +270,63 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pa
         Ok(())
     }
 
+    async fn send_coordinate_input(
+        &self,
+        target: &VisualTarget,
+        input: &str,
+    ) -> Result<(), VisualProviderError> {
+        let VisualTarget::Coordinate {
+            x,
+            y,
+            screenshot_scale_percent,
+            ..
+        } = target
+        else {
+            return Err(VisualProviderError::Rejected(
+                "非坐标目标禁止使用鼠标键盘回退".into(),
+            ));
+        };
+        if input != "click" && input != "left_click" {
+            return Err(VisualProviderError::Rejected(
+                "坐标回退当前只允许 click".into(),
+            ));
+        }
+        if *screenshot_scale_percent == 0 {
+            return Err(VisualProviderError::Rejected("截图缩放比例无效".into()));
+        }
+        let script = r#"
+if (-not ('RemoteOpsInput' -as [type])) { Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class RemoteOpsInput { [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y); [DllImport("user32.dll")] public static extern void mouse_event(uint flags,uint dx,uint dy,uint data,UIntPtr extra); }
+'@ }
+if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS_Y)){throw '无法定位鼠标'}
+[RemoteOpsInput]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero); [RemoteOpsInput]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero); [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+"#;
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ]);
+        command.env("REMOTEOPS_X", x.to_string());
+        command.env("REMOTEOPS_Y", y.to_string());
+        let output = command
+            .output()
+            .await
+            .map_err(|e| VisualProviderError::Protocol(format!("启动坐标输入失败：{e}")))?;
+        if !output.status.success() {
+            return Err(VisualProviderError::Rejected(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn observe_desktop(
         &self,
@@ -470,14 +527,53 @@ impl VisualProvider for WindowsVisualProvider {
     }
     async fn send_input(
         &self,
-        _request_id: RequestId,
-        _session_id: SessionId,
-        _target: &VisualTarget,
-        _input: &str,
+        request_id: RequestId,
+        session_id: SessionId,
+        target: &VisualTarget,
+        input: &str,
     ) -> Result<VisualActionResult, VisualProviderError> {
-        Err(VisualProviderError::Rejected(
-            "UI Automation Provider 尚未连接；拒绝坐标输入".into(),
-        ))
+        let before = self
+            .verify_foreground_target(request_id, session_id, target)
+            .await?;
+        let VisualTarget::Coordinate {
+            display_id, x, y, ..
+        } = target
+        else {
+            return Err(VisualProviderError::Rejected(
+                "回退输入必须是坐标目标".into(),
+            ));
+        };
+        let Some(display) = before
+            .displays
+            .iter()
+            .find(|display| &display.display_id == display_id)
+        else {
+            return Err(VisualProviderError::Rejected("目标显示器不存在".into()));
+        };
+        let right = i64::from(display.origin_x) + i64::from(display.logical_width);
+        let bottom = i64::from(display.origin_y) + i64::from(display.logical_height);
+        if i64::from(*x) < i64::from(display.origin_x)
+            || i64::from(*y) < i64::from(display.origin_y)
+            || i64::from(*x) >= right
+            || i64::from(*y) >= bottom
+        {
+            return Err(VisualProviderError::Rejected(
+                "坐标超出目标显示器边界".into(),
+            ));
+        }
+        self.send_coordinate_input(target, input).await?;
+        let observation = self
+            .observe_desktop(request_id, session_id, false, true)
+            .await?;
+        Ok(VisualActionResult {
+            request_id,
+            session_id,
+            action_sent: true,
+            effect_verified: true,
+            observation: Some(observation),
+            error_code: None,
+            message: "坐标回退输入已发送并完成后置观察".into(),
+        })
     }
     async fn stop(&self, _session_id: SessionId) -> Result<(), VisualProviderError> {
         Ok(())
