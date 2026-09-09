@@ -12,6 +12,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
+/// 创建不分配控制台且随监管器释放而终止的后台进程。
+fn provider_process_command(executable: &std::path::Path) -> Command {
+    let mut command = Command::new(executable);
+    command.creation_flags(0x0800_0000);
+    command.kill_on_drop(true);
+    command
+}
+
 /// Provider 与 Agent 之间的 Named Pipe 命令。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -136,15 +144,13 @@ impl WindowsMcpSupervisor {
         if self.is_running() {
             return Ok(());
         }
-        let mut command = Command::new(&self.config.executable);
+        let mut command = provider_process_command(&self.config.executable);
         command
             .arg("--pipe")
             .arg(&self.pipe_name)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        #[cfg(windows)]
-        command.creation_flags(0x0800_0000);
         let child = command
             .spawn()
             .map_err(|e| format!("启动 Windows-MCP 失败：{e}"))?;
@@ -268,6 +274,28 @@ pub fn validate_pipe_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn supervised_console_process_does_not_allocate_a_console() {
+        let executable =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("Windows 系统目录应存在"))
+                .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let script = r#"Add-Type 'using System; using System.Runtime.InteropServices; public static class Probe { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); }'; [Probe]::GetConsoleWindow().ToInt64()"#;
+        let output = timeout(
+            Duration::from_secs(20),
+            provider_process_command(&executable)
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .output(),
+        )
+        .await
+        .expect("探测应在时限内完成")
+        .expect("探测应能启动");
+        assert!(
+            output.status.success(),
+            "探测失败：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+    }
     #[test]
     fn safety_rejects_secure_desktop_and_unapproved_fallback() {
         let mut s = DesktopSafety {

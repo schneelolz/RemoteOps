@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.14"
+version = "0.2.0-preview.15"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -26,6 +26,7 @@ remoteops-domain = { path = "../../crates/remoteops-domain" }
 remoteops-device = { path = "../../crates/remoteops-device" }
 remoteops-i18n = { path = "../../crates/remoteops-i18n" }
 remoteops-protocol = { path = "../../crates/remoteops-protocol" }
+remoteops-visual = { path = "../../crates/remoteops-visual" }
 rustls.workspace = true
 serde.workspace = true
 tokio.workspace = true

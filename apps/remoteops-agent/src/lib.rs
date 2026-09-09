@@ -928,8 +928,42 @@ pub async fn run_agent(
 pub async fn run_agent_with_permission_control(
     config: AgentConfig,
     event_sender: Option<AgentEventSender>,
+    shutdown: watch::Receiver<bool>,
+    permission_control: AgentPermissionControl,
+) -> anyhow::Result<()> {
+    let visual_enabled = cfg!(windows)
+        && env::var("REMOTEOPS_VISUAL_PROVIDER_ENABLED")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let visual_provider: Arc<dyn VisualProvider> = if visual_enabled {
+        default_visual_provider()
+    } else {
+        Arc::new(remoteops_visual::UnavailableVisualProvider)
+    };
+    run_agent_with_visual_provider(
+        config,
+        event_sender,
+        shutdown,
+        permission_control,
+        visual_provider,
+        visual_enabled,
+    )
+    .await
+}
+
+/// 使用表现层显式提供的视觉 Provider 运行 Agent。
+/// GUI 宿主通过此入口启用本机视觉能力，无需依赖进程环境变量。
+///
+/// # Errors
+///
+/// 当本地状态、证书、设备或 Relay 生命周期无法继续时返回错误。
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_agent_with_visual_provider(
+    config: AgentConfig,
+    event_sender: Option<AgentEventSender>,
     mut shutdown: watch::Receiver<bool>,
     permission_control: AgentPermissionControl,
+    visual_provider: Arc<dyn VisualProvider>,
+    visual_enabled: bool,
 ) -> anyhow::Result<()> {
     let client_config = if let Some(certificate_path) = config.ca_cert.as_deref() {
         load_client_config(certificate_path)
@@ -954,14 +988,6 @@ pub async fn run_agent_with_permission_control(
     let environment = detect_environment_profile(device.as_ref()).await;
     // Provider 必须跨请求复用，外部 Windows-MCP 的子进程和 Named Pipe
     // 生命周期不能随着每个请求重新创建。
-    let visual_enabled = cfg!(windows)
-        && env::var("REMOTEOPS_VISUAL_PROVIDER_ENABLED")
-            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-    let visual_provider: Arc<dyn VisualProvider> = if visual_enabled {
-        default_visual_provider()
-    } else {
-        Arc::new(remoteops_visual::UnavailableVisualProvider)
-    };
     let visual_ready = if visual_enabled {
         match tokio::time::timeout(
             Duration::from_secs(5),
