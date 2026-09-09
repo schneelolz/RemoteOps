@@ -181,6 +181,70 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::P
         Ok(())
     }
 
+    async fn type_text_uia(
+        &self,
+        target: &VisualTarget,
+        text: &str,
+    ) -> Result<(), VisualProviderError> {
+        let VisualTarget::Control {
+            automation_id,
+            name,
+            ..
+        } = target
+        else {
+            return Err(VisualProviderError::Rejected(
+                "文本输入必须定位到 UIA 控件，拒绝坐标回退".into(),
+            ));
+        };
+        if automation_id.is_none() && name.is_none() {
+            return Err(VisualProviderError::Rejected(
+                "UIA 文本目标缺少 automation_id 或 name".into(),
+            ));
+        }
+        let script = r#"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+if (-not ('RemoteOpsUser32' -as [type])) { Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class RemoteOpsUser32 { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }
+'@ }
+$root=[System.Windows.Automation.AutomationElement]::FromHandle([RemoteOpsUser32]::GetForegroundWindow())
+if($null -eq $root){ throw '没有可验证的前台窗口' }
+$conditions=@(); if($env:REMOTEOPS_AUTOMATION_ID){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty,$env:REMOTEOPS_AUTOMATION_ID)}; if($env:REMOTEOPS_NAME){$conditions += [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$env:REMOTEOPS_NAME)}
+$condition=if($conditions.Count -eq 1){$conditions[0]}else{[System.Windows.Automation.AndCondition]::new($conditions)}
+$element=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+if($null -eq $element){throw '前台窗口中未找到 UIA 文本目标'}
+$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if($pattern.Current.IsReadOnly){throw 'UIA 文本控件为只读'}; $pattern.SetValue($env:REMOTEOPS_TEXT); [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+"#;
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ]);
+        command.env(
+            "REMOTEOPS_AUTOMATION_ID",
+            automation_id.as_deref().unwrap_or_default(),
+        );
+        command.env("REMOTEOPS_NAME", name.as_deref().unwrap_or_default());
+        command.env("REMOTEOPS_TEXT", text);
+        let output = command
+            .output()
+            .await
+            .map_err(|e| VisualProviderError::Protocol(format!("启动 UIA 文本输入失败：{e}")))?;
+        if !output.status.success() {
+            return Err(VisualProviderError::Rejected(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn observe_desktop(
         &self,
@@ -356,14 +420,24 @@ impl VisualProvider for WindowsVisualProvider {
     }
     async fn type_text(
         &self,
-        _request_id: RequestId,
-        _session_id: SessionId,
-        _target: &VisualTarget,
-        _text: &str,
+        request_id: RequestId,
+        session_id: SessionId,
+        target: &VisualTarget,
+        text: &str,
     ) -> Result<VisualActionResult, VisualProviderError> {
-        Err(VisualProviderError::Rejected(
-            "UI Automation Provider 尚未连接；拒绝输入".into(),
-        ))
+        self.type_text_uia(target, text).await?;
+        let observation = self
+            .observe_desktop(request_id, session_id, false, true)
+            .await?;
+        Ok(VisualActionResult {
+            request_id,
+            session_id,
+            action_sent: true,
+            effect_verified: true,
+            observation: Some(observation),
+            error_code: None,
+            message: "UIA ValuePattern 输入已发送并完成后置观察".into(),
+        })
     }
     async fn send_input(
         &self,
