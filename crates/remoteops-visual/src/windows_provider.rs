@@ -136,12 +136,16 @@ impl WindowsMcpSupervisor {
         if self.is_running() {
             return Ok(());
         }
-        let child = Command::new(&self.config.executable)
+        let mut command = Command::new(&self.config.executable);
+        command
             .arg("--pipe")
             .arg(&self.pipe_name)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000);
+        let child = command
             .spawn()
             .map_err(|e| format!("启动 Windows-MCP 失败：{e}"))?;
         self.child = Some(child);
