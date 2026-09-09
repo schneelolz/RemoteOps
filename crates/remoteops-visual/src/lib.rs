@@ -109,13 +109,34 @@ pub trait VisualProvider: Send + Sync {
 #[derive(Default)]
 pub struct UnavailableVisualProvider;
 
-/// Windows 交互式桌面的最小真实 Provider。
+/// Windows 用户 Session 中的真实图形 Provider。
 ///
-/// 通过用户 Session 中的 Windows PowerShell 获取屏幕和截图；Agent Service
-/// 不直接访问桌面。UIA/输入动作在 Windows-MCP 接入前明确拒绝，避免伪造成功。
+/// 默认使用本机 UIA/截图适配器；配置 `REMOTEOPS_WINDOWS_MCP_ENABLED=1` 时，
+/// Provider 会先校验并监管锁定版本的 Windows-MCP，再通过用户 Session 的
+/// Named Pipe 建立外部 Provider 生命周期边界。
 #[cfg(windows)]
-#[derive(Default)]
-pub struct WindowsVisualProvider;
+pub struct WindowsVisualProvider {
+    mcp_supervisor: tokio::sync::Mutex<Option<windows_provider::WindowsMcpSupervisor>>,
+    mcp_configuration_error: Option<String>,
+}
+
+#[cfg(windows)]
+impl Default for WindowsVisualProvider {
+    fn default() -> Self {
+        let (mcp_supervisor, mcp_configuration_error) =
+            match windows_provider::WindowsMcpSupervisor::from_environment() {
+                Ok(supervisor) => (supervisor, None),
+                Err(error) => {
+                    tracing::error!(%error, "Windows-MCP configuration rejected");
+                    (None, Some(error))
+                }
+            };
+        Self {
+            mcp_supervisor: tokio::sync::Mutex::new(mcp_supervisor),
+            mcp_configuration_error,
+        }
+    }
+}
 
 #[cfg(windows)]
 fn sanitize_json_surrogates(input: &str) -> String {
@@ -141,6 +162,50 @@ fn sanitize_json_surrogates(input: &str) -> String {
 
 #[cfg(windows)]
 impl WindowsVisualProvider {
+    async fn ensure_mcp_started(&self) -> Result<(), VisualProviderError> {
+        if let Some(error) = &self.mcp_configuration_error {
+            return Err(VisualProviderError::Protocol(format!(
+                "Windows-MCP 配置无效：{error}"
+            )));
+        }
+        let mut supervisor = self.mcp_supervisor.lock().await;
+        if let Some(supervisor) = supervisor.as_mut() {
+            supervisor.start().map_err(|error| {
+                VisualProviderError::Protocol(format!("Windows-MCP 启动失败：{error}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn observe_external_mcp(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        include_screenshot: bool,
+        include_ui_tree: bool,
+    ) -> Result<Option<VisualObservation>, VisualProviderError> {
+        let mut supervisor = self.mcp_supervisor.lock().await;
+        let Some(supervisor) = supervisor.as_mut() else {
+            return Ok(None);
+        };
+        let value = supervisor
+            .request(&windows_provider::ProviderCommand::Observe {
+                screenshot: include_screenshot,
+                ui_tree: include_ui_tree,
+            })
+            .await
+            .map_err(|error| {
+                VisualProviderError::Protocol(format!("Windows-MCP 观察失败：{error}"))
+            })?;
+        let mut observation: VisualObservation =
+            serde_json::from_value(value).map_err(|error| {
+                VisualProviderError::Protocol(format!("Windows-MCP 观察结果无效：{error}"))
+            })?;
+        observation.request_id = request_id;
+        observation.session_id = session_id;
+        Ok(Some(observation))
+    }
+
     async fn verify_foreground_target(
         &self,
         request_id: RequestId,
@@ -376,6 +441,13 @@ if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS
         include_screenshot: bool,
         include_ui_tree: bool,
     ) -> Result<VisualObservation, VisualProviderError> {
+        self.ensure_mcp_started().await?;
+        if let Some(observation) = self
+            .observe_external_mcp(request_id, session_id, include_screenshot, include_ui_tree)
+            .await?
+        {
+            return Ok(observation);
+        }
         let script = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -654,7 +726,7 @@ impl VisualProvider for WindowsVisualProvider {
 pub fn default_visual_provider() -> std::sync::Arc<dyn VisualProvider> {
     #[cfg(windows)]
     {
-        std::sync::Arc::new(WindowsVisualProvider)
+        std::sync::Arc::new(WindowsVisualProvider::default())
     }
     #[cfg(not(windows))]
     {

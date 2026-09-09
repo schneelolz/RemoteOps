@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::time::timeout;
 
 /// Provider 与 Agent 之间的 Named Pipe 命令。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -83,6 +86,32 @@ pub struct WindowsMcpSupervisor {
 }
 
 impl WindowsMcpSupervisor {
+    /// 从 Provider 环境读取锁定版本配置；未启用外部 Provider 时返回 `None`。
+    ///
+    /// # Errors
+    /// 外部 Provider 已启用但路径、摘要或 Pipe 配置缺失或无效时返回错误。
+    pub fn from_environment() -> Result<Option<Self>, String> {
+        if !std::env::var("REMOTEOPS_WINDOWS_MCP_ENABLED")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        {
+            return Ok(None);
+        }
+        let executable = std::env::var_os("REMOTEOPS_WINDOWS_MCP_PATH")
+            .ok_or_else(|| "已启用 Windows-MCP，但未配置 REMOTEOPS_WINDOWS_MCP_PATH".to_owned())?;
+        let sha256 = std::env::var("REMOTEOPS_WINDOWS_MCP_SHA256")
+            .map_err(|_| "已启用 Windows-MCP，但未配置 REMOTEOPS_WINDOWS_MCP_SHA256".to_owned())?;
+        let pipe_name = std::env::var("REMOTEOPS_WINDOWS_MCP_PIPE")
+            .unwrap_or_else(|_| format!(r"\.pipeRemoteOps-windows-mcp-{}", std::process::id()));
+        Self::new(
+            WindowsMcpConfig {
+                executable: executable.into(),
+                sha256,
+            },
+            pipe_name,
+        )
+        .map(Some)
+    }
+
     /// 创建监管器并校验用户 Session 专属 Pipe 名称。
     ///
     /// # Errors
@@ -142,6 +171,42 @@ impl WindowsMcpSupervisor {
     pub async fn restart(&mut self) -> Result<(), String> {
         self.stop().await;
         self.start()
+    }
+
+    /// 向受监管的 Windows-MCP 发送一条带换行分隔的 JSON 请求。
+    ///
+    /// Named Pipe 连接只在子进程已启动且 Pipe 名称通过校验时建立；连接或响应
+    /// 超时会返回明确错误，调用方必须把该错误写入审计并停止后续图形动作。
+    ///
+    /// # Errors
+    /// 子进程未运行、Pipe 无法连接、读写超时或响应不是有效 JSON 时返回错误。
+    pub async fn request(
+        &mut self,
+        command: &ProviderCommand,
+    ) -> Result<serde_json::Value, String> {
+        if !self.is_running() {
+            return Err("Windows-MCP Provider 未运行，拒绝通过 Named Pipe 请求".into());
+        }
+        let mut pipe = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&self.pipe_name)
+            .map_err(|error| format!("连接 Windows-MCP Named Pipe 失败：{error}"))?;
+        let mut payload = serde_json::to_vec(command)
+            .map_err(|error| format!("序列化 Windows-MCP 请求失败：{error}"))?;
+        payload.push(b'\n');
+        timeout(Duration::from_secs(10), pipe.write_all(&payload))
+            .await
+            .map_err(|_| "写入 Windows-MCP Named Pipe 超时".to_owned())?
+            .map_err(|error| format!("写入 Windows-MCP Named Pipe 失败：{error}"))?;
+        let mut line = String::new();
+        timeout(
+            Duration::from_secs(30),
+            BufReader::new(&mut pipe).read_line(&mut line),
+        )
+        .await
+        .map_err(|_| "读取 Windows-MCP Named Pipe 超时".to_owned())?
+        .map_err(|error| format!("读取 Windows-MCP Named Pipe 失败：{error}"))?;
+        serde_json::from_str(line.trim())
+            .map_err(|error| format!("Windows-MCP 返回无效 JSON：{error}"))
     }
 }
 
