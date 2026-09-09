@@ -557,6 +557,8 @@ if ($foreground -ne [IntPtr]::Zero -and [string]::IsNullOrEmpty($script:activeFi
     $script:activeFingerprint=[BitConverter]::ToString(([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("$activePid|$($activeText.ToString())|$($activeRect.Left)|$($activeRect.Top)|$($activeRect.Right)|$($activeRect.Bottom)")))).Replace('-','').ToLowerInvariant()
   }
 }
+$state = if($foreground -ne [IntPtr]::Zero -and $windows.Count -gt 0){'ready'}else{'no_interactive_desktop'}
+$stateReason = if($state -eq 'ready'){$null}elseif($foreground -eq [IntPtr]::Zero){'foreground_window_unavailable'}else{'window_enumeration_unavailable'}
 $ui = $null
 if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1') {
   if ($foreground -eq [IntPtr]::Zero) {
@@ -579,7 +581,7 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
   $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $ms=New-Object System.IO.MemoryStream
   $bmp.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png); $shot=[Convert]::ToBase64String($ms.ToArray()); $g.Dispose(); $bmp.Dispose(); $ms.Dispose()
 }
-[pscustomobject]@{ displays=$displays; windows=$windows; active_window_fingerprint=$script:activeFingerprint; screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; ui_tree=$ui } | ConvertTo-Json -Compress -Depth 8
+[pscustomobject]@{ state=$state; state_reason=$stateReason; displays=$displays; windows=$windows; active_window_fingerprint=$script:activeFingerprint; screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; ui_tree=$ui } | ConvertTo-Json -Compress -Depth 8
 "#;
         let mut command = hidden_powershell_command();
         command.args([
@@ -631,11 +633,16 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
             .get("screenshot_height")
             .and_then(serde_json::Value::as_u64)
             .and_then(|v| u32::try_from(v).ok());
+        let state = value
+            .get("state")
+            .cloned()
+            .and_then(|state| serde_json::from_value(state).ok())
+            .unwrap_or(remoteops_domain::VisualSessionState::NoInteractiveDesktop);
         Ok(VisualObservation {
             request_id,
             session_id,
             provider_instance_id: "windows-powershell-desktop".into(),
-            state: remoteops_domain::VisualSessionState::Ready,
+            state,
             windows,
             displays,
             active_window_fingerprint,
