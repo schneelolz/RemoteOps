@@ -100,8 +100,8 @@ impl WindowsMcpSupervisor {
             .ok_or_else(|| "已启用 Windows-MCP，但未配置 REMOTEOPS_WINDOWS_MCP_PATH".to_owned())?;
         let sha256 = std::env::var("REMOTEOPS_WINDOWS_MCP_SHA256")
             .map_err(|_| "已启用 Windows-MCP，但未配置 REMOTEOPS_WINDOWS_MCP_SHA256".to_owned())?;
-        let pipe_name = std::env::var("REMOTEOPS_WINDOWS_MCP_PIPE")
-            .unwrap_or_else(|_| format!(r"\.pipeRemoteOps-windows-mcp-{}", std::process::id()));
+        let pipe_name =
+            std::env::var("REMOTEOPS_WINDOWS_MCP_PIPE").unwrap_or_else(|_| default_pipe_name());
         Self::new(
             WindowsMcpConfig {
                 executable: executable.into(),
@@ -210,6 +210,10 @@ impl WindowsMcpSupervisor {
     }
 }
 
+fn default_pipe_name() -> String {
+    format!(r"\\.\pipe\RemoteOps-windows-mcp-{}", std::process::id())
+}
+
 /// 交互式 Session 的安全门禁，供 UIA 和输入后端共同使用。
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -284,5 +288,6 @@ mod tests {
             sha256: "a".repeat(64),
         };
         assert!(c.validate().is_ok());
+        assert!(validate_pipe_name(&default_pipe_name()).is_ok());
     }
 }
