@@ -12,6 +12,7 @@ members = [
     "crates/remoteops-ai",
     "crates/remoteops-i18n",
     "crates/remoteops-host-identity",
+    "crates/remoteops-visual",
     "apps/remoteops-relay",
     "apps/remoteops-agent",
     "apps/remoteops-agent-service",

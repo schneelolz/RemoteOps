@@ -28,6 +28,7 @@ remoteops-host-identity = { path = "../../crates/remoteops-host-identity" }
 remoteops-policy = { path = "../../crates/remoteops-policy" }
 remoteops-protocol = { path = "../../crates/remoteops-protocol" }
 remoteops-serial = { path = "../../crates/remoteops-serial" }
+remoteops-visual = { path = "../../crates/remoteops-visual" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

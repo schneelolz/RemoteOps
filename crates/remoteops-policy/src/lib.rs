@@ -274,7 +274,14 @@ impl DefaultPolicy {
             | RemoteOperation::HumanTakeover
             | RemoteOperation::ReleaseHumanTakeover
             | RemoteOperation::EmergencyStop
-            | RemoteOperation::CancelRequest { .. } => RiskLevel::ReadOnly,
+            | RemoteOperation::CancelRequest { .. }
+            | RemoteOperation::VisualObserve { .. }
+            | RemoteOperation::VisualWaitFor { .. }
+            | RemoteOperation::VisualStop => RiskLevel::ReadOnly,
+            RemoteOperation::VisualInvoke { .. } | RemoteOperation::VisualTypeText { .. } => {
+                RiskLevel::Mutating
+            }
+            RemoteOperation::VisualSendInput { .. } => RiskLevel::High,
             RemoteOperation::RunSsh {
                 command, readonly, ..
             } => {
@@ -1410,5 +1417,36 @@ mod tests {
                 .state,
             ApprovalState::Approved
         );
+    }
+
+    #[test]
+    fn visual_observation_is_read_only_but_input_requires_approval() {
+        let policy = DefaultPolicy::default();
+        let observe = RemoteOperation::VisualObserve {
+            include_screenshot: true,
+            include_ui_tree: true,
+        };
+        assert_eq!(
+            policy.evaluate(EventSource::Ai, &observe),
+            PolicyDecision::Allow
+        );
+
+        let input = RemoteOperation::VisualSendInput {
+            target: remoteops_domain::VisualTarget::Coordinate {
+                window_fingerprint: "window".to_owned(),
+                display_id: "display-0".to_owned(),
+                x: 1,
+                y: 1,
+                screenshot_scale_percent: 100,
+            },
+            input: "click".to_owned(),
+        };
+        assert!(matches!(
+            policy.evaluate(EventSource::Ai, &input),
+            PolicyDecision::RequireApproval {
+                risk: RiskLevel::High,
+                ..
+            }
+        ));
     }
 }

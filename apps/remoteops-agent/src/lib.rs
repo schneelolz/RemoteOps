@@ -49,6 +49,7 @@ use remoteops_serial::{
     SerialDirection, SerialObservedChunk, SerialQueryError, SerialQueryPlan, SerialQueryRunner,
     SerialQueryTransport, SerialTranscript,
 };
+use remoteops_visual::{UnavailableVisualProvider, VisualProvider};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -668,6 +669,8 @@ struct RequestRuntimeState {
     file_uploads: Arc<Mutex<BTreeMap<FileTransferId, FileUploadRuntime>>>,
     /// 当前连接已经消费的加密凭据载荷标识。
     used_credential_envelopes: Arc<Mutex<BTreeSet<RequestId>>>,
+    /// 当前用户 Session 的图形 Provider。
+    visual_provider: Arc<dyn VisualProvider>,
 }
 
 struct PendingTask {
@@ -1433,6 +1436,7 @@ where
                     serial_sessions: serial_sessions.clone(),
                     file_uploads: file_uploads.clone(),
                     used_credential_envelopes: used_credential_envelopes.clone(),
+                    visual_provider: Arc::new(UnavailableVisualProvider),
                 };
                 let terminal = Arc::new(AtomicTaskTerminal::running());
                 let interactive_shell = pending_interactive_shell(&request, &shell_sessions).await;
@@ -2437,6 +2441,75 @@ async fn execute_operation(
         RemoteOperation::CancelRequest { .. } => {
             unreachable!("取消请求在连接循环中处理");
         }
+        RemoteOperation::VisualObserve {
+            include_screenshot,
+            include_ui_tree,
+        } => {
+            let observation = runtime_state
+                .visual_provider
+                .observe(
+                    request.request_id,
+                    request.session_id,
+                    *include_screenshot,
+                    *include_ui_tree,
+                )
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形观察已完成".clone_into(&mut response.summary);
+            response.details = Some(serde_json::to_value(observation)?);
+        }
+        RemoteOperation::VisualWaitFor {
+            condition,
+            timeout_millis,
+        } => {
+            let observation = runtime_state
+                .visual_provider
+                .wait_for(
+                    request.request_id,
+                    request.session_id,
+                    condition,
+                    *timeout_millis,
+                )
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形状态等待已完成".clone_into(&mut response.summary);
+            response.details = Some(serde_json::to_value(observation)?);
+        }
+        RemoteOperation::VisualInvoke { target, action } => {
+            let result = runtime_state
+                .visual_provider
+                .invoke(request.request_id, request.session_id, target, action)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形控件动作已处理".clone_into(&mut response.summary);
+            response.details = Some(serde_json::to_value(result)?);
+        }
+        RemoteOperation::VisualTypeText { target, text } => {
+            let result = runtime_state
+                .visual_provider
+                .type_text(request.request_id, request.session_id, target, text)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形文本输入已处理".clone_into(&mut response.summary);
+            response.details = Some(serde_json::to_value(result)?);
+        }
+        RemoteOperation::VisualSendInput { target, input } => {
+            let result = runtime_state
+                .visual_provider
+                .send_input(request.request_id, request.session_id, target, input)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形输入已处理".clone_into(&mut response.summary);
+            response.details = Some(serde_json::to_value(result)?);
+        }
+        RemoteOperation::VisualStop => {
+            runtime_state
+                .visual_provider
+                .stop(request.session_id)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形会话已停止".clone_into(&mut response.summary);
+        }
     }
     Ok(response)
 }
@@ -2862,6 +2935,12 @@ fn capabilities_from_environment(environment: &EnvironmentProfile) -> Capability
         .any(|tool| tool.name == "ssh" && tool.available)
     {
         capabilities.push(Capability::Ssh);
+    }
+    if cfg!(windows)
+        && env::var("REMOTEOPS_VISUAL_PROVIDER_ENABLED")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        capabilities.push(Capability::Visual);
     }
     CapabilitySet::new(capabilities)
 }
@@ -3339,6 +3418,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::clone(file_uploads),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+            visual_provider: Arc::new(UnavailableVisualProvider),
         };
         let agent_instance_id = AgentInstanceId::new();
         let credential_encryption = CredentialEncryptionKeyPair::generate();
@@ -3744,6 +3824,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+            visual_provider: Arc::new(UnavailableVisualProvider),
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let sequence = Arc::new(AtomicU64::new(1));
@@ -4479,6 +4560,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+            visual_provider: Arc::new(UnavailableVisualProvider),
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let credential_encryption = CredentialEncryptionKeyPair::generate();
@@ -4573,6 +4655,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+            visual_provider: Arc::new(UnavailableVisualProvider),
         };
         let transfer_root = test_state_file("encrypted-ssh").with_extension("dir");
         let device = SystemDevice::with_transfer_root(&transfer_root).expect("应创建交换目录");

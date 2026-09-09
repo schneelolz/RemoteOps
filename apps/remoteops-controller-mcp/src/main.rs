@@ -21,7 +21,7 @@ use remoteops_domain::{
     ApprovalId, Capability, ControllerInstanceId, ControllerOwnerId, EventSource, FileTransferId,
     PairingCode, PermissionMode, PowerAction, RemoteOperation, SerialDataBits, SerialFlowControl,
     SerialLineEnding, SerialParity, SerialSettings, SerialStopBits, SerialTerminalProfile,
-    ServiceAction, SessionId, ShellId, ShellKind,
+    ServiceAction, SessionId, ShellId, ShellKind, VisualTarget,
 };
 use remoteops_protocol::{
     ControllerControlMode, ControllerControlModeUpdate, CredentialEncryptionContext,
@@ -402,6 +402,30 @@ struct ShellHandle {
 struct TargetInput {
     /// `list_connections` 返回的不可变 `session_id`。
     session_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VisualObserveInput {
+    session_id: String,
+    include_screenshot: Option<bool>,
+    include_ui_tree: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VisualWaitInput {
+    session_id: String,
+    condition: String,
+    timeout_millis: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VisualActionInput {
+    session_id: String,
+    target: String,
+    action: Option<String>,
+    text: Option<String>,
+    input: Option<String>,
+    approval_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1403,7 +1427,7 @@ impl RemoteOpsMcp {
         if connection.credential_encryption_public_key.is_empty()
             || connection.credential_encryption_key_id.is_empty()
         {
-            return Err("Agent 未提供 v14 凭据加密公钥；请同步升级 Agent、Relay 和 MCP".to_owned());
+            return Err("Agent 未提供 v15 凭据加密公钥；请同步升级 Agent、Relay 和 MCP".to_owned());
         }
         let cache_key = SshCredentialCacheKey {
             session_id,
@@ -2068,6 +2092,216 @@ impl RemoteOpsMcp {
             self.shells.lock().await.remove(&shell_id);
         }
         Ok(Json(action_output(session_id, result)))
+    }
+
+    /// 获取交互式 Windows 桌面的 UIA 状态和可选截图。
+    #[tool(
+        name = "desktop_capabilities",
+        description = "查询现场 Windows 交互式桌面是否可用，以及窗口/UIA/截图/输入能力。",
+        annotations(
+            title = "查询图形能力",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn desktop_capabilities(
+        &self,
+        Parameters(input): Parameters<TargetInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::VisualObserve {
+                include_screenshot: false,
+                include_ui_tree: false,
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// 观察交互式桌面窗口、UIA 树和按需截图。
+    #[tool(
+        name = "observe_window",
+        description = "观察精确 session_id 上的 Windows 窗口和 UI Automation 状态；按需返回截图。",
+        annotations(
+            title = "观察 Windows 界面",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn observe_window(
+        &self,
+        Parameters(input): Parameters<VisualObserveInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::VisualObserve {
+                include_screenshot: input.include_screenshot.unwrap_or(true),
+                include_ui_tree: input.include_ui_tree.unwrap_or(true),
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// 等待窗口、文本或 UI 状态变化。
+    #[tool(
+        name = "wait_for_visual_state",
+        description = "等待现场 Windows 桌面满足指定条件，避免 AI 盲目重复截图。",
+        annotations(
+            title = "等待界面状态",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn wait_for_visual_state(
+        &self,
+        Parameters(input): Parameters<VisualWaitInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::VisualWaitFor {
+                condition: input.condition,
+                timeout_millis: input.timeout_millis.unwrap_or(30_000).min(120_000),
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// 通过 UIA 语义控件调用低风险动作。
+    #[tool(
+        name = "invoke_control",
+        description = "按 UIA 控件目标调用按钮、菜单、选择或切换动作；AI 默认需要当前用户逐项确认。target 必须是 VisualTarget JSON。",
+        annotations(
+            title = "操作 Windows 控件",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn invoke_control(
+        &self,
+        Parameters(input): Parameters<VisualActionInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        let target = parse_visual_target(&input.target)?;
+        let action = input.action.unwrap_or_else(|| "invoke".to_owned());
+        let authorization = self
+            .authorize_mutation(
+                &context,
+                session_id,
+                &format!("图形控件动作：{action}"),
+                input.approval_id,
+            )
+            .await?;
+        self.execute_authorized(
+            session_id,
+            RemoteOperation::VisualInvoke { target, action },
+            authorization,
+            None,
+        )
+        .await
+    }
+
+    /// 向已验证的 UIA 文本控件输入文字。
+    #[tool(
+        name = "type_text",
+        description = "向已验证的 Windows 文本控件输入文字；密码和敏感凭据不能使用此工具。",
+        annotations(
+            title = "输入 Windows 文本",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn type_text(
+        &self,
+        Parameters(input): Parameters<VisualActionInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        let target = parse_visual_target(&input.target)?;
+        let text = input.text.ok_or_else(|| "type_text 缺少 text".to_owned())?;
+        let authorization = self
+            .authorize_mutation(&context, session_id, "图形文本输入", input.approval_id)
+            .await?;
+        self.execute_authorized(
+            session_id,
+            RemoteOperation::VisualTypeText { target, text },
+            authorization,
+            None,
+        )
+        .await
+    }
+
+    /// UIA 不可用时执行经审批的坐标或键鼠输入回退。
+    #[tool(
+        name = "send_input",
+        description = "在 UIA 不可用时执行坐标或键鼠输入回退；要求交互式桌面和当前前台窗口。",
+        annotations(
+            title = "发送 Windows 输入",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn send_input(
+        &self,
+        Parameters(input): Parameters<VisualActionInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        let target = parse_visual_target(&input.target)?;
+        let input_json = input
+            .input
+            .ok_or_else(|| "send_input 缺少 input".to_owned())?;
+        let authorization = self
+            .authorize_mutation(&context, session_id, "图形键鼠输入", input.approval_id)
+            .await?;
+        self.execute_authorized(
+            session_id,
+            RemoteOperation::VisualSendInput {
+                target,
+                input: input_json,
+            },
+            authorization,
+            None,
+        )
+        .await
+    }
+
+    /// 停止图形 Provider 会话。
+    #[tool(
+        name = "stop_visual_session",
+        description = "停止现场 Windows 图形 Provider，撤销当前图形输入租约。",
+        annotations(
+            title = "停止图形会话",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn stop_visual_session(
+        &self,
+        Parameters(input): Parameters<TargetInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.execute_simple(input.session_id, RemoteOperation::VisualStop, None, None)
+            .await
     }
 
     /// 从 Agent 所在网络测试 TCP 端口。
@@ -3440,6 +3674,10 @@ fn parse_session_id(value: &str) -> Result<SessionId, String> {
     value
         .parse::<SessionId>()
         .map_err(|error| error.to_string())
+}
+
+fn parse_visual_target(value: &str) -> Result<VisualTarget, String> {
+    serde_json::from_str(value).map_err(|error| format!("VisualTarget JSON 无效：{error}"))
 }
 
 fn elicitation_accepted(action: &ElicitationAction) -> bool {

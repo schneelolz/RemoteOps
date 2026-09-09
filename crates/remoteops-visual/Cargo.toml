@@ -1,21 +1,21 @@
 [package]
-name = "remoteops-domain"
+name = "remoteops-visual"
 version.workspace = true
 publish = false
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description = "RemoteOps AI visual provider abstraction and test doubles"
 
 [dependencies]
-chrono.workspace = true
-serde.workspace = true
+async-trait.workspace = true
+remoteops-domain = { path = "../remoteops-domain" }
 serde_json.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

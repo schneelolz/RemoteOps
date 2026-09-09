@@ -3750,6 +3750,7 @@ dependencies = [
  "remoteops-policy",
  "remoteops-protocol",
  "remoteops-serial",
+ "remoteops-visual",
  "serde",
  "serde_json",
  "tokio",
@@ -4096,6 +4097,17 @@ name = "remoteops-ssh-askpass"
 version = "0.2.0-preview.6"
 dependencies = [
  "winresource",
+]
+
+[[package]]
+name = "remoteops-visual"
+version = "0.2.0-preview.5"
+dependencies = [
+ "async-trait",
+ "remoteops-domain",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

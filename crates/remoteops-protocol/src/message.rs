@@ -7,7 +7,7 @@ use remoteops_domain::{
 use serde::{Deserialize, Serialize};
 
 /// 当前线协议版本。
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 
 /// Controller 的受信任调用身份。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

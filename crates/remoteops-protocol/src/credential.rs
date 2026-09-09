@@ -207,7 +207,7 @@ mod tests {
 
     fn context() -> CredentialEncryptionContext {
         CredentialEncryptionContext {
-            protocol_version: 14,
+            protocol_version: 15,
             agent_instance_id: AgentInstanceId::new(),
             session_id: SessionId::new(),
             envelope_id: RequestId::new(),
