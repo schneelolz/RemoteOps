@@ -89,6 +89,28 @@ pub struct UnavailableVisualProvider;
 pub struct WindowsVisualProvider;
 
 #[cfg(windows)]
+fn sanitize_json_surrogates(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if index + 5 < bytes.len() && bytes[index] == b'\\' && bytes[index + 1] == b'u' {
+            let hex = &input[index + 2..index + 6];
+            if let Ok(value) = u16::from_str_radix(hex, 16)
+                && (0xD800..=0xDFFF).contains(&value)
+            {
+                index += 6;
+                continue;
+            }
+        }
+        let ch = input[index..].chars().next().expect("valid UTF-8 boundary");
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+    output
+}
+
+#[cfg(windows)]
 impl WindowsVisualProvider {
     #[allow(clippy::too_many_lines)]
     async fn observe_desktop(
@@ -119,6 +141,7 @@ public static class RemoteOpsUser32 {
 '@ }
 if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1') { Add-Type -AssemblyName System.Drawing }
 $screens = [System.Windows.Forms.Screen]::AllScreens
+function Safe-Text([string]$s) { if ($null -eq $s) { return '' }; return -join ($s.ToCharArray() | Where-Object { $o=[int]$_; $o -lt 55296 -or ($o -ge 57344 -and $o -le 65535) }) }
 $displays = @($screens | ForEach-Object {
   [pscustomobject]@{ display_id=$_.DeviceName; physical_width=$_.Bounds.Width; physical_height=$_.Bounds.Height; logical_width=$_.Bounds.Width; logical_height=$_.Bounds.Height; dpi=96; scale_percent=100; origin_x=$_.Bounds.X; origin_y=$_.Bounds.Y }
 })
@@ -127,16 +150,17 @@ $callback = [RemoteOpsUser32+EnumWindowsProc]{ param($handle,$unused)
   if (-not [RemoteOpsUser32]::IsWindowVisible($handle)) { return $true }
   $text = New-Object Text.StringBuilder 512; [void][RemoteOpsUser32]::GetWindowText($handle,$text,$text.Capacity)
   if ($text.Length -eq 0) { return $true }
-  $pid=[uint32]0; [void][RemoteOpsUser32]::GetWindowThreadProcessId($handle,[ref]$pid); $rect=New-Object RemoteOpsUser32+RECT
+  $windowPid=[uint32]0; [void][RemoteOpsUser32]::GetWindowThreadProcessId($handle,[ref]$windowPid); $rect=New-Object RemoteOpsUser32+RECT
   if (-not [RemoteOpsUser32]::GetWindowRect($handle,[ref]$rect)) { return $true }
-  $proc=Get-Process -Id $pid -ErrorAction SilentlyContinue; $name=if($proc){$proc.ProcessName}else{'unknown'}
-  $fingerprint=[BitConverter]::ToString(([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("$pid|$($text.ToString())|$($rect.Left)|$($rect.Top)|$($rect.Right)|$($rect.Bottom)")))).Replace('-','').ToLowerInvariant()
-  $windows.Add([pscustomobject]@{ window_id="0x$('{0:x}' -f $handle.ToInt64())"; process_id=$pid; process_name=$name; title=$text.ToString(); automation_id=$null; session_id=(Get-Process -Id $pid -IncludeUserName -ErrorAction SilentlyContinue).SessionId.ToString(); left=$rect.Left; top=$rect.Top; width=[math]::Max(0,$rect.Right-$rect.Left); height=[math]::Max(0,$rect.Bottom-$rect.Top); fingerprint=$fingerprint })
+  $proc=Get-Process -Id $windowPid -ErrorAction SilentlyContinue; $name=if($proc){$proc.ProcessName}else{'unknown'}
+  $fingerprint=[BitConverter]::ToString(([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("$windowPid|$($text.ToString())|$($rect.Left)|$($rect.Top)|$($rect.Right)|$($rect.Bottom)")))).Replace('-','').ToLowerInvariant()
+  $pobj=Get-Process -Id $windowPid -ErrorAction SilentlyContinue; $sid=if($pobj){[string]$pobj.SessionId}else{'-1'}
+  $windows.Add([pscustomobject]@{ window_id="0x$('{0:x}' -f $handle.ToInt64())"; process_id=$windowPid; process_name=(Safe-Text $name); title=(Safe-Text $text.ToString()); automation_id=$null; session_id=$sid; left=$rect.Left; top=$rect.Top; width=[math]::Max(0,$rect.Right-$rect.Left); height=[math]::Max(0,$rect.Bottom-$rect.Top); fingerprint=$fingerprint })
   return $true
 }; [void][RemoteOpsUser32]::EnumWindows($callback,[IntPtr]::Zero)
 $ui = $null
 if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1' -and $foreground -ne [IntPtr]::Zero) {
-  function Convert-Uia([System.Windows.Automation.AutomationElement]$e,[int]$depth) { if($null -eq $e -or $depth -gt 3){return $null}; $n=[pscustomobject]@{name=$e.Current.Name; automation_id=$e.Current.AutomationId; control_type=$e.Current.ControlType.ProgrammaticName; children=@()}; $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $c=$walker.GetFirstChild($e); $list=@(); while($null -ne $c -and $list.Count -lt 40){$list += Convert-Uia $c ($depth+1); $c=$walker.GetNextSibling($c)}; $n.children=$list; return $n }
+  function Convert-Uia([System.Windows.Automation.AutomationElement]$e,[int]$depth) { if($null -eq $e -or $depth -gt 3){return $null}; $n=[pscustomobject]@{name=(Safe-Text $e.Current.Name); automation_id=(Safe-Text $e.Current.AutomationId); control_type=(Safe-Text $e.Current.ControlType.ProgrammaticName); children=@()}; $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $c=$walker.GetFirstChild($e); $list=@(); while($null -ne $c -and $list.Count -lt 40){$list += Convert-Uia $c ($depth+1); $c=$walker.GetNextSibling($c)}; $n.children=$list; return $n }
   try { $ui=Convert-Uia ([System.Windows.Automation.AutomationElement]::FromHandle($foreground)) 0 } catch { $ui=$null }
 }
 $shot = $null; $w = $null; $h = $null
@@ -174,7 +198,9 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             ));
         }
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        let output_text = String::from_utf8_lossy(&output.stdout);
+        let output_text = sanitize_json_surrogates(&output_text);
+        let value: serde_json::Value = serde_json::from_str(&output_text)
             .map_err(|e| VisualProviderError::Protocol(format!("桌面采集结果无效：{e}")))?;
         let displays = serde_json::from_value(value.get("displays").cloned().unwrap_or_default())
             .unwrap_or_default();
