@@ -90,6 +90,7 @@ pub struct WindowsVisualProvider;
 
 #[cfg(windows)]
 impl WindowsVisualProvider {
+    #[allow(clippy::too_many_lines)]
     async fn observe_desktop(
         &self,
         request_id: RequestId,
@@ -97,13 +98,47 @@ impl WindowsVisualProvider {
         include_screenshot: bool,
         include_ui_tree: bool,
     ) -> Result<VisualObservation, VisualProviderError> {
-        let script = r"
+        let script = r#"
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+if (-not ('RemoteOpsUser32' -as [type])) { Add-Type @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class RemoteOpsUser32 {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr p);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+}
+'@ }
 if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1') { Add-Type -AssemblyName System.Drawing }
 $screens = [System.Windows.Forms.Screen]::AllScreens
 $displays = @($screens | ForEach-Object {
   [pscustomobject]@{ display_id=$_.DeviceName; physical_width=$_.Bounds.Width; physical_height=$_.Bounds.Height; logical_width=$_.Bounds.Width; logical_height=$_.Bounds.Height; dpi=96; scale_percent=100; origin_x=$_.Bounds.X; origin_y=$_.Bounds.Y }
 })
+$windows = [System.Collections.Generic.List[object]]::new(); $foreground = [RemoteOpsUser32]::GetForegroundWindow()
+$callback = [RemoteOpsUser32+EnumWindowsProc]{ param($handle,$unused)
+  if (-not [RemoteOpsUser32]::IsWindowVisible($handle)) { return $true }
+  $text = New-Object Text.StringBuilder 512; [void][RemoteOpsUser32]::GetWindowText($handle,$text,$text.Capacity)
+  if ($text.Length -eq 0) { return $true }
+  $pid=[uint32]0; [void][RemoteOpsUser32]::GetWindowThreadProcessId($handle,[ref]$pid); $rect=New-Object RemoteOpsUser32+RECT
+  if (-not [RemoteOpsUser32]::GetWindowRect($handle,[ref]$rect)) { return $true }
+  $proc=Get-Process -Id $pid -ErrorAction SilentlyContinue; $name=if($proc){$proc.ProcessName}else{'unknown'}
+  $fingerprint=[BitConverter]::ToString(([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("$pid|$($text.ToString())|$($rect.Left)|$($rect.Top)|$($rect.Right)|$($rect.Bottom)")))).Replace('-','').ToLowerInvariant()
+  $windows.Add([pscustomobject]@{ window_id="0x$('{0:x}' -f $handle.ToInt64())"; process_id=$pid; process_name=$name; title=$text.ToString(); automation_id=$null; session_id=(Get-Process -Id $pid -IncludeUserName -ErrorAction SilentlyContinue).SessionId.ToString(); left=$rect.Left; top=$rect.Top; width=[math]::Max(0,$rect.Right-$rect.Left); height=[math]::Max(0,$rect.Bottom-$rect.Top); fingerprint=$fingerprint })
+  return $true
+}; [void][RemoteOpsUser32]::EnumWindows($callback,[IntPtr]::Zero)
+$ui = $null
+if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1' -and $foreground -ne [IntPtr]::Zero) {
+  function Convert-Uia([System.Windows.Automation.AutomationElement]$e,[int]$depth) { if($null -eq $e -or $depth -gt 3){return $null}; $n=[pscustomobject]@{name=$e.Current.Name; automation_id=$e.Current.AutomationId; control_type=$e.Current.ControlType.ProgrammaticName; children=@()}; $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $c=$walker.GetFirstChild($e); $list=@(); while($null -ne $c -and $list.Count -lt 40){$list += Convert-Uia $c ($depth+1); $c=$walker.GetNextSibling($c)}; $n.children=$list; return $n }
+  try { $ui=Convert-Uia ([System.Windows.Automation.AutomationElement]::FromHandle($foreground)) 0 } catch { $ui=$null }
+}
 $shot = $null; $w = $null; $h = $null
 if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
   $b = $screens[0].Bounds; $w=$b.Width; $h=$b.Height
@@ -111,8 +146,8 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
   $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $ms=New-Object System.IO.MemoryStream
   $bmp.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png); $shot=[Convert]::ToBase64String($ms.ToArray()); $g.Dispose(); $bmp.Dispose(); $ms.Dispose()
 }
-[pscustomobject]@{ displays=$displays; screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; ui_tree=$(if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1') { '{}' } else { '$null' }) } | ConvertTo-Json -Compress -Depth 5
-";
+[pscustomobject]@{ displays=$displays; windows=$windows; active_window_fingerprint=($windows | Where-Object { $_.window_id -eq "0x$('{0:x}' -f $foreground.ToInt64())" } | Select-Object -First 1 -ExpandProperty fingerprint); screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; ui_tree=$ui } | ConvertTo-Json -Compress -Depth 8
+"#;
         let mut command = tokio::process::Command::new("powershell.exe");
         command.args([
             "-NoProfile",
@@ -143,6 +178,12 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
             .map_err(|e| VisualProviderError::Protocol(format!("桌面采集结果无效：{e}")))?;
         let displays = serde_json::from_value(value.get("displays").cloned().unwrap_or_default())
             .unwrap_or_default();
+        let windows = serde_json::from_value(value.get("windows").cloned().unwrap_or_default())
+            .unwrap_or_default();
+        let active_window_fingerprint = value
+            .get("active_window_fingerprint")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         let screenshot_base64 = value
             .get("screenshot_base64")
             .and_then(|v| v.as_str())
@@ -160,11 +201,10 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
             session_id,
             provider_instance_id: "windows-powershell-desktop".into(),
             state: remoteops_domain::VisualSessionState::Ready,
-            windows: Vec::new(),
+            windows,
             displays,
-            active_window_fingerprint: None,
-            ui_tree: include_ui_tree
-                .then(|| serde_json::json!({"provider":"windows-powershell","available":false})),
+            active_window_fingerprint,
+            ui_tree: value.get("ui_tree").cloned().filter(|v| !v.is_null()),
             screenshot_base64,
             screenshot_width,
             screenshot_height,
