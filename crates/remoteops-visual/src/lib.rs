@@ -112,6 +112,31 @@ fn sanitize_json_surrogates(input: &str) -> String {
 
 #[cfg(windows)]
 impl WindowsVisualProvider {
+    async fn verify_foreground_target(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        target: &VisualTarget,
+    ) -> Result<VisualObservation, VisualProviderError> {
+        let expected = match target {
+            VisualTarget::Control {
+                window_fingerprint, ..
+            }
+            | VisualTarget::Coordinate {
+                window_fingerprint, ..
+            } => window_fingerprint,
+        };
+        let observation = self
+            .observe_desktop(request_id, session_id, false, false)
+            .await?;
+        if observation.active_window_fingerprint.as_deref() != Some(expected.as_str()) {
+            return Err(VisualProviderError::Rejected(
+                "目标窗口已不是当前前台窗口，拒绝图形输入".into(),
+            ));
+        }
+        Ok(observation)
+    }
+
     async fn invoke_uia(
         &self,
         target: &VisualTarget,
@@ -404,6 +429,8 @@ impl VisualProvider for WindowsVisualProvider {
         target: &VisualTarget,
         action: &str,
     ) -> Result<VisualActionResult, VisualProviderError> {
+        self.verify_foreground_target(request_id, session_id, target)
+            .await?;
         self.invoke_uia(target, action).await?;
         let observation = self
             .observe_desktop(request_id, session_id, false, true)
@@ -425,6 +452,8 @@ impl VisualProvider for WindowsVisualProvider {
         target: &VisualTarget,
         text: &str,
     ) -> Result<VisualActionResult, VisualProviderError> {
+        self.verify_foreground_target(request_id, session_id, target)
+            .await?;
         self.type_text_uia(target, text).await?;
         let observation = self
             .observe_desktop(request_id, session_id, false, true)
