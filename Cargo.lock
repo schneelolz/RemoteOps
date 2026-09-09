@@ -3784,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-service"
-version = "0.2.0-preview.7"
+version = "0.2.0-preview.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4105,7 +4105,10 @@ version = "0.2.0-preview.5"
 dependencies = [
  "async-trait",
  "remoteops-domain",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tracing",
  "thiserror 2.0.20",
  "tokio",
 ]

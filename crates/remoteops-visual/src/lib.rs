@@ -4,6 +4,9 @@ use async_trait::async_trait;
 use remoteops_domain::{RequestId, SessionId, VisualActionResult, VisualObservation, VisualTarget};
 use thiserror::Error;
 
+#[cfg(windows)]
+pub mod windows_provider;
+
 /// Provider 运行错误。
 #[derive(Debug, Error)]
 pub enum VisualProviderError {

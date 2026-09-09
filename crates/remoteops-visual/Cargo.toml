@@ -12,6 +12,10 @@ description = "RemoteOps AI visual provider abstraction and test doubles"
 async-trait.workspace = true
 remoteops-domain = { path = "../remoteops-domain" }
 serde_json.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
