@@ -3740,7 +3740,7 @@ version = "0.2.0-preview.7"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "remoteops-audit",
@@ -3815,7 +3815,7 @@ name = "remoteops-application"
 version = "0.2.0-preview.5"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "remoteops-audit",
@@ -3849,7 +3849,7 @@ name = "remoteops-controller-cli"
 version = "0.2.0-preview.5"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "hex",
  "remoteops-application",
@@ -3868,7 +3868,7 @@ version = "0.2.0-preview.5"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "eframe",
@@ -3899,7 +3899,7 @@ version = "0.2.0-preview.5"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "hex",
  "remoteops-application",
@@ -3935,7 +3935,7 @@ name = "remoteops-device"
 version = "0.2.0-preview.5"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "local-encoding-ng",
  "process-wrap",
  "remoteops-domain",
@@ -4007,7 +4007,7 @@ dependencies = [
 name = "remoteops-protocol"
 version = "0.2.0-preview.5"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "hpke",
