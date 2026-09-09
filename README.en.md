@@ -17,9 +17,9 @@
 
 </div>
 
-## What it is
+## Overview
 
-RemoteOps is a self-hosted tool for AI-assisted remote operations. A field Windows computer or headless Ubuntu host runs the Agent. An engineer runs a Controller or local MCP. Both connect through a Relay that you deploy and operate. AI can inspect the environment, run policy-controlled read-only diagnostics, inspect files and logs, and request human approval for changes.
+RemoteOps is a self-hosted tool for AI-assisted remote operations. A field Windows computer or headless Ubuntu host runs the Agent. The operator runs a Controller or MCP server locally, connecting to the Agent through a self-hosted Relay. Through MCP, an AI client can inspect the environment, run policy-controlled read-only diagnostics, inspect files and logs, and request human approval for changes.
 
 The Agent makes an outbound connection to the Relay, so the field computer does not need a public inbound port. The AI client and its credentials stay on the engineer's computer.
 
@@ -35,14 +35,14 @@ flowchart LR
 
 The solid arrows show an operation request: Codex calls the local MCP, which sends it through the Relay to the Agent and the field computer. The dashed arrow shows connection setup: the Agent connects out to the Relay, so the field computer does not need a public inbound port.
 
-## What it can do
+## Key capabilities
 
 - Inspect Windows and Ubuntu system, network, process, service, log, and capability information.
 - Run one-shot or persistent shells with streaming UTF-8 output: CMD, Windows PowerShell, and PowerShell 7 on Windows; `/bin/sh` on Linux.
 - Upload, download, and verify files inside a restricted transfer root.
 - Connect to SSH and serial devices, with structured read-only queries and individually approved writes.
 - Expose local STDIO MCP tools to Codex and other AI clients, with CLI and GUI controllers also available.
-- Enforce Session, Owner, permission, human approval, TLS trust, and redacted audit boundaries.
+- Constrain remote operations through session binding (Session), owner isolation (Owner), permission modes, human approval, TLS trust validation, and redacted audit logs.
 
 It does not currently provide screen capture, mouse or keyboard control, RDP/VNC, arbitrary port forwarding, SOCKS, network scanning, a shared public Relay, macOS field agents, or Linux desktop control.
 
@@ -62,7 +62,7 @@ The Agent CLI / Service candidate is `0.2.0-preview.7`, the Agent GUI is `0.2.0-
 
 See the [documentation hub](docs/README.md) for complete parameters, certificates, backups, and troubleshooting.
 
-### 1. Deploy your Relay
+### 1. Deploy the Relay
 
 The Relay requires Linux x64, Docker, and an address reachable by both the Agent and the engineer's computer. Copy the template and set your tokens, Owner UUID, and TLS SANs:
 
@@ -102,7 +102,7 @@ The initial Linux baseline is Ubuntu 24.04 x86_64, glibc, and systemd. Other dis
 
 For installers, token storage, and uninstall steps, see [RemoteOps MCP guide](docs/RemoteOpsMCP使用手册.md) and [macOS MCP setup](docs/macOSMCP接入说明.md). Restart Codex and confirm that `remoteops` is connected in `/mcp`.
 
-### 4. Start with read-only verification
+### 4. Verify the connection and read-only operations
 
 ```text
 Pair the field computer with RemoteOps using the current code shown by the Agent window or Linux status script.
@@ -116,7 +116,18 @@ Mutations require user approval in the default step-by-step mode. Full access re
 
 ## Design and code structure
 
-The project follows a “core libraries plus multiple shells” structure. Domain, policy, protocol, device, session, audit, and application use cases live in `crates`. GUI, CLI, MCP, Service, and Relay hosts live in `apps`. Shells own arguments, interaction, and host lifecycle; libraries own reusable rules. See the [architecture guide](docs/ARCHITECTURE.md), [code review](docs/CODE_REVIEW.md), and [contribution guide](CONTRIBUTING.md).
+The project uses a Rust workspace to manage shared libraries and applications. Shared libraries provide domain models, communication protocols, permission policies, and operation orchestration. Applications provide user interfaces, AI client integration, and background services.
+
+| Directory | Responsibility |
+|---|---|
+| `crates/` | Shared libraries for domain models, protocols, sessions, policies, auditing, device and serial access, application use cases, AI integration, localization, and host identity |
+| `apps/` | Applications and services: Agent, Controller GUI/CLI, MCP server, Agent system service, Relay, and supporting tools |
+| `deploy/` | Deployment configuration, container orchestration, and platform installation resources |
+| `scripts/` | Build, packaging, and validation scripts |
+| `tests/` | Standalone test projects, including MCP smoke tests; module unit tests are maintained alongside source code |
+| `docs/` | Architecture, deployment, security, acceptance, and maintenance documentation |
+
+The architectural goal is to share policies and operation logic across application entry points. Some Agent runtime logic and Controller GUI orchestration still reside in application projects and are planned for extraction into shared libraries. See the [architecture guide](docs/ARCHITECTURE.md) for module responsibilities and dependency boundaries, and the [code review](docs/CODE_REVIEW.md) for planned maintainability improvements.
 
 ## Build and verify
 

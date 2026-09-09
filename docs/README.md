@@ -43,6 +43,7 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 - [项目状态](PROJECT_STATUS.md)
 - [路线图](ROADMAP.md)
 - [Visual Provider 调研](VISUAL_PROVIDER_RESEARCH.md)
+- [项目价值与图形化路线评估](项目价值与图形化路线评估.md)
 
 ## 安全底线
 
