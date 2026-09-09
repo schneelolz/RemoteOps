@@ -2110,16 +2110,40 @@ impl RemoteOpsMcp {
         &self,
         Parameters(input): Parameters<TargetInput>,
     ) -> Result<Json<ActionOutput>, String> {
-        self.execute_simple(
-            input.session_id,
-            RemoteOperation::VisualObserve {
-                include_screenshot: false,
-                include_ui_tree: false,
-            },
-            None,
-            None,
-        )
-        .await
+        let mut output = self
+            .execute_simple(
+                input.session_id,
+                RemoteOperation::VisualObserve {
+                    include_screenshot: false,
+                    include_ui_tree: true,
+                },
+                None,
+                None,
+            )
+            .await?;
+        if let Some(observation) = output.0.details.take() {
+            let uia_available = observation
+                .get("ui_tree")
+                .is_some_and(|value| !value.is_null());
+            let screenshot_available = observation
+                .get("provider_instance_id")
+                .is_some_and(|_| true);
+            output.0.details = Some(serde_json::json!({
+                "provider_instance_id": observation.get("provider_instance_id"),
+                "state": observation.get("state"),
+                "interactive_desktop": observation.get("state").is_some_and(|v| v == "ready"),
+                "capabilities": {
+                    "visual": true,
+                    "screenshot": screenshot_available,
+                    "ui_automation": uia_available,
+                    "control_invoke": uia_available,
+                    "text_input": false,
+                    "synthetic_input": false
+                },
+                "observation": observation
+            }));
+        }
+        Ok(output)
     }
 
     /// 观察交互式桌面窗口、UIA 树和按需截图。
