@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.15"
+version = "0.2.0-preview.16"
 publish = false
 edition.workspace = true
 license.workspace = true

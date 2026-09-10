@@ -564,7 +564,20 @@ if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1') {
   if ($foreground -eq [IntPtr]::Zero) {
     $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='foreground_window_unavailable'; children=@()}
   } else {
-  function Convert-Uia([System.Windows.Automation.AutomationElement]$e,[int]$depth) { if($null -eq $e -or $depth -gt 3){return $null}; $n=[pscustomobject]@{name=(Safe-Text $e.Current.Name); automation_id=(Safe-Text $e.Current.AutomationId); control_type=(Safe-Text $e.Current.ControlType.ProgrammaticName); children=@()}; $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $c=$walker.GetFirstChild($e); $list=@(); while($null -ne $c -and $list.Count -lt 40){$list += Convert-Uia $c ($depth+1); $c=$walker.GetNextSibling($c)}; $n.children=$list; return $n }
+  function Convert-Uia([System.Windows.Automation.AutomationElement]$e,[int]$depth) {
+    if($null -eq $e){return $null}
+    $n=[pscustomobject]@{name=(Safe-Text $e.Current.Name); automation_id=(Safe-Text $e.Current.AutomationId); control_type=(Safe-Text $e.Current.ControlType.ProgrammaticName); children=@()}
+    if($depth -ge 3){return $n}
+    $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $c=$walker.GetFirstChild($e); $list=@(); $visited=0
+    while($null -ne $c -and $visited -lt 40){
+      $visited++; $child=Convert-Uia $c ($depth+1)
+      if($null -ne $child){$list += $child}
+      $c=$walker.GetNextSibling($c)
+    }
+    $n.children=$list
+    return $n
+  }
   $comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2); if ($comResult -lt 0) { throw 'UIA COM initialization failed' }
   try {
     $root=[System.Windows.Automation.AutomationElement]::FromHandle($foreground)
