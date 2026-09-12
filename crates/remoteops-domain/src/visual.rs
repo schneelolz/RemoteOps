@@ -44,6 +44,25 @@ pub struct VisualDisplay {
     pub scale_percent: u32,
     pub origin_x: i32,
     pub origin_y: i32,
+    /// 物理屏幕坐标中的显示器原点，用于 DPI 坐标映射。
+    #[serde(default)]
+    pub physical_origin_x: i32,
+    /// 物理屏幕坐标中的显示器原点，用于 DPI 坐标映射。
+    #[serde(default)]
+    pub physical_origin_y: i32,
+}
+
+impl VisualDisplay {
+    /// 判断逻辑坐标是否落在当前显示器的半开区间内。
+    #[must_use]
+    pub fn contains_logical_point(&self, x: i32, y: i32) -> bool {
+        let right = i64::from(self.origin_x) + i64::from(self.logical_width);
+        let bottom = i64::from(self.origin_y) + i64::from(self.logical_height);
+        i64::from(x) >= i64::from(self.origin_x)
+            && i64::from(y) >= i64::from(self.origin_y)
+            && i64::from(x) < right
+            && i64::from(y) < bottom
+    }
 }
 
 /// 远程桌面窗口的稳定指纹。
@@ -81,9 +100,68 @@ pub enum VisualTarget {
         x: i32,
         y: i32,
         screenshot_scale_percent: u32,
+        /// 可选拖拽终点；旧请求缺少该字段时按普通单点目标处理。
+        #[serde(default)]
+        end_x: Option<i32>,
+        /// 可选拖拽终点；必须与 `end_x` 同时提供。
+        #[serde(default)]
+        end_y: Option<i32>,
     },
 }
 
+impl VisualTarget {
+    /// 返回坐标目标的起点和拖拽终点。
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn coordinate_points(&self) -> Option<((i32, i32), Option<(i32, i32)>)> {
+        let Self::Coordinate {
+            x, y, end_x, end_y, ..
+        } = self
+        else {
+            return None;
+        };
+        Some(((*x, *y), end_x.zip(*end_y)))
+    }
+    /// 判断坐标目标是否描述了完整拖拽终点。
+    #[must_use]
+    pub fn is_drag_target(&self) -> bool {
+        matches!(
+            self,
+            Self::Coordinate {
+                end_x: Some(_),
+                end_y: Some(_),
+                ..
+            }
+        )
+    }
+    /// 校验坐标目标是否落在显示器逻辑边界。
+    #[must_use]
+    pub fn is_valid_for_display(&self, display: &VisualDisplay) -> bool {
+        let Self::Coordinate {
+            display_id,
+            x,
+            y,
+            screenshot_scale_percent,
+            end_x,
+            end_y,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if display_id != &display.display_id
+            || *screenshot_scale_percent == 0
+            || !display.contains_logical_point(*x, *y)
+        {
+            return false;
+        }
+        match (end_x, end_y) {
+            (None, None) => true,
+            (Some(x), Some(y)) => display.contains_logical_point(*x, *y),
+            _ => false,
+        }
+    }
+}
 /// 一次图形观察结果。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VisualObservation {
@@ -98,6 +176,10 @@ pub struct VisualObservation {
     pub screenshot_base64: Option<String>,
     pub screenshot_width: Option<u32>,
     pub screenshot_height: Option<u32>,
+    #[serde(default)]
+    pub cursor_x: Option<i32>,
+    #[serde(default)]
+    pub cursor_y: Option<i32>,
     pub redacted: bool,
 }
 
@@ -111,4 +193,117 @@ pub struct VisualActionResult {
     pub observation: Option<VisualObservation>,
     pub error_code: Option<String>,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn display() -> VisualDisplay {
+        VisualDisplay {
+            display_id: "display-0".to_owned(),
+            physical_width: 800,
+            physical_height: 600,
+            logical_width: 400,
+            logical_height: 300,
+            dpi: 144,
+            scale_percent: 150,
+            origin_x: -100,
+            origin_y: 20,
+            physical_origin_x: -150,
+            physical_origin_y: 30,
+        }
+    }
+
+    #[test]
+    fn legacy_coordinate_json_defaults_drag_endpoint_to_none() {
+        let target = serde_json::from_str::<VisualTarget>(
+            r#"{"kind":"coordinate","window_fingerprint":"window-1","display_id":"display-0","x":0,"y":20,"screenshot_scale_percent":150}"#,
+        )
+        .expect("旧坐标目标 JSON 应保持兼容");
+
+        assert_eq!(target.coordinate_points(), Some(((0, 20), None)));
+        assert!(!target.is_drag_target());
+        assert!(target.is_valid_for_display(&display()));
+    }
+
+    #[test]
+    fn coordinate_drag_round_trips_and_requires_complete_endpoint() {
+        let target = VisualTarget::Coordinate {
+            window_fingerprint: "window-1".to_owned(),
+            display_id: "display-0".to_owned(),
+            x: 0,
+            y: 20,
+            screenshot_scale_percent: 150,
+            end_x: Some(299),
+            end_y: Some(319),
+        };
+        let json = serde_json::to_string(&target).expect("拖拽坐标目标应能序列化");
+        let restored =
+            serde_json::from_str::<VisualTarget>(&json).expect("拖拽坐标目标应能反序列化");
+
+        assert_eq!(restored, target);
+        assert!(json.contains("\"end_x\":299"));
+        assert!(json.contains("\"end_y\":319"));
+        assert_eq!(
+            restored.coordinate_points(),
+            Some(((0, 20), Some((299, 319))))
+        );
+        assert!(restored.is_drag_target());
+        assert!(restored.is_valid_for_display(&display()));
+
+        let incomplete = VisualTarget::Coordinate {
+            window_fingerprint: "window-1".to_owned(),
+            display_id: "display-0".to_owned(),
+            x: 0,
+            y: 20,
+            screenshot_scale_percent: 150,
+            end_x: Some(1),
+            end_y: None,
+        };
+        assert!(!incomplete.is_drag_target());
+        assert!(!incomplete.is_valid_for_display(&display()));
+    }
+
+    #[test]
+    fn coordinate_validation_uses_negative_origin_and_exclusive_edges() {
+        let display = display();
+        let valid = VisualTarget::Coordinate {
+            window_fingerprint: "window-1".to_owned(),
+            display_id: "display-0".to_owned(),
+            x: -100,
+            y: 20,
+            screenshot_scale_percent: 100,
+            end_x: Some(299),
+            end_y: Some(319),
+        };
+        assert!(valid.is_valid_for_display(&display));
+
+        for (x, y) in [(300, 20), (0, 320), (-101, 20), (-100, 19)] {
+            let out_of_bounds = VisualTarget::Coordinate {
+                window_fingerprint: "window-1".to_owned(),
+                display_id: "display-0".to_owned(),
+                x,
+                y,
+                screenshot_scale_percent: 100,
+                end_x: Some(299),
+                end_y: Some(319),
+            };
+            assert!(
+                !out_of_bounds.is_valid_for_display(&display),
+                "越界点 ({x}, {y}) 应拒绝"
+            );
+        }
+
+        let zero_scale = VisualTarget::Coordinate {
+            window_fingerprint: "window-1".to_owned(),
+            display_id: "display-0".to_owned(),
+            x: -100,
+            y: 20,
+            screenshot_scale_percent: 0,
+            end_x: Some(299),
+            end_y: Some(319),
+        };
+        assert!(!zero_scale.is_valid_for_display(&display));
+    }
 }

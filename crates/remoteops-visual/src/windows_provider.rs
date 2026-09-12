@@ -104,6 +104,11 @@ impl WindowsMcpSupervisor {
         {
             return Ok(None);
         }
+        if !std::env::var("REMOTEOPS_WINDOWS_MCP_PROTOCOL")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("remoteops-pipe"))
+        {
+            return Ok(None);
+        }
         let executable = std::env::var_os("REMOTEOPS_WINDOWS_MCP_PATH")
             .ok_or_else(|| "已启用 Windows-MCP，但未配置 REMOTEOPS_WINDOWS_MCP_PATH".to_owned())?;
         let sha256 = std::env::var("REMOTEOPS_WINDOWS_MCP_SHA256")

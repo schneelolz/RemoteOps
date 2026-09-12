@@ -16,6 +16,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -34,7 +35,7 @@ use remoteops_domain::{
     AgentInstanceId, ApprovalState, Capability, CapabilitySet, ControllerInstanceId,
     ControllerOwnerId, EnvironmentProfile, EventPayload, FileTransferId, PermissionMode,
     RemoteEvent, RemoteOperation, RequestId, SerialSessionId, SessionId, ShellId, ShellKind,
-    ShellProfile, ToolProfile,
+    ShellProfile, ToolProfile, VisualWaitCondition, normalize_visual_wait_timeout,
 };
 use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel};
 use remoteops_protocol::{
@@ -55,7 +56,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{Mutex, Notify, mpsc, watch},
     task::JoinHandle,
-    time::{Duration, interval, sleep},
+    time::{Duration, interval, sleep, timeout},
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -1722,6 +1723,50 @@ fn set_operation_readonly(operation: &mut RemoteOperation, readonly: bool) {
     }
 }
 
+async fn wait_for_visual_condition(
+    provider: &dyn VisualProvider,
+    request_id: RequestId,
+    session_id: SessionId,
+    condition: &str,
+    timeout_millis: u64,
+) -> anyhow::Result<remoteops_domain::VisualObservation> {
+    let condition = VisualWaitCondition::parse(condition).map_err(|error| anyhow!(error))?;
+    let timeout_millis =
+        normalize_visual_wait_timeout(Some(timeout_millis)).map_err(|error| anyhow!(error))?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_millis);
+    let include_screenshot = matches!(condition, VisualWaitCondition::Hash { .. });
+    let include_ui_tree = matches!(
+        condition,
+        VisualWaitCondition::Text { .. } | VisualWaitCondition::Control { .. }
+    );
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("图形等待超时（{timeout_millis} 毫秒）");
+        }
+        let observation = timeout(
+            remaining,
+            provider.observe(request_id, session_id, include_screenshot, include_ui_tree),
+        )
+        .await
+        .map_err(|_| anyhow!("图形观察超出等待截止时间"))?
+        .map_err(|error| anyhow!(error.to_string()))?;
+        if observation.request_id != request_id {
+            bail!("图形观察 request_id 与等待请求不匹配");
+        }
+        if observation.session_id != session_id {
+            bail!("图形观察 session_id 与等待请求不匹配");
+        }
+        if condition.matches(&observation) {
+            return Ok(observation);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("图形等待超时（{timeout_millis} 毫秒）");
+        }
+        sleep(Duration::from_millis(250).min(remaining)).await;
+    }
+}
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let maximum = left.len().max(right.len());
     let mut difference = left.len() ^ right.len();
@@ -2530,16 +2575,14 @@ async fn execute_operation(
             condition,
             timeout_millis,
         } => {
-            let observation = runtime_state
-                .visual_provider
-                .wait_for(
-                    request.request_id,
-                    request.session_id,
-                    condition,
-                    *timeout_millis,
-                )
-                .await
-                .map_err(|error| anyhow!(error.to_string()))?;
+            let observation = wait_for_visual_condition(
+                runtime_state.visual_provider.as_ref(),
+                request.request_id,
+                request.session_id,
+                condition,
+                *timeout_millis,
+            )
+            .await?;
             "图形状态等待已完成".clone_into(&mut response.summary);
             response.details = Some(serde_json::to_value(observation)?);
         }

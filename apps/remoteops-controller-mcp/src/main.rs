@@ -1903,7 +1903,31 @@ impl RemoteOpsMcp {
             .into_iter()
             .find(|connection| connection.session_id == session_id)
             .ok_or_else(|| "未找到 session_id".to_owned())?;
+        let windows_target = connection
+            .environment
+            .os_family
+            .eq_ignore_ascii_case("windows");
         let mut output = connection_output(connection);
+        if windows_target {
+            // 桌面会随 RDP 登录、锁屏和 Provider 恢复而变化，不复用首次注册的旧结论。
+            let current = self
+                .execute_simple(
+                    session_id.to_string(),
+                    RemoteOperation::VisualObserve {
+                        include_screenshot: false,
+                        include_ui_tree: false,
+                    },
+                    None,
+                    None,
+                )
+                .await;
+            let initialized = current
+                .as_ref()
+                .ok()
+                .and_then(|result| result.0.details.as_ref())
+                .is_some_and(visual_provider_initialized);
+            refresh_visual_capability(&mut output.capabilities, initialized);
+        }
         output.transfer_root = self.transfer_root.display().to_string();
         output.control_mode = self.control_mode_name(session_id).await.to_owned();
         Ok(Json(output))
@@ -2114,14 +2138,14 @@ impl RemoteOpsMcp {
             .execute_simple(
                 input.session_id,
                 RemoteOperation::VisualObserve {
-                    include_screenshot: false,
+                    include_screenshot: true,
                     include_ui_tree: true,
                 },
                 None,
                 None,
             )
             .await?;
-        if let Some(observation) = output.0.details.take() {
+        if let Some(mut observation) = output.0.details.take() {
             let uia_available = visual_uia_available(&observation);
             let interactive_desktop = observation
                 .get("state")
@@ -2134,6 +2158,15 @@ impl RemoteOpsMcp {
                 .get("displays")
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|displays| !displays.is_empty());
+            let provider_initialized = interactive_desktop && displays_available;
+            let screenshot_available = observation
+                .get("screenshot_base64")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|image| !image.is_empty());
+            // 能力探测验证截图，但不把像素内容塞进能力列表响应。
+            if let Some(details) = observation.as_object_mut() {
+                details.remove("screenshot_base64");
+            }
             let foreground_available = observation
                 .get("active_window_fingerprint")
                 .is_some_and(|value| value.as_str().is_some_and(|text| !text.is_empty()));
@@ -2150,20 +2183,37 @@ impl RemoteOpsMcp {
             if !uia_available {
                 unavailable_reasons.push("ui_automation_unavailable");
             }
+            if !screenshot_available {
+                unavailable_reasons.push("screenshot_unavailable");
+                if let Some(error) = observation
+                    .get("ui_tree")
+                    .and_then(|tree| tree.get("screenshot_error"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    unavailable_reasons.push(error);
+                }
+            }
             output.0.details = Some(serde_json::json!({
                 "provider_instance_id": observation.get("provider_instance_id"),
                 "state": observation.get("state"),
                 "interactive_desktop": interactive_desktop,
-                "initialized": interactive_desktop && displays_available,
+                "initialized": provider_initialized,
                 "capabilities": {
-                    "visual": interactive_desktop && windows_available,
-                    "screenshot": interactive_desktop && displays_available,
+                    "visual": provider_initialized,
+                    "screenshot": provider_initialized && screenshot_available,
+                    // 窗口枚举是独立的只读能力；锁屏时可能仍能列出窗口，但不能把它升级为 UIA 或输入能力。
+                    "window_enumeration": windows_available,
                     "ui_automation": interactive_desktop && windows_available && foreground_available && uia_available,
                     "control_invoke": interactive_desktop && windows_available && foreground_available && uia_available,
                     "text_input": interactive_desktop && windows_available && foreground_available && uia_available,
                     "synthetic_input": interactive_desktop && windows_available && foreground_available && !uia_available
                 },
                 "unavailable_reasons": unavailable_reasons,
+                "provider": {
+                    "instance_id": observation.get("provider_instance_id"),
+                    "state": observation.get("state"),
+                    "uia_reason": observation.get("ui_tree").and_then(|tree| tree.get("reason"))
+                },
                 "observation": observation
             }));
         }
@@ -2214,11 +2264,13 @@ impl RemoteOpsMcp {
         &self,
         Parameters(input): Parameters<VisualWaitInput>,
     ) -> Result<Json<ActionOutput>, String> {
+        let timeout_millis = remoteops_domain::normalize_visual_wait_timeout(input.timeout_millis)?;
+        remoteops_domain::VisualWaitCondition::parse(&input.condition)?;
         self.execute_simple(
             input.session_id,
             RemoteOperation::VisualWaitFor {
                 condition: input.condition,
-                timeout_millis: input.timeout_millis.unwrap_or(30_000).min(120_000),
+                timeout_millis,
             },
             None,
             None,
@@ -2317,6 +2369,7 @@ impl RemoteOpsMcp {
         let input_json = input
             .input
             .ok_or_else(|| "send_input 缺少 input".to_owned())?;
+        let input_json = encode_visual_drag_input(&target, &input_json);
         let authorization = self
             .authorize_mutation(&context, session_id, "图形键鼠输入", input.approval_id)
             .await?;
@@ -3728,6 +3781,48 @@ fn parse_visual_target(value: &str) -> Result<VisualTarget, String> {
     serde_json::from_str(value).map_err(|error| format!("VisualTarget JSON 无效：{error}"))
 }
 
+/// 将拖拽终点同时放入输入字段，兼容尚未支持扩展坐标字段的旧 Relay。
+fn encode_visual_drag_input(target: &VisualTarget, input: &str) -> String {
+    if !matches!(input, "drag" | "drag_left") {
+        return input.to_owned();
+    }
+    let VisualTarget::Coordinate {
+        end_x: Some(end_x),
+        end_y: Some(end_y),
+        ..
+    } = target
+    else {
+        return input.to_owned();
+    };
+    format!("drag_to:{end_x},{end_y}")
+}
+
+#[cfg(test)]
+mod visual_target_tests {
+    use super::{encode_visual_drag_input, parse_visual_target};
+    #[test]
+    fn parse_visual_target_preserves_drag_endpoint() {
+        let target = parse_visual_target(
+            r#"{"kind":"coordinate","window_fingerprint":"w","display_id":"display-0","x":10,"y":20,"screenshot_scale_percent":100,"end_x":30,"end_y":40}"#,
+        )
+        .expect("拖拽坐标目标应可解析");
+        assert_eq!(
+            target.coordinate_points(),
+            Some(((10, 20), Some((30, 40))))
+        );
+    }
+
+    #[test]
+    fn encode_visual_drag_input_keeps_endpoint_for_legacy_relay() {
+        let target = parse_visual_target(
+            r#"{"kind":"coordinate","window_fingerprint":"w","display_id":"display-0","x":10,"y":20,"screenshot_scale_percent":100,"end_x":30,"end_y":40}"#,
+        )
+        .expect("拖拽坐标目标应可解析");
+        assert_eq!(encode_visual_drag_input(&target, "drag"), "drag_to:30,40");
+        assert_eq!(encode_visual_drag_input(&target, "click"), "click");
+    }
+}
+
 fn elicitation_accepted(action: &ElicitationAction) -> bool {
     matches!(action, ElicitationAction::Accept)
 }
@@ -3992,6 +4087,25 @@ fn visual_uia_available(observation: &serde_json::Value) -> bool {
         == Some(true)
 }
 
+/// 只把当前观察确认的交互桌面能力公开给工具调用方。
+fn visual_provider_initialized(observation: &serde_json::Value) -> bool {
+    observation
+        .get("state")
+        .is_some_and(|state| state == "ready")
+        && observation
+            .get("displays")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|displays| !displays.is_empty())
+}
+
+/// 用实时探测覆盖可能因启动超时或锁屏而过期的 visual 标记。
+fn refresh_visual_capability(capabilities: &mut Vec<String>, initialized: bool) {
+    capabilities.retain(|capability| capability != "visual");
+    if initialized {
+        capabilities.push("visual".to_owned());
+    }
+}
+
 fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> ConnectionOutput {
     ConnectionOutput {
         display_name: connection.display_name(),
@@ -4077,6 +4191,31 @@ mod tests {
         assert!(super::visual_uia_available(&serde_json::json!({
             "ui_tree": {"available": true, "name": "Explorer", "children": []}
         })));
+    }
+
+    #[test]
+    fn visual_capability_refreshes_after_recovery_and_failure() {
+        let mut capabilities = vec!["cmd".to_owned(), "visual".to_owned()];
+        for observation in [
+            serde_json::json!({"state":"stopped","displays":[{}]}),
+            serde_json::json!({"state":"ready","displays":[]}),
+            serde_json::json!({"error":"initialization_failed"}),
+        ] {
+            super::refresh_visual_capability(
+                &mut capabilities,
+                super::visual_provider_initialized(&observation),
+            );
+            assert_eq!(capabilities, ["cmd"]);
+        }
+        let recovered = serde_json::json!({"state":"ready","displays":[{}],"windows":[]});
+        super::refresh_visual_capability(
+            &mut capabilities,
+            super::visual_provider_initialized(&recovered),
+        );
+        super::refresh_visual_capability(&mut capabilities, true);
+        assert_eq!(capabilities, ["cmd", "visual"]);
+        super::refresh_visual_capability(&mut capabilities, false);
+        assert_eq!(capabilities, ["cmd"]);
     }
 
     use super::*;

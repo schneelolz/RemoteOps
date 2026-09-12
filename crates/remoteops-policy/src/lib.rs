@@ -1438,6 +1438,8 @@ mod tests {
                 x: 1,
                 y: 1,
                 screenshot_scale_percent: 100,
+                end_x: None,
+                end_y: None,
             },
             input: "click".to_owned(),
         };

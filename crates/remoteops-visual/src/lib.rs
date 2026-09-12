@@ -7,13 +7,58 @@ use thiserror::Error;
 #[cfg(windows)]
 pub mod windows_provider;
 
+#[cfg(windows)]
+pub mod windows_mcp_stdio;
+
+/// 观察和动作共用相同的控件身份算法，区分同名、同类型的不同 UIA 实例。
+#[cfg(windows)]
+const UIA_CONTROL_HELPERS: &str = r"
+function Safe-Text([string]$s) {
+ if($null -eq $s){return ''}
+ return [Text.Encoding]::UTF8.GetString([Text.Encoding]::UTF8.GetBytes($s))
+}
+function Get-RemoteOpsControlFingerprint($element,[string]$windowFingerprint) {
+ $runtimeId=@($element.GetRuntimeId())
+ if($runtimeId.Count -eq 0){throw 'uia_runtime_id_unavailable'}
+ $identity=ConvertTo-Json -InputObject @($windowFingerprint,$runtimeId,(Safe-Text $element.Current.AutomationId),(Safe-Text $element.Current.Name),[string]$element.Current.ControlType.ProgrammaticName) -Compress -Depth 4
+ $hash=[Security.Cryptography.SHA256]::Create()
+ try{return [BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity))).Replace('-','').ToLowerInvariant()}finally{$hash.Dispose()}
+}
+function Test-RemoteOpsControlType([string]$actual,[string]$expected) {
+ if([string]::IsNullOrEmpty($expected)){return $true}
+ if($actual -ceq $expected){return $true}
+ # 控制器允许传入 button 这类短名称，观察树使用 UIA 的标准 ControlType.Button。
+ return $actual -ceq ('ControlType.' + $expected.Substring(0,1).ToUpperInvariant() + $expected.Substring(1).ToLowerInvariant())
+}
+function Find-RemoteOpsControl($node,[int]$depth) {
+ if($null -eq $node -or $depth -gt 8){return $null}
+ if(-not $env:REMOTEOPS_TARGET_FINGERPRINT){throw 'uia_target_fingerprint_required'}
+ $id=Safe-Text $node.Current.AutomationId; $nodeName=Safe-Text $node.Current.Name
+ $nodeType=[string]$node.Current.ControlType.ProgrammaticName
+ if(((-not $env:REMOTEOPS_AUTOMATION_ID) -or $id -ceq $env:REMOTEOPS_AUTOMATION_ID) -and ((-not $env:REMOTEOPS_NAME) -or $nodeName -ceq $env:REMOTEOPS_NAME) -and (Test-RemoteOpsControlType $nodeType $env:REMOTEOPS_CONTROL_TYPE)){
+   if((Get-RemoteOpsControlFingerprint $node $env:REMOTEOPS_WINDOW_FINGERPRINT) -ceq $env:REMOTEOPS_TARGET_FINGERPRINT){return $node}
+ }
+ $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $child=$walker.GetFirstChild($node)
+ while($null -ne $child){$found=Find-RemoteOpsControl $child ($depth+1); if($null -ne $found){return $found}; $child=$walker.GetNextSibling($child)}
+ return $null
+}
+";
+
 /// 在实际执行 UIA 的子进程中重新校验窗口，避免前置观察与输入之间切换了前台。
 #[cfg(windows)]
 const TARGET_WINDOW_GUARD: &str = r#"
 Add-Type @'
 using System; using System.Text; using System.Runtime.InteropServices;
 public static class RemoteOpsTarget {
+ [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+ [DllImport("user32.dll")] public static extern IntPtr GetProcessWindowStation();
+ [DllImport("user32.dll")] public static extern IntPtr GetThreadDesktop(uint threadId);
+ [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+ [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr desktop);
+ [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool GetUserObjectInformation(IntPtr handle, int index, StringBuilder name, int size, out int needed);
  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+ [DllImport("user32.dll", SetLastError=true)] public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO info);
+ [StructLayout(LayoutKind.Sequential)] public struct GUITHREADINFO { public uint cbSize; public uint flags; public IntPtr hwndActive; public IntPtr hwndFocus; public IntPtr hwndCapture; public IntPtr hwndMenuOwner; public IntPtr hwndMoveSize; public IntPtr hwndCaret; public RECT rcCaret; }
  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder text, int count);
@@ -21,8 +66,36 @@ public static class RemoteOpsTarget {
  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 }
 '@
-function Assert-RemoteOpsTarget {
+function Get-RemoteOpsForeground {
  $handle=[RemoteOpsTarget]::GetForegroundWindow()
+ if($handle -ne [IntPtr]::Zero){return [pscustomobject]@{handle=$handle; source='GetForegroundWindow'; gui_error=$null}}
+ $info=New-Object RemoteOpsTarget+GUITHREADINFO
+ $info.cbSize=[Runtime.InteropServices.Marshal]::SizeOf($info)
+ $available=[RemoteOpsTarget]::GetGUIThreadInfo(0,[ref]$info)
+ $guiError=if($available){0}else{[Runtime.InteropServices.Marshal]::GetLastWin32Error()}
+ if($available -and $info.hwndActive -ne [IntPtr]::Zero){return [pscustomobject]@{handle=$info.hwndActive; source='GetGUIThreadInfo'; gui_error=$guiError}}
+ return [pscustomobject]@{handle=[IntPtr]::Zero; source='unavailable'; gui_error=$guiError}
+}
+function Get-RemoteOpsDesktopContext {
+ function Get-ObjectName([IntPtr]$handle) {
+  if($handle -eq [IntPtr]::Zero){return ''}
+  $buffer=New-Object Text.StringBuilder 512; $needed=0
+  if(-not [RemoteOpsTarget]::GetUserObjectInformation($handle,2,$buffer,1024,[ref]$needed)){return ''}
+  return $buffer.ToString()
+ }
+ $session=(Get-Process -Id $PID).SessionId
+ $station=Get-ObjectName ([RemoteOpsTarget]::GetProcessWindowStation())
+ $desktop=Get-ObjectName ([RemoteOpsTarget]::GetThreadDesktop([RemoteOpsTarget]::GetCurrentThreadId()))
+ $input=[RemoteOpsTarget]::OpenInputDesktop(0,$false,1); $inputError=[Runtime.InteropServices.Marshal]::GetLastWin32Error()
+ try{$inputName=Get-ObjectName $input}finally{if($input -ne [IntPtr]::Zero){[void][RemoteOpsTarget]::CloseDesktop($input)}}
+ $reason=if($session -eq 0){'session_zero'}elseif($station -ine 'WinSta0'){'noninteractive_window_station'}elseif($desktop -ine 'Default' -or $inputName -ine 'Default'){'input_desktop_unavailable_or_secure'}else{$null}
+ $foreground=Get-RemoteOpsForeground
+ return [pscustomobject]@{interactive=($null -eq $reason); reason=$reason; process_session_id=$session; window_station=$station; thread_desktop=$desktop; input_desktop=$inputName; input_desktop_error=if($input -eq [IntPtr]::Zero){$inputError}else{0}; apartment_state=[string][Threading.Thread]::CurrentThread.ApartmentState; foreground_handle=$foreground.handle.ToInt64(); foreground_source=$foreground.source; gui_thread_info_error=$foreground.gui_error}
+}
+function Assert-RemoteOpsTarget {
+ $context=Get-RemoteOpsDesktopContext
+ if(-not $context.interactive){throw $context.reason}
+ $handle=(Get-RemoteOpsForeground).handle
  if($handle -eq [IntPtr]::Zero){throw 'foreground_window_unavailable'}
  $handle=[RemoteOpsTarget]::GetAncestor($handle,2)
  $windowPid=[uint32]0; [void][RemoteOpsTarget]::GetWindowThreadProcessId($handle,[ref]$windowPid)
@@ -148,13 +221,15 @@ pub struct UnavailableVisualProvider;
 #[cfg(windows)]
 pub struct WindowsVisualProvider {
     mcp_supervisor: tokio::sync::Mutex<Option<windows_provider::WindowsMcpSupervisor>>,
+    stdio_mcp: tokio::sync::Mutex<Option<windows_mcp_stdio::WindowsMcpStdioClient>>,
+    stdio_config: Option<windows_provider::WindowsMcpConfig>,
     mcp_configuration_error: Option<String>,
 }
 
 #[cfg(windows)]
 impl Default for WindowsVisualProvider {
     fn default() -> Self {
-        let (mcp_supervisor, mcp_configuration_error) =
+        let (mcp_supervisor, mut mcp_configuration_error) =
             match windows_provider::WindowsMcpSupervisor::from_environment() {
                 Ok(supervisor) => (supervisor, None),
                 Err(error) => {
@@ -162,33 +237,48 @@ impl Default for WindowsVisualProvider {
                     (None, Some(error))
                 }
             };
+        let stdio_config = if std::env::var("REMOTEOPS_WINDOWS_MCP_ENABLED")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            && std::env::var("REMOTEOPS_WINDOWS_MCP_PROTOCOL")
+                .map_or(true, |value| !value.eq_ignore_ascii_case("remoteops-pipe"))
+        {
+            match (
+                std::env::var_os("REMOTEOPS_WINDOWS_MCP_PATH"),
+                std::env::var("REMOTEOPS_WINDOWS_MCP_SHA256"),
+            ) {
+                (Some(executable), Ok(sha256)) => {
+                    let config = windows_provider::WindowsMcpConfig {
+                        executable: executable.into(),
+                        sha256,
+                    };
+                    config.validate().map_or_else(
+                        |error| {
+                            tracing::error!(%error, "Windows-MCP stdio configuration rejected");
+                            None
+                        },
+                        |()| Some(config),
+                    )
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let stdio_enabled = std::env::var("REMOTEOPS_WINDOWS_MCP_ENABLED")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            && std::env::var("REMOTEOPS_WINDOWS_MCP_PROTOCOL")
+                .map_or(true, |value| !value.eq_ignore_ascii_case("remoteops-pipe"));
+        if stdio_enabled && stdio_config.is_none() && mcp_configuration_error.is_none() {
+            mcp_configuration_error =
+                Some("已启用 Windows-MCP stdio，但路径或 SHA-256 配置无效".to_owned());
+        }
         Self {
             mcp_supervisor: tokio::sync::Mutex::new(mcp_supervisor),
+            stdio_mcp: tokio::sync::Mutex::new(None),
+            stdio_config,
             mcp_configuration_error,
         }
     }
-}
-
-#[cfg(windows)]
-fn sanitize_json_surrogates(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut output = String::with_capacity(input.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if index + 5 < bytes.len() && bytes[index] == b'\\' && bytes[index + 1] == b'u' {
-            let hex = &input[index + 2..index + 6];
-            if let Ok(value) = u16::from_str_radix(hex, 16)
-                && (0xD800..=0xDFFF).contains(&value)
-            {
-                index += 6;
-                continue;
-            }
-        }
-        let ch = input[index..].chars().next().expect("valid UTF-8 boundary");
-        output.push(ch);
-        index += ch.len_utf8();
-    }
-    output
 }
 
 #[cfg(windows)]
@@ -205,6 +295,36 @@ impl WindowsVisualProvider {
                 VisualProviderError::Protocol(format!("Windows-MCP 启动失败：{error}"))
             })?;
         }
+        drop(supervisor);
+        if let Some(config) = self.stdio_config.as_ref() {
+            let mut client = self.stdio_mcp.lock().await;
+            if client.as_mut().is_some_and(|client| !client.is_usable())
+                && let Some(mut stopped) = client.take()
+            {
+                stopped.stop().await;
+            }
+            if client.is_none() {
+                let mut started = windows_mcp_stdio::WindowsMcpStdioClient::start(config)
+                    .await
+                    .map_err(|error| {
+                        VisualProviderError::Protocol(format!(
+                            "Windows-MCP stdio 启动失败：{error}"
+                        ))
+                    })?;
+                let tools = started.list_tools().await.map_err(|error| {
+                    VisualProviderError::Protocol(format!("Windows-MCP 工具发现失败：{error}"))
+                })?;
+                if !tools.iter().any(|tool| tool == "Snapshot")
+                    || !tools.iter().any(|tool| tool == "Screenshot")
+                {
+                    started.stop().await;
+                    return Err(VisualProviderError::Protocol(
+                        "Windows-MCP 缺少 Snapshot/Screenshot 工具".into(),
+                    ));
+                }
+                *client = Some(started);
+            }
+        }
         Ok(())
     }
 
@@ -216,6 +336,9 @@ impl WindowsVisualProvider {
         include_ui_tree: bool,
     ) -> Result<Option<VisualObservation>, VisualProviderError> {
         let mut supervisor = self.mcp_supervisor.lock().await;
+        if self.stdio_config.is_some() {
+            return Ok(None);
+        }
         let Some(supervisor) = supervisor.as_mut() else {
             return Ok(None);
         };
@@ -272,6 +395,7 @@ impl WindowsVisualProvider {
             automation_id,
             name,
             control_type,
+            target_fingerprint,
             ..
         } = target
         else {
@@ -279,7 +403,7 @@ impl WindowsVisualProvider {
                 "坐标目标必须经过单独审批，当前拒绝回退输入".into(),
             ));
         };
-        if action != "invoke" && action != "click" {
+        if !matches!(action, "invoke" | "click" | "submit" | "press_enter") {
             return Err(VisualProviderError::Rejected(format!(
                 "不支持的 UIA 动作：{action}"
             )));
@@ -301,20 +425,23 @@ $comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2); if ($comResult -l
 $targetHandle=Assert-RemoteOpsTarget
 $root=[System.Windows.Automation.AutomationElement]::FromHandle($targetHandle)
 if($null -eq $root){ throw '没有可验证的前台窗口' }
-function Find-RemoteOpsControl([System.Windows.Automation.AutomationElement]$node,[int]$depth) {
-  if($null -eq $node -or $depth -gt 8){return $null}
-  $id=[string]$node.Current.AutomationId; $nodeName=[string]$node.Current.Name
-  if(((-not $env:REMOTEOPS_AUTOMATION_ID) -or $id -eq $env:REMOTEOPS_AUTOMATION_ID) -and ((-not $env:REMOTEOPS_NAME) -or $nodeName -eq $env:REMOTEOPS_NAME)){return $node}
-  $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $child=$walker.GetFirstChild($node)
-  while($null -ne $child){$found=Find-RemoteOpsControl $child ($depth+1); if($null -ne $found){return $found}; $child=$walker.GetNextSibling($child)}
-  return $null
-}
 if(-not $env:REMOTEOPS_AUTOMATION_ID -and -not $env:REMOTEOPS_NAME){throw 'UIA 目标缺少 automation_id 或 name'}
 $element=Find-RemoteOpsControl $root 0
 if($null -eq $element){throw '前台窗口中未找到 UIA 目标'}
-$pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); [void](Assert-RemoteOpsTarget); $pattern.Invoke(); if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+$action=$env:REMOTEOPS_UIA_ACTION
+if($action -eq 'press_enter') {
+  Add-Type -AssemblyName System.Windows.Forms
+  [void]$element.SetFocus(); [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+} else {
+  $pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); [void](Assert-RemoteOpsTarget); $pattern.Invoke()
+}
+if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
-        let script = format!("{TARGET_WINDOW_GUARD}\n{script}");
+        let script = format!(
+            "{TARGET_WINDOW_GUARD}
+{UIA_CONTROL_HELPERS}
+{script}"
+        );
         let mut command = hidden_powershell_command();
         command.args([
             "-NoProfile",
@@ -337,6 +464,8 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::P
             "REMOTEOPS_CONTROL_TYPE",
             control_type.as_deref().unwrap_or_default(),
         );
+        command.env("REMOTEOPS_TARGET_FINGERPRINT", target_fingerprint);
+        command.env("REMOTEOPS_UIA_ACTION", action);
         let output = run_desktop_command(command).await?;
         if !output.status.success() {
             return Err(VisualProviderError::Rejected(
@@ -355,6 +484,8 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::P
             window_fingerprint,
             automation_id,
             name,
+            target_fingerprint,
+            control_type,
             ..
         } = target
         else {
@@ -384,19 +515,15 @@ $comResult=[RemoteOpsCom]::CoInitializeEx([IntPtr]::Zero,0x2); if ($comResult -l
 $targetHandle=Assert-RemoteOpsTarget
 $root=[System.Windows.Automation.AutomationElement]::FromHandle($targetHandle)
 if($null -eq $root){ throw '没有可验证的前台窗口' }
-function Find-RemoteOpsControl([System.Windows.Automation.AutomationElement]$node,[int]$depth) {
-  if($null -eq $node -or $depth -gt 8){return $null}
-  $id=[string]$node.Current.AutomationId; $nodeName=[string]$node.Current.Name
-  if(((-not $env:REMOTEOPS_AUTOMATION_ID) -or $id -eq $env:REMOTEOPS_AUTOMATION_ID) -and ((-not $env:REMOTEOPS_NAME) -or $nodeName -eq $env:REMOTEOPS_NAME)){return $node}
-  $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $child=$walker.GetFirstChild($node)
-  while($null -ne $child){$found=Find-RemoteOpsControl $child ($depth+1); if($null -ne $found){return $found}; $child=$walker.GetNextSibling($child)}
-  return $null
-}
 $element=Find-RemoteOpsControl $root 0
 if($null -eq $element){throw '前台窗口中未找到 UIA 文本目标'}
 $pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if($pattern.Current.IsReadOnly){throw 'UIA 文本控件为只读'}; [void](Assert-RemoteOpsTarget); $pattern.SetValue($env:REMOTEOPS_TEXT); if($pattern.Current.Value -cne $env:REMOTEOPS_TEXT){throw 'UIA value verification failed'}; if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
-        let script = format!("{TARGET_WINDOW_GUARD}\n{script}");
+        let script = format!(
+            "{TARGET_WINDOW_GUARD}
+{UIA_CONTROL_HELPERS}
+{script}"
+        );
         let mut command = hidden_powershell_command();
         command.args([
             "-NoProfile",
@@ -415,6 +542,11 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pa
             automation_id.as_deref().unwrap_or_default(),
         );
         command.env("REMOTEOPS_NAME", name.as_deref().unwrap_or_default());
+        command.env(
+            "REMOTEOPS_CONTROL_TYPE",
+            control_type.as_deref().unwrap_or_default(),
+        );
+        command.env("REMOTEOPS_TARGET_FINGERPRINT", target_fingerprint);
         command.env("REMOTEOPS_TEXT", text);
         let output = run_desktop_command(command).await?;
         if !output.status.success() {
@@ -425,15 +557,21 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pa
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn send_coordinate_input(
         &self,
         target: &VisualTarget,
         input: &str,
+        observation: &VisualObservation,
     ) -> Result<(), VisualProviderError> {
         let VisualTarget::Coordinate {
             x,
             y,
+            window_fingerprint,
             screenshot_scale_percent,
+            end_x,
+            end_y,
+            display_id,
             ..
         } = target
         else {
@@ -441,24 +579,90 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pa
                 "非坐标目标禁止使用鼠标键盘回退".into(),
             ));
         };
-        if input != "click" && input != "left_click" {
-            return Err(VisualProviderError::Rejected(
-                "坐标回退当前只允许 click".into(),
-            ));
-        }
         if *screenshot_scale_percent == 0 {
             return Err(VisualProviderError::Rejected("截图缩放比例无效".into()));
         }
+        let is_drag = matches!(input, "drag" | "drag_left");
+        let endpoint = match (end_x, end_y) {
+            (Some(end_x), Some(end_y)) => Some((*end_x, *end_y)),
+            (None, None) => None,
+            _ => {
+                return Err(VisualProviderError::Rejected(
+                    "拖拽终点必须同时提供 end_x 和 end_y".into(),
+                ));
+            }
+        };
+        if is_drag != endpoint.is_some() {
+            return Err(VisualProviderError::Rejected(
+                if is_drag {
+                    "拖拽输入缺少终点"
+                } else {
+                    "只有拖拽输入允许提供终点"
+                }
+                .into(),
+            ));
+        }
+        let supported = is_supported_input(input);
+        if !supported {
+            return Err(VisualProviderError::Rejected("不支持的图形输入".into()));
+        }
+        let display = observation
+            .displays
+            .iter()
+            .find(|display| &display.display_id == display_id)
+            .ok_or_else(|| VisualProviderError::Rejected("目标显示器不存在".into()))?;
+        let start = map_screenshot_point(*x, *y, display, *screenshot_scale_percent)?;
+        let end = endpoint
+            .map(|(x, y)| map_screenshot_point(x, y, display, *screenshot_scale_percent))
+            .transpose()?;
         let script = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 if (-not ('RemoteOpsInput' -as [type])) { Add-Type @'
 using System; using System.Runtime.InteropServices;
-public static class RemoteOpsInput { [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y); [DllImport("user32.dll")] public static extern void mouse_event(uint flags,uint dx,uint dy,uint data,UIntPtr extra); }
+public static class RemoteOpsInput {
+ [DllImport("user32.dll", SetLastError=true)] public static extern bool SetCursorPos(int x, int y);
+ [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, int data, UIntPtr extra);
+}
 '@ }
+[void](Assert-RemoteOpsTarget)
 if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS_Y)){throw '无法定位鼠标'}
-[RemoteOpsInput]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero); [RemoteOpsInput]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero); [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+[void](Assert-RemoteOpsTarget)
+$inputName=$env:REMOTEOPS_INPUT
+switch -Regex ($inputName) {
+ '^move$' { break }
+ '^(click|left_click)$' { [RemoteOpsInput]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero); [RemoteOpsInput]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero); break }
+ '^double_click$' { 1..2 | ForEach-Object { [RemoteOpsInput]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero); [RemoteOpsInput]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero); if($_ -eq 1){Start-Sleep -Milliseconds 80} }; break }
+ '^right_click$' { [RemoteOpsInput]::mouse_event(0x0008,0,0,0,[UIntPtr]::Zero); [RemoteOpsInput]::mouse_event(0x0010,0,0,0,[UIntPtr]::Zero); break }
+ '^middle_click$' { [RemoteOpsInput]::mouse_event(0x0020,0,0,0,[UIntPtr]::Zero); [RemoteOpsInput]::mouse_event(0x0040,0,0,0,[UIntPtr]::Zero); break }
+ '^wheel_up$' { [RemoteOpsInput]::mouse_event(0x0800,0,0,120,[UIntPtr]::Zero); break }
+ '^wheel_down$' { [RemoteOpsInput]::mouse_event(0x0800,0,0,-120,[UIntPtr]::Zero); break }
+ '^drag(_left)?$' {
+   if($null -eq $env:REMOTEOPS_END_X -or $null -eq $env:REMOTEOPS_END_Y){throw '拖拽终点缺失'}
+   [RemoteOpsInput]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero)
+   $sx=[int]$env:REMOTEOPS_X; $sy=[int]$env:REMOTEOPS_Y; $ex=[int]$env:REMOTEOPS_END_X; $ey=[int]$env:REMOTEOPS_END_Y
+   1..8 | ForEach-Object { $t=$_ / 8.0; $nx=[int][math]::Round($sx + (($ex-$sx)*$t)); $ny=[int][math]::Round($sy + (($ey-$sy)*$t)); if(-not [RemoteOpsInput]::SetCursorPos($nx,$ny)){throw '无法移动拖拽指针'}; Start-Sleep -Milliseconds 15 }
+   [RemoteOpsInput]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero); break
+ }
+ '^key:(.+)$' {
+   Add-Type -AssemblyName System.Windows.Forms
+   $key=$inputName.Substring(4); $upper=$key.ToUpperInvariant()
+   $sendKey=switch ($upper) {
+     'ENTER' {'{ENTER}'} 'TAB' {'{TAB}'} 'SHIFT+TAB' {'+{TAB}'} 'ESC' {'{ESC}'} 'ESCAPE' {'{ESC}'} 'BACKSPACE' {'{BACKSPACE}'} 'DELETE' {'{DELETE}'} 'UP' {'{UP}'} 'DOWN' {'{DOWN}'} 'LEFT' {'{LEFT}'} 'RIGHT' {'{RIGHT}'} 'HOME' {'{HOME}'} 'END' {'{END}'} 'SPACE' {' '}
+     'CTRL+L' {'^l'} 'CTRL+C' {'^c'} 'CTRL+V' {'^v'} 'CTRL+A' {'^a'} 'CTRL+Z' {'^z'} 'CTRL+Y' {'^y'} 'CTRL+W' {'^w'} 'CTRL+TAB' {'^{TAB}'} 'ALT+F4' {'%{F4}'} 'ALT+TAB' {'%{TAB}'}
+     default { if($key.Length -eq 1 -and $key -match '^[A-Za-z0-9]$'){ $key } elseif($upper -match '^F([1-9]|1[0-2])$'){ '{' + $upper + '}' } else { throw '不支持的键盘输入' } }
+   }
+   [System.Windows.Forms.SendKeys]::SendWait($sendKey); break
+ }
+ default { throw '不支持的图形输入' }
+}
+[void](Assert-RemoteOpsTarget)
+[pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
+        let script = format!(
+            "{TARGET_WINDOW_GUARD}
+{script}"
+        );
         let mut command = hidden_powershell_command();
         command.args([
             "-NoProfile",
@@ -469,10 +673,16 @@ if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            script,
+            &script,
         ]);
-        command.env("REMOTEOPS_X", x.to_string());
-        command.env("REMOTEOPS_Y", y.to_string());
+        command.env("REMOTEOPS_X", start.0.to_string());
+        command.env("REMOTEOPS_WINDOW_FINGERPRINT", window_fingerprint);
+        command.env("REMOTEOPS_Y", start.1.to_string());
+        if let Some((end_x, end_y)) = end {
+            command.env("REMOTEOPS_END_X", end_x.to_string());
+            command.env("REMOTEOPS_END_Y", end_y.to_string());
+        }
+        command.env("REMOTEOPS_INPUT", input);
         let output = run_desktop_command(command).await?;
         if !output.status.success() {
             return Err(VisualProviderError::Rejected(
@@ -491,6 +701,24 @@ if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS
         include_ui_tree: bool,
     ) -> Result<VisualObservation, VisualProviderError> {
         self.ensure_mcp_started().await?;
+        // 上游文本仅用于状态证据；安全窗口指纹仍由下方原生句柄采集产生。
+        let upstream_snapshot = if self.stdio_config.is_some() {
+            let mut client = self.stdio_mcp.lock().await;
+            Some(
+                client
+                    .as_mut()
+                    .ok_or_else(|| {
+                        VisualProviderError::Protocol("Windows-MCP stdio 尚未初始化".into())
+                    })?
+                    .snapshot(include_ui_tree)
+                    .await
+                    .map_err(|error| {
+                        VisualProviderError::Protocol(format!("Windows-MCP 观察失败：{error}"))
+                    })?,
+            )
+        } else {
+            None
+        };
         if let Some(observation) = self
             .observe_external_mcp(request_id, session_id, include_screenshot, include_ui_tree)
             .await?
@@ -500,6 +728,11 @@ if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS
         let script = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$desktopContext=Get-RemoteOpsDesktopContext
+if(-not $desktopContext.interactive){
+ [pscustomobject]@{state='no_interactive_desktop'; displays=@(); windows=@(); ui_tree=[pscustomobject]@{available=$false; reason=$desktopContext.reason; diagnostics=$desktopContext; children=@()}} | ConvertTo-Json -Compress -Depth 8
+ exit 0
+}
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -525,15 +758,16 @@ public static class RemoteOpsUser32 {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
 }
 '@ }
 if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1') { Add-Type -AssemblyName System.Drawing }
 $screens = [System.Windows.Forms.Screen]::AllScreens
-function Safe-Text([string]$s) { if ($null -eq $s) { return '' }; return -join ($s.ToCharArray() | Where-Object { $o=[int]$_; $o -lt 55296 -or ($o -ge 57344 -and $o -le 65535) }) }
 $displays = @($screens | ForEach-Object {
-  [pscustomobject]@{ display_id=$_.DeviceName; physical_width=$_.Bounds.Width; physical_height=$_.Bounds.Height; logical_width=$_.Bounds.Width; logical_height=$_.Bounds.Height; dpi=96; scale_percent=100; origin_x=$_.Bounds.X; origin_y=$_.Bounds.Y }
+  [pscustomobject]@{ display_id=$_.DeviceName; physical_width=$_.Bounds.Width; physical_height=$_.Bounds.Height; logical_width=$_.Bounds.Width; logical_height=$_.Bounds.Height; dpi=96; scale_percent=100; origin_x=$_.Bounds.X; origin_y=$_.Bounds.Y; physical_origin_x=$_.Bounds.X; physical_origin_y=$_.Bounds.Y }
 })
-$windows = [System.Collections.Generic.List[object]]::new(); $foreground = [RemoteOpsUser32]::GetForegroundWindow(); $activeFingerprint = $null
+$windows = [System.Collections.Generic.List[object]]::new(); $foreground = (Get-RemoteOpsForeground).handle; $activeFingerprint = $null
 if($foreground -ne [IntPtr]::Zero){$foreground=[RemoteOpsUser32]::GetAncestor($foreground,2)}
 $callback = [RemoteOpsUser32+EnumWindowsProc]{ param($handle,$unused)
   if (-not [RemoteOpsUser32]::IsWindowVisible($handle)) { return $true }
@@ -564,14 +798,22 @@ if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1') {
   if ($foreground -eq [IntPtr]::Zero) {
     $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='foreground_window_unavailable'; children=@()}
   } else {
-  function Convert-Uia([System.Windows.Automation.AutomationElement]$e,[int]$depth) {
+  function Convert-Uia([System.Windows.Automation.AutomationElement]$e,[int]$depth,[string]$windowFingerprint) {
     if($null -eq $e){return $null}
-    $n=[pscustomobject]@{name=(Safe-Text $e.Current.Name); automation_id=(Safe-Text $e.Current.AutomationId); control_type=(Safe-Text $e.Current.ControlType.ProgrammaticName); children=@()}
-    if($depth -ge 3){return $n}
-    $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $nodeName=Safe-Text $e.Current.Name; $nodeId=Safe-Text $e.Current.AutomationId; $nodeType=Safe-Text $e.Current.ControlType.ProgrammaticName
+    $nodeFingerprint=Get-RemoteOpsControlFingerprint $e $windowFingerprint
+    $n=[pscustomobject]@{name=$nodeName; automation_id=$nodeId; control_type=$nodeType; target_fingerprint=$nodeFingerprint; children=@()}
+    # Explorer 的磁盘/文件项目通常位于 ListView -> ListItem 的第四层；
+    # 保留硬上限，避免大型目录导致观察结果失控。
+    if($depth -ge 6){return $n}
+    $walker=if($nodeId -eq 'listview'){
+      [System.Windows.Automation.TreeWalker]::RawViewWalker
+    } else {
+      [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    }
     $c=$walker.GetFirstChild($e); $list=@(); $visited=0
-    while($null -ne $c -and $visited -lt 40){
-      $visited++; $child=Convert-Uia $c ($depth+1)
+    while($null -ne $c -and $visited -lt 120){
+      $visited++; $child=Convert-Uia $c ($depth+1) $windowFingerprint
       if($null -ne $child){$list += $child}
       $c=$walker.GetNextSibling($c)
     }
@@ -582,20 +824,33 @@ if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1') {
   try {
     $root=[System.Windows.Automation.AutomationElement]::FromHandle($foreground)
     if ($null -eq $root) { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='uia_root_unavailable'; children=@()} }
-    else { $ui=Convert-Uia $root 0; if ($null -ne $ui) { $ui | Add-Member -NotePropertyName available -NotePropertyValue $true }; if ($null -eq $ui) { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='uia_tree_unavailable'; children=@()} } }
+    else { $ui=Convert-Uia $root 0 $script:activeFingerprint; if ($null -ne $ui) { $ui | Add-Member -NotePropertyName available -NotePropertyValue $true }; if ($null -eq $ui) { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason='uia_tree_unavailable'; children=@()} } }
   } catch { $ui=[pscustomobject]@{available=$false; provider='windows-powershell'; reason=(Safe-Text $_.Exception.Message); children=@()} }
   finally { if ($comResult -ge 0) { [RemoteOpsCom]::CoUninitialize() } }
   }
 }
-$shot = $null; $w = $null; $h = $null
+$shot = $null; $w = $null; $h = $null; $screenshotError = $null
 if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
-  $b = $screens[0].Bounds; $w=$b.Width; $h=$b.Height
-  $bmp = New-Object System.Drawing.Bitmap($w,$h); $g=[System.Drawing.Graphics]::FromImage($bmp)
-  $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $ms=New-Object System.IO.MemoryStream
-  $bmp.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png); $shot=[Convert]::ToBase64String($ms.ToArray()); $g.Dispose(); $bmp.Dispose(); $ms.Dispose()
+  try {
+    $b = $screens[0].Bounds; $w=$b.Width; $h=$b.Height
+    $bmp = New-Object System.Drawing.Bitmap($w,$h); $g=[System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $ms=New-Object System.IO.MemoryStream
+    $bmp.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png); $shot=[Convert]::ToBase64String($ms.ToArray())
+  } catch { $screenshotError = (Safe-Text $_.Exception.Message); $shot = $null; $w = $null; $h = $null }
+  finally { if ($null -ne $g) { $g.Dispose() }; if ($null -ne $bmp) { $bmp.Dispose() }; if ($null -ne $ms) { $ms.Dispose() } }
 }
-[pscustomobject]@{ state=$state; state_reason=$stateReason; displays=$displays; windows=$windows; active_window_fingerprint=$script:activeFingerprint; screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; ui_tree=$ui } | ConvertTo-Json -Compress -Depth 8
+if($null -ne $ui){$ui | Add-Member -NotePropertyName diagnostics -NotePropertyValue $desktopContext}
+if($null -ne $ui -and $null -ne $screenshotError){$ui | Add-Member -NotePropertyName screenshot_error -NotePropertyValue $screenshotError}
+[void]0
+$cursor = $null
+try { $p = New-Object RemoteOpsUser32+POINT; if ([RemoteOpsUser32]::GetCursorPos([ref]$p)) { $cursor = [pscustomobject]@{ x=$p.X; y=$p.Y } } } catch { $cursor = $null }
+[pscustomobject]@{ state=$state; state_reason=$stateReason; displays=$displays; windows=$windows; active_window_fingerprint=$script:activeFingerprint; screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; cursor=$cursor; ui_tree=$ui } | ConvertTo-Json -Compress -Depth 8
 "#;
+        let script = format!(
+            "{TARGET_WINDOW_GUARD}
+{UIA_CONTROL_HELPERS}
+{script}"
+        );
         let mut command = hidden_powershell_command();
         command.args([
             "-NoProfile",
@@ -606,7 +861,7 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            script,
+            &script,
         ]);
         command.env(
             "REMOTEOPS_INCLUDE_SCREENSHOT",
@@ -623,13 +878,14 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
             ));
         }
         let output_text = String::from_utf8_lossy(&output.stdout);
-        let output_text = sanitize_json_surrogates(&output_text);
         let value: serde_json::Value = serde_json::from_str(&output_text)
             .map_err(|e| VisualProviderError::Protocol(format!("桌面采集结果无效：{e}")))?;
         let displays = serde_json::from_value(value.get("displays").cloned().unwrap_or_default())
-            .unwrap_or_default();
+            .map_err(|error| {
+            VisualProviderError::Protocol(format!("显示器采集结构无效：{error}"))
+        })?;
         let windows = serde_json::from_value(value.get("windows").cloned().unwrap_or_default())
-            .unwrap_or_default();
+            .map_err(|error| VisualProviderError::Protocol(format!("窗口采集结构无效：{error}")))?;
         let active_window_fingerprint = value
             .get("active_window_fingerprint")
             .and_then(|v| v.as_str())
@@ -646,11 +902,25 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
             .get("screenshot_height")
             .and_then(serde_json::Value::as_u64)
             .and_then(|v| u32::try_from(v).ok());
+        let cursor_x = value.get("cursor").and_then(|v| v.get("x")).and_then(serde_json::Value::as_i64).and_then(|v| i32::try_from(v).ok());
+        let cursor_y = value.get("cursor").and_then(|v| v.get("y")).and_then(serde_json::Value::as_i64).and_then(|v| i32::try_from(v).ok());
         let state = value
             .get("state")
             .cloned()
             .and_then(|state| serde_json::from_value(state).ok())
             .unwrap_or(remoteops_domain::VisualSessionState::NoInteractiveDesktop);
+        let mut ui_tree = value.get("ui_tree").cloned().filter(|v| !v.is_null());
+        if let Some(tree) = ui_tree.as_mut().and_then(serde_json::Value::as_object_mut) {
+            tree.insert("provider".into(), serde_json::json!("windows-native-uia"));
+            if let Some(snapshot) = upstream_snapshot {
+                tree.insert(
+                    "upstream".into(),
+                    serde_json::json!({
+                        "provider":"windows-mcp-stdio", "initialized":true, "snapshot":snapshot
+                    }),
+                );
+            }
+        }
         Ok(VisualObservation {
             request_id,
             session_id,
@@ -659,10 +929,12 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
             windows,
             displays,
             active_window_fingerprint,
-            ui_tree: value.get("ui_tree").cloned().filter(|v| !v.is_null()),
+            ui_tree,
             screenshot_base64,
             screenshot_width,
             screenshot_height,
+            cursor_x,
+            cursor_y,
             redacted: false,
         })
     }
@@ -685,11 +957,38 @@ impl VisualProvider for WindowsVisualProvider {
         &self,
         request_id: RequestId,
         session_id: SessionId,
-        _condition: &str,
-        _timeout_millis: u64,
+        condition: &str,
+        timeout_millis: u64,
     ) -> Result<VisualObservation, VisualProviderError> {
-        self.observe_desktop(request_id, session_id, false, true)
-            .await
+        let condition = remoteops_domain::VisualWaitCondition::parse(condition)
+            .map_err(VisualProviderError::Rejected)?;
+        let timeout_millis = remoteops_domain::normalize_visual_wait_timeout(Some(timeout_millis))
+            .map_err(VisualProviderError::Rejected)?;
+        let include_screenshot = matches!(
+            condition,
+            remoteops_domain::VisualWaitCondition::Hash { .. }
+        );
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_millis);
+        loop {
+            let observation = self
+                .observe_desktop(request_id, session_id, include_screenshot, true)
+                .await?;
+            if condition.matches(&observation) {
+                return Ok(observation);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(VisualProviderError::Rejected(
+                    "图形等待超时：条件未满足".to_owned(),
+                ));
+            }
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                now + std::time::Duration::from_millis(250),
+            ))
+            .await;
+        }
     }
     async fn invoke(
         &self,
@@ -745,13 +1044,12 @@ impl VisualProvider for WindowsVisualProvider {
         target: &VisualTarget,
         input: &str,
     ) -> Result<VisualActionResult, VisualProviderError> {
+        let (action, embedded_endpoint) = parse_visual_input(input)?;
+        let effective_target = target_with_drag_endpoint(target, embedded_endpoint)?;
         let before = self
-            .verify_foreground_target(request_id, session_id, target)
+            .verify_foreground_target(request_id, session_id, &effective_target)
             .await?;
-        let VisualTarget::Coordinate {
-            display_id, x, y, ..
-        } = target
-        else {
+        let VisualTarget::Coordinate { display_id, .. } = &effective_target else {
             return Err(VisualProviderError::Rejected(
                 "回退输入必须是坐标目标".into(),
             ));
@@ -763,34 +1061,192 @@ impl VisualProvider for WindowsVisualProvider {
         else {
             return Err(VisualProviderError::Rejected("目标显示器不存在".into()));
         };
-        let right = i64::from(display.origin_x) + i64::from(display.logical_width);
-        let bottom = i64::from(display.origin_y) + i64::from(display.logical_height);
-        if i64::from(*x) < i64::from(display.origin_x)
-            || i64::from(*y) < i64::from(display.origin_y)
-            || i64::from(*x) >= right
-            || i64::from(*y) >= bottom
-        {
+        if !effective_target.is_valid_for_display(display) {
             return Err(VisualProviderError::Rejected(
-                "坐标超出目标显示器边界".into(),
+                "坐标目标或拖拽终点超出目标显示器边界".into(),
             ));
         }
-        self.send_coordinate_input(target, input).await?;
+        self.send_coordinate_input(&effective_target, action, &before)
+            .await?;
         let observation = self
             .observe_desktop(request_id, session_id, false, true)
             .await?;
+        let effect_verified = if matches!(action, "move" | "drag" | "drag_left") {
+            cursor_effect_verified(&effective_target, action, display, &observation)
+        } else {
+            observed_uia_change(&before, &observation)
+        };
         Ok(VisualActionResult {
             request_id,
             session_id,
             action_sent: true,
-            effect_verified: true,
+            effect_verified,
             observation: Some(observation),
-            error_code: None,
-            message: "坐标回退输入已发送并完成后置观察".into(),
+            error_code: (!effect_verified).then(|| "effect_not_observable".to_owned()),
+            message: if effect_verified {
+                "坐标回退输入已发送并完成 UIA 后置观察".into()
+            } else {
+                "坐标回退输入已发送；当前 Provider 未取得可证明的界面变化".into()
+            },
         })
     }
     async fn stop(&self, _session_id: SessionId) -> Result<(), VisualProviderError> {
+        if let Some(mut client) = self.stdio_mcp.lock().await.take() {
+            client.stop().await;
+        }
+        if let Some(supervisor) = self.mcp_supervisor.lock().await.as_mut() {
+            supervisor.stop().await;
+        }
         Ok(())
     }
+}
+
+type VisualInputParts<'a> = (&'a str, Option<(i32, i32)>);
+
+fn parse_visual_input(input: &str) -> Result<VisualInputParts<'_>, VisualProviderError> {
+    if let Some(value) = input.strip_prefix("drag_to:") {
+        let (x, y) = value
+            .split_once(',')
+            .ok_or_else(|| VisualProviderError::Rejected("拖拽终点格式无效".into()))?;
+        let x = x
+            .parse::<i32>()
+            .map_err(|_| VisualProviderError::Rejected("拖拽终点 X 无效".into()))?;
+        let y = y
+            .parse::<i32>()
+            .map_err(|_| VisualProviderError::Rejected("拖拽终点 Y 无效".into()))?;
+        return Ok(("drag", Some((x, y))));
+    }
+    Ok((input, None))
+}
+
+fn target_with_drag_endpoint(
+    target: &VisualTarget,
+    endpoint: Option<(i32, i32)>,
+) -> Result<VisualTarget, VisualProviderError> {
+    let Some((end_x, end_y)) = endpoint else {
+        return Ok(target.clone());
+    };
+    let VisualTarget::Coordinate {
+        window_fingerprint,
+        display_id,
+        x,
+        y,
+        screenshot_scale_percent,
+        end_x: current_end_x,
+        end_y: current_end_y,
+    } = target
+    else {
+        return Err(VisualProviderError::Rejected(
+            "拖拽终点只能用于坐标目标".into(),
+        ));
+    };
+    if current_end_x.is_some() || current_end_y.is_some() {
+        return Err(VisualProviderError::Rejected(
+            "拖拽终点重复提供".into(),
+        ));
+    }
+    Ok(VisualTarget::Coordinate {
+        window_fingerprint: window_fingerprint.clone(),
+        display_id: display_id.clone(),
+        x: *x,
+        y: *y,
+        screenshot_scale_percent: *screenshot_scale_percent,
+        end_x: Some(end_x),
+        end_y: Some(end_y),
+    })
+}
+
+fn is_supported_input(input: &str) -> bool {
+    matches!(
+        input,
+        "move"
+            | "click"
+            | "left_click"
+            | "double_click"
+            | "right_click"
+            | "middle_click"
+            | "wheel_up"
+            | "wheel_down"
+            | "drag"
+            | "drag_left"
+    ) || input
+        .strip_prefix("key:")
+        .is_some_and(|key| !key.is_empty())
+}
+
+#[cfg(windows)]
+fn map_screenshot_point(
+    x: i32,
+    y: i32,
+    display: &remoteops_domain::VisualDisplay,
+    screenshot_scale_percent: u32,
+) -> Result<(i32, i32), VisualProviderError> {
+    if screenshot_scale_percent == 0 || display.logical_width == 0 || display.logical_height == 0 {
+        return Err(VisualProviderError::Rejected("显示器缩放信息无效".into()));
+    }
+    let logical_x = i64::from(display.origin_x)
+        + ((i64::from(x) - i64::from(display.origin_x)) * 100
+            + i64::from(screenshot_scale_percent) / 2)
+            / i64::from(screenshot_scale_percent);
+    let logical_y = i64::from(display.origin_y)
+        + ((i64::from(y) - i64::from(display.origin_y)) * 100
+            + i64::from(screenshot_scale_percent) / 2)
+            / i64::from(screenshot_scale_percent);
+    let logical_x = i32::try_from(logical_x)
+        .map_err(|_| VisualProviderError::Rejected("X 坐标超出整数范围".into()))?;
+    let logical_y = i32::try_from(logical_y)
+        .map_err(|_| VisualProviderError::Rejected("Y 坐标超出整数范围".into()))?;
+    if !display.contains_logical_point(logical_x, logical_y) {
+        return Err(VisualProviderError::Rejected(
+            "坐标超出目标显示器边界".into(),
+        ));
+    }
+    let physical_x = i64::from(display.physical_origin_x)
+        + (i64::from(logical_x - display.origin_x) * i64::from(display.physical_width)
+            + i64::from(display.logical_width) / 2)
+            / i64::from(display.logical_width);
+    let physical_y = i64::from(display.physical_origin_y)
+        + (i64::from(logical_y - display.origin_y) * i64::from(display.physical_height)
+            + i64::from(display.logical_height) / 2)
+            / i64::from(display.logical_height);
+    Ok((
+        i32::try_from(physical_x)
+            .map_err(|_| VisualProviderError::Rejected("物理 X 坐标超出整数范围".into()))?,
+        i32::try_from(physical_y)
+            .map_err(|_| VisualProviderError::Rejected("物理 Y 坐标超出整数范围".into()))?,
+    ))
+}
+
+#[cfg(windows)]
+fn cursor_effect_verified(
+    target: &VisualTarget,
+    input: &str,
+    display: &remoteops_domain::VisualDisplay,
+    observation: &VisualObservation,
+) -> bool {
+    let Some(((start_x, start_y), end)) = target.coordinate_points() else {
+        return false;
+    };
+    let point = if matches!(input, "drag" | "drag_left") {
+        end.unwrap_or((start_x, start_y))
+    } else {
+        (start_x, start_y)
+    };
+    let Ok((expected_x, expected_y)) = map_screenshot_point(
+        point.0,
+        point.1,
+        display,
+        match target {
+            VisualTarget::Coordinate { screenshot_scale_percent, .. } => *screenshot_scale_percent,
+            VisualTarget::Control { .. } => return false,
+        },
+    ) else {
+        return false;
+    };
+    let (Some(actual_x), Some(actual_y)) = (observation.cursor_x, observation.cursor_y) else {
+        return false;
+    };
+    (actual_x - expected_x).abs() <= 2 && (actual_y - expected_y).abs() <= 2
 }
 
 /// 仅将同一前台窗口中可见的 UIA 变化作为动作效果证据。
@@ -798,7 +1254,7 @@ impl VisualProvider for WindowsVisualProvider {
 fn observed_uia_change(before: &VisualObservation, after: &VisualObservation) -> bool {
     after.state == remoteops_domain::VisualSessionState::Ready
         && before.active_window_fingerprint.is_some()
-        && before.active_window_fingerprint == after.active_window_fingerprint
+        && same_observed_window(before, after)
         && before
             .ui_tree
             .as_ref()
@@ -807,7 +1263,46 @@ fn observed_uia_change(before: &VisualObservation, after: &VisualObservation) ->
             .ui_tree
             .as_ref()
             .is_some_and(|tree| tree.get("available") == Some(&serde_json::Value::Bool(true)))
-        && before.ui_tree != after.ui_tree
+        && before.ui_tree.as_ref().map(native_uia_state)
+            != after.ui_tree.as_ref().map(native_uia_state)
+}
+
+/// 标题或位置变化会刷新窗口指纹，使用两次观察中的原生句柄和进程核对同一窗口。
+#[cfg(windows)]
+fn same_observed_window(before: &VisualObservation, after: &VisualObservation) -> bool {
+    if before.active_window_fingerprint == after.active_window_fingerprint {
+        return before.active_window_fingerprint.is_some();
+    }
+    let find = |observation: &VisualObservation| {
+        observation
+            .windows
+            .iter()
+            .find(|window| {
+                Some(window.fingerprint.as_str())
+                    == observation.active_window_fingerprint.as_deref()
+            })
+            .map(|window| {
+                (
+                    window.window_id.clone(),
+                    window.process_id,
+                    window.session_id.clone(),
+                )
+            })
+    };
+    let previous = find(before);
+    previous.is_some() && previous == find(after)
+}
+
+/// 剔除上游光标、其他窗口和诊断元信息；它们不能证明目标控件操作生效。
+#[cfg(windows)]
+fn native_uia_state(node: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "name":node.get("name"),
+        "automation_id":node.get("automation_id"),
+        "control_type":node.get("control_type"),
+        "children":node.get("children").and_then(serde_json::Value::as_array)
+            .map(|children| children.iter().map(native_uia_state).collect::<Vec<_>>())
+    })
 }
 
 /// 创建当前宿主的默认图形 Provider。
@@ -900,6 +1395,8 @@ impl VisualProvider for MockVisualProvider {
             screenshot_base64: include_screenshot.then(|| "mock".to_owned()),
             screenshot_width: include_screenshot.then_some(1),
             screenshot_height: include_screenshot.then_some(1),
+            cursor_x: None,
+            cursor_y: None,
             redacted: true,
         })
     }
@@ -963,6 +1460,114 @@ impl VisualProvider for MockVisualProvider {
 mod tests {
     use super::*;
 
+    #[test]
+    fn keyboard_input_requires_non_empty_key_name() {
+        assert!(is_supported_input("key:ENTER"));
+        assert!(is_supported_input("key:CTRL+A"));
+        assert!(!is_supported_input("key:"));
+        assert!(!is_supported_input("keyboard:ENTER"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn runtime_ids_distinguish_duplicate_controls_and_preserve_unicode() {
+        let script = format!(
+            r"{UIA_CONTROL_HELPERS}
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$a=[pscustomobject]@{{Current=[pscustomobject]@{{Name=('Control'+[char]0xD83D+[char]0xDE80);AutomationId='same';ControlType=[pscustomobject]@{{ProgrammaticName='ControlType.Button'}}}}}}
+$b=[pscustomobject]@{{Current=$a.Current}}
+$a | Add-Member -MemberType ScriptMethod -Name GetRuntimeId -Value {{return @(1,2)}}
+$b | Add-Member -MemberType ScriptMethod -Name GetRuntimeId -Value {{return @(1,3)}}
+[pscustomobject]@{{first=(Get-RemoteOpsControlFingerprint $a 'window');repeat=(Get-RemoteOpsControlFingerprint $a 'window');second=(Get-RemoteOpsControlFingerprint $b 'window');name=(Safe-Text $a.Current.Name);short_type=(Test-RemoteOpsControlType 'ControlType.Button' 'button')}} | ConvertTo-Json -Compress
+"
+        );
+        let mut command = hidden_powershell_command();
+        command.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", &script]);
+        let output = run_desktop_command(command).await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["first"], value["repeat"]);
+        assert_ne!(value["first"], value["second"]);
+        assert_eq!(value["name"], "Control🚀");
+        assert_eq!(value["short_type"], true);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn foreground_probe_has_complete_native_layout_and_honest_source() {
+        let script = format!(
+            r"$ErrorActionPreference='Stop'
+{TARGET_WINDOW_GUARD}
+$info=New-Object RemoteOpsTarget+GUITHREADINFO
+$size=[Runtime.InteropServices.Marshal]::SizeOf($info)
+$offset=[Runtime.InteropServices.Marshal]::OffsetOf([RemoteOpsTarget+GUITHREADINFO],'rcCaret').ToInt64()
+$info.cbSize=$size
+$success=[RemoteOpsTarget]::GetGUIThreadInfo(0,[ref]$info)
+$errorCode=if($success){{0}}else{{[Runtime.InteropServices.Marshal]::GetLastWin32Error()}}
+$foreground=Get-RemoteOpsForeground
+[pscustomobject]@{{size=$size; caret_offset=$offset; pointer_size=[IntPtr]::Size; error_code=$errorCode; handle=$foreground.handle.ToInt64(); source=$foreground.source}} | ConvertTo-Json -Compress
+"
+        );
+        let mut command = hidden_powershell_command();
+        command.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", &script]);
+        let output = run_desktop_command(command).await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let pointer_size = value["pointer_size"].as_u64().unwrap();
+        assert_eq!(value["size"], 24 + 6 * pointer_size);
+        assert_eq!(value["caret_offset"], 8 + 6 * pointer_size);
+        // ERROR_INVALID_PARAMETER 会暴露遗漏 rcCaret 导致的错误 cbSize。
+        assert_ne!(value["error_code"], 87);
+        if value["handle"] == 0 {
+            assert_eq!(value["source"], "unavailable");
+        } else {
+            assert!(matches!(
+                value["source"].as_str(),
+                Some("GetForegroundWindow" | "GetGUIThreadInfo")
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "需要已登录的 Windows 交互桌面；仅做只读观察"]
+    async fn native_interactive_observation_reports_windows_and_uia_diagnostics() {
+        let provider = WindowsVisualProvider {
+            mcp_supervisor: tokio::sync::Mutex::new(None),
+            stdio_mcp: tokio::sync::Mutex::new(None),
+            stdio_config: None,
+            mcp_configuration_error: None,
+        };
+        let observation = provider
+            .observe(RequestId::new(), SessionId::new(), false, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            observation.state,
+            remoteops_domain::VisualSessionState::Ready
+        );
+        assert!(!observation.windows.is_empty());
+        assert!(observation.active_window_fingerprint.is_some());
+        let tree = observation.ui_tree.unwrap();
+        assert!(tree["diagnostics"]["process_session_id"].as_u64().unwrap() > 0);
+        assert_eq!(tree["diagnostics"]["window_station"], "WinSta0");
+        assert_eq!(tree["diagnostics"]["apartment_state"], "STA");
+        assert_eq!(
+            tree["available"], true,
+            "UIA 不可用原因：{}",
+            tree["reason"]
+        );
+        assert_eq!(tree["target_fingerprint"].as_str().unwrap().len(), 64);
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn effect_verification_rejects_noop_failed_tree_and_changed_window() {
@@ -973,6 +1578,13 @@ mod tests {
         before.active_window_fingerprint = Some("target".into());
         before.ui_tree = Some(serde_json::json!({"available":true,"children":[]}));
         assert!(!observed_uia_change(&before, &before));
+        let mut metadata_only = before.clone();
+        metadata_only.ui_tree.as_mut().unwrap()["upstream"] =
+            serde_json::json!({"snapshot":"Cursor Position: (100, 200)"});
+        assert!(!observed_uia_change(&before, &metadata_only));
+        metadata_only.ui_tree.as_mut().unwrap()["diagnostics"] =
+            serde_json::json!({"capture_ms":50});
+        assert!(!observed_uia_change(&before, &metadata_only));
         let mut after = before.clone();
         after.ui_tree = Some(serde_json::json!({"available":true,"children":[{"name":"menu"}]}));
         assert!(observed_uia_change(&before, &after));

@@ -3736,7 +3736,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.15"
+version = "0.2.0-preview.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.16"
+version = "0.2.0-preview.21"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3897,7 +3897,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-mcp"
-version = "0.2.0-preview.7"
+version = "0.2.0-preview.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3956,9 +3956,11 @@ dependencies = [
 name = "remoteops-domain"
 version = "0.2.0-preview.5"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "uuid",
 ]
