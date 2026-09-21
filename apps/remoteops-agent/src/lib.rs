@@ -1329,7 +1329,16 @@ where
                         .values()
                         .any(|binding| binding.session_id == session_id)
                     {
+                        abort_pending_tasks_for_session(
+                            &tasks,
+                            Some(&log_observer),
+                            session_id,
+                            "Controller 会话已撤销，操作已中断",
+                        )
+                        .await;
                         close_file_uploads_for_session(&file_uploads, session_id).await;
+                        close_session_resources(&shell_sessions, &serial_sessions, session_id)
+                            .await;
                     }
                     update_active_owner(&local_permission_policy, &controller_bindings);
                     emit_agent_event(
@@ -2759,6 +2768,44 @@ async fn abort_pending_tasks(
     }
 }
 
+async fn abort_pending_tasks_for_session(
+    tasks: &Arc<Mutex<BTreeMap<RequestId, PendingTask>>>,
+    log_observer: Option<&Arc<std::sync::Mutex<operation_log::LogObserver>>>,
+    session_id: SessionId,
+    message: &str,
+) {
+    let pending = {
+        let mut tasks = tasks.lock().await;
+        let ids = tasks
+            .iter()
+            .filter_map(|(id, task)| (task.session_id == session_id).then_some(*id))
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| tasks.remove(&id).map(|task| (task, id)))
+            .collect::<Vec<_>>()
+    };
+    for (pending, request_id) in pending {
+        let PendingTask {
+            session_id,
+            task,
+            terminal,
+            interactive_shell,
+        } = pending;
+        if terminal.try_commit(TaskTerminal::Aborted).is_ok() {
+            if let Some(observer) = log_observer
+                && let Ok(mut observer) = observer.lock()
+            {
+                observer.interrupt(session_id, request_id, Utc::now(), message);
+            }
+            if let Some(shell) = interactive_shell {
+                let _ = shell.interrupt().await;
+            }
+        }
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 async fn cancel_pending_task(
     tasks: &Arc<Mutex<BTreeMap<RequestId, PendingTask>>>,
     recent_task_terminals: &Arc<Mutex<BTreeMap<RequestId, TaskTerminal>>>,
@@ -2902,7 +2949,10 @@ fn spawn_serial_reader(
     tokio::spawn(async move {
         while !cancelled.load(Ordering::Relaxed) {
             match port.read(4096).await {
-                Ok(bytes) if bytes.is_empty() => {}
+                Ok(bytes) if bytes.is_empty() => {
+                    // 某些 Windows 串口驱动会立即返回空数据，避免空读忙等。
+                    sleep(Duration::from_millis(20)).await;
+                }
                 Ok(bytes) => {
                     transcript
                         .lock()
@@ -3415,6 +3465,41 @@ async fn close_file_uploads_for_session(
         if let Err(error) = upload.abort().await {
             warn!(error = %error, %session_id, "清理会话未完成文件上传失败");
         }
+    }
+}
+
+async fn close_session_resources(
+    shell_sessions: &Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
+    serial_sessions: &Arc<Mutex<BTreeMap<SerialSessionId, SerialRuntime>>>,
+    session_id: SessionId,
+) {
+    let shells = {
+        let mut sessions = shell_sessions.lock().await;
+        let ids = sessions
+            .iter()
+            .filter_map(|(id, runtime)| (runtime.session_id == session_id).then_some(*id))
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| sessions.remove(&id))
+            .map(|runtime| runtime.session)
+            .collect::<Vec<_>>()
+    };
+    for shell in shells {
+        let _ = shell.close().await;
+    }
+    let serials = {
+        let mut sessions = serial_sessions.lock().await;
+        let ids = sessions
+            .iter()
+            .filter_map(|(id, runtime)| (runtime.session_id == session_id).then_some(*id))
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| sessions.remove(&id))
+            .map(|runtime| runtime.cancelled)
+            .collect::<Vec<_>>()
+    };
+    for cancelled in serials {
+        cancelled.store(true, Ordering::Relaxed);
     }
 }
 

@@ -3736,7 +3736,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.21"
+version = "0.2.0-preview.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3785,7 +3785,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-service"
-version = "0.2.0-preview.10"
+version = "0.2.0-preview.11"
 dependencies = [
  "anyhow",
  "chrono",
