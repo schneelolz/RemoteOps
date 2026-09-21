@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
     [switch]$SkipNetwork,
@@ -8,7 +8,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$expectedVersion = '0.2.0-preview.5'
+$expectedMcpVersion = '0.2.0-preview.10'
+$expectedCredentialPromptVersion = '0.2.0-preview.5'
 $expectedToolTimeoutSec = 360
 $configPath = Join-Path $CodexHome 'config.toml'
 $installDirectory = Join-Path $CodexHome 'remoteops'
@@ -33,7 +34,7 @@ if (-not (Test-Path -LiteralPath $credentialPromptPath -PathType Leaf)) {
 else {
     Write-Host '[通过] SSH 密码安全输入程序已安装。'
     $promptVersionOutput = (& $credentialPromptPath --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $promptVersionOutput -notmatch [regex]::Escape($expectedVersion)) {
+    if ($LASTEXITCODE -ne 0 -or $promptVersionOutput -notmatch [regex]::Escape($expectedCredentialPromptVersion)) {
         $failures.Add("SSH 密码安全输入程序版本不正确：$promptVersionOutput")
     }
     else {
@@ -170,13 +171,13 @@ elseif (-not (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
 }
 elseif (
     (Split-Path -Leaf $installedExecutable) -notmatch
-        "^remoteops-controller-mcp-$([regex]::Escape($expectedVersion))(?:-[0-9a-f]{12})?\.exe$"
+        "^remoteops-controller-mcp-$([regex]::Escape($expectedMcpVersion))(?:-[0-9a-f]{12})?\.exe$"
 ) {
     $failures.Add('RemoteOps MCP 配置没有指向当前版本程序。')
 }
 else {
     $versionOutput = (& $installedExecutable --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($expectedVersion)) {
+    if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($expectedMcpVersion)) {
         $failures.Add("MCP 版本不正确：$versionOutput")
     }
     else {
