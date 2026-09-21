@@ -902,8 +902,16 @@ try { $p = New-Object RemoteOpsUser32+POINT; if ([RemoteOpsUser32]::GetCursorPos
             .get("screenshot_height")
             .and_then(serde_json::Value::as_u64)
             .and_then(|v| u32::try_from(v).ok());
-        let cursor_x = value.get("cursor").and_then(|v| v.get("x")).and_then(serde_json::Value::as_i64).and_then(|v| i32::try_from(v).ok());
-        let cursor_y = value.get("cursor").and_then(|v| v.get("y")).and_then(serde_json::Value::as_i64).and_then(|v| i32::try_from(v).ok());
+        let cursor_x = value
+            .get("cursor")
+            .and_then(|v| v.get("x"))
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|v| i32::try_from(v).ok());
+        let cursor_y = value
+            .get("cursor")
+            .and_then(|v| v.get("y"))
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|v| i32::try_from(v).ok());
         let state = value
             .get("state")
             .cloned()
@@ -1141,9 +1149,7 @@ fn target_with_drag_endpoint(
         ));
     };
     if current_end_x.is_some() || current_end_y.is_some() {
-        return Err(VisualProviderError::Rejected(
-            "拖拽终点重复提供".into(),
-        ));
+        return Err(VisualProviderError::Rejected("拖拽终点重复提供".into()));
     }
     Ok(VisualTarget::Coordinate {
         window_fingerprint: window_fingerprint.clone(),
@@ -1237,7 +1243,10 @@ fn cursor_effect_verified(
         point.1,
         display,
         match target {
-            VisualTarget::Coordinate { screenshot_scale_percent, .. } => *screenshot_scale_percent,
+            VisualTarget::Coordinate {
+                screenshot_scale_percent,
+                ..
+            } => *screenshot_scale_percent,
             VisualTarget::Control { .. } => return false,
         },
     ) else {

@@ -3806,10 +3806,7 @@ mod visual_target_tests {
             r#"{"kind":"coordinate","window_fingerprint":"w","display_id":"display-0","x":10,"y":20,"screenshot_scale_percent":100,"end_x":30,"end_y":40}"#,
         )
         .expect("拖拽坐标目标应可解析");
-        assert_eq!(
-            target.coordinate_points(),
-            Some(((10, 20), Some((30, 40))))
-        );
+        assert_eq!(target.coordinate_points(), Some(((10, 20), Some((30, 40)))));
     }
 
     #[test]
