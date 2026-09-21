@@ -482,6 +482,8 @@ enum WindowCenteringState {
         metrics_recorded: bool,
         /// 上一帧原生窗口外框尺寸。
         previous_outer_size: Option<Vec2>,
+        /// 防止异常 DPI 或 RDP 尺寸导致永久高频重绘。
+        attempts: u16,
     },
     /// 已使用最终外框完成居中。
     Complete,
@@ -492,12 +494,14 @@ impl Default for WindowCenteringState {
         Self::Waiting {
             metrics_recorded: false,
             previous_outer_size: None,
+            attempts: 0,
         }
     }
 }
 
 impl RemoteOpsAgentApp {
     /// 创建窗口并启动真实或演示后台。
+    #[allow(clippy::too_many_lines)]
     fn new(
         cc: &eframe::CreationContext<'_>,
         startup: StartupState,
@@ -529,12 +533,25 @@ impl RemoteOpsAgentApp {
             egui::ColorImage::from(&brand_icon),
             egui::TextureOptions::LINEAR,
         ));
+        let (runtime_event_sender, runtime_events) = mpsc::channel();
         let (event_sender, events) = mpsc::channel();
+        let repaint_context = cc.egui_ctx.clone();
+        std::thread::Builder::new()
+            .name("remoteops-agent-event-forwarder".to_owned())
+            .spawn(move || {
+                while let Ok(event) = runtime_events.recv() {
+                    if event_sender.send(event).is_err() {
+                        break;
+                    }
+                    repaint_context.request_repaint();
+                }
+            })
+            .expect("应能启动 Agent 事件转发线程");
         let (trust_sender, trust_events) = mpsc::channel();
         let (shutdown, _) = watch::channel(false);
         let mut app = Self {
             diagnostics,
-            event_sender,
+            event_sender: runtime_event_sender,
             events,
             trust_sender,
             trust_events,
@@ -1089,18 +1106,26 @@ impl RemoteOpsAgentApp {
     }
 
     /// 将控制码和复制按钮作为一个整体水平居中展示。
+    #[allow(clippy::cast_possible_truncation)]
     fn render_pairing_code_row(&mut self, ui: &mut egui::Ui) {
         ui.allocate_ui_with_layout(
             pairing_code_row_size(ui.available_width()),
             Layout::left_to_right(Align::Center),
             |ui| {
                 let Some(pairing_code) = self.pairing_code.as_deref() else {
-                    let spinner_size = 24.0;
-                    ui.add_space(centered_left_padding(ui.available_width(), spinner_size));
-                    ui.add(
-                        egui::Spinner::new()
-                            .size(spinner_size)
-                            .color(Color32::from_rgb(37, 99, 235)),
+                    let indicator_size = 24.0;
+                    ui.add_space(centered_left_padding(ui.available_width(), indicator_size));
+                    let (rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(indicator_size), egui::Sense::hover());
+                    let time = ui.input(|input| input.time);
+                    let angle = (time * std::f64::consts::TAU) as f32;
+                    let center = rect.center();
+                    let radius = indicator_size * 0.38;
+                    let start = center + Vec2::angled(angle) * radius;
+                    let end = center + Vec2::angled(angle + 4.2) * radius;
+                    ui.painter().line_segment(
+                        [start, end],
+                        Stroke::new(3.0, Color32::from_rgb(37, 99, 235)),
                     );
                     return;
                 };
@@ -1931,6 +1956,7 @@ impl eframe::App for RemoteOpsAgentApp {
         if let WindowCenteringState::Waiting {
             metrics_recorded,
             previous_outer_size,
+            attempts,
         } = &mut self.window_centering
         {
             let metrics = ctx.input(|input| {
@@ -1959,7 +1985,12 @@ impl eframe::App for RemoteOpsAgentApp {
             if let Some((monitor_size, inner_size, outer_size)) = viewport_metrics {
                 if !window_size_is_stable(required_size, inner_size) {
                     *previous_outer_size = None;
-                    ctx.request_repaint_after(Duration::from_millis(16));
+                    *attempts = attempts.saturating_add(1);
+                    if *attempts < 120 {
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    } else {
+                        self.window_centering = WindowCenteringState::Complete;
+                    }
                 } else if previous_outer_size
                     .is_some_and(|previous| window_size_is_stable(previous, outer_size))
                 {
@@ -1972,7 +2003,12 @@ impl eframe::App for RemoteOpsAgentApp {
                     self.window_centering = WindowCenteringState::Complete;
                 } else {
                     *previous_outer_size = Some(outer_size);
-                    ctx.request_repaint_after(Duration::from_millis(16));
+                    *attempts = attempts.saturating_add(1);
+                    if *attempts < 120 {
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    } else {
+                        self.window_centering = WindowCenteringState::Complete;
+                    }
                 }
             }
         }
@@ -1984,15 +2020,19 @@ impl eframe::App for RemoteOpsAgentApp {
             egui::CentralPanel::default()
                 .frame(Frame::new().fill(background).inner_margin(Margin::ZERO))
                 .show(ui, |ui| self.render_setup(ui));
-            ctx.request_repaint_after(Duration::from_millis(250));
+            ctx.request_repaint_after(Duration::from_secs(1));
             return;
         }
         if self.receive_events() {
             ctx.request_repaint();
         }
-        // TLS 预检和 Agent 后台线程可能在 GUI 空闲后才发送事件；保持低频轮询，
-        // 否则没有达到 MAX_EVENTS_PER_FRAME 时事件不会触发下一帧，连接状态会卡住。
-        ctx.request_repaint_after(Duration::from_millis(250));
+        if self.pairing_code.is_none() {
+            // 等待控制码时保留低频动画，避免空闲窗口持续高频重绘。
+            ctx.request_repaint_after(Duration::from_millis(500));
+        } else {
+            // 控制码倒计时按秒变化；后台事件通过转发线程主动唤醒界面。
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         if matches!(self.status, UiStatus::Stopped) && !self.allow_close {
             self.allow_close = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -2121,7 +2161,7 @@ impl eframe::App for RemoteOpsAgentApp {
         self.render_stop_confirmation(&ctx);
         self.render_advanced_settings(&ctx);
         self.render_certificate_confirmation(&ctx);
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ctx.request_repaint_after(Duration::from_secs(1));
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -2522,7 +2562,7 @@ fn default_renderer() -> eframe::Renderer {
 /// 把 WGPU 限制到 Windows 原生 DirectX 12，允许系统在无显卡时选择软件适配器。
 #[cfg(target_os = "windows")]
 fn configure_windows_wgpu(options: &mut eframe::NativeOptions) {
-    options.wgpu_options.surface = eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT;
+    options.wgpu_options.surface = eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY;
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
         setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
         setup.power_preference = eframe::wgpu::PowerPreference::LowPower;
@@ -2903,7 +2943,7 @@ mod tests {
             let options = agent_native_options(default_renderer(), false);
             assert_eq!(
                 options.wgpu_options.surface,
-                eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT
+                eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY
             );
         }
         assert_eq!(
