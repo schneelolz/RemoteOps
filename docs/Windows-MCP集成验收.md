@@ -25,3 +25,11 @@ UIA `invoke_control` 还支持 `submit`（调用目标控件的 InvokePattern）
 后续现场复测已恢复交互桌面：截图为 2560×1440，前台句柄、Session 1、`WinSta0\Default` 和 UIA 均可用。`0.2.0-preview.19` Agent 的 `move` 已实测 `action_sent=true`、`effect_verified=true`，后置光标坐标与目标一致；从 `(1200,700)` 到 `(1300,800)` 的拖拽也已实测 `action_sent=true`、`effect_verified=true`，最终光标为 `(1300,800)`。点击、双击、右键、中键、滚轮和键盘组合均已实测发送成功，但在空白 Agent 窗口上没有可观察 UIA 状态变化，因此按协议返回 `effect_verified=false`。资源管理器地址栏 UIA `type_text` 输入 `C:\Windows` 和 `press_enter` 提交均已实测 `action_sent=true`、`effect_verified=true`。
 
 2026-09-13 PC130 现场纯图形界面链路复测（Agent `0.2.0-preview.20`）已完成：先对桌面左上角“此电脑”图形项执行坐标双击，前台窗口由 `Program Manager` 变为 `此电脑 - 文件资源管理器`；随后在“此电脑”截图中对 `本地磁盘 (U:)` 图标执行坐标双击，前台窗口变为 `本地磁盘 (U:) - 文件资源管理器`；最后在 U 盘根目录截图中对 `BaiduNetdiskDownload` 文件夹图形项执行坐标双击，前台窗口变为该文件夹。三步均使用目标窗口指纹和截图前后校验，没有使用地址栏输入、命令行 `explorer` 或直接路径导航。第一步动作返回的自动效果校验为 `false`，但前后截图和窗口标题已证明双击生效；后两步均返回 `action_sent=true`、`effect_verified=true`。同一现场还实测了右键菜单、Escape 关闭菜单、返回按钮、滚轮和 `Ctrl+A` 输入发送。Explorer 的虚拟化 `listview` 目前仍主要返回容器节点，已在 `0.2.0-preview.21` 加入 Raw View 遍历和更深层级枚举；在 UIA 项目不可访问时，验收采用带目标窗口指纹的截图坐标回退，并保留上述前后截图证据。
+
+2026-09-22 PC130 现场图形能力复测（Agent `0.2.0-preview.24`，RDP Session 1 交互桌面）验证了观察链路修复：UI 树 JSON 序列化深度由 8 提升到 32 后不再出现字符串化节点，Explorer 的 8 个文件项目全部以 `ControlType.ListItem` 返回，111 个节点携带 `rect`，树深度由 3 层恢复到 6 层；`invoke_control` 借助与观察一致的 RawView 遍历能直接打开文件项目（`action_sent=true`、`effect_verified=true`，窗口标题变为 `7ZipSfx.000 - 文件资源管理器`）。
+
+同轮实测：以 `rect` 中心 `(749,474)` 坐标双击命中 `7ZipSfx.000`；以“向上一级”按钮 `rect` 中心 `(399,353)` 坐标点击后导航回 `Temp`；`type_text` 写入地址栏、`key:ESC` 关闭开始菜单、`wait_for_visual_state` 等待窗口条件均得到预期结果；对 `cmd.exe` 发送 `ESC` 正确返回 `effect_verified=false`，无效操作不会被误报。
+
+本轮同时确认两个观察缺口与处置：右键菜单属于无标题的顶级弹出窗口，既不在前台窗口的 UIA 子树中，也被窗口枚举的标题过滤排除，因此菜单确实弹出但动作返回 `effect_verified=false`；`0.2.0-preview.25` 在观察结果中新增 `popups` 字段，枚举无标题顶级窗口（含 `rect`，最多 4 个），并把弹出层纳入效果变化比较。控制器本地 MCP `0.2.0-preview.10` 早于拖拽终点字段引入的提交，`end_x`/`end_y` 在传输中被忽略，拖拽返回“拖拽输入缺少终点”；`0.2.0-preview.11` 的 MCP 组件已包含该字段与 `drag_to` 编码，需与控制端一并更新后再做现场拖拽复测。
+
+截至本轮结束，`drag`、`wheel_up/down`、`middle_click` 与 `popups` 的现场复测待新 MCP 与 Agent 部署后完成。

@@ -849,6 +849,27 @@ if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
   } catch { $screenshotError = (Safe-Text $_.Exception.Message); $shot = $null; $w = $null; $h = $null }
   finally { if ($null -ne $g) { $g.Dispose() }; if ($null -ne $bmp) { $bmp.Dispose() }; if ($null -ne $ms) { $ms.Dispose() } }
 }
+# 右键菜单等弹出层不在前台窗口的 UIA 子树里，也不带标题，单独枚举无标题的顶级窗口。
+# 弹出窗口不是前台窗口，控制器只能用 rect 做坐标操作；最多保留 4 个避免噪音。
+$popups=@()
+if($null -ne $ui -and $env:REMOTEOPS_INCLUDE_UI_TREE -eq '1'){
+ try {
+  $rootElement=[System.Windows.Automation.AutomationElement]::RootElement
+  foreach($topWindow in $rootElement.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition)){
+   try {
+    if($topWindow.Current.NativeWindowHandle -eq $foreground.ToInt64()){continue}
+    if(-not [string]::IsNullOrEmpty((Safe-Text $topWindow.Current.Name))){continue}
+    $bounds=$topWindow.Current.BoundingRectangle
+    if([double]::IsNaN($bounds.Width) -or [double]::IsInfinity($bounds.Width)){continue}
+    if($bounds.Width -lt 24 -or $bounds.Height -lt 24){continue}
+    $popupNode=Convert-Uia $topWindow 0 'popup'
+    if($null -ne $popupNode){$popupNode | Add-Member -NotePropertyName popup -NotePropertyValue $true; $popups += $popupNode}
+   } catch {}
+   if($popups.Count -ge 4){break}
+  }
+ } catch {}
+ $ui | Add-Member -NotePropertyName popups -NotePropertyValue $popups
+}
 if($null -ne $ui){$ui | Add-Member -NotePropertyName diagnostics -NotePropertyValue $desktopContext}
 if($null -ne $ui -and $null -ne $screenshotError){$ui | Add-Member -NotePropertyName screenshot_error -NotePropertyValue $screenshotError}
 [void]0
@@ -1324,14 +1345,20 @@ fn foreground_window_switched(before: &VisualObservation, after: &VisualObservat
 }
 
 /// 剔除上游光标、其他窗口和诊断元信息；它们不能证明目标控件操作生效。
+/// 弹出层参与比较，右键菜单出现或消失都算可观测变化。
 #[cfg(windows)]
 fn native_uia_state(node: &serde_json::Value) -> serde_json::Value {
+    fn map_nodes(value: Option<&serde_json::Value>) -> Option<Vec<serde_json::Value>> {
+        value
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.iter().map(native_uia_state).collect())
+    }
     serde_json::json!({
         "name":node.get("name"),
         "automation_id":node.get("automation_id"),
         "control_type":node.get("control_type"),
-        "children":node.get("children").and_then(serde_json::Value::as_array)
-            .map(|children| children.iter().map(native_uia_state).collect::<Vec<_>>())
+        "children":map_nodes(node.get("children")),
+        "popups":map_nodes(node.get("popups"))
     })
 }
 
@@ -1731,5 +1758,42 @@ $offscreen=[pscustomobject]@{{Current=[pscustomobject]@{{BoundingRectangle=[pscu
             &observation(Some("same-window")),
             &observation(Some("same-window"))
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn popup_appearance_counts_as_observable_effect() {
+        let tree = |popups: serde_json::Value| {
+            serde_json::json!({
+                "available": true,
+                "name": "Temp - 文件资源管理器",
+                "children": [{"name": "项目视图"}],
+                "popups": popups
+            })
+        };
+        let make = |ui: serde_json::Value| VisualObservation {
+            request_id: RequestId::new(),
+            session_id: SessionId::new(),
+            provider_instance_id: "test".to_owned(),
+            state: remoteops_domain::VisualSessionState::Ready,
+            windows: Vec::new(),
+            displays: Vec::new(),
+            active_window_fingerprint: Some("window".to_owned()),
+            ui_tree: Some(ui),
+            screenshot_base64: None,
+            screenshot_width: None,
+            screenshot_height: None,
+            cursor_x: None,
+            cursor_y: None,
+            redacted: false,
+        };
+        let closed = make(tree(serde_json::json!([])));
+        let opened = make(tree(
+            serde_json::json!([{"name": "打开", "control_type": "ControlType.MenuItem"}]),
+        ));
+        // 右键菜单弹出虽然没有改变前台窗口子树，仍然是可观测的界面变化。
+        assert!(observed_uia_change(&closed, &opened));
+        // 弹出层保持不变时不产生误判。
+        assert!(!observed_uia_change(&closed, &closed.clone()));
     }
 }
