@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-EXPECTED_VERSION="0.2.0-preview.5"
+EXPECTED_MCP_VERSION="0.2.0-preview.11"
+EXPECTED_CREDENTIAL_PROMPT_VERSION="0.2.0-preview.5"
 KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
@@ -18,18 +19,18 @@ fail() { echo "[失败] $1" >&2; failures=$((failures + 1)); }
 CONFIG_PATH="$CODEX_HOME/config.toml"
 CONNECTION_CONFIG="$CODEX_HOME/remoteops/controller-config.json"
 LAUNCHER="$CODEX_HOME/remoteops/launch-remoteops-controller-mcp.sh"
-BINARY="$CODEX_HOME/remoteops/remoteops-controller-mcp-$EXPECTED_VERSION"
+BINARY="$CODEX_HOME/remoteops/remoteops-controller-mcp-$EXPECTED_MCP_VERSION"
 CREDENTIAL_PROMPT="$CODEX_HOME/remoteops/remoteops-credential-prompt"
 
 [[ -x "$BINARY" ]] && pass "MCP 程序存在且可执行。" || fail "未找到当前版本 MCP：$BINARY"
 [[ -x "$CREDENTIAL_PROMPT" ]] && pass "SSH 密码安全输入程序存在且可执行。" || fail "缺少 SSH 密码安全输入程序。"
 if [[ -x "$BINARY" ]]; then
   version_output="$($BINARY --version 2>&1 || true)"
-  [[ "$version_output" == *"$EXPECTED_VERSION"* ]] && pass "MCP 版本：$version_output" || fail "MCP 版本不正确：$version_output"
+  [[ "$version_output" == *"$EXPECTED_MCP_VERSION"* ]] && pass "MCP 版本：$version_output" || fail "MCP 版本不正确：$version_output"
 fi
 if [[ -x "$CREDENTIAL_PROMPT" ]]; then
   prompt_version_output="$($CREDENTIAL_PROMPT --version 2>&1 || true)"
-  [[ "$prompt_version_output" == *"$EXPECTED_VERSION"* ]] && pass "SSH 密码安全输入程序版本：$prompt_version_output" || fail "SSH 密码安全输入程序版本不正确：$prompt_version_output"
+  [[ "$prompt_version_output" == *"$EXPECTED_CREDENTIAL_PROMPT_VERSION"* ]] && pass "SSH 密码安全输入程序版本：$prompt_version_output" || fail "SSH 密码安全输入程序版本不正确：$prompt_version_output"
 fi
 [[ -x "$LAUNCHER" ]] && pass "Keychain 启动脚本存在。" || fail "缺少 MCP 启动脚本。"
 security find-generic-password -a "$CURRENT_USER" -s "$KEYCHAIN_SERVICE" -w >/dev/null 2>&1 && pass "Controller Token 已存在于 Keychain。" || fail "Keychain 中没有 Controller Token。"

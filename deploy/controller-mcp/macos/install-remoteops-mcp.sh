@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-PACKAGE_VERSION="0.2.0-preview.5"
+MCP_PACKAGE_VERSION="0.2.0-preview.11"
+CREDENTIAL_PROMPT_VERSION="0.2.0-preview.5"
 KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
@@ -85,11 +86,11 @@ if [[ ! -f "$SOURCE_SKILL/SKILL.md" ]]; then
   echo "安装包缺少 RemoteOps skill。" >&2
   exit 1
 fi
-if ! "$SOURCE_BINARY" --version | grep -Fq "$PACKAGE_VERSION"; then
+if ! "$SOURCE_BINARY" --version | grep -Fq "$MCP_PACKAGE_VERSION"; then
   echo "MCP 可执行文件版本与安装包不一致。" >&2
   exit 1
 fi
-if ! "$SOURCE_CREDENTIAL_PROMPT" --version | grep -Fq "$PACKAGE_VERSION"; then
+if ! "$SOURCE_CREDENTIAL_PROMPT" --version | grep -Fq "$CREDENTIAL_PROMPT_VERSION"; then
   echo "SSH 密码安全输入程序版本与安装包不一致。" >&2
   exit 1
 fi
@@ -128,7 +129,7 @@ elif ! security find-generic-password -a "$CURRENT_USER" -s "$KEYCHAIN_SERVICE" 
 fi
 
 INSTALL_DIR="$CODEX_HOME/remoteops"
-INSTALLED_BINARY="$INSTALL_DIR/remoteops-controller-mcp-$PACKAGE_VERSION"
+INSTALLED_BINARY="$INSTALL_DIR/remoteops-controller-mcp-$MCP_PACKAGE_VERSION"
 INSTALLED_CREDENTIAL_PROMPT="$INSTALL_DIR/remoteops-credential-prompt"
 LAUNCHER="$INSTALL_DIR/launch-remoteops-controller-mcp.sh"
 CONNECTION_CONFIG="$INSTALL_DIR/controller-config.json"
@@ -235,7 +236,7 @@ chmod 600 "$CONFIG_PATH"
 find "$INSTALL_DIR" -maxdepth 1 -type f -name 'remoteops-controller-mcp-*' ! -name "$(basename "$INSTALLED_BINARY")" -delete
 
 echo
-echo "RemoteOps MCP $PACKAGE_VERSION 已安装。"
+echo "RemoteOps MCP $MCP_PACKAGE_VERSION 已安装。"
 echo "程序：$INSTALLED_BINARY"
 echo "配置：$CONFIG_PATH"
 echo "Relay 配置：$CONNECTION_CONFIG"

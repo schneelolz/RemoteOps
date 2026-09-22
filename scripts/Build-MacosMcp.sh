@@ -4,7 +4,7 @@ set -euo pipefail
 WORKSPACE_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 TARGET="aarch64-apple-darwin"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
-VERSION="$(cargo metadata --manifest-path "$WORKSPACE_ROOT/Cargo.toml" --format-version 1 --no-deps --locked | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"]=="remoteops-controller-mcp"))')"
+read -r VERSION CREDENTIAL_PROMPT_VERSION <<<"$(cargo metadata --manifest-path "$WORKSPACE_ROOT/Cargo.toml" --format-version 1 --no-deps --locked | python3 -c 'import json,sys; data=json.load(sys.stdin); versions={p["name"]:p["version"] for p in data["packages"]}; print(versions["remoteops-controller-mcp"], versions["remoteops-credential-prompt"])')"
 OUTPUT_ROOT="${1:-$WORKSPACE_ROOT/artifacts/release/$VERSION/mcp}"
 PACKAGE_NAME="RemoteOps-MCP-macOS-arm64-$VERSION"
 PACKAGE_DIR="$OUTPUT_ROOT/$PACKAGE_NAME"
@@ -33,7 +33,7 @@ pwsh -NoProfile -File "$WORKSPACE_ROOT/scripts/New-ThirdPartyNotices.ps1" -Outpu
 lipo -archs "$PACKAGE_DIR/remoteops-controller-mcp" | grep -qw arm64
 lipo -archs "$PACKAGE_DIR/remoteops-credential-prompt" | grep -qw arm64
 "$PACKAGE_DIR/remoteops-controller-mcp" --version | grep -Fq "$VERSION"
-"$PACKAGE_DIR/remoteops-credential-prompt" --version | grep -Fq "$VERSION"
+"$PACKAGE_DIR/remoteops-credential-prompt" --version | grep -Fq "$CREDENTIAL_PROMPT_VERSION"
 pwsh -NoProfile -File "$WORKSPACE_ROOT/scripts/Test-ReleaseArtifacts.ps1" -ArtifactRoot "$PACKAGE_DIR" -RequireLegalFiles
 tar -C "$OUTPUT_ROOT" -czf "$ARCHIVE_PATH" "$PACKAGE_NAME"
 shasum -a 256 "$ARCHIVE_PATH"
