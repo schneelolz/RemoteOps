@@ -118,6 +118,14 @@ function Assert-RemoteOpsTarget {
  if($actual -cne $env:REMOTEOPS_WINDOW_FINGERPRINT){throw 'foreground_target_changed'}
  return $handle
 }
+function Assert-RemoteOpsTargetUnchanged([IntPtr]$initialHandle) {
+ # 拖拽和窗口按钮会改变窗口位置、尺寸甚至标题，完整指纹复核必然失效；
+ # 窗口句柄在移动或改标题时保持不变，只在真正切换前台时才变化。
+ $current=(Get-RemoteOpsForeground).handle
+ if($current -eq [IntPtr]::Zero){throw 'foreground_window_unavailable'}
+ $current=[RemoteOpsTarget]::GetAncestor($current,2)
+ if($current -ne $initialHandle){throw 'foreground_window_changed'}
+}
 "#;
 
 #[cfg(windows)]
@@ -636,7 +644,7 @@ public static class RemoteOpsInput {
 '@ }
 [void](Assert-RemoteOpsTarget)
 if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS_Y)){throw '无法定位鼠标'}
-[void](Assert-RemoteOpsTarget)
+$targetHandle=Assert-RemoteOpsTarget
 $inputName=$env:REMOTEOPS_INPUT
 switch -Regex ($inputName) {
  '^move$' { break }
@@ -665,7 +673,7 @@ switch -Regex ($inputName) {
  }
  default { throw '不支持的图形输入' }
 }
-[void](Assert-RemoteOpsTarget)
+Assert-RemoteOpsTargetUnchanged $targetHandle
 [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
         let script = format!(
@@ -1795,5 +1803,17 @@ $offscreen=[pscustomobject]@{{Current=[pscustomobject]@{{BoundingRectangle=[pscu
         assert!(observed_uia_change(&closed, &opened));
         // 弹出层保持不变时不产生误判。
         assert!(!observed_uia_change(&closed, &closed.clone()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_recheck_tolerates_window_geometry_changes() {
+        // 拖拽和窗口按钮会改变窗口位置或标题；末尾复核必须用句柄，
+        // 否则拿包含位置与标题的完整指纹复比一定会报 foreground_target_changed。
+        assert!(TARGET_WINDOW_GUARD.contains("function Assert-RemoteOpsTargetUnchanged"));
+        assert!(
+            TARGET_WINDOW_GUARD
+                .contains("if($current -ne $initialHandle){throw 'foreground_window_changed'}")
+        );
     }
 }
