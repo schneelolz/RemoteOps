@@ -1150,8 +1150,12 @@ impl VisualProvider for WindowsVisualProvider {
     }
 }
 
+// 以下解析与校验函数只服务 Windows 的坐标回退路径；
+// 缺少 cfg 时 Linux 构建会把它们当成 dead code 并在 -D warnings 下编译失败。
+#[cfg(windows)]
 type VisualInputParts<'a> = (&'a str, Option<(i32, i32)>);
 
+#[cfg(windows)]
 fn parse_visual_input(input: &str) -> Result<VisualInputParts<'_>, VisualProviderError> {
     if let Some(value) = input.strip_prefix("drag_to:") {
         let (x, y) = value
@@ -1168,6 +1172,7 @@ fn parse_visual_input(input: &str) -> Result<VisualInputParts<'_>, VisualProvide
     Ok((input, None))
 }
 
+#[cfg(windows)]
 fn target_with_drag_endpoint(
     target: &VisualTarget,
     endpoint: Option<(i32, i32)>,
@@ -1203,6 +1208,7 @@ fn target_with_drag_endpoint(
     })
 }
 
+#[cfg(windows)]
 fn is_supported_input(input: &str) -> bool {
     matches!(
         input,
@@ -1525,6 +1531,7 @@ impl VisualProvider for MockVisualProvider {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn keyboard_input_requires_non_empty_key_name() {
         assert!(is_supported_input("key:ENTER"));
@@ -1689,6 +1696,7 @@ $foreground=Get-RemoteOpsForeground
         assert!(result.effect_verified);
     }
 
+    #[cfg(windows)]
     #[test]
     fn listview_helpers_keep_file_children_and_control_rectangles() {
         // Explorer 的文件项目只在 ListView 的 RawView 子树里可见，退化成 ControlView 就看不到文件列表。
