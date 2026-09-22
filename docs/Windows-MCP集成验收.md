@@ -33,3 +33,11 @@ UIA `invoke_control` 还支持 `submit`（调用目标控件的 InvokePattern）
 本轮同时确认两个观察缺口与处置：右键菜单属于无标题的顶级弹出窗口，既不在前台窗口的 UIA 子树中，也被窗口枚举的标题过滤排除，因此菜单确实弹出但动作返回 `effect_verified=false`；`0.2.0-preview.25` 在观察结果中新增 `popups` 字段，枚举无标题顶级窗口（含 `rect`，最多 4 个），并把弹出层纳入效果变化比较。控制器本地 MCP `0.2.0-preview.10` 早于拖拽终点字段引入的提交，`end_x`/`end_y` 在传输中被忽略，拖拽返回“拖拽输入缺少终点”；`0.2.0-preview.11` 的 MCP 组件已包含该字段与 `drag_to` 编码，需与控制端一并更新后再做现场拖拽复测。
 
 截至本轮结束，`drag`、`wheel_up/down`、`middle_click` 与 `popups` 的现场复测待新 MCP 与 Agent 部署后完成。
+
+2026-09-22 后续复测（Agent `0.2.0-preview.26` + 控制器 MCP `0.2.0-preview.11`）补齐了上一轮遗留的三项，并修复一处拖拽误报：坐标输入的末尾复核原本使用包含进程、标题和窗口矩形的完整指纹，拖拽移动窗口自身后必然失配并返回 `foreground_target_changed`；现改为只比较根窗口句柄（`Assert-RemoteOpsTargetUnchanged`），窗口在移动或改标题时句柄保持不变，只有真正切换前台才拒绝。修复后拖拽实测 `action_sent=true`、`effect_verified=true`，窗口由 `(1012,481)` 移到 `(832,361)`，位移与请求一致。
+
+弹出层观察在同一轮验证：右键点击文件后观察结果返回 `popups`（`ControlType.Pane`、`rect 536,500,206x374`），动作返回 `action_sent=true`、`effect_verified=true`，菜单出现已计入可观测变化。滚轮与中键在 `System32` 目录实测 `action_sent=true`、`effect_verified=true`；中键点击还打开了 `AppV` 文件夹，为动作确实送达提供了独立证据。
+
+需要留意的环境细节：RDP 会话重连后显示器标识会变化（本轮由 `\.DISPLAY65` 变为 `\.DISPLAY81`），坐标目标必须使用当次 `observe_window` 返回的 `displays[].display_id`，硬编码历史值会得到“目标显示器不存在”。
+
+截至本轮，`move`、`click`、`double_click`、`right_click`、`middle_click`、`wheel_up/down`、`drag`、`key:<键名>`、UIA `invoke/submit/press_enter` 与 `type_text` 均已在现场实测通过。弹出层目前只回报窗口级 `rect`，菜单项本身仍不进入 UIA 子树；需要点选具体菜单项时应结合截图坐标。
