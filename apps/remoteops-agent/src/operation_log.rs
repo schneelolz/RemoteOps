@@ -428,6 +428,12 @@ fn operation_label(operation: &RemoteOperation) -> &'static str {
         RemoteOperation::ReleaseHumanTakeover => "释放人工接管",
         RemoteOperation::EmergencyStop => "紧急停止",
         RemoteOperation::CancelRequest { .. } => "取消请求",
+        RemoteOperation::VisualObserve { .. } => "图形观察",
+        RemoteOperation::VisualWaitFor { .. } => "等待图形状态",
+        RemoteOperation::VisualInvoke { .. } => "图形控件操作",
+        RemoteOperation::VisualTypeText { .. } => "图形文本输入",
+        RemoteOperation::VisualSendInput { .. } => "图形键鼠输入",
+        RemoteOperation::VisualStop => "停止图形会话",
     }
 }
 

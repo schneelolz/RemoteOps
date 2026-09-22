@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
     [Parameter(Mandatory)]
@@ -17,7 +17,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$packageVersion = '0.2.0-preview.5'
+$mcpVersion = '0.2.0-preview.11'
+$credentialPromptVersion = '0.2.0-preview.5'
 $tokenVariable = 'REMOTEOPS_CONTROLLER_TOKEN'
 $ownerVariable = 'REMOTEOPS_CONTROLLER_OWNER_ID'
 $sourceExecutable = Join-Path $PSScriptRoot 'remoteops-controller-mcp.exe'
@@ -159,11 +160,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $sourceSkill 'SKILL.md') -PathType L
 }
 
 $versionOutput = (& $sourceExecutable --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($packageVersion)) {
+if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($mcpVersion)) {
     throw "MCP 可执行文件版本不正确：$versionOutput"
 }
 $promptVersionOutput = (& $sourceCredentialPrompt --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $promptVersionOutput -notmatch [regex]::Escape($packageVersion)) {
+if ($LASTEXITCODE -ne 0 -or $promptVersionOutput -notmatch [regex]::Escape($credentialPromptVersion)) {
     throw "SSH 密码安全输入程序版本不正确：$promptVersionOutput"
 }
 
@@ -201,7 +202,7 @@ $ownerValue = $OwnerId.ToString('D')
 [Environment]::SetEnvironmentVariable($ownerVariable, $ownerValue, 'User')
 
 $installDirectory = Join-Path $CodexHome 'remoteops'
-$installedExecutable = Join-Path $installDirectory "remoteops-controller-mcp-$packageVersion.exe"
+$installedExecutable = Join-Path $installDirectory "remoteops-controller-mcp-$mcpVersion.exe"
 $installedCredentialPrompt = Join-Path $installDirectory 'remoteops-credential-prompt.exe'
 $connectionConfigPath = Join-Path $installDirectory 'controller-config.json'
 $standardSkillDirectory = if ($isDefaultCodexHome) {
@@ -220,7 +221,7 @@ try {
 catch {
     $sourceHash = (Get-FileHash -LiteralPath $sourceExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
     $installedExecutable = Join-Path $installDirectory (
-        "remoteops-controller-mcp-$packageVersion-$($sourceHash.Substring(0, 12)).exe"
+        "remoteops-controller-mcp-$mcpVersion-$($sourceHash.Substring(0, 12)).exe"
     )
     if (Test-Path -LiteralPath $installedExecutable -PathType Leaf) {
         $installedHash = (
@@ -268,8 +269,8 @@ else {
     ''
 }
 $newline = if ($originalContent.Contains("`r`n")) { "`r`n" } else { "`n" }
-$retainedLines = Remove-RemoteOpsConfigSections -Content $originalContent
-$retainedLines = Set-CodexGranularApprovalPolicy -Lines $retainedLines
+$retainedLines = @(Remove-RemoteOpsConfigSections -Content $originalContent)
+$retainedLines = @(Set-CodexGranularApprovalPolicy -Lines $retainedLines)
 $configLines = [System.Collections.Generic.List[string]]::new()
 foreach ($line in $retainedLines) {
     $configLines.Add($line)
@@ -333,7 +334,7 @@ if (
 }
 
 Write-Host ''
-Write-Host "RemoteOps MCP $packageVersion 已安装。"
+Write-Host "RemoteOps MCP $mcpVersion 已安装。"
 Write-Host "程序：$installedExecutable"
 Write-Host "配置：$configPath"
 Write-Host "Relay 配置：$connectionConfigPath"

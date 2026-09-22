@@ -416,6 +416,43 @@ pub enum RemoteOperation {
         /// 被中断的请求标识。
         request_id: RequestId,
     },
+    /// 获取当前用户桌面能力和窗口状态。
+    VisualObserve {
+        /// 是否包含截图。
+        include_screenshot: bool,
+        /// 是否包含 UI Automation 树。
+        include_ui_tree: bool,
+    },
+    /// 等待指定的窗口、文本或状态变化。
+    VisualWaitFor {
+        /// 等待条件的 JSON 描述。
+        condition: String,
+        /// 最大等待毫秒数。
+        timeout_millis: u64,
+    },
+    /// 调用一个 UIA 控件动作。
+    VisualInvoke {
+        /// 目标控件或坐标。
+        target: crate::VisualTarget,
+        /// 结构化动作名称。
+        action: String,
+    },
+    /// 向已验证文本控件输入文字。
+    VisualTypeText {
+        /// 目标控件。
+        target: crate::VisualTarget,
+        /// 文本内容；敏感输入不得使用此字段。
+        text: String,
+    },
+    /// UIA 不可用时的坐标或键盘回退输入。
+    VisualSendInput {
+        /// 目标坐标。
+        target: crate::VisualTarget,
+        /// 键鼠输入的 JSON 描述。
+        input: String,
+    },
+    /// 停止当前图形 Provider 会话。
+    VisualStop,
 }
 
 /// 统一事件负载。
@@ -567,5 +604,25 @@ mod tests {
         assert!(json.contains("\"kind\":\"run_serial_query\""));
         assert!(json.contains("\"profile\":\"huawei_vrp\""));
         assert!(json.contains("\"max_pages\":50"));
+    }
+
+    #[test]
+    fn visual_operation_round_trips_with_target_fingerprint() {
+        let operation = RemoteOperation::VisualInvoke {
+            target: crate::VisualTarget::Control {
+                window_fingerprint: "window-1".to_owned(),
+                automation_id: Some("ok".to_owned()),
+                name: Some("OK".to_owned()),
+                control_type: Some("button".to_owned()),
+                target_fingerprint: "control-1".to_owned(),
+            },
+            action: "invoke".to_owned(),
+        };
+        let encoded = serde_json::to_string(&operation).expect("图形操作应能序列化");
+        let restored =
+            serde_json::from_str::<RemoteOperation>(&encoded).expect("图形操作应能反序列化");
+        assert_eq!(restored, operation);
+        assert!(encoded.contains("visual_invoke"));
+        assert!(encoded.contains("control-1"));
     }
 }

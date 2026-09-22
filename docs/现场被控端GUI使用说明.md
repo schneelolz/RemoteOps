@@ -1,8 +1,8 @@
 # RemoteOps 现场被控端 GUI 使用说明
 
-> 文档状态：当前现场客户机手册，适用于 Agent GUI `0.2.0-preview.9`。
+> 文档状态：当前现场客户机手册，适用于 Agent GUI `0.2.0-preview.23`。
 
-- 适用版本：`0.2.0-preview.9`
+- 适用版本：`0.2.0-preview.23`
 - 本地验收程序：`target/release/remoteops-agent-gui.exe`（尚未发布）
 - Relay：由部署者配置，不内置公共默认值
 - 使用方式：管理员完成一次配置后，现场人员双击启动

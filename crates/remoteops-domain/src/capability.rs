@@ -24,6 +24,8 @@ pub enum Capability {
     TcpExchange,
     /// 进程、服务和系统电源操作能力。
     SystemOperations,
+    /// 交互式 Windows 桌面图形能力。
+    Visual,
 }
 
 /// Agent 已启用能力的有序集合。

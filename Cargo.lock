@@ -3736,7 +3736,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.7"
+version = "0.2.0-preview.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3750,6 +3750,7 @@ dependencies = [
  "remoteops-policy",
  "remoteops-protocol",
  "remoteops-serial",
+ "remoteops-visual",
  "serde",
  "serde_json",
  "tokio",
@@ -3761,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.9"
+version = "0.2.0-preview.26"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3773,6 +3774,7 @@ dependencies = [
  "remoteops-domain",
  "remoteops-i18n",
  "remoteops-protocol",
+ "remoteops-visual",
  "rfd",
  "rustls",
  "serde",
@@ -3783,7 +3785,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-service"
-version = "0.2.0-preview.7"
+version = "0.2.0-preview.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3895,7 +3897,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-mcp"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.11"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3954,9 +3956,11 @@ dependencies = [
 name = "remoteops-domain"
 version = "0.2.0-preview.5"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "uuid",
 ]
@@ -4096,6 +4100,20 @@ name = "remoteops-ssh-askpass"
 version = "0.2.0-preview.6"
 dependencies = [
  "winresource",
+]
+
+[[package]]
+name = "remoteops-visual"
+version = "0.2.0-preview.5"
+dependencies = [
+ "async-trait",
+ "remoteops-domain",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4286,9 +4304,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
  "ring",

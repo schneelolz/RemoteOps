@@ -8,6 +8,8 @@ mod event;
 mod identifiers;
 mod lease;
 mod permission;
+mod visual;
+mod visual_wait;
 
 pub use capability::{Capability, CapabilitySet, ShellKind};
 pub use connection::{ConnectionDescriptor, ConnectionState, SessionRole};
@@ -26,3 +28,11 @@ pub use identifiers::{
 };
 pub use lease::PairingLease;
 pub use permission::PermissionMode;
+pub use visual::{
+    VisualActionResult, VisualCapability, VisualDisplay, VisualObservation, VisualSessionState,
+    VisualTarget, VisualWindow,
+};
+pub use visual_wait::{
+    DEFAULT_VISUAL_WAIT_TIMEOUT_MILLIS, MAX_VISUAL_WAIT_CONDITION_BYTES,
+    MAX_VISUAL_WAIT_TIMEOUT_MILLIS, VisualWaitCondition, normalize_visual_wait_timeout,
+};

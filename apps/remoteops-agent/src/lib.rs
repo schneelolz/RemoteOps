@@ -16,6 +16,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -34,7 +35,7 @@ use remoteops_domain::{
     AgentInstanceId, ApprovalState, Capability, CapabilitySet, ControllerInstanceId,
     ControllerOwnerId, EnvironmentProfile, EventPayload, FileTransferId, PermissionMode,
     RemoteEvent, RemoteOperation, RequestId, SerialSessionId, SessionId, ShellId, ShellKind,
-    ShellProfile, ToolProfile,
+    ShellProfile, ToolProfile, VisualWaitCondition, normalize_visual_wait_timeout,
 };
 use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel};
 use remoteops_protocol::{
@@ -49,12 +50,13 @@ use remoteops_serial::{
     SerialDirection, SerialObservedChunk, SerialQueryError, SerialQueryPlan, SerialQueryRunner,
     SerialQueryTransport, SerialTranscript,
 };
+use remoteops_visual::{VisualProvider, default_visual_provider};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{Mutex, Notify, mpsc, watch},
     task::JoinHandle,
-    time::{Duration, interval, sleep},
+    time::{Duration, interval, sleep, timeout},
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -668,6 +670,8 @@ struct RequestRuntimeState {
     file_uploads: Arc<Mutex<BTreeMap<FileTransferId, FileUploadRuntime>>>,
     /// 当前连接已经消费的加密凭据载荷标识。
     used_credential_envelopes: Arc<Mutex<BTreeSet<RequestId>>>,
+    /// 当前用户 Session 的图形 Provider。
+    visual_provider: Arc<dyn VisualProvider>,
 }
 
 struct PendingTask {
@@ -925,8 +929,42 @@ pub async fn run_agent(
 pub async fn run_agent_with_permission_control(
     config: AgentConfig,
     event_sender: Option<AgentEventSender>,
+    shutdown: watch::Receiver<bool>,
+    permission_control: AgentPermissionControl,
+) -> anyhow::Result<()> {
+    let visual_enabled = cfg!(windows)
+        && env::var("REMOTEOPS_VISUAL_PROVIDER_ENABLED")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let visual_provider: Arc<dyn VisualProvider> = if visual_enabled {
+        default_visual_provider()
+    } else {
+        Arc::new(remoteops_visual::UnavailableVisualProvider)
+    };
+    run_agent_with_visual_provider(
+        config,
+        event_sender,
+        shutdown,
+        permission_control,
+        visual_provider,
+        visual_enabled,
+    )
+    .await
+}
+
+/// 使用表现层显式提供的视觉 Provider 运行 Agent。
+/// GUI 宿主通过此入口启用本机视觉能力，无需依赖进程环境变量。
+///
+/// # Errors
+///
+/// 当本地状态、证书、设备或 Relay 生命周期无法继续时返回错误。
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_agent_with_visual_provider(
+    config: AgentConfig,
+    event_sender: Option<AgentEventSender>,
     mut shutdown: watch::Receiver<bool>,
     permission_control: AgentPermissionControl,
+    visual_provider: Arc<dyn VisualProvider>,
+    visual_enabled: bool,
 ) -> anyhow::Result<()> {
     let client_config = if let Some(certificate_path) = config.ca_cert.as_deref() {
         load_client_config(certificate_path)
@@ -949,7 +987,39 @@ pub async fn run_agent_with_permission_control(
         })?,
     );
     let environment = detect_environment_profile(device.as_ref()).await;
-    let capabilities = capabilities_from_environment(&environment);
+    // Provider 必须跨请求复用，外部 Windows-MCP 的子进程和 Named Pipe
+    // 生命周期不能随着每个请求重新创建。
+    let visual_ready = if visual_enabled {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            visual_provider.observe(RequestId::new(), SessionId::new(), false, true),
+        )
+        .await
+        {
+            Ok(Ok(observation)) => {
+                let ready = matches!(
+                    observation.state,
+                    remoteops_domain::VisualSessionState::Ready
+                ) && !observation.windows.is_empty()
+                    && observation.active_window_fingerprint.is_some();
+                if !ready {
+                    warn!(state = ?observation.state, windows = observation.windows.len(), "图形 Provider 未通过启动探测");
+                }
+                ready
+            }
+            Ok(Err(error)) => {
+                warn!(%error, "图形 Provider 启动探测失败");
+                false
+            }
+            Err(_) => {
+                warn!("图形 Provider 启动探测超时");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let capabilities = capabilities_from_environment(&environment, visual_ready);
     let host_identity = remoteops_host_identity::collect();
     let hostname = host_identity.hostname;
     let mac_address = host_identity.mac_address;
@@ -1017,6 +1087,7 @@ pub async fn run_agent_with_permission_control(
             operating_system.clone(),
             capabilities.clone(),
             environment.clone(),
+            visual_provider.clone(),
             device.clone(),
             sequence.clone(),
             shell_sessions.clone(),
@@ -1071,6 +1142,7 @@ async fn run_connection<S>(
     operating_system: String,
     capabilities: CapabilitySet,
     environment: EnvironmentProfile,
+    visual_provider: Arc<dyn VisualProvider>,
     device: Arc<SystemDevice>,
     sequence: Arc<AtomicU64>,
     shell_sessions: Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
@@ -1257,7 +1329,16 @@ where
                         .values()
                         .any(|binding| binding.session_id == session_id)
                     {
+                        abort_pending_tasks_for_session(
+                            &tasks,
+                            Some(&log_observer),
+                            session_id,
+                            "Controller 会话已撤销，操作已中断",
+                        )
+                        .await;
                         close_file_uploads_for_session(&file_uploads, session_id).await;
+                        close_session_resources(&shell_sessions, &serial_sessions, session_id)
+                            .await;
                     }
                     update_active_owner(&local_permission_policy, &controller_bindings);
                     emit_agent_event(
@@ -1433,6 +1514,7 @@ where
                     serial_sessions: serial_sessions.clone(),
                     file_uploads: file_uploads.clone(),
                     used_credential_envelopes: used_credential_envelopes.clone(),
+                    visual_provider: visual_provider.clone(),
                 };
                 let terminal = Arc::new(AtomicTaskTerminal::running());
                 let interactive_shell = pending_interactive_shell(&request, &shell_sessions).await;
@@ -1650,6 +1732,50 @@ fn set_operation_readonly(operation: &mut RemoteOperation, readonly: bool) {
     }
 }
 
+async fn wait_for_visual_condition(
+    provider: &dyn VisualProvider,
+    request_id: RequestId,
+    session_id: SessionId,
+    condition: &str,
+    timeout_millis: u64,
+) -> anyhow::Result<remoteops_domain::VisualObservation> {
+    let condition = VisualWaitCondition::parse(condition).map_err(|error| anyhow!(error))?;
+    let timeout_millis =
+        normalize_visual_wait_timeout(Some(timeout_millis)).map_err(|error| anyhow!(error))?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_millis);
+    let include_screenshot = matches!(condition, VisualWaitCondition::Hash { .. });
+    let include_ui_tree = matches!(
+        condition,
+        VisualWaitCondition::Text { .. } | VisualWaitCondition::Control { .. }
+    );
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("图形等待超时（{timeout_millis} 毫秒）");
+        }
+        let observation = timeout(
+            remaining,
+            provider.observe(request_id, session_id, include_screenshot, include_ui_tree),
+        )
+        .await
+        .map_err(|_| anyhow!("图形观察超出等待截止时间"))?
+        .map_err(|error| anyhow!(error.to_string()))?;
+        if observation.request_id != request_id {
+            bail!("图形观察 request_id 与等待请求不匹配");
+        }
+        if observation.session_id != session_id {
+            bail!("图形观察 session_id 与等待请求不匹配");
+        }
+        if condition.matches(&observation) {
+            return Ok(observation);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("图形等待超时（{timeout_millis} 毫秒）");
+        }
+        sleep(Duration::from_millis(250).min(remaining)).await;
+    }
+}
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let maximum = left.len().max(right.len());
     let mut difference = left.len() ^ right.len();
@@ -2437,6 +2563,73 @@ async fn execute_operation(
         RemoteOperation::CancelRequest { .. } => {
             unreachable!("取消请求在连接循环中处理");
         }
+        RemoteOperation::VisualObserve {
+            include_screenshot,
+            include_ui_tree,
+        } => {
+            let observation = runtime_state
+                .visual_provider
+                .observe(
+                    request.request_id,
+                    request.session_id,
+                    *include_screenshot,
+                    *include_ui_tree,
+                )
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形观察已完成".clone_into(&mut response.summary);
+            response.details = Some(serde_json::to_value(observation)?);
+        }
+        RemoteOperation::VisualWaitFor {
+            condition,
+            timeout_millis,
+        } => {
+            let observation = wait_for_visual_condition(
+                runtime_state.visual_provider.as_ref(),
+                request.request_id,
+                request.session_id,
+                condition,
+                *timeout_millis,
+            )
+            .await?;
+            "图形状态等待已完成".clone_into(&mut response.summary);
+            response.details = Some(serde_json::to_value(observation)?);
+        }
+        RemoteOperation::VisualInvoke { target, action } => {
+            let result = runtime_state
+                .visual_provider
+                .invoke(request.request_id, request.session_id, target, action)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形控件动作已处理".clone_into(&mut response.summary);
+            response.details = Some(serde_json::to_value(result)?);
+        }
+        RemoteOperation::VisualTypeText { target, text } => {
+            let result = runtime_state
+                .visual_provider
+                .type_text(request.request_id, request.session_id, target, text)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形文本输入已处理".clone_into(&mut response.summary);
+            response.details = Some(serde_json::to_value(result)?);
+        }
+        RemoteOperation::VisualSendInput { target, input } => {
+            let result = runtime_state
+                .visual_provider
+                .send_input(request.request_id, request.session_id, target, input)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形输入已处理".clone_into(&mut response.summary);
+            response.details = Some(serde_json::to_value(result)?);
+        }
+        RemoteOperation::VisualStop => {
+            runtime_state
+                .visual_provider
+                .stop(request.session_id)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            "图形会话已停止".clone_into(&mut response.summary);
+        }
     }
     Ok(response)
 }
@@ -2572,6 +2765,44 @@ async fn abort_pending_tasks(
                 let _ = task.await;
             }
         }
+    }
+}
+
+async fn abort_pending_tasks_for_session(
+    tasks: &Arc<Mutex<BTreeMap<RequestId, PendingTask>>>,
+    log_observer: Option<&Arc<std::sync::Mutex<operation_log::LogObserver>>>,
+    session_id: SessionId,
+    message: &str,
+) {
+    let pending = {
+        let mut tasks = tasks.lock().await;
+        let ids = tasks
+            .iter()
+            .filter_map(|(id, task)| (task.session_id == session_id).then_some(*id))
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| tasks.remove(&id).map(|task| (task, id)))
+            .collect::<Vec<_>>()
+    };
+    for (pending, request_id) in pending {
+        let PendingTask {
+            session_id,
+            task,
+            terminal,
+            interactive_shell,
+        } = pending;
+        if terminal.try_commit(TaskTerminal::Aborted).is_ok() {
+            if let Some(observer) = log_observer
+                && let Ok(mut observer) = observer.lock()
+            {
+                observer.interrupt(session_id, request_id, Utc::now(), message);
+            }
+            if let Some(shell) = interactive_shell {
+                let _ = shell.interrupt().await;
+            }
+        }
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -2718,7 +2949,10 @@ fn spawn_serial_reader(
     tokio::spawn(async move {
         while !cancelled.load(Ordering::Relaxed) {
             match port.read(4096).await {
-                Ok(bytes) if bytes.is_empty() => {}
+                Ok(bytes) if bytes.is_empty() => {
+                    // 某些 Windows 串口驱动会立即返回空数据，避免空读忙等。
+                    sleep(Duration::from_millis(20)).await;
+                }
                 Ok(bytes) => {
                     transcript
                         .lock()
@@ -2841,7 +3075,10 @@ async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile
     }
 }
 
-fn capabilities_from_environment(environment: &EnvironmentProfile) -> CapabilitySet {
+fn capabilities_from_environment(
+    environment: &EnvironmentProfile,
+    visual_ready: bool,
+) -> CapabilitySet {
     let mut capabilities = vec![
         Capability::PortProbe,
         Capability::TcpExchange,
@@ -2862,6 +3099,9 @@ fn capabilities_from_environment(environment: &EnvironmentProfile) -> Capability
         .any(|tool| tool.name == "ssh" && tool.available)
     {
         capabilities.push(Capability::Ssh);
+    }
+    if visual_ready {
+        capabilities.push(Capability::Visual);
     }
     CapabilitySet::new(capabilities)
 }
@@ -3228,6 +3468,41 @@ async fn close_file_uploads_for_session(
     }
 }
 
+async fn close_session_resources(
+    shell_sessions: &Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
+    serial_sessions: &Arc<Mutex<BTreeMap<SerialSessionId, SerialRuntime>>>,
+    session_id: SessionId,
+) {
+    let shells = {
+        let mut sessions = shell_sessions.lock().await;
+        let ids = sessions
+            .iter()
+            .filter_map(|(id, runtime)| (runtime.session_id == session_id).then_some(*id))
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| sessions.remove(&id))
+            .map(|runtime| runtime.session)
+            .collect::<Vec<_>>()
+    };
+    for shell in shells {
+        let _ = shell.close().await;
+    }
+    let serials = {
+        let mut sessions = serial_sessions.lock().await;
+        let ids = sessions
+            .iter()
+            .filter_map(|(id, runtime)| (runtime.session_id == session_id).then_some(*id))
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| sessions.remove(&id))
+            .map(|runtime| runtime.cancelled)
+            .collect::<Vec<_>>()
+    };
+    for cancelled in serials {
+        cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
 fn print_agent_event(event: &AgentEvent) {
     match event {
         AgentEvent::Started {
@@ -3290,6 +3565,18 @@ fn print_agent_event(event: &AgentEvent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visual_capability_requires_successful_provider_initialization() {
+        let environment = remoteops_domain::EnvironmentProfile::empty();
+        assert!(
+            !super::capabilities_from_environment(&environment, false)
+                .contains(remoteops_domain::Capability::Visual)
+        );
+        assert!(
+            super::capabilities_from_environment(&environment, true)
+                .contains(remoteops_domain::Capability::Visual)
+        );
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use remoteops_domain::{
@@ -3339,6 +3626,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::clone(file_uploads),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+            visual_provider: default_visual_provider(),
         };
         let agent_instance_id = AgentInstanceId::new();
         let credential_encryption = CredentialEncryptionKeyPair::generate();
@@ -3546,6 +3834,7 @@ mod tests {
                 "test-os".to_owned(),
                 CapabilitySet::new([Capability::Cmd]),
                 EnvironmentProfile::empty(),
+                default_visual_provider(),
                 Arc::new(SystemDevice::new()),
                 Arc::new(AtomicU64::new(1)),
                 Arc::new(Mutex::new(BTreeMap::new())),
@@ -3744,6 +4033,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+            visual_provider: default_visual_provider(),
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let sequence = Arc::new(AtomicU64::new(1));
@@ -4479,6 +4769,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+            visual_provider: default_visual_provider(),
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let credential_encryption = CredentialEncryptionKeyPair::generate();
@@ -4573,6 +4864,7 @@ mod tests {
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+            visual_provider: default_visual_provider(),
         };
         let transfer_root = test_state_file("encrypted-ssh").with_extension("dir");
         let device = SystemDevice::with_transfer_root(&transfer_root).expect("应创建交换目录");

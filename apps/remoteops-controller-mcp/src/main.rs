@@ -21,7 +21,7 @@ use remoteops_domain::{
     ApprovalId, Capability, ControllerInstanceId, ControllerOwnerId, EventSource, FileTransferId,
     PairingCode, PermissionMode, PowerAction, RemoteOperation, SerialDataBits, SerialFlowControl,
     SerialLineEnding, SerialParity, SerialSettings, SerialStopBits, SerialTerminalProfile,
-    ServiceAction, SessionId, ShellId, ShellKind,
+    ServiceAction, SessionId, ShellId, ShellKind, VisualTarget,
 };
 use remoteops_protocol::{
     ControllerControlMode, ControllerControlModeUpdate, CredentialEncryptionContext,
@@ -402,6 +402,30 @@ struct ShellHandle {
 struct TargetInput {
     /// `list_connections` 返回的不可变 `session_id`。
     session_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VisualObserveInput {
+    session_id: String,
+    include_screenshot: Option<bool>,
+    include_ui_tree: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VisualWaitInput {
+    session_id: String,
+    condition: String,
+    timeout_millis: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct VisualActionInput {
+    session_id: String,
+    target: String,
+    action: Option<String>,
+    text: Option<String>,
+    input: Option<String>,
+    approval_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1403,7 +1427,7 @@ impl RemoteOpsMcp {
         if connection.credential_encryption_public_key.is_empty()
             || connection.credential_encryption_key_id.is_empty()
         {
-            return Err("Agent 未提供 v14 凭据加密公钥；请同步升级 Agent、Relay 和 MCP".to_owned());
+            return Err("Agent 未提供 v15 凭据加密公钥；请同步升级 Agent、Relay 和 MCP".to_owned());
         }
         let cache_key = SshCredentialCacheKey {
             session_id,
@@ -1879,7 +1903,31 @@ impl RemoteOpsMcp {
             .into_iter()
             .find(|connection| connection.session_id == session_id)
             .ok_or_else(|| "未找到 session_id".to_owned())?;
+        let windows_target = connection
+            .environment
+            .os_family
+            .eq_ignore_ascii_case("windows");
         let mut output = connection_output(connection);
+        if windows_target {
+            // 桌面会随 RDP 登录、锁屏和 Provider 恢复而变化，不复用首次注册的旧结论。
+            let current = self
+                .execute_simple(
+                    session_id.to_string(),
+                    RemoteOperation::VisualObserve {
+                        include_screenshot: false,
+                        include_ui_tree: false,
+                    },
+                    None,
+                    None,
+                )
+                .await;
+            let initialized = current
+                .as_ref()
+                .ok()
+                .and_then(|result| result.0.details.as_ref())
+                .is_some_and(visual_provider_initialized);
+            refresh_visual_capability(&mut output.capabilities, initialized);
+        }
         output.transfer_root = self.transfer_root.display().to_string();
         output.control_mode = self.control_mode_name(session_id).await.to_owned();
         Ok(Json(output))
@@ -2068,6 +2116,293 @@ impl RemoteOpsMcp {
             self.shells.lock().await.remove(&shell_id);
         }
         Ok(Json(action_output(session_id, result)))
+    }
+
+    /// 获取交互式 Windows 桌面的 UIA 状态和可选截图。
+    #[tool(
+        name = "desktop_capabilities",
+        description = "查询现场 Windows 交互式桌面是否可用，以及窗口/UIA/截图/输入能力。",
+        annotations(
+            title = "查询图形能力",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn desktop_capabilities(
+        &self,
+        Parameters(input): Parameters<TargetInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let mut output = self
+            .execute_simple(
+                input.session_id,
+                RemoteOperation::VisualObserve {
+                    include_screenshot: true,
+                    include_ui_tree: true,
+                },
+                None,
+                None,
+            )
+            .await?;
+        if let Some(mut observation) = output.0.details.take() {
+            let uia_available = visual_uia_available(&observation);
+            let interactive_desktop = observation
+                .get("state")
+                .is_some_and(|value| value == "ready");
+            let windows_available = observation
+                .get("windows")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|windows| !windows.is_empty());
+            let displays_available = observation
+                .get("displays")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|displays| !displays.is_empty());
+            let provider_initialized = interactive_desktop && displays_available;
+            let screenshot_available = observation
+                .get("screenshot_base64")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|image| !image.is_empty());
+            // 能力探测验证截图，但不把像素内容塞进能力列表响应。
+            if let Some(details) = observation.as_object_mut() {
+                details.remove("screenshot_base64");
+            }
+            let foreground_available = observation
+                .get("active_window_fingerprint")
+                .is_some_and(|value| value.as_str().is_some_and(|text| !text.is_empty()));
+            let mut unavailable_reasons = Vec::new();
+            if !interactive_desktop {
+                unavailable_reasons.push("interactive_desktop_unavailable");
+            }
+            if !windows_available {
+                unavailable_reasons.push("window_enumeration_unavailable");
+            }
+            if !foreground_available {
+                unavailable_reasons.push("foreground_window_unavailable");
+            }
+            if !uia_available {
+                unavailable_reasons.push("ui_automation_unavailable");
+            }
+            if !screenshot_available {
+                unavailable_reasons.push("screenshot_unavailable");
+                if let Some(error) = observation
+                    .get("ui_tree")
+                    .and_then(|tree| tree.get("screenshot_error"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    unavailable_reasons.push(error);
+                }
+            }
+            output.0.details = Some(serde_json::json!({
+                "provider_instance_id": observation.get("provider_instance_id"),
+                "state": observation.get("state"),
+                "interactive_desktop": interactive_desktop,
+                "initialized": provider_initialized,
+                "capabilities": {
+                    "visual": provider_initialized,
+                    "screenshot": provider_initialized && screenshot_available,
+                    // 窗口枚举是独立的只读能力；锁屏时可能仍能列出窗口，但不能把它升级为 UIA 或输入能力。
+                    "window_enumeration": windows_available,
+                    "ui_automation": interactive_desktop && windows_available && foreground_available && uia_available,
+                    "control_invoke": interactive_desktop && windows_available && foreground_available && uia_available,
+                    "text_input": interactive_desktop && windows_available && foreground_available && uia_available,
+                    "synthetic_input": interactive_desktop && windows_available && foreground_available && !uia_available
+                },
+                "unavailable_reasons": unavailable_reasons,
+                "provider": {
+                    "instance_id": observation.get("provider_instance_id"),
+                    "state": observation.get("state"),
+                    "uia_reason": observation.get("ui_tree").and_then(|tree| tree.get("reason"))
+                },
+                "observation": observation
+            }));
+        }
+        Ok(output)
+    }
+
+    /// 观察交互式桌面窗口、UIA 树和按需截图。
+    #[tool(
+        name = "observe_window",
+        description = "观察精确 session_id 上的 Windows 窗口和 UI Automation 状态；按需返回截图。",
+        annotations(
+            title = "观察 Windows 界面",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn observe_window(
+        &self,
+        Parameters(input): Parameters<VisualObserveInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::VisualObserve {
+                include_screenshot: input.include_screenshot.unwrap_or(true),
+                include_ui_tree: input.include_ui_tree.unwrap_or(true),
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// 等待窗口、文本或 UI 状态变化。
+    #[tool(
+        name = "wait_for_visual_state",
+        description = "等待现场 Windows 桌面满足指定条件，避免 AI 盲目重复截图。",
+        annotations(
+            title = "等待界面状态",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn wait_for_visual_state(
+        &self,
+        Parameters(input): Parameters<VisualWaitInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let timeout_millis = remoteops_domain::normalize_visual_wait_timeout(input.timeout_millis)?;
+        remoteops_domain::VisualWaitCondition::parse(&input.condition)?;
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::VisualWaitFor {
+                condition: input.condition,
+                timeout_millis,
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// 通过 UIA 语义控件调用低风险动作。
+    #[tool(
+        name = "invoke_control",
+        description = "按 UIA 控件目标调用按钮、菜单、选择或切换动作；AI 默认需要当前用户逐项确认。target 必须是 VisualTarget JSON。",
+        annotations(
+            title = "操作 Windows 控件",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn invoke_control(
+        &self,
+        Parameters(input): Parameters<VisualActionInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        let target = parse_visual_target(&input.target)?;
+        let action = input.action.unwrap_or_else(|| "invoke".to_owned());
+        let authorization = self
+            .authorize_mutation(
+                &context,
+                session_id,
+                &format!("图形控件动作：{action}"),
+                input.approval_id,
+            )
+            .await?;
+        self.execute_authorized(
+            session_id,
+            RemoteOperation::VisualInvoke { target, action },
+            authorization,
+            None,
+        )
+        .await
+    }
+
+    /// 向已验证的 UIA 文本控件输入文字。
+    #[tool(
+        name = "type_text",
+        description = "向已验证的 Windows 文本控件输入文字；密码和敏感凭据不能使用此工具。",
+        annotations(
+            title = "输入 Windows 文本",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn type_text(
+        &self,
+        Parameters(input): Parameters<VisualActionInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        let target = parse_visual_target(&input.target)?;
+        let text = input.text.ok_or_else(|| "type_text 缺少 text".to_owned())?;
+        let authorization = self
+            .authorize_mutation(&context, session_id, "图形文本输入", input.approval_id)
+            .await?;
+        self.execute_authorized(
+            session_id,
+            RemoteOperation::VisualTypeText { target, text },
+            authorization,
+            None,
+        )
+        .await
+    }
+
+    /// UIA 不可用时执行经审批的坐标或键鼠输入回退。
+    #[tool(
+        name = "send_input",
+        description = "在 UIA 不可用时执行坐标或键鼠输入回退；要求交互式桌面和当前前台窗口。",
+        annotations(
+            title = "发送 Windows 输入",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn send_input(
+        &self,
+        Parameters(input): Parameters<VisualActionInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        let target = parse_visual_target(&input.target)?;
+        let input_json = input
+            .input
+            .ok_or_else(|| "send_input 缺少 input".to_owned())?;
+        let input_json = encode_visual_drag_input(&target, &input_json);
+        let authorization = self
+            .authorize_mutation(&context, session_id, "图形键鼠输入", input.approval_id)
+            .await?;
+        self.execute_authorized(
+            session_id,
+            RemoteOperation::VisualSendInput {
+                target,
+                input: input_json,
+            },
+            authorization,
+            None,
+        )
+        .await
+    }
+
+    /// 停止图形 Provider 会话。
+    #[tool(
+        name = "stop_visual_session",
+        description = "停止现场 Windows 图形 Provider，撤销当前图形输入租约。",
+        annotations(
+            title = "停止图形会话",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn stop_visual_session(
+        &self,
+        Parameters(input): Parameters<TargetInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.execute_simple(input.session_id, RemoteOperation::VisualStop, None, None)
+            .await
     }
 
     /// 从 Agent 所在网络测试 TCP 端口。
@@ -3442,6 +3777,49 @@ fn parse_session_id(value: &str) -> Result<SessionId, String> {
         .map_err(|error| error.to_string())
 }
 
+fn parse_visual_target(value: &str) -> Result<VisualTarget, String> {
+    serde_json::from_str(value).map_err(|error| format!("VisualTarget JSON 无效：{error}"))
+}
+
+/// 将拖拽终点同时放入输入字段，兼容尚未支持扩展坐标字段的旧 Relay。
+fn encode_visual_drag_input(target: &VisualTarget, input: &str) -> String {
+    if !matches!(input, "drag" | "drag_left") {
+        return input.to_owned();
+    }
+    let VisualTarget::Coordinate {
+        end_x: Some(end_x),
+        end_y: Some(end_y),
+        ..
+    } = target
+    else {
+        return input.to_owned();
+    };
+    format!("drag_to:{end_x},{end_y}")
+}
+
+#[cfg(test)]
+mod visual_target_tests {
+    use super::{encode_visual_drag_input, parse_visual_target};
+    #[test]
+    fn parse_visual_target_preserves_drag_endpoint() {
+        let target = parse_visual_target(
+            r#"{"kind":"coordinate","window_fingerprint":"w","display_id":"display-0","x":10,"y":20,"screenshot_scale_percent":100,"end_x":30,"end_y":40}"#,
+        )
+        .expect("拖拽坐标目标应可解析");
+        assert_eq!(target.coordinate_points(), Some(((10, 20), Some((30, 40)))));
+    }
+
+    #[test]
+    fn encode_visual_drag_input_keeps_endpoint_for_legacy_relay() {
+        let target = parse_visual_target(
+            r#"{"kind":"coordinate","window_fingerprint":"w","display_id":"display-0","x":10,"y":20,"screenshot_scale_percent":100,"end_x":30,"end_y":40}"#,
+        )
+        .expect("拖拽坐标目标应可解析");
+        assert_eq!(encode_visual_drag_input(&target, "drag"), "drag_to:30,40");
+        assert_eq!(encode_visual_drag_input(&target, "click"), "click");
+    }
+}
+
 fn elicitation_accepted(action: &ElicitationAction) -> bool {
     matches!(action, ElicitationAction::Accept)
 }
@@ -3697,6 +4075,34 @@ async fn ensure_shell_capability(
     Ok(())
 }
 
+/// 只接受 Provider 明确确认的 UIA 可用状态，错误对象不代表成功。
+fn visual_uia_available(observation: &serde_json::Value) -> bool {
+    observation
+        .get("ui_tree")
+        .and_then(|tree| tree.get("available"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+/// 只把当前观察确认的交互桌面能力公开给工具调用方。
+fn visual_provider_initialized(observation: &serde_json::Value) -> bool {
+    observation
+        .get("state")
+        .is_some_and(|state| state == "ready")
+        && observation
+            .get("displays")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|displays| !displays.is_empty())
+}
+
+/// 用实时探测覆盖可能因启动超时或锁屏而过期的 visual 标记。
+fn refresh_visual_capability(capabilities: &mut Vec<String>, initialized: bool) {
+    capabilities.retain(|capability| capability != "visual");
+    if initialized {
+        capabilities.push("visual".to_owned());
+    }
+}
+
 fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> ConnectionOutput {
     ConnectionOutput {
         display_name: connection.display_name(),
@@ -3769,6 +4175,46 @@ fn application_error(error: ApplicationError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visual_uia_requires_explicit_success() {
+        for observation in [
+            serde_json::json!({}),
+            serde_json::json!({"ui_tree": null}),
+            serde_json::json!({"ui_tree": {}}),
+            serde_json::json!({"ui_tree": {"available": false, "reason": "uia_root_unavailable"}}),
+        ] {
+            assert!(!super::visual_uia_available(&observation));
+        }
+        assert!(super::visual_uia_available(&serde_json::json!({
+            "ui_tree": {"available": true, "name": "Explorer", "children": []}
+        })));
+    }
+
+    #[test]
+    fn visual_capability_refreshes_after_recovery_and_failure() {
+        let mut capabilities = vec!["cmd".to_owned(), "visual".to_owned()];
+        for observation in [
+            serde_json::json!({"state":"stopped","displays":[{}]}),
+            serde_json::json!({"state":"ready","displays":[]}),
+            serde_json::json!({"error":"initialization_failed"}),
+        ] {
+            super::refresh_visual_capability(
+                &mut capabilities,
+                super::visual_provider_initialized(&observation),
+            );
+            assert_eq!(capabilities, ["cmd"]);
+        }
+        let recovered = serde_json::json!({"state":"ready","displays":[{}],"windows":[]});
+        super::refresh_visual_capability(
+            &mut capabilities,
+            super::visual_provider_initialized(&recovered),
+        );
+        super::refresh_visual_capability(&mut capabilities, true);
+        assert_eq!(capabilities, ["cmd", "visual"]);
+        super::refresh_visual_capability(&mut capabilities, false);
+        assert_eq!(capabilities, ["cmd"]);
+    }
+
     use super::*;
 
     struct FakeCredentialPrompt {

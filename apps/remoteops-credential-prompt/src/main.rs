@@ -107,6 +107,7 @@ fn prompt_language(explicit: Option<&str>) -> &'static str {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_lines)]
 fn platform_prompt(
     target: &str,
     command_sha256: &str,
