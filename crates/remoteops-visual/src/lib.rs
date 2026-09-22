@@ -30,6 +30,14 @@ function Test-RemoteOpsControlType([string]$actual,[string]$expected) {
  # 控制器允许传入 button 这类短名称，观察树使用 UIA 的标准 ControlType.Button。
  return $actual -ceq ('ControlType.' + $expected.Substring(0,1).ToUpperInvariant() + $expected.Substring(1).ToLowerInvariant())
 }
+function Get-RemoteOpsNodeRect($element) {
+ # 不可见或已销毁的元素没有有效边界，返回空值避免污染观察结果。
+ try {
+  $bounds=$element.Current.BoundingRectangle
+  if([double]::IsNaN($bounds.Width) -or [double]::IsInfinity($bounds.Width) -or $bounds.Width -le 0 -or $bounds.Height -le 0){return $null}
+  return [pscustomobject]@{ x=[int][math]::Round($bounds.X); y=[int][math]::Round($bounds.Y); width=[int][math]::Round($bounds.Width); height=[int][math]::Round($bounds.Height) }
+ } catch { return $null }
+}
 function Find-RemoteOpsControl($node,[int]$depth) {
  if($null -eq $node -or $depth -gt 8){return $null}
  if(-not $env:REMOTEOPS_TARGET_FINGERPRINT){throw 'uia_target_fingerprint_required'}
@@ -38,7 +46,8 @@ function Find-RemoteOpsControl($node,[int]$depth) {
  if(((-not $env:REMOTEOPS_AUTOMATION_ID) -or $id -ceq $env:REMOTEOPS_AUTOMATION_ID) -and ((-not $env:REMOTEOPS_NAME) -or $nodeName -ceq $env:REMOTEOPS_NAME) -and (Test-RemoteOpsControlType $nodeType $env:REMOTEOPS_CONTROL_TYPE)){
    if((Get-RemoteOpsControlFingerprint $node $env:REMOTEOPS_WINDOW_FINGERPRINT) -ceq $env:REMOTEOPS_TARGET_FINGERPRINT){return $node}
  }
- $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker; $child=$walker.GetFirstChild($node)
+ # Explorer 的文件项目只出现在 ListView 的 RawView 子树中，与观察树保持一致。
+ $walker=if($id -ceq 'listview'){[System.Windows.Automation.TreeWalker]::RawViewWalker}else{[System.Windows.Automation.TreeWalker]::ControlViewWalker}; $child=$walker.GetFirstChild($node)
  while($null -ne $child){$found=Find-RemoteOpsControl $child ($depth+1); if($null -ne $found){return $found}; $child=$walker.GetNextSibling($child)}
  return $null
 }
@@ -730,7 +739,7 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $desktopContext=Get-RemoteOpsDesktopContext
 if(-not $desktopContext.interactive){
- [pscustomobject]@{state='no_interactive_desktop'; displays=@(); windows=@(); ui_tree=[pscustomobject]@{available=$false; reason=$desktopContext.reason; diagnostics=$desktopContext; children=@()}} | ConvertTo-Json -Compress -Depth 8
+ [pscustomobject]@{state='no_interactive_desktop'; displays=@(); windows=@(); ui_tree=[pscustomobject]@{available=$false; reason=$desktopContext.reason; diagnostics=$desktopContext; children=@()}} | ConvertTo-Json -Compress -Depth 32
  exit 0
 }
 Add-Type -AssemblyName System.Windows.Forms
@@ -802,7 +811,8 @@ if ($env:REMOTEOPS_INCLUDE_UI_TREE -eq '1') {
     if($null -eq $e){return $null}
     $nodeName=Safe-Text $e.Current.Name; $nodeId=Safe-Text $e.Current.AutomationId; $nodeType=Safe-Text $e.Current.ControlType.ProgrammaticName
     $nodeFingerprint=Get-RemoteOpsControlFingerprint $e $windowFingerprint
-    $n=[pscustomobject]@{name=$nodeName; automation_id=$nodeId; control_type=$nodeType; target_fingerprint=$nodeFingerprint; children=@()}
+    $nodeRect=Get-RemoteOpsNodeRect $e
+    $n=[pscustomobject]@{name=$nodeName; automation_id=$nodeId; control_type=$nodeType; target_fingerprint=$nodeFingerprint; rect=$nodeRect; children=@()}
     # Explorer 的磁盘/文件项目通常位于 ListView -> ListItem 的第四层；
     # 保留硬上限，避免大型目录导致观察结果失控。
     if($depth -ge 6){return $n}
@@ -844,7 +854,8 @@ if($null -ne $ui -and $null -ne $screenshotError){$ui | Add-Member -NoteProperty
 [void]0
 $cursor = $null
 try { $p = New-Object RemoteOpsUser32+POINT; if ([RemoteOpsUser32]::GetCursorPos([ref]$p)) { $cursor = [pscustomobject]@{ x=$p.X; y=$p.Y } } } catch { $cursor = $null }
-[pscustomobject]@{ state=$state; state_reason=$stateReason; displays=$displays; windows=$windows; active_window_fingerprint=$script:activeFingerprint; screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; cursor=$cursor; ui_tree=$ui } | ConvertTo-Json -Compress -Depth 8
+# UIA 树通常有 6 层，JSON 深度不足会让 ListItem 等深层节点退化成字符串，控制器将无法定位文件项目。
+[pscustomobject]@{ state=$state; state_reason=$stateReason; displays=$displays; windows=$windows; active_window_fingerprint=$script:activeFingerprint; screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; cursor=$cursor; ui_tree=$ui } | ConvertTo-Json -Compress -Depth 32
 "#;
         let script = format!(
             "{TARGET_WINDOW_GUARD}
@@ -1083,6 +1094,7 @@ impl VisualProvider for WindowsVisualProvider {
             cursor_effect_verified(&effective_target, action, display, &observation)
         } else {
             observed_uia_change(&before, &observation)
+                || foreground_window_switched(&before, &observation)
         };
         Ok(VisualActionResult {
             request_id,
@@ -1300,6 +1312,15 @@ fn same_observed_window(before: &VisualObservation, after: &VisualObservation) -
     };
     let previous = find(before);
     previous.is_some() && previous == find(after)
+}
+
+/// 点击等动作可能通过切换前台窗口产生效果（例如任务栏按钮），此时窗口内 UIA 树不再可比。
+#[cfg(windows)]
+fn foreground_window_switched(before: &VisualObservation, after: &VisualObservation) -> bool {
+    after.state == remoteops_domain::VisualSessionState::Ready
+        && before.active_window_fingerprint.is_some()
+        && after.active_window_fingerprint.is_some()
+        && before.active_window_fingerprint != after.active_window_fingerprint
 }
 
 /// 剔除上游光标、其他窗口和诊断元信息；它们不能证明目标控件操作生效。
@@ -1631,5 +1652,84 @@ $foreground=Get-RemoteOpsForeground
             .expect("mock invoke should succeed");
         assert!(result.action_sent);
         assert!(result.effect_verified);
+    }
+
+    #[test]
+    fn listview_helpers_keep_file_children_and_control_rectangles() {
+        // Explorer 的文件项目只在 ListView 的 RawView 子树里可见，退化成 ControlView 就看不到文件列表。
+        assert!(UIA_CONTROL_HELPERS.contains("RawViewWalker"));
+        assert!(UIA_CONTROL_HELPERS.contains("if($id -ceq 'listview')"));
+        // 节点必须带矩形，控制器才能据此换算坐标，而不是靠截图目测。
+        assert!(UIA_CONTROL_HELPERS.contains("function Get-RemoteOpsNodeRect"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn control_rect_helper_reports_visible_bounds_and_skips_empty_elements() {
+        let script = format!(
+            r"{UIA_CONTROL_HELPERS}
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$visible=[pscustomobject]@{{Current=[pscustomobject]@{{BoundingRectangle=[pscustomobject]@{{X=10.4;Y=20.6;Width=100.2;Height=30.9}}}}}}
+$empty=[pscustomobject]@{{Current=[pscustomobject]@{{BoundingRectangle=[pscustomobject]@{{X=0;Y=0;Width=0;Height=0}}}}}}
+$offscreen=[pscustomobject]@{{Current=[pscustomobject]@{{BoundingRectangle=[pscustomobject]@{{X=-32000;Y=-32000;Width=160;Height=28}}}}}}
+[pscustomobject]@{{visible=(Get-RemoteOpsNodeRect $visible);empty=(Get-RemoteOpsNodeRect $empty);offscreen=(Get-RemoteOpsNodeRect $offscreen)}} | ConvertTo-Json -Compress -Depth 4
+"
+        );
+        let mut command = hidden_powershell_command();
+        command.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", &script]);
+        let output = run_desktop_command(command).await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["visible"]["x"], 10);
+        assert_eq!(value["visible"]["y"], 21);
+        assert_eq!(value["visible"]["width"], 100);
+        assert_eq!(value["visible"]["height"], 31);
+        assert!(value["empty"].is_null());
+        assert_eq!(value["offscreen"]["x"], -32000);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn foreground_window_switch_counts_as_observable_effect() {
+        fn observation(fingerprint: Option<&str>) -> VisualObservation {
+            VisualObservation {
+                request_id: RequestId::new(),
+                session_id: SessionId::new(),
+                provider_instance_id: "test".to_owned(),
+                state: remoteops_domain::VisualSessionState::Ready,
+                windows: Vec::new(),
+                displays: Vec::new(),
+                active_window_fingerprint: fingerprint.map(str::to_owned),
+                ui_tree: None,
+                screenshot_base64: None,
+                screenshot_width: None,
+                screenshot_height: None,
+                cursor_x: None,
+                cursor_y: None,
+                redacted: false,
+            }
+        }
+        // 点击任务栏图标会切换前台窗口，切换本身就是可观测效果。
+        assert!(foreground_window_switched(
+            &observation(Some("before-window")),
+            &observation(Some("after-window"))
+        ));
+        // 前台丢失或未识别时不能当作效果证据。
+        assert!(!foreground_window_switched(
+            &observation(Some("before-window")),
+            &observation(None)
+        ));
+        assert!(!foreground_window_switched(
+            &observation(None),
+            &observation(Some("after-window"))
+        ));
+        assert!(!foreground_window_switched(
+            &observation(Some("same-window")),
+            &observation(Some("same-window"))
+        ));
     }
 }
