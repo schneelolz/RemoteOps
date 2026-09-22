@@ -50,7 +50,7 @@ chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.
 默认安装位置：
 
 ```text
-~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.5
+~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.11
 ~/.codex/remoteops/launch-remoteops-controller-mcp.sh
 ~/.codex/remoteops/controller-config.json
 ~/.codex/config.toml
