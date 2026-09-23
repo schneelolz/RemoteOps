@@ -35,6 +35,17 @@ flowchart LR
 
 The solid arrows show an operation request: Codex calls the local MCP, which sends it through the Relay to the Agent and the field computer. The dashed arrow shows connection setup: the Agent connects out to the Relay, so the field computer does not need a public inbound port.
 
+## How It Feels in Practice
+
+RemoteOps is more than remote command execution. It connects pairing, analysis, transfer, validation, and iteration into an AI-assisted workflow. Once the field Agent is running, you usually provide one current pairing code. Within the authorized scope, the AI can:
+
+- read logs, system state, and the runtime environment, then analyze the cause of a problem;
+- upload tools, scripts, or test programs and run them;
+- replace configuration or test files based on the results, then run and analyze again;
+- summarize the verification results and continue with the next step.
+
+For a server migration, provide two pairing codes: one for the pre-migration environment and one for the new environment. The AI can connect to both sides, help export the Docker environment (images, container configuration, and data), upload it to the new host, start the services, and verify the result. This moves much of the repetitive migration, testing, and troubleshooting work into the AI workflow; the human mainly provides the pairing codes, confirms permissions, and handles decisions that require explicit approval. Permission modes, approvals, and audit policies still govern the actual operations.
+
 ## Key capabilities
 
 - Inspect Windows and Ubuntu system, network, process, service, log, and capability information.

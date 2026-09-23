@@ -1,54 +1,32 @@
-# Agent GUI 设计验收
-
-## 验收结论
-
-2026-09-08 在 Windows 原生窗口完成 `0.2.0-preview.9` 的视觉与交互验收。目标客户区为 `520 × 440`，100% 缩放下原生外框为 `536 × 479`。本次修正保持固定窗口尺寸和既有日志覆盖抽屉，不改变 v14 协议。
-
-三张用户参考图均作为视觉事实来源，并与同状态实现截图并排对照：
-
-- 初始状态：`C:\Users\ywb\AppData\Local\Temp\codex-clipboard-bb178db7-78f6-4282-90bc-ad2ac6f2cff3.png`，`522 × 474`。
-- 标题与图标：`C:\Users\ywb\AppData\Local\Temp\codex-clipboard-92e6ad2f-4b02-46e5-80f8-f28348088c3d.png`，`527 × 476`。
-- 连接详情：`C:\Users\ywb\AppData\Local\Temp\codex-clipboard-c937b8fc-8887-4dd3-96df-cd727e6a32b3.png`，`520 × 470`。
-
-## 逐项结果
-
-| 检查项 | 实现结果 | 验收结果 |
-| --- | --- | --- |
-| 初始界面缺少等待反馈 | 控制码尚未取得时显示蓝色旋转动画，并显示“正在获取临时控制码” | 通过；加载过程不改变布局，不显示伪控制码 |
-| 原生标题和应用内标题重复 | 原生标题保留本地化产品名称，应用内标题改为 `RemoteOps Agent` | 通过；两个层级职责清楚 |
-| 左上角仍显示旧图标 | 原生窗口和应用内标题均加载 `assets/brand/remoteops-mark.png` | 通过；两处均显示蓝色盾牌品牌图标 |
-| 标题缺少程序版本 | 使用编译时 `CARGO_PKG_VERSION` 生成原生标题 | 通过；中英文标题均显示 `v0.2.0-preview.9`，没有硬编码版本文案 |
-| 传输目录显示不全 | 去除 `\\?\` 扩展前缀，路径和右侧图标均可点击，悬停显示完整路径 | 通过；实测资源管理器打开 `C:\Users\ywb\AppData\Local\RemoteOps\transfers` |
-
-参考图中的 Relay、权限和用户目录属于运行数据。验收截图使用 `--demo`，因此显示 `demo.invalid`、当前用户目录和未提升权限；这些差异不属于布局或交互偏差。
-
-## 截图证据
-
-- [中文初始等待状态](docs/assets/agent-gui/initial-loading-zh.png)
-- [中文就绪状态](docs/assets/agent-gui/runtime-zh.png)
-- [英文就绪状态](docs/assets/agent-gui/runtime-en.png)
-- [可点击传输目录](docs/assets/agent-gui/advanced-settings-zh.png)
-- [中文覆盖日志抽屉](docs/assets/agent-gui/drawer-zh.png)
-- [英文覆盖日志抽屉](docs/assets/agent-gui/drawer-en.png)
-
-对照过程覆盖完整主窗口、初始加载局部、标题局部和连接详情局部。最终复核未发现 P0、P1 或 P2 视觉问题，也未发现滚动条、文字裁切、元素重叠或点击目标过小的问题。
-
-## 自动化验证与版本
-
-以下验证均已通过：
-
-- `cargo test -p remoteops-agent-gui -p remoteops-i18n`：25 项通过。
-- `cargo clippy -p remoteops-agent-gui -p remoteops-i18n --all-targets -- -D warnings`：通过，无警告。
-- `cargo check --workspace --all-targets`：通过。
-- `cargo fmt --all -- --check`：通过。
-- `cargo build -p remoteops-agent-gui`：Debug 构建通过。
-- `cargo build --release -p remoteops-agent-gui`：Release 构建通过。
-- `./scripts/Test-Documentation.ps1`：44 个 Markdown 文件链接检查通过。
-
-Debug 与 Release 的 `remoteops-agent-gui.exe` 字符串版本均为 `0.2.0-preview.9`，Windows 数字文件版本均为 `0.2.0.9`。
-
-## 验证边界
-
-本次没有连接外部 Relay，也未操作真实 SSH 或串口硬件。不同 DPI、RDP 和全新低权限 Windows 账户未复测。原生视觉检查在 Windows 100% 缩放环境完成；本地候选未部署、未提交、未推送或公开发布。
+# Agent UI design QA
 
 final result: passed
+
+Scope: local native UI implementation and demo interactions on macOS. Windows release acceptance remains pending; this is not a Windows certification.
+
+## Evidence
+
+- Approved source: `docs/design/agent-ui-refresh/design-target.png` (1448×1086), final centered English dark concept.
+- Implementation: `docs/design/agent-ui-refresh/en-dark.png` (1600×1200), captured from native Rust/egui demo using Computer Use.
+- Also inspected and saved: `zh-light.png`, `zh-dark.png`, `en-light.png`, `logs-dark.png`, `stop-confirmation-dark.png` in that directory.
+- Source and actual English dark images were inspected together. Both depict an engineer-connected demo with code 482-915-307; countdown is live rather than fixed at 09:58.
+- Compare app-owned content at proportional dimensions; exclude the host's native title bar, capture overlay/pointer and differing OS window controls. Capture is at 2× density; screenshots record the initial 600×450 layout; current configured native content is 500×375 logical points, and its bounds are separately tested without a display.
+
+## Findings and resolution
+
+- Typography: replaced egui strong-only styling with native bold display fonts; CJK fallback installed separately. Code is dominant, supporting labels are smaller, English footer text fits. No unreadable or clipped primary text in the four captured states.
+- Layout: number plus copy button centered as one unit; label/countdown centered independently. Capability widths measured including separator spacing to center both languages. Footer actions remain at bottom with clear separation. Fixed-size native layout boundary test passes for both locales and themes.
+- Colors: shared semantic palette across main screen and overlays. Light menu selection now uses white text on blue. Filled destructive confirmation uses a darker red for white-label contrast. Manual theme overrides and system preference are tested.
+- Assets: existing brand icon for native window; existing Phosphor library for UI icons. No rasterized controls, placeholder art or stretched source screenshot.
+- Copy/content: bilingual settings, native title, main labels, tooltips and dialogs. Operational log messages remain raw data, including Chinese demo messages under English UI. Connection heading also represents starting, reconnecting and failure states rather than always claiming ready.
+- Interaction: copy success checkmark observed; language and theme changes live; persisted preferences recovered on restart; details opened/closed; logs opened and dismissed using Escape; stop cancellation retains UI, confirmation closes the native window (runtime log records native_window_closed).
+
+No unresolved P0/P1/P2 local findings. P3 differences: settings gear has a visible button affordance; exact system font metrics and icon shapes differ slightly from the generated mock. The native window frame is intentionally OS-owned.
+
+## Validation limits
+
+24 GUI tests + 3 translation tests pass; Clippy with warnings denied and local build pass. Actual Windows compilation, Windows font rendering, 100/125/150% DPI, OS theme change events, and live remote-session behavior need Windows acceptance. See `docs/design/agent-ui-refresh/README.md` for steps.
+
+## Final refinements
+
+Native content is now 500×375. Logs use a full page with Back/Escape navigation and compact metadata; saved original screenshots predate this change. The loading indicator uses three gently fading dots. A permission subtitle is demo-only and does not report or alter live authorization. All workspace check, Clippy and test commands passed on macOS.
