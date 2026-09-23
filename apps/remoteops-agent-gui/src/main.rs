@@ -12,11 +12,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod appearance;
+use appearance::{Appearance, Palette};
+
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use eframe::egui::{
     self, Align, Align2, Color32, FontDefinitions, FontFamily, FontId, Frame, Grid, Layout, Margin,
-    Order, RichText, Stroke, TextStyle, Vec2, ViewportCommand,
+    RichText, Stroke, Vec2, ViewportCommand,
 };
 use egui_phosphor::regular as icons;
 use remoteops_agent::{
@@ -35,30 +38,25 @@ use tokio::sync::watch;
 /// 首次设置页使用的固定窗口内部尺寸。
 const SETUP_WINDOW_SIZE: Vec2 = Vec2::new(640.0, 330.0);
 /// 日常运行页使用的固定窗口内部尺寸。
-const RUNNING_WINDOW_SIZE: Vec2 = Vec2::new(520.0, 440.0);
+const RUNNING_WINDOW_SIZE: Vec2 = Vec2::new(500.0, 375.0);
 /// Windows 后台进程创建标志，避免权限探测弹出控制台窗口。
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 控制码及复制按钮所在行的固定高度。
-const PAIRING_CODE_ROW_HEIGHT: f32 = 40.0;
+const PAIRING_CODE_ROW_HEIGHT: f32 = 64.0;
 /// 复制控制码图标按钮的固定边长。
-const COPY_CODE_BUTTON_SIZE: f32 = 36.0;
+const COPY_CODE_BUTTON_SIZE: f32 = 44.0;
 /// 日志在内存中保留的最大条目数。
 const MAX_OPERATION_LOGS: usize = 1_000;
 /// 每帧最多消费的后台事件数，避免大量输出阻塞界面。
 const MAX_EVENTS_PER_FRAME: usize = 200;
-/// 日志覆盖抽屉宽度。
-const LOG_DRAWER_WIDTH: f32 = 360.0;
+
 /// 原生窗口和界面标题使用的 `RemoteOps` 品牌图标。
 const BRAND_ICON_PNG: &[u8] = include_bytes!("../../../assets/brand/remoteops-mark.png");
 
-/// 使用编译时包版本生成原生窗口标题，避免版本文案与产物脱节。
+/// 原生标题只保留产品名称；版本号在设置菜单内显示。
 fn agent_window_title(translator: &Translator) -> String {
-    format!(
-        "{} · v{}",
-        translator.text("app.agent_title"),
-        env!("CARGO_PKG_VERSION")
-    )
+    translator.text("app.agent_title")
 }
 
 /// 从仓库品牌资源加载原生窗口图标。
@@ -191,6 +189,9 @@ struct Args {
 struct AgentGuiSettings {
     /// 用户选择的界面语言。
     language: Option<Language>,
+    /// 外观设置；旧版设置缺少此字段时跟随系统。
+    #[serde(default)]
+    appearance: Appearance,
 }
 
 impl Args {
@@ -392,10 +393,6 @@ fn short_request_id(request_id: &RequestId) -> String {
     value.chars().skip(value.len().saturating_sub(8)).collect()
 }
 
-fn log_drawer_left(screen_left: f32, screen_width: f32, width: f32, progress: f32) -> f32 {
-    screen_left + screen_width - width * progress
-}
-
 /// 被控端窗口状态。
 #[allow(clippy::struct_excessive_bools)]
 #[allow(dead_code)]
@@ -440,6 +437,8 @@ struct RemoteOpsAgentApp {
     active_connections: usize,
     /// 当前 Owner、Controller 类型和权限绑定。
     controller_bindings: Vec<AgentControllerBinding>,
+    /// 仅演示模式展示权限样式，不参与授权。
+    permission_preview: bool,
     /// 最近的远程操作日志，按时间顺序保留有限条目。
     operation_logs: VecDeque<AgentOperationLog>,
     /// 是否打开右侧日志覆盖抽屉。
@@ -454,8 +453,8 @@ struct RemoteOpsAgentApp {
     elevated: Option<bool>,
     /// 共享界面翻译器。
     translator: Translator,
-    /// 应用内标题使用的实际品牌图标纹理。
-    brand_texture: Option<egui::TextureHandle>,
+    /// 用户选择的外观。
+    appearance: Appearance,
     /// 外部语言包路径。
     language_file: Option<PathBuf>,
     /// 是否展示停止确认框。
@@ -527,12 +526,7 @@ impl RemoteOpsAgentApp {
         }
         cc.egui_ctx
             .send_viewport_cmd(ViewportCommand::Title(agent_window_title(&translator)));
-        let brand_icon = brand_icon_data();
-        let brand_texture = Some(cc.egui_ctx.load_texture(
-            "remoteops-brand-mark",
-            egui::ColorImage::from(&brand_icon),
-            egui::TextureOptions::LINEAR,
-        ));
+        saved_settings.appearance.apply(&cc.egui_ctx);
         let (runtime_event_sender, runtime_events) = mpsc::channel();
         let (event_sender, events) = mpsc::channel();
         let repaint_context = cc.egui_ctx.clone();
@@ -570,6 +564,7 @@ impl RemoteOpsAgentApp {
             pairing_code_expires_at: None,
             active_connections: 0,
             controller_bindings: Vec::new(),
+            permission_preview: false,
             operation_logs: VecDeque::new(),
             log_drawer_open: false,
             log_filter: LogFilter::All,
@@ -577,7 +572,7 @@ impl RemoteOpsAgentApp {
             permission_control: AgentPermissionControl::default(),
             elevated: detect_elevated(),
             translator,
-            brand_texture,
+            appearance: saved_settings.appearance,
             language_file,
             show_stop_confirmation: false,
             show_advanced_settings: false,
@@ -597,6 +592,7 @@ impl RemoteOpsAgentApp {
                 app.relay.clone_from(&config.relay);
                 app.permission_control = AgentPermissionControl::from_config(&config);
                 if startup_demo {
+                    app.permission_preview = true;
                     app.worker = Some(spawn_demo(
                         app.event_sender.clone(),
                         config,
@@ -798,17 +794,14 @@ impl RemoteOpsAgentApp {
     /// 渲染首次运行配置页面。
     #[allow(clippy::too_many_lines)]
     fn render_setup(&mut self, ui: &mut egui::Ui) {
+        let colors = Palette::current(ui.ctx());
         let mut save_clicked = false;
         Frame::new()
-            .fill(Color32::from_rgb(246, 249, 253))
+            .fill(colors.background)
             .inner_margin(Margin::symmetric(32, 28))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(icons::GEAR)
-                            .color(Color32::from_rgb(15, 103, 232))
-                            .size(27.0),
-                    );
+                    ui.label(RichText::new(icons::GEAR).color(colors.accent).size(27.0));
                     ui.label(
                         RichText::new(self.translator.text("agent.setup.title"))
                             .strong()
@@ -860,14 +853,14 @@ impl RemoteOpsAgentApp {
                         "agent.setup.config_path",
                         &[("path", &setup.config_path.display().to_string())],
                     ))
-                    .color(Color32::from_rgb(100, 116, 139))
+                    .color(colors.secondary)
                     .size(12.0),
                 );
                 if let Some(error) = &setup.error {
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new(setup_error_message(error))
-                            .color(Color32::from_rgb(190, 38, 51))
+                            .color(colors.danger)
                             .size(13.0),
                     );
                 }
@@ -881,7 +874,7 @@ impl RemoteOpsAgentApp {
                                     .strong()
                                     .color(Color32::WHITE),
                             )
-                            .fill(Color32::from_rgb(15, 103, 232))
+                            .fill(colors.accent)
                             .corner_radius(8.0),
                         )
                         .clicked();
@@ -894,6 +887,7 @@ impl RemoteOpsAgentApp {
 
     /// 渲染未知或变化证书的本地确认窗口。
     fn render_certificate_confirmation(&mut self, ctx: &egui::Context) {
+        let colors = Palette::current(ctx);
         let Some(confirmation) = self.certificate_confirmation.as_ref() else {
             return;
         };
@@ -906,7 +900,7 @@ impl RemoteOpsAgentApp {
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(self.translator.text("agent.certificate.warning"))
-                        .color(Color32::from_rgb(190, 38, 51))
+                        .color(colors.danger)
                         .strong(),
                 );
                 ui.add_space(10.0);
@@ -919,16 +913,12 @@ impl RemoteOpsAgentApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(&confirmation.reason)
-                        .color(Color32::from_rgb(100, 116, 139))
+                        .color(colors.secondary)
                         .size(12.0),
                 );
                 if let Some(error) = &confirmation.save_error {
                     ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(error)
-                            .color(Color32::from_rgb(190, 38, 51))
-                            .size(12.0),
-                    );
+                    ui.label(RichText::new(error).color(colors.danger).size(12.0));
                 }
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -989,92 +979,34 @@ impl RemoteOpsAgentApp {
     /// 渲染当前服务状态、控制码和工程师连接状态。
     #[allow(clippy::too_many_lines)]
     fn render_status_card(&mut self, ui: &mut egui::Ui) {
-        Frame::new()
-            .fill(Color32::WHITE)
-            .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
-            .corner_radius(12.0)
-            .inner_margin(Margin::symmetric(20, 10))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new(self.translator.text("agent.local_ready"))
-                            .strong()
-                            .size(17.0)
-                            .color(Color32::from_rgb(15, 23, 42)),
-                    );
-                    ui.add_space(2.0);
-                    ui.label(
-                        RichText::new(self.translator.text("agent.pairing_code"))
-                            .size(11.0)
-                            .color(Color32::from_rgb(100, 116, 139)),
-                    );
-                });
-                if let Some(detail) = self.status.detail() {
-                    ui.add_space(2.0);
-                    ui.vertical_centered(|ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(detail)
-                                    .color(Color32::from_rgb(100, 116, 139))
-                                    .size(11.5),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(detail);
-                    });
-                }
-                ui.add_space(4.0);
-                ui.vertical_centered(|ui| {
-                    self.render_pairing_code_row(ui);
-                    ui.add_space(2.0);
-                    let expiry = self.pairing_code_expiry_label();
-                    let content_width = 16.0
-                        + ui.spacing().item_spacing.x
-                        + ui.painter()
-                            .layout_no_wrap(
-                                expiry.clone(),
-                                FontId::proportional(12.0),
-                                Color32::from_rgb(100, 116, 139),
-                            )
-                            .size()
-                            .x;
-                    ui.horizontal(|ui| {
-                        ui.add_space(centered_left_padding(ui.available_width(), content_width));
-                        ui.label(
-                            RichText::new(icons::TIMER)
-                                .color(Color32::from_rgb(100, 116, 139))
-                                .size(13.0),
-                        );
-                        ui.label(
-                            RichText::new(expiry)
-                                .color(Color32::from_rgb(100, 116, 139))
-                                .size(12.0),
-                        );
-                    });
-                });
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let label = self.controller_status_label();
-                    let is_controlled = self.active_connections > 0;
-                    let (color, icon) = if is_controlled {
-                        (Color32::from_rgb(14, 116, 144), icons::USER_CHECK)
-                    } else {
-                        (Color32::from_rgb(51, 65, 85), icons::USERS)
-                    };
-                    let content_width = 20.0
-                        + ui.spacing().item_spacing.x
-                        + ui.painter()
-                            .layout_no_wrap(label.clone(), FontId::proportional(13.5), color)
-                            .size()
-                            .x;
-                    ui.add_space(centered_left_padding(ui.available_width(), content_width));
-                    ui.label(RichText::new(icon).color(color).size(17.0));
-                    ui.label(RichText::new(label).color(color).strong().size(13.5));
-                });
-            });
+        let scale = ui.available_width() / 544.0;
+        let colors = Palette::current(ui.ctx());
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new(self.translator.text("agent.pairing_code"))
+                    .size(17.0 * scale)
+                    .color(colors.secondary),
+            );
+            ui.add_space(12.0 * scale);
+            self.render_pairing_code_row(ui);
+            ui.add_space(12.0 * scale);
+            ui.label(
+                RichText::new(format!(
+                    "{}  {}",
+                    icons::CLOCK,
+                    self.pairing_code_expiry_label()
+                ))
+                .size(15.0 * scale)
+                .color(colors.secondary),
+            );
+            if let Some(detail) = self.status.detail() {
+                ui.add(
+                    egui::Label::new(RichText::new(detail).size(12.0).color(colors.danger))
+                        .truncate(),
+                )
+                .on_hover_text(detail);
+            }
+        });
     }
 
     /// 返回当前控制码的租约倒计时文案。
@@ -1108,77 +1040,87 @@ impl RemoteOpsAgentApp {
     /// 将控制码和复制按钮作为一个整体水平居中展示。
     #[allow(clippy::cast_possible_truncation)]
     fn render_pairing_code_row(&mut self, ui: &mut egui::Ui) {
+        let scale = ui.available_width() / 544.0;
+        let code_font = FontId::new(52.0 * scale, FontFamily::Name("display".into()));
+        let colors = Palette::current(ui.ctx());
         ui.allocate_ui_with_layout(
-            pairing_code_row_size(ui.available_width()),
+            pairing_code_row_size(ui.available_width()) * Vec2::new(1.0, scale),
             Layout::left_to_right(Align::Center),
             |ui| {
+                ui.spacing_mut().item_spacing.x = 14.0 * scale;
                 let Some(pairing_code) = self.pairing_code.as_deref() else {
-                    let indicator_size = 24.0;
-                    ui.add_space(centered_left_padding(ui.available_width(), indicator_size));
-                    let (rect, _) =
-                        ui.allocate_exact_size(Vec2::splat(indicator_size), egui::Sense::hover());
-                    let time = ui.input(|input| input.time);
-                    let angle = (time * std::f64::consts::TAU) as f32;
-                    let center = rect.center();
-                    let radius = indicator_size * 0.38;
-                    let start = center + Vec2::angled(angle) * radius;
-                    let end = center + Vec2::angled(angle + 4.2) * radius;
-                    ui.painter().line_segment(
-                        [start, end],
-                        Stroke::new(3.0, Color32::from_rgb(37, 99, 235)),
+                    let indicator_width = 54.0 * scale;
+                    ui.add_space(centered_left_padding(ui.available_width(), indicator_width));
+                    let (rect, _) = ui.allocate_exact_size(
+                        Vec2::new(indicator_width, 24.0 * scale),
+                        egui::Sense::hover(),
                     );
+                    let loading = !matches!(self.status, UiStatus::Failed(_) | UiStatus::Stopped);
+                    let time = ui.input(|input| input.time) as f32;
+                    for index in [0.0_f32, 1.0, 2.0] {
+                        let phase = time * std::f32::consts::TAU / 1.8 - index * 0.7;
+                        let opacity = if loading {
+                            0.35 + 0.65 * (phase.sin() + 1.0) / 2.0
+                        } else {
+                            0.35
+                        };
+                        let center =
+                            egui::pos2(rect.left() + (9.0 + index * 18.0) * scale, rect.center().y);
+                        ui.painter().circle_filled(
+                            center,
+                            3.5 * scale,
+                            colors.accent.gamma_multiply(opacity),
+                        );
+                    }
+                    if loading {
+                        ui.ctx().request_repaint_after(Duration::from_millis(33));
+                    }
                     return;
                 };
                 let code = display_pairing_code(pairing_code);
                 let code_active = self.pairing_code_is_active();
                 let code_color = if code_active {
-                    Color32::from_rgb(15, 23, 42)
+                    colors.text
                 } else {
-                    Color32::from_rgb(148, 163, 184)
+                    colors.secondary
                 };
                 let code_width = ui
                     .painter()
-                    .layout_no_wrap(code.clone(), FontId::monospace(34.0), code_color)
+                    .layout_no_wrap(code.clone(), code_font.clone(), code_color)
                     .size()
                     .x;
                 ui.add_space(pairing_code_left_padding(
                     ui.available_width(),
                     code_width,
-                    ui.spacing().item_spacing.x,
+                    ui.spacing().item_spacing.x + COPY_CODE_BUTTON_SIZE * (scale - 1.0),
                 ));
                 ui.label(
                     RichText::new(code)
                         .color(code_color)
-                        .size(34.0)
-                        .monospace()
+                        .font(code_font)
                         .strong(),
                 );
                 let copied = self
                     .copied_until
                     .is_some_and(|deadline| deadline > Instant::now());
                 let (icon, icon_color, tooltip_key) = if copied {
-                    (
-                        icons::CHECK,
-                        Color32::from_rgb(22, 163, 74),
-                        "agent.action.copied",
-                    )
+                    (icons::CHECK, Color32::WHITE, "agent.action.copied")
                 } else {
-                    (
-                        icons::COPY,
-                        Color32::from_rgb(51, 65, 85),
-                        "agent.action.copy",
-                    )
+                    (icons::COPY, Color32::WHITE, "agent.action.copy")
                 };
                 let response = ui
                     .scope(|ui| {
                         stabilize_copy_button_style(ui.style_mut());
+                        ui.spacing_mut().button_padding = Vec2::ZERO;
                         ui.add_enabled(
                             code_active,
-                            egui::Button::new(RichText::new(icon).color(icon_color).size(18.0))
-                                .fill(Color32::from_rgb(248, 250, 252))
-                                .stroke(Stroke::new(1.0, Color32::from_rgb(203, 213, 225)))
-                                .corner_radius(6.0)
-                                .min_size(Vec2::splat(COPY_CODE_BUTTON_SIZE)),
+                            egui::Button::new(
+                                RichText::new(icon).color(icon_color).size(22.0 * scale),
+                            )
+                            .fill(colors.accent)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(6.0)
+                            .min_size(Vec2::splat(COPY_CODE_BUTTON_SIZE * scale)),
                         )
                     })
                     .inner
@@ -1197,302 +1139,240 @@ impl RemoteOpsAgentApp {
     fn controller_status_label(&self) -> String {
         match self.active_connections {
             0 => self.translator.text("agent.engineer.waiting"),
-            _ => self.translator.text("status.controlled"),
+            _ => self.translator.text("agent.engineer.connected"),
         }
+    }
+
+    fn connection_heading(&self) -> String {
+        let key = match self.status {
+            UiStatus::Starting => "status.starting",
+            UiStatus::Connecting => "status.connecting",
+            UiStatus::Reconnecting(_) => "status.reconnecting",
+            UiStatus::Failed(_) => "status.failed",
+            UiStatus::Stopped => "status.stopped",
+            _ => return self.controller_status_label(),
+        };
+        self.translator.text(key)
     }
 
     /// 渲染紧凑的能力可用性摘要。
     fn render_capabilities(&mut self, ui: &mut egui::Ui) {
-        Frame::new()
-            .fill(Color32::WHITE)
-            .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
-            .corner_radius(12.0)
-            .inner_margin(Margin::symmetric(12, 8))
-            .show(ui, |ui| {
-                let capabilities = [
-                    (
-                        icons::TERMINAL_WINDOW,
-                        self.translator.text("agent.capability.command_short"),
-                        self.has_shell_capability(),
-                    ),
-                    (
-                        icons::FOLDER_OPEN,
-                        self.translator.text("agent.capability.file_short"),
-                        self.capabilities.contains(Capability::FileTransfer),
-                    ),
-                    (
-                        icons::DESKTOP,
-                        self.translator.text("agent.capability.ssh_short"),
-                        self.capabilities.contains(Capability::Ssh),
-                    ),
-                    (
-                        icons::PLUGS_CONNECTED,
-                        self.translator.text("agent.capability.serial_short"),
-                        self.capabilities.contains(Capability::Serial),
-                    ),
-                ];
-                let log_width = 112.0;
-                let capability_width =
-                    (ui.available_width() - log_width - 2.0 * ui.spacing().item_spacing.x).max(0.0);
-                ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(capability_width, 28.0),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
-                            ui.set_min_width(capability_width);
-                            for (icon, label, enabled) in capabilities {
-                                self.render_capability_text(ui, icon, &label, enabled);
-                            }
-                        },
+        let scale = ui.available_width() / 544.0;
+        let colors = Palette::current(ui.ctx());
+        let capabilities = [
+            (
+                icons::TERMINAL_WINDOW,
+                "agent.capability.command_short",
+                self.has_shell_capability(),
+            ),
+            (
+                icons::FILE,
+                "agent.capability.file_short",
+                self.capabilities.contains(Capability::FileTransfer),
+            ),
+            (
+                icons::HARD_DRIVES,
+                "agent.capability.ssh_short",
+                self.capabilities.contains(Capability::Ssh),
+            ),
+            (
+                icons::PLUG,
+                "agent.capability.serial_short",
+                self.capabilities.contains(Capability::Serial),
+            ),
+        ];
+        let labels: Vec<_> = capabilities
+            .iter()
+            .map(|(icon, key, enabled)| {
+                (format!("{icon}  {}", self.translator.text(key)), *enabled)
+            })
+            .collect();
+        let gap = 36.0 * scale;
+        let width: f32 = labels
+            .iter()
+            .map(|(text, _)| {
+                ui.painter()
+                    .layout_no_wrap(
+                        text.clone(),
+                        FontId::proportional(15.0 * scale),
+                        colors.secondary,
+                    )
+                    .size()
+                    .x
+            })
+            .sum::<f32>()
+            + 3.0 * gap;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(centered_left_padding(ui.available_width(), width));
+            for (index, (label, enabled)) in labels.iter().enumerate() {
+                if index > 0 {
+                    let (rect, _) =
+                        ui.allocate_exact_size(Vec2::new(gap, 22.0 * scale), egui::Sense::hover());
+                    ui.painter().vline(
+                        rect.center().x,
+                        rect.center().y - 7.0 * scale..=rect.center().y + 7.0 * scale,
+                        Stroke::new(1.0, colors.border),
                     );
-                    ui.add_space(8.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(log_width, 28.0),
-                        Layout::right_to_left(Align::Center),
-                        |ui| {
-                            let unread = if self.log_unread > 0 {
-                                format!("{} {}", icons::BELL, self.log_unread.min(99))
-                            } else {
-                                icons::LIST_BULLETS.to_owned()
-                            };
-                            let button = egui::Button::new(
-                                RichText::new(format!(
-                                    "{}  {}",
-                                    unread,
-                                    self.translator.text("agent.log.entry")
-                                ))
-                                .color(Color32::from_rgb(15, 103, 232))
-                                .size(12.0)
-                                .strong(),
-                            )
-                            .fill(Color32::from_rgb(239, 246, 255))
-                            .stroke(Stroke::new(1.0, Color32::from_rgb(191, 219, 254)))
-                            .corner_radius(6.0)
-                            .min_size(Vec2::new(88.0, 28.0));
-                            if ui.add(button).clicked() {
-                                self.log_drawer_open = true;
-                                self.log_unread = 0;
-                            }
-                        },
-                    );
-                });
-            });
-    }
-
-    /// 渲染紧凑的能力标签，减少能力区对主界面的占用。
-    fn render_capability_text(&self, ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool) {
-        let color = if enabled {
-            Color32::from_rgb(30, 41, 59)
-        } else {
-            Color32::from_rgb(148, 163, 184)
-        };
-        let response = ui.label(
-            RichText::new(format!("{icon} {label}"))
-                .size(11.0)
-                .color(color),
-        );
-        response.on_hover_text(if enabled {
-            self.translator.text("agent.capability.enabled")
-        } else {
-            self.translator.text("agent.capability.disabled")
-        });
-    }
-
-    /// 渲染右侧覆盖式日志抽屉。抽屉打开时覆盖底层内容而不改变窗口尺寸。
-    #[allow(clippy::too_many_lines)]
-    fn render_log_drawer(&mut self, ctx: &egui::Context) {
-        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-            self.log_drawer_open = false;
-        }
-        let target = self.log_drawer_open;
-        let progress = ctx.animate_bool(egui::Id::new("agent-log-drawer-animation"), target);
-        if progress <= 0.001 {
-            return;
-        }
-        let screen = ctx.content_rect();
-        let backdrop = egui::Area::new(egui::Id::new("agent-log-backdrop"))
-            .order(Order::Foreground)
-            .fixed_pos(screen.min);
-        backdrop.show(ctx, |ui| {
-            let response = ui.allocate_rect(
-                egui::Rect::from_min_size(egui::Pos2::ZERO, screen.size()),
-                egui::Sense::click(),
-            );
-            if response.clicked() {
-                self.log_drawer_open = false;
+                }
+                ui.add_enabled(
+                    *enabled,
+                    egui::Label::new(
+                        RichText::new(label)
+                            .size(15.0 * scale)
+                            .color(colors.secondary),
+                    ),
+                )
+                .on_hover_text(self.translator.text(if *enabled {
+                    "agent.capability.enabled"
+                } else {
+                    "agent.capability.disabled"
+                }));
             }
         });
-        let left = log_drawer_left(screen.left(), screen.width(), LOG_DRAWER_WIDTH, progress);
-        egui::Area::new(egui::Id::new("agent-log-drawer"))
-            .order(Order::Foreground)
-            .constrain(false)
-            .fixed_pos(egui::pos2(left, screen.top()))
-            .show(ctx, |ui| {
-                ui.set_height(screen.height());
-                ui.set_min_width(LOG_DRAWER_WIDTH);
-                ui.set_max_width(LOG_DRAWER_WIDTH);
-                ui.set_width(LOG_DRAWER_WIDTH);
+    }
+
+    /// 日志使用完整页面，避免窄抽屉遮挡主界面。
+    #[allow(clippy::too_many_lines)]
+    fn render_log_page(&mut self, ui: &mut egui::Ui) {
+        let colors = Palette::current(ui.ctx());
+        egui::CentralPanel::default()
+            .frame(
                 Frame::new()
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
-                    .inner_margin(Margin::symmetric(16, 14))
-                    .shadow(egui::Shadow {
-                        offset: [-8, 0],
-                        blur: 24,
-                        spread: 2,
-                        color: Color32::from_black_alpha(42),
-                    })
+                    .fill(colors.background)
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(icons::LIST_BULLETS)
+                            .size(18.0)
+                            .color(colors.accent),
+                    );
+                    ui.label(
+                        RichText::new(self.translator.text("agent.log.title"))
+                            .strong()
+                            .size(17.0),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(self.translator.text("agent.log.back")).clicked() {
+                            self.log_drawer_open = false;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (filter, key) in [
+                        (LogFilter::All, "agent.log.filter_all"),
+                        (LogFilter::Running, "agent.log.filter_running"),
+                        (LogFilter::Success, "agent.log.filter_success"),
+                        (LogFilter::Error, "agent.log.filter_error"),
+                        (LogFilter::Info, "agent.log.filter_info"),
+                    ] {
+                        let selected = self.log_filter == filter;
+                        if ui
+                            .selectable_label(
+                                selected,
+                                RichText::new(self.translator.text(key)).size(12.0),
+                            )
+                            .clicked()
+                        {
+                            self.log_filter = filter;
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(self.translator.text_with(
+                            "agent.log.count",
+                            &[("count", &self.operation_logs.len().to_string())],
+                        ))
+                        .size(11.0)
+                        .color(colors.secondary),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .small_button(self.translator.text("agent.log.clear"))
+                            .clicked()
+                        {
+                            self.operation_logs.clear();
+                            self.log_unread = 0;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("agent-operation-logs")
+                    .auto_shrink([false, false])
+                    .max_height(ui.available_height())
                     .show(ui, |ui| {
-                        ui.set_min_width(LOG_DRAWER_WIDTH - 34.0);
-                        ui.set_max_width(LOG_DRAWER_WIDTH - 34.0);
-                        ui.set_height((screen.height() - 30.0).max(0.0));
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(icons::LIST_BULLETS)
-                                    .size(18.0)
-                                    .color(Color32::from_rgb(15, 103, 232)),
-                            );
-                            ui.label(
-                                RichText::new(self.translator.text("agent.log.title"))
-                                    .strong()
-                                    .size(17.0),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button(RichText::new(icons::X).size(16.0)).clicked() {
-                                    self.log_drawer_open = false;
-                                }
-                            });
-                        });
-                        ui.add_space(8.0);
-                        ui.horizontal_wrapped(|ui| {
-                            for (filter, key) in [
-                                (LogFilter::All, "agent.log.filter_all"),
-                                (LogFilter::Running, "agent.log.filter_running"),
-                                (LogFilter::Success, "agent.log.filter_success"),
-                                (LogFilter::Error, "agent.log.filter_error"),
-                                (LogFilter::Info, "agent.log.filter_info"),
-                            ] {
-                                let selected = self.log_filter == filter;
-                                if ui
-                                    .selectable_label(
-                                        selected,
-                                        RichText::new(self.translator.text(key)).size(12.0),
-                                    )
-                                    .clicked()
-                                {
-                                    self.log_filter = filter;
-                                }
-                            }
-                        });
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(self.translator.text_with(
-                                    "agent.log.count",
-                                    &[("count", &self.operation_logs.len().to_string())],
-                                ))
-                                .size(11.0)
-                                .color(Color32::from_rgb(100, 116, 139)),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .small_button(self.translator.text("agent.log.clear"))
-                                    .clicked()
-                                {
-                                    self.operation_logs.clear();
-                                    self.log_unread = 0;
-                                }
-                            });
-                        });
-                        ui.add_space(4.0);
-                        egui::ScrollArea::vertical()
-                            .id_salt("agent-operation-logs")
-                            .auto_shrink([false, false])
-                            .max_height(ui.available_height())
-                            .show(ui, |ui| {
-                                let mut shown = false;
-                                for log in self
-                                    .operation_logs
-                                    .iter()
-                                    .filter(|log| self.log_filter.matches(log.level))
-                                {
-                                    shown = true;
-                                    let (icon, color) = match log.level {
-                                        AgentLogLevel::Running => {
-                                            (icons::ARROW_CLOCKWISE, Color32::from_rgb(29, 78, 216))
-                                        }
-                                        AgentLogLevel::Success => {
-                                            (icons::CHECK_CIRCLE, Color32::from_rgb(22, 128, 61))
-                                        }
-                                        AgentLogLevel::Error => {
-                                            (icons::X_CIRCLE, Color32::from_rgb(185, 28, 28))
-                                        }
-                                        AgentLogLevel::Info => {
-                                            (icons::INFO, Color32::from_rgb(71, 85, 105))
-                                        }
-                                    };
-                                    ui.horizontal_top(|ui| {
-                                        ui.label(RichText::new(icon).color(color).size(14.0));
-                                        ui.vertical(|ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(log.message.clone())
-                                                        .size(12.0)
-                                                        .color(Color32::from_rgb(30, 41, 59))
-                                                        .text_style(egui::TextStyle::Body),
-                                                )
-                                                .selectable(true),
-                                            );
-                                            ui.label(
-                                                RichText::new(
-                                                    log.occurred_at
-                                                        .with_timezone(&Local)
-                                                        .format("%H:%M:%S")
-                                                        .to_string(),
-                                                )
-                                                .size(10.0)
-                                                .color(Color32::from_rgb(148, 163, 184)),
-                                            );
-                                            if let Some(request_id) = &log.request_id {
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        " · {}",
-                                                        short_request_id(request_id)
-                                                    ))
-                                                    .size(10.0)
-                                                    .color(Color32::from_rgb(148, 163, 184)),
-                                                );
-                                            }
-                                        });
-                                    });
-                                    ui.add_space(6.0);
-                                }
-                                if !shown {
-                                    ui.vertical_centered(|ui| {
-                                        let key = if self.operation_logs.is_empty() {
-                                            "agent.log.empty"
-                                        } else {
-                                            "agent.log.filter_empty"
-                                        };
-                                        ui.add_space(24.0);
-                                        ui.label(
-                                            RichText::new(self.translator.text(key))
+                        let mut shown = false;
+                        for log in self
+                            .operation_logs
+                            .iter()
+                            .filter(|log| self.log_filter.matches(log.level))
+                        {
+                            shown = true;
+                            let (icon, color) = match log.level {
+                                AgentLogLevel::Running => (icons::ARROW_CLOCKWISE, colors.accent),
+                                AgentLogLevel::Success => (icons::CHECK_CIRCLE, colors.success),
+                                AgentLogLevel::Error => (icons::X_CIRCLE, colors.danger),
+                                AgentLogLevel::Info => (icons::INFO, colors.secondary),
+                            };
+                            ui.horizontal_top(|ui| {
+                                ui.label(RichText::new(icon).color(color).size(14.0));
+                                ui.vertical(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(log.message.clone())
                                                 .size(12.0)
-                                                .color(Color32::from_rgb(148, 163, 184)),
-                                        );
-                                    });
-                                }
+                                                .color(colors.text)
+                                                .text_style(egui::TextStyle::Body),
+                                        )
+                                        .selectable(true)
+                                        .wrap(),
+                                    );
+                                    let time = log
+                                        .occurred_at
+                                        .with_timezone(&Local)
+                                        .format("%H:%M:%S")
+                                        .to_string();
+                                    let metadata = log.request_id.as_ref().map_or_else(
+                                        || time.clone(),
+                                        |id| format!("{time} · {}", short_request_id(id)),
+                                    );
+                                    ui.label(
+                                        RichText::new(metadata).size(10.0).color(colors.secondary),
+                                    );
+                                });
                             });
+                            ui.add_space(4.0);
+                            ui.separator();
+                        }
+                        if !shown {
+                            ui.vertical_centered(|ui| {
+                                let key = if self.operation_logs.is_empty() {
+                                    "agent.log.empty"
+                                } else {
+                                    "agent.log.filter_empty"
+                                };
+                                ui.add_space(24.0);
+                                ui.label(
+                                    RichText::new(self.translator.text(key))
+                                        .size(12.0)
+                                        .color(colors.secondary),
+                                );
+                            });
+                        }
                     });
             });
-        if progress < 0.999 {
-            ctx.request_repaint();
-        }
     }
 
     /// 渲染只读运行信息；SSH 密码只在控制端 MCP 的本机安全窗口录入。
     #[allow(clippy::too_many_lines)]
     fn render_advanced_settings(&mut self, ctx: &egui::Context) {
+        let colors = Palette::current(ctx);
         if !self.show_advanced_settings {
             return;
         }
@@ -1500,8 +1380,8 @@ impl RemoteOpsAgentApp {
             .backdrop_color(Color32::from_black_alpha(90))
             .frame(
                 Frame::new()
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+                    .fill(colors.surface)
+                    .stroke(Stroke::new(1.0, colors.border))
                     .corner_radius(8.0)
                     .inner_margin(Margin::symmetric(20, 18))
                     .shadow(egui::Shadow {
@@ -1515,11 +1395,7 @@ impl RemoteOpsAgentApp {
             ui.set_min_width(400.0);
             ui.set_max_width(420.0);
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(icons::GEAR)
-                        .size(22.0)
-                        .color(Color32::from_rgb(51, 65, 85)),
-                );
+                ui.label(RichText::new(icons::GEAR).size(22.0).color(colors.text));
                 ui.label(
                     RichText::new(self.translator.text("agent.advanced.title"))
                         .size(19.0)
@@ -1580,27 +1456,20 @@ impl RemoteOpsAgentApp {
             }
             if let Some(error) = &self.transfer_root_open_error {
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new(error)
-                        .size(11.0)
-                        .color(Color32::from_rgb(185, 28, 28)),
-                );
+                ui.label(RichText::new(error).size(11.0).color(colors.danger));
             }
         });
     }
 
     /// 渲染一行紧凑运行详情，长值通过悬停查看全文。
     fn render_detail_line(ui: &mut egui::Ui, icon: &str, label: &str, value: String) {
+        let colors = Palette::current(ui.ctx());
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(icon)
-                    .size(14.0)
-                    .color(Color32::from_rgb(71, 85, 105)),
-            );
+            ui.label(RichText::new(icon).size(14.0).color(colors.secondary));
             ui.label(
                 RichText::new(format!("{label}:"))
                     .size(12.0)
-                    .color(Color32::from_rgb(71, 85, 105)),
+                    .color(colors.secondary),
             );
             ui.add(egui::Label::new(RichText::new(&value).size(12.0)).truncate())
                 .on_hover_text(value);
@@ -1615,16 +1484,13 @@ impl RemoteOpsAgentApp {
         value: &str,
         tooltip: &str,
     ) -> bool {
+        let colors = Palette::current(ui.ctx());
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(icon)
-                    .size(14.0)
-                    .color(Color32::from_rgb(71, 85, 105)),
-            );
+            ui.label(RichText::new(icon).size(14.0).color(colors.secondary));
             ui.label(
                 RichText::new(format!("{label}:"))
                     .size(12.0)
-                    .color(Color32::from_rgb(71, 85, 105)),
+                    .color(colors.secondary),
             );
             let available_width = ui.available_width();
             ui.allocate_ui_with_layout(
@@ -1637,7 +1503,7 @@ impl RemoteOpsAgentApp {
                             egui::Label::new(
                                 RichText::new(icons::ARROW_SQUARE_OUT)
                                     .size(14.0)
-                                    .color(Color32::from_rgb(15, 103, 232)),
+                                    .color(colors.accent),
                             )
                             .sense(egui::Sense::click()),
                         )
@@ -1645,13 +1511,9 @@ impl RemoteOpsAgentApp {
                         .on_hover_text(&hint);
                     let path = ui
                         .add(
-                            egui::Label::new(
-                                RichText::new(value)
-                                    .size(12.0)
-                                    .color(Color32::from_rgb(15, 103, 232)),
-                            )
-                            .truncate()
-                            .sense(egui::Sense::click()),
+                            egui::Label::new(RichText::new(value).size(12.0).color(colors.accent))
+                                .truncate()
+                                .sense(egui::Sense::click()),
                         )
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text(hint);
@@ -1676,62 +1538,183 @@ impl RemoteOpsAgentApp {
 
     /// 渲染连接详情与停止协助操作栏。
     fn render_action_bar(&mut self, ui: &mut egui::Ui) {
-        Frame::new()
-            .fill(Color32::WHITE)
-            .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
-            .inner_margin(Margin {
-                left: 16,
-                right: 16,
-                top: 10,
-                bottom: 12,
-            })
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let details = egui::Button::new(
-                        RichText::new(format!(
-                            "{}  {}",
-                            icons::INFO,
-                            self.translator.text("agent.action.advanced_settings")
-                        ))
-                        .color(Color32::from_rgb(51, 65, 85))
-                        .size(13.5)
-                        .strong(),
-                    )
-                    .fill(Color32::from_rgb(248, 250, 252))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(203, 213, 225)))
-                    .corner_radius(6.0)
-                    .min_size(Vec2::new(148.0, 36.0));
-                    if ui.add(details).clicked() {
-                        self.show_advanced_settings = true;
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let stop_label = if self.active_connections > 0 {
-                            self.translator.text("agent.action.stop_remote")
-                        } else {
-                            self.translator.text("agent.action.exit_agent")
-                        };
-                        let stop = egui::Button::new(
-                            RichText::new(format!("{}  {}", icons::STOP_CIRCLE, stop_label))
-                                .color(Color32::from_rgb(220, 38, 38))
-                                .size(13.5)
-                                .strong(),
+        let scale = ui.available_width() / 544.0;
+        let colors = Palette::current(ui.ctx());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let button = |icon: &str, label: String| {
+                egui::Button::new(
+                    RichText::new(format!("{icon}  {label}"))
+                        .size(14.0 * scale)
+                        .color(colors.text),
+                )
+                .fill(colors.surface)
+                .stroke(Stroke::new(1.0, colors.border))
+                .corner_radius(6.0)
+                .min_size(Vec2::new(0.0, 44.0 * scale))
+            };
+            if ui
+                .add(button(
+                    icons::LIST_BULLETS,
+                    self.translator.text("agent.action.advanced_settings"),
+                ))
+                .clicked()
+            {
+                self.show_advanced_settings = true;
+            }
+            let response = ui.add(button(
+                icons::FILE_TEXT,
+                self.translator.text("agent.log.entry"),
+            ));
+            if self.log_unread > 0 {
+                ui.painter().circle_filled(
+                    response.rect.right_top() + Vec2::new(-5.0, 5.0),
+                    3.0,
+                    colors.accent,
+                );
+            }
+            if response.clicked() {
+                self.log_drawer_open = true;
+                self.log_unread = 0;
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let key = if self.active_connections > 0 {
+                    "agent.action.stop_remote"
+                } else {
+                    "agent.action.exit_agent"
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!(
+                                "{}  {}",
+                                icons::STOP_CIRCLE,
+                                self.translator.text(key)
+                            ))
+                            .size(14.0 * scale)
+                            .color(colors.danger),
                         )
-                        .fill(Color32::from_rgb(254, 242, 242))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(252, 165, 165)))
+                        .fill(colors.danger_surface)
+                        .stroke(Stroke::new(1.0, colors.danger))
                         .corner_radius(6.0)
-                        .min_size(Vec2::new(148.0, 36.0));
-                        if ui.add(stop).clicked() {
-                            self.show_stop_confirmation = true;
+                        .min_size(Vec2::new(136.0 * scale, 44.0 * scale)),
+                    )
+                    .clicked()
+                {
+                    self.show_stop_confirmation = true;
+                }
+            });
+        });
+    }
+
+    /// 主界面布局，返回内容边界以验证固定窗口下不会裁切。
+    fn render_main(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        let colors = Palette::current(ui.ctx());
+        egui::CentralPanel::default()
+            .frame(
+                Frame::new()
+                    .fill(colors.background)
+                    .inner_margin(Margin::same(23)),
+            )
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let scale = ui.available_width() / 544.0;
+                ui.horizontal(|ui| {
+                    let status_color = match self.status {
+                        UiStatus::Controlled => colors.success,
+                        UiStatus::Failed(_) => colors.danger,
+                        _ => colors.secondary,
+                    };
+                    let (dot, _) =
+                        ui.allocate_exact_size(Vec2::splat(14.0 * scale), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot.center(), 6.0 * scale, status_color);
+                    ui.add_space(6.0 * scale);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(390.0 * scale);
+                        ui.label(
+                            RichText::new(self.connection_heading())
+                                .font(FontId::new(
+                                    23.0 * scale,
+                                    FontFamily::Name("display".into()),
+                                ))
+                                .strong()
+                                .color(colors.text),
+                        );
+                        if self.permission_preview && matches!(self.status, UiStatus::Controlled) {
+                            ui.add_space(3.0 * scale);
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}  {}",
+                                    icons::SHIELD_CHECK,
+                                    self.translator.text("status.full_access_authorized")
+                                ))
+                                .size(12.0 * scale)
+                                .color(colors.secondary),
+                            );
                         }
                     });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        self.render_preferences(ui, scale);
+                    });
                 });
-            });
+                ui.add_space(24.0 * scale);
+                self.render_status_card(ui);
+                ui.add_space((ui.available_height() - 151.0 * scale).max(25.0 * scale));
+                ui.separator();
+                ui.add_space(21.0 * scale);
+                self.render_capabilities(ui);
+                ui.add_space(21.0 * scale);
+                ui.separator();
+                ui.add_space((ui.available_height() - 44.0 * scale).max(16.0 * scale));
+                self.render_action_bar(ui);
+                ui.min_rect()
+            })
+            .inner
+    }
+
+    /// 语言和外观设置保持在同一个轻量菜单内。
+    fn render_preferences(&mut self, ui: &mut egui::Ui, scale: f32) {
+        ui.menu_button(RichText::new(icons::GEAR).size(22.0 * scale), |ui| {
+            ui.set_min_width(180.0);
+            ui.label(self.translator.text("agent.preferences.language"));
+            for language in [Language::ZhCn, Language::EnUs] {
+                if ui
+                    .selectable_label(
+                        self.translator.language() == language,
+                        self.translator
+                            .text(&format!("language.{}", language.code())),
+                    )
+                    .clicked()
+                {
+                    self.set_language(language, ui.ctx());
+                }
+            }
+            ui.separator();
+            ui.label(self.translator.text("agent.preferences.appearance"));
+            for appearance in [Appearance::System, Appearance::Light, Appearance::Dark] {
+                if ui
+                    .selectable_label(
+                        self.appearance == appearance,
+                        self.translator.text(appearance.label_key()),
+                    )
+                    .clicked()
+                {
+                    self.appearance = appearance;
+                    appearance.apply(ui.ctx());
+                }
+            }
+            ui.separator();
+            ui.weak(format!("v{}", env!("CARGO_PKG_VERSION")));
+        })
+        .response
+        .on_hover_text(self.translator.text("agent.preferences.title"));
     }
 
     /// 渲染停止确认框。
     #[allow(clippy::too_many_lines)]
     fn render_stop_confirmation(&mut self, ctx: &egui::Context) {
+        let colors = Palette::current(ctx);
         if !self.show_stop_confirmation {
             return;
         }
@@ -1739,8 +1722,8 @@ impl RemoteOpsAgentApp {
             .backdrop_color(Color32::from_black_alpha(120))
             .frame(
                 Frame::new()
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+                    .fill(colors.surface)
+                    .stroke(Stroke::new(1.0, colors.border))
                     .corner_radius(14.0)
                     .inner_margin(Margin::symmetric(20, 18))
                     .shadow(egui::Shadow {
@@ -1764,7 +1747,7 @@ impl RemoteOpsAgentApp {
                     egui::Label::new(
                         RichText::new(icons::WARNING)
                             .size(32.0)
-                            .color(Color32::from_rgb(220, 38, 38)),
+                            .color(colors.danger),
                     ),
                 );
                 ui.add_space(12.0);
@@ -1773,27 +1756,27 @@ impl RemoteOpsAgentApp {
                         RichText::new(self.translator.text(&format!("{key_prefix}.title")))
                             .size(20.0)
                             .strong()
-                            .color(Color32::from_rgb(15, 23, 42)),
+                            .color(colors.text),
                     );
                     ui.add_space(3.0);
                     ui.label(
                         RichText::new(self.translator.text(&format!("{key_prefix}.subtitle")))
                             .size(13.0)
-                            .color(Color32::from_rgb(100, 116, 139)),
+                            .color(colors.secondary),
                     );
                 });
             });
             ui.add_space(14.0);
             Frame::new()
-                .fill(Color32::from_rgb(248, 250, 252))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+                .fill(colors.surface)
+                .stroke(Stroke::new(1.0, colors.border))
                 .corner_radius(10.0)
                 .inner_margin(Margin::symmetric(14, 12))
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new(self.translator.text(&format!("{key_prefix}.message")))
                             .size(14.0)
-                            .color(Color32::from_rgb(51, 65, 85)),
+                            .color(colors.text),
                     );
                 });
             ui.add_space(18.0);
@@ -1806,7 +1789,7 @@ impl RemoteOpsAgentApp {
                                 .color(Color32::WHITE)
                                 .strong(),
                         )
-                        .fill(Color32::from_rgb(220, 38, 38))
+                        .fill(Color32::from_rgb(195, 32, 55))
                         .corner_radius(8.0),
                     )
                     .clicked()
@@ -1819,11 +1802,11 @@ impl RemoteOpsAgentApp {
                         [136.0, 40.0],
                         egui::Button::new(
                             RichText::new(self.translator.text("agent.stop.cancel"))
-                                .color(Color32::from_rgb(30, 41, 59))
+                                .color(colors.text)
                                 .strong(),
                         )
-                        .fill(Color32::WHITE)
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(203, 213, 225)))
+                        .fill(colors.surface)
+                        .stroke(Stroke::new(1.0, colors.border))
                         .corner_radius(8.0),
                     )
                     .clicked()
@@ -1935,9 +1918,9 @@ impl eframe::App for RemoteOpsAgentApp {
         let ctx = ui.ctx().clone();
         let is_setup = self.setup.is_some();
         let (required_size, background) = if is_setup {
-            (SETUP_WINDOW_SIZE, Color32::from_rgb(246, 249, 253))
+            (SETUP_WINDOW_SIZE, Palette::current(&ctx).background)
         } else {
-            (RUNNING_WINDOW_SIZE, Color32::WHITE)
+            (RUNNING_WINDOW_SIZE, Palette::current(&ctx).background)
         };
         if self.layout_is_setup != Some(is_setup) {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(required_size));
@@ -2026,13 +2009,8 @@ impl eframe::App for RemoteOpsAgentApp {
         if self.receive_events() {
             ctx.request_repaint();
         }
-        if self.pairing_code.is_none() {
-            // 等待控制码时保留低频动画，避免空闲窗口持续高频重绘。
-            ctx.request_repaint_after(Duration::from_millis(500));
-        } else {
-            // 控制码倒计时按秒变化；后台事件通过转发线程主动唤醒界面。
-            ctx.request_repaint_after(Duration::from_secs(1));
-        }
+        // 加载动画仅在控制码区域可见时请求重绘；其余状态按秒刷新。
+        ctx.request_repaint_after(Duration::from_secs(1));
         if matches!(self.status, UiStatus::Stopped) && !self.allow_close {
             self.allow_close = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -2046,118 +2024,14 @@ impl eframe::App for RemoteOpsAgentApp {
                 self.show_stop_confirmation = true;
             }
         }
-        egui::CentralPanel::default()
-            .frame(
-                Frame::new()
-                    .fill(Color32::from_rgb(246, 248, 250))
-                    .inner_margin(Margin::ZERO),
-            )
-            .show(ui, |ui| {
-                // 底部操作栏独立占位，避免内容增高时被裁切。
-                egui::Panel::bottom("agent-action-bar")
-                    .frame(Frame::new().fill(Color32::WHITE))
-                    .show(ui, |ui| self.render_action_bar(ui));
-                egui::Panel::top("agent-header")
-                    .frame(Frame::new().fill(Color32::WHITE))
-                    .show(ui, |ui| {
-                        Frame::new()
-                            .fill(Color32::WHITE)
-                            .inner_margin(Margin::symmetric(16, 9))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    if let Some(texture) = &self.brand_texture {
-                                        ui.image((texture.id(), Vec2::splat(20.0)));
-                                    }
-                                    ui.label(
-                                        RichText::new(self.translator.text("app.agent_brand"))
-                                            .strong()
-                                            .size(15.0),
-                                    );
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.scope(|ui| {
-                                            ui.style_mut().animation_time = 0.0;
-                                            Frame::new()
-                                                .fill(Color32::from_rgb(241, 245, 249))
-                                                .stroke(Stroke::new(
-                                                    1.0,
-                                                    Color32::from_rgb(226, 232, 240),
-                                                ))
-                                                .corner_radius(6.0)
-                                                .inner_margin(Margin::symmetric(2, 2))
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        for language in
-                                                            [Language::ZhCn, Language::EnUs]
-                                                        {
-                                                            let selected =
-                                                                self.translator.language()
-                                                                    == language;
-                                                            let fill = if selected {
-                                                                Color32::WHITE
-                                                            } else {
-                                                                Color32::TRANSPARENT
-                                                            };
-                                                            let text_color = if selected {
-                                                                Color32::from_rgb(15, 103, 232)
-                                                            } else {
-                                                                Color32::from_rgb(100, 116, 139)
-                                                            };
-                                                            let stroke = if selected {
-                                                                Stroke::new(
-                                                                    1.0,
-                                                                    Color32::from_rgb(
-                                                                        203, 213, 225,
-                                                                    ),
-                                                                )
-                                                            } else {
-                                                                Stroke::NONE
-                                                            };
-                                                            let button = egui::Button::new(
-                                                                RichText::new(
-                                                                    self.translator.text(&format!(
-                                                                        "language.{}.short",
-                                                                        language.code()
-                                                                    )),
-                                                                )
-                                                                .color(text_color)
-                                                                .size(12.0),
-                                                            )
-                                                            .fill(fill)
-                                                            .stroke(stroke)
-                                                            .corner_radius(4.0)
-                                                            .min_size(Vec2::new(42.0, 22.0));
-                                                            if ui.add(button).clicked() {
-                                                                self.set_language(language, &ctx);
-                                                            }
-                                                        }
-                                                    });
-                                                });
-                                        });
-                                    });
-                                });
-                            });
-                        ui.separator();
-                    });
-                egui::ScrollArea::vertical()
-                    .id_salt("agent-main-content")
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        Frame::new()
-                            .inner_margin(Margin {
-                                left: 16,
-                                right: 16,
-                                top: 10,
-                                bottom: 8,
-                            })
-                            .show(ui, |ui| {
-                                self.render_status_card(ui);
-                                ui.add_space(8.0);
-                                self.render_capabilities(ui);
-                            });
-                    });
-            });
-        self.render_log_drawer(&ctx);
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.log_drawer_open = false;
+        }
+        if self.log_drawer_open {
+            self.render_log_page(ui);
+        } else {
+            self.render_main(ui);
+        }
         self.render_stop_confirmation(&ctx);
         self.render_advanced_settings(&ctx);
         self.render_certificate_confirmation(&ctx);
@@ -2170,6 +2044,7 @@ impl eframe::App for RemoteOpsAgentApp {
             "remoteops_agent_gui_settings",
             &AgentGuiSettings {
                 language: Some(self.translator.language()),
+                appearance: self.appearance,
             },
         );
     }
@@ -2343,13 +2218,18 @@ fn spawn_demo(
                 ]),
             });
             // 演示模式保留短暂加载阶段，便于验收控制码获取动画。
-            std::thread::sleep(Duration::from_secs(2));
+            let loading_seconds = std::env::var("REMOTEOPS_DEMO_LOADING_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(2)
+                .min(120);
+            std::thread::sleep(Duration::from_secs(loading_seconds));
             let _ = event_sender.send(AgentEvent::Connected {
                 pairing_code: "482-915-307".to_owned(),
                 lease_expires_at: Utc::now() + chrono::Duration::minutes(10),
             });
             let _ = event_sender.send(AgentEvent::ControllerCountChanged {
-                active_connections: 0,
+                active_connections: 1,
             });
             let mut request_id = RequestId::new();
             for index in 0..30 {
@@ -2388,6 +2268,8 @@ fn configure_fonts(ctx: &egui::Context) {
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\msyh.ttf",
         r"C:\Windows\Fonts\simhei.ttf",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
     ] {
         if let Ok(bytes) = std::fs::read(candidate) {
             fonts.font_data.insert(
@@ -2407,41 +2289,65 @@ fn configure_fonts(ctx: &egui::Context) {
             break;
         }
     }
+    for candidate in [
+        r"C:\Windows\Fonts\segoeui.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(candidate) {
+            fonts.font_data.insert(
+                "remoteops_body".into(),
+                egui::FontData::from_owned(bytes).into(),
+            );
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .insert(0, "remoteops_body".into());
+            break;
+        }
+    }
+    // 数字与状态标题使用真正的粗体；egui 的 strong() 只增强颜色。
+    let mut display_fonts = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    for candidate in [
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(candidate) {
+            fonts.font_data.insert(
+                "remoteops_display".into(),
+                egui::FontData::from_owned(bytes).into(),
+            );
+            display_fonts.insert(0, "remoteops_display".into());
+            break;
+        }
+    }
+    for candidate in [
+        r"C:\Windows\Fonts\msyhbd.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+    ] {
+        if let Ok(bytes) = std::fs::read(candidate) {
+            fonts.font_data.insert(
+                "remoteops_zh_bold".into(),
+                egui::FontData::from_owned(bytes).into(),
+            );
+            display_fonts.insert(1.min(display_fonts.len()), "remoteops_zh_bold".into());
+            break;
+        }
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name("display".into()), display_fonts);
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
 }
 
 /// 应用简洁、清晰的 Windows 工具型界面样式。
 fn install_style(ctx: &egui::Context) {
-    ctx.set_theme(egui::ThemePreference::Light);
-    let theme = ctx.theme();
-    let mut style = (*ctx.style_of(theme)).clone();
-    style.animation_time = 0.18;
-    style.spacing.item_spacing = Vec2::new(7.0, 6.0);
-    style.spacing.button_padding = Vec2::new(12.0, 7.0);
-    style.spacing.interact_size = Vec2::new(36.0, 34.0);
-    style.text_styles.insert(
-        TextStyle::Heading,
-        FontId::new(20.0, FontFamily::Proportional),
-    );
-    style
-        .text_styles
-        .insert(TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
-    style.text_styles.insert(
-        TextStyle::Button,
-        FontId::new(14.0, FontFamily::Proportional),
-    );
-    style.visuals.panel_fill = Color32::WHITE;
-    style.visuals.window_fill = Color32::WHITE;
-    style.visuals.override_text_color = Some(Color32::from_rgb(15, 23, 42));
-    style.visuals.selection.bg_fill = Color32::from_rgb(219, 234, 254);
-    style.visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(37, 112, 232));
-    style.visuals.widgets.inactive.corner_radius = 4.0.into();
-    style.visuals.widgets.hovered.corner_radius = 4.0.into();
-    style.visuals.widgets.active.corner_radius = 4.0.into();
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(241, 245, 249);
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(219, 234, 254);
-    ctx.set_style_of(theme, style);
+    appearance::install_style(ctx);
 }
 
 /// 安装 GUI 进程级 panic 记录器，保留默认终端输出行为。
@@ -2779,7 +2685,7 @@ mod tests {
         assert!(options.run_and_return);
         assert!(!options.persist_window);
         assert!(options.centered);
-        assert_eq!(RUNNING_WINDOW_SIZE, Vec2::new(520.0, 440.0));
+        assert_eq!(RUNNING_WINDOW_SIZE, Vec2::new(500.0, 375.0));
         assert_eq!(options.viewport.inner_size, Some(RUNNING_WINDOW_SIZE));
         assert_eq!(options.viewport.min_inner_size, Some(RUNNING_WINDOW_SIZE));
         assert_eq!(options.viewport.max_inner_size, Some(RUNNING_WINDOW_SIZE));
@@ -2793,12 +2699,9 @@ mod tests {
     }
 
     #[test]
-    fn native_window_title_uses_compiled_package_version() {
+    fn native_window_title_uses_localized_product_name() {
         let translator = Translator::new(Language::ZhCn);
-        assert_eq!(
-            agent_window_title(&translator),
-            format!("RemoteOps 远程协助 · v{}", env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(agent_window_title(&translator), "RemoteOps 远程协助");
     }
 
     #[test]
@@ -2815,12 +2718,15 @@ mod tests {
 
     #[test]
     fn pairing_code_row_has_bounded_height_in_running_window() {
-        assert_eq!(pairing_code_row_size(321.0), Vec2::new(321.0, 40.0));
+        assert_eq!(
+            pairing_code_row_size(321.0),
+            Vec2::new(321.0, PAIRING_CODE_ROW_HEIGHT)
+        );
     }
 
     #[test]
     fn pairing_code_content_uses_explicit_centering_padding() {
-        assert!((pairing_code_left_padding(440.0, 164.0, 8.0) - 116.0).abs() < f32::EPSILON);
+        assert!((pairing_code_left_padding(440.0, 164.0, 8.0) - 112.0).abs() < f32::EPSILON);
         assert!(pairing_code_left_padding(180.0, 164.0, 8.0).abs() < f32::EPSILON);
     }
 
@@ -2879,12 +2785,6 @@ mod tests {
         assert!(LogFilter::Running.matches(AgentLogLevel::Running));
         assert!(!LogFilter::Running.matches(AgentLogLevel::Success));
         assert!(LogFilter::Error.matches(AgentLogLevel::Error));
-    }
-
-    #[test]
-    fn log_drawer_geometry_keeps_fixed_overlay_width() {
-        assert!((log_drawer_left(0.0, 520.0, 360.0, 1.0) - 160.0).abs() < f32::EPSILON);
-        assert!((log_drawer_left(0.0, 520.0, 360.0, 0.0) - 520.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -3061,12 +2961,11 @@ mod tests {
         assert_eq!(attempts, vec![requested, legacy]);
     }
 
-    #[test]
-    fn controller_status_reports_one_owner() {
+    fn test_app() -> RemoteOpsAgentApp {
         let (event_sender, events) = mpsc::channel();
         let (trust_sender, trust_events) = mpsc::channel();
         let (shutdown, _receiver) = watch::channel(false);
-        let app = RemoteOpsAgentApp {
+        RemoteOpsAgentApp {
             diagnostics: StartupDiagnostics { path: None },
             event_sender,
             events,
@@ -3087,6 +2986,7 @@ mod tests {
             pairing_code_expires_at: None,
             active_connections: 1,
             controller_bindings: Vec::new(),
+            permission_preview: false,
             operation_logs: VecDeque::new(),
             log_drawer_open: false,
             log_filter: LogFilter::All,
@@ -3094,7 +2994,7 @@ mod tests {
             permission_control: AgentPermissionControl::default(),
             elevated: Some(true),
             translator: Translator::new(remoteops_i18n::Language::ZhCn),
-            brand_texture: None,
+            appearance: Appearance::default(),
             language_file: None,
             show_stop_confirmation: false,
             show_advanced_settings: false,
@@ -3103,7 +3003,82 @@ mod tests {
             copied_until: None,
             layout_is_setup: None,
             window_centering: WindowCenteringState::default(),
+        }
+    }
+
+    #[test]
+    fn controller_status_reports_one_owner() {
+        assert_eq!(test_app().controller_status_label(), "工程师已连接");
+    }
+    #[test]
+    fn localized_main_layout_fits_native_window() {
+        for language in [Language::ZhCn, Language::EnUs] {
+            for appearance in [Appearance::Light, Appearance::Dark] {
+                let ctx = egui::Context::default();
+                configure_fonts(&ctx);
+                install_style(&ctx);
+                appearance.apply(&ctx);
+                let mut app = test_app();
+                app.translator = Translator::new(language);
+                app.pairing_code = Some("482-915-307".into());
+                app.permission_preview = true;
+                app.status = UiStatus::Controlled;
+                let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, RUNNING_WINDOW_SIZE);
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(viewport),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let content = app.render_main(ui);
+                        assert!(
+                            viewport.contains_rect(content),
+                            "{language:?} {appearance:?}: {content:?}"
+                        );
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn language_and_appearance_persist_and_old_settings_remain_readable() {
+        #[derive(Default)]
+        struct MemoryStorage(std::collections::HashMap<String, String>);
+        impl eframe::Storage for MemoryStorage {
+            fn get_string(&self, key: &str) -> Option<String> {
+                self.0.get(key).cloned()
+            }
+            fn set_string(&mut self, key: &str, value: String) {
+                self.0.insert(key.into(), value);
+            }
+            fn remove_string(&mut self, key: &str) {
+                self.0.remove(key);
+            }
+            fn flush(&mut self) {}
+        }
+        #[derive(Serialize)]
+        struct OldSettings {
+            language: Option<Language>,
+        }
+        let mut storage = MemoryStorage::default();
+        eframe::set_value(
+            &mut storage,
+            "settings",
+            &OldSettings {
+                language: Some(Language::EnUs),
+            },
+        );
+        let old: AgentGuiSettings = eframe::get_value(&storage, "settings").unwrap();
+        assert_eq!(old.language, Some(Language::EnUs));
+        assert_eq!(old.appearance, Appearance::System);
+        let settings = AgentGuiSettings {
+            language: Some(Language::ZhCn),
+            appearance: Appearance::Dark,
         };
-        assert_eq!(app.controller_status_label(), "工程师已连接");
+        eframe::set_value(&mut storage, "settings", &settings);
+        let restored: AgentGuiSettings = eframe::get_value(&storage, "settings").unwrap();
+        assert_eq!(restored.language, settings.language);
+        assert_eq!(restored.appearance, Appearance::Dark);
     }
 }
