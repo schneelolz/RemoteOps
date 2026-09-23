@@ -11,7 +11,10 @@ if [[ "${1:-}" == "--skip-network" ]]; then SKIP_NETWORK=1; fi
 
 failures=0
 pass() { echo "[通过] $1"; }
-fail() { echo "[失败] $1" >&2; failures=$((failures + 1)); }
+fail() {
+  echo "[失败] $1" >&2
+  failures=$((failures + 1))
+}
 
 [[ "$(uname -s)" == "Darwin" ]] || fail "当前系统不是 macOS。"
 [[ "$(uname -m)" == "arm64" ]] || fail "当前 Mac 不是 Apple Silicon（arm64）。"
@@ -80,7 +83,8 @@ if [[ "$SKIP_NETWORK" -eq 0 && -f "$CONNECTION_CONFIG" ]]; then
   relay="$(plutil -extract relay raw "$CONNECTION_CONFIG" 2>/dev/null || true)"
   host="${relay%:*}"
   port="${relay##*:}"
-  host="${host#\[}"; host="${host%\]}"
+  host="${host#\[}"
+  host="${host%\]}"
   if [[ -n "$host" && "$port" =~ ^[0-9]+$ ]] && nc -G 5 -z "$host" "$port" >/dev/null 2>&1; then
     pass "$relay TCP 可达。"
   else
