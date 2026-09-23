@@ -1073,7 +1073,7 @@ impl RemoteOpsAgentApp {
                         );
                     }
                     if loading {
-                        ui.ctx().request_repaint_after(Duration::from_millis(33));
+                        ui.ctx().request_repaint_after(Duration::from_millis(500));
                     }
                     return;
                 };
@@ -3038,6 +3038,47 @@ mod tests {
                     },
                 );
             }
+        }
+    }
+
+    #[test]
+    fn loading_and_reconnecting_keep_repaints_low_frequency() {
+        for status in [
+            UiStatus::Connecting,
+            UiStatus::Reconnecting("offline".into()),
+        ] {
+            let ctx = egui::Context::default();
+            configure_fonts(&ctx);
+            install_style(&ctx);
+            let mut app = test_app();
+            app.status = status;
+            app.active_connections = 0;
+            let mut delay = Duration::ZERO;
+            // 跳过字体初始化等首帧刷新，检查持续等待时的实际重绘请求。
+            for frame in 0..5 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        time: Some(f64::from(frame)),
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            RUNNING_WINDOW_SIZE,
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.render_main(ui);
+                    },
+                );
+                delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            }
+            assert!(
+                delay >= Duration::from_millis(450),
+                "repaint delay: {delay:?}"
+            );
+            assert!(
+                delay <= Duration::from_millis(500),
+                "loading animation stalled"
+            );
         }
     }
 
