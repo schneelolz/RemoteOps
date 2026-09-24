@@ -141,7 +141,7 @@ pub struct AgentPermissionModeChanged {
     pub permission_mode: PermissionMode,
 }
 
-/// MCP 在本机维护的会话控制模式，仅用于 Relay 状态展示。
+/// MCP 在本机维护的会话控制模式，仅用于控制模式展示，不参与授权判断。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControllerControlMode {
@@ -234,6 +234,9 @@ pub struct ControllerBinding {
     pub controller_kind: ControllerKind,
     /// Relay 当前强制执行的会话权限。
     pub permission_mode: PermissionMode,
+    /// Controller 上报的控制模式，仅供展示，不参与授权判断。
+    #[serde(default)]
+    pub controller_control_mode: Option<ControllerControlMode>,
     /// 只在 Relay 与 Agent 之间传输的随机绑定令牌。
     pub binding_token: String,
 }
@@ -443,6 +446,40 @@ mod tests {
     use remoteops_domain::{ApprovalState, SessionId, ShellKind};
 
     use super::*;
+
+    #[test]
+    fn controller_binding_modes_round_trip_and_legacy_defaults_to_none() {
+        let mut binding = ControllerBinding {
+            session_id: SessionId::new(),
+            controller_instance_id: ControllerInstanceId::new(),
+            owner_id: ControllerOwnerId::new(),
+            controller_kind: ControllerKind::Ai,
+            permission_mode: PermissionMode::ApprovalRequired,
+            controller_control_mode: None,
+            binding_token: "binding-token".to_owned(),
+        };
+        for mode in [
+            None,
+            Some(ControllerControlMode::StepByStep),
+            Some(ControllerControlMode::FullAccess),
+            Some(ControllerControlMode::ReadOnly),
+            Some(ControllerControlMode::ExternalApproval),
+            Some(ControllerControlMode::Expired),
+        ] {
+            binding.controller_control_mode = mode;
+            let message = WireMessage::ControllerBinding(binding.clone());
+            let json = serde_json::to_vec(&message).expect("绑定应可编码");
+            let decoded: WireMessage = serde_json::from_slice(&json).expect("绑定应可解码");
+            assert_eq!(decoded, message);
+        }
+        let mut legacy = serde_json::to_value(&binding).expect("绑定应可编码");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("controller_control_mode");
+        let decoded: ControllerBinding = serde_json::from_value(legacy).expect("旧绑定应兼容");
+        assert_eq!(decoded.controller_control_mode, None);
+    }
 
     #[test]
     fn remote_request_round_trips_json() {
