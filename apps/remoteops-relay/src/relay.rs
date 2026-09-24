@@ -144,7 +144,7 @@ struct SessionBinding {
     /// 当前角色请求的最高权限，由 Agent 权限上限进一步裁剪。
     permission_mode: PermissionMode,
     binding_token: String,
-    /// MCP 本地控制模式，仅用于管理界面展示。
+    // MCP 本地控制模式，仅用于界面展示。
     controller_control_mode: Option<ControllerControlMode>,
 }
 
@@ -2431,13 +2431,30 @@ impl Relay {
             let Some(bindings) = state.session_bindings.get_mut(&update.session_id) else {
                 continue;
             };
+            let permission_mode = bindings.permission_mode_for(ControllerKind::Ai);
             let Some(binding) = bindings.ai.as_mut() else {
                 continue;
             };
-            if binding.controller_id == controller_id
-                && binding.controller_generation == connection_generation
+            if binding.controller_id != controller_id
+                || binding.controller_generation != connection_generation
+                || binding.controller_control_mode == Some(update.mode)
             {
-                binding.controller_control_mode = Some(update.mode);
+                continue;
+            }
+            binding.controller_control_mode = Some(update.mode);
+            let message = WireMessage::ControllerBinding(controller_binding(
+                update.session_id,
+                binding,
+                permission_mode,
+            ));
+            // 在同一状态锁内入队，避免旧模式通知越过后续更新或解绑。
+            if let Some(sender) = state
+                .agents
+                .values()
+                .find(|agent| agent.session_id == update.session_id && agent.ready)
+                .and_then(|agent| agent.sender.as_ref())
+            {
+                let _ = sender.send(message);
             }
         }
     }
@@ -3538,6 +3555,7 @@ fn controller_binding(
         controller_kind: binding.controller_kind,
         permission_mode,
         binding_token: binding.binding_token.clone(),
+        controller_control_mode: binding.controller_control_mode,
     }
 }
 
@@ -3816,6 +3834,159 @@ mod tests {
             .await
             .expect("Controller 注册应成功");
         (controller_id, generation, receiver)
+    }
+
+    #[tokio::test]
+    async fn control_mode_updates_notify_agent_only_for_current_ai_binding_changes() {
+        let relay = relay(Duration::minutes(10));
+        let agent_id = AgentInstanceId::new();
+        let (agent, mut receiver, session_id) = ready_agent(&relay, agent_id, None).await;
+        let (ai_id, generation, _controller_receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        let result = relay
+            .pair_controller(
+                ai_id,
+                generation,
+                PairRequest {
+                    request_id: RequestId::new(),
+                    pairing_code: agent.welcome.pairing_code.clone(),
+                    permission_mode: PermissionMode::FullAccess,
+                },
+            )
+            .await;
+        assert!(result.error.is_none());
+        let initial_binding = match receiver.try_recv().expect("配对应下发绑定") {
+            WireMessage::ControllerBinding(binding) => binding,
+            other => panic!("预期绑定，实际为 {other:?}"),
+        };
+        assert_eq!(initial_binding.controller_control_mode, None);
+        while receiver.try_recv().is_ok() {}
+
+        let (other_ai, other_generation, _other_receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        let (human, human_generation, _human_receiver) =
+            register_controller(&relay, ControllerKind::Human).await;
+        for (controller_id, connection_generation) in [
+            (ai_id, generation + 1),
+            (other_ai, other_generation),
+            (human, human_generation),
+        ] {
+            relay
+                .update_controller_control_modes(
+                    controller_id,
+                    connection_generation,
+                    vec![ControllerControlModeUpdate {
+                        session_id,
+                        mode: ControllerControlMode::FullAccess,
+                    }],
+                )
+                .await;
+            assert!(receiver.try_recv().is_err());
+        }
+
+        for mode in [
+            ControllerControlMode::StepByStep,
+            ControllerControlMode::FullAccess,
+            ControllerControlMode::Expired,
+        ] {
+            for duplicate in [false, true] {
+                relay
+                    .update_controller_control_modes(
+                        ai_id,
+                        generation,
+                        vec![ControllerControlModeUpdate { session_id, mode }],
+                    )
+                    .await;
+                if duplicate {
+                    assert!(receiver.try_recv().is_err());
+                } else {
+                    let WireMessage::ControllerBinding(binding) =
+                        receiver.try_recv().expect("模式变化应通知 Agent")
+                    else {
+                        panic!("预期 ControllerBinding");
+                    };
+                    assert_eq!(binding.controller_control_mode, Some(mode));
+                    assert_eq!(binding.binding_token, initial_binding.binding_token);
+                    assert_eq!(binding.permission_mode, initial_binding.permission_mode);
+                }
+            }
+        }
+
+        relay
+            .mark_agent_disconnected(agent_id, agent.connection_generation)
+            .await;
+        let (sender, _resumed_receiver) = test_channel();
+        let resumed = relay
+            .register_agent(hello(agent_id, Some(agent.welcome.resume_token)), sender)
+            .await
+            .expect("Agent 重连应成功");
+        assert!(
+            relay
+                .commit_agent_resume(agent_id, resumed.connection_generation)
+                .await
+        );
+        let (_, bindings) = relay
+            .finalize_agent_resume(agent_id, resumed.connection_generation)
+            .await
+            .expect("Agent 恢复应成功");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].controller_control_mode, None);
+    }
+
+    #[tokio::test]
+    async fn agent_resume_snapshot_includes_latest_reported_control_mode() {
+        let relay = relay(Duration::minutes(10));
+        let agent_id = AgentInstanceId::new();
+        let (agent, _receiver, session_id) = ready_agent(&relay, agent_id, None).await;
+        let (ai_id, generation, _controller_receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        assert!(
+            relay
+                .pair_controller(
+                    ai_id,
+                    generation,
+                    PairRequest {
+                        request_id: RequestId::new(),
+                        pairing_code: agent.welcome.pairing_code,
+                        permission_mode: PermissionMode::FullAccess,
+                    },
+                )
+                .await
+                .error
+                .is_none()
+        );
+        relay
+            .mark_agent_disconnected(agent_id, agent.connection_generation)
+            .await;
+        let (sender, _resumed_receiver) = test_channel();
+        let resumed = relay
+            .register_agent(hello(agent_id, Some(agent.welcome.resume_token)), sender)
+            .await
+            .expect("Agent 重连应成功");
+        relay
+            .update_controller_control_modes(
+                ai_id,
+                generation,
+                vec![ControllerControlModeUpdate {
+                    session_id,
+                    mode: ControllerControlMode::StepByStep,
+                }],
+            )
+            .await;
+        assert!(
+            relay
+                .commit_agent_resume(agent_id, resumed.connection_generation)
+                .await
+        );
+        let (_, bindings) = relay
+            .finalize_agent_resume(agent_id, resumed.connection_generation)
+            .await
+            .expect("Agent 恢复应成功");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].controller_control_mode,
+            Some(ControllerControlMode::StepByStep)
+        );
     }
 
     async fn controller_sender(relay: &Relay, controller_id: ControllerInstanceId) -> Sender {

@@ -41,10 +41,10 @@ use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel};
 use remoteops_protocol::{
     AgentHello, AgentLeaseRenewed, AgentPermissionModeChanged, AgentResumeCommitAck,
     AgentWelcomeAck, AuthorizedRemoteRequest, ClientHello, ControllerBinding,
-    CredentialEncryptionContext, CredentialEncryptionKeyPair, EncryptedCredentialPayload,
-    PROTOCOL_VERSION, RemoteRequest, RemoteResponse, WireMessage, connect_tls, load_client_config,
-    load_native_client_config, load_pinned_client_config, normalize_certificate_fingerprint,
-    open_credential, read_frame, write_frame,
+    ControllerControlMode, CredentialEncryptionContext, CredentialEncryptionKeyPair,
+    EncryptedCredentialPayload, PROTOCOL_VERSION, RemoteRequest, RemoteResponse, WireMessage,
+    connect_tls, load_client_config, load_native_client_config, load_pinned_client_config,
+    normalize_certificate_fingerprint, open_credential, read_frame, write_frame,
 };
 use remoteops_serial::{
     SerialDirection, SerialObservedChunk, SerialQueryError, SerialQueryPlan, SerialQueryRunner,
@@ -451,6 +451,8 @@ pub struct AgentControllerBinding {
     pub controller_kind: remoteops_protocol::ControllerKind,
     /// Relay 会话当前请求的权限。
     pub permission_mode: PermissionMode,
+    /// Controller 上报的控制模式，仅供展示，不参与授权判断。
+    pub controller_control_mode: Option<ControllerControlMode>,
     /// Agent 本地是否允许该 Owner 使用 `FullAccess`。
     pub full_access_authorized_locally: bool,
 }
@@ -1666,6 +1668,7 @@ fn emit_controller_bindings(
             owner_id: binding.owner_id,
             controller_kind: binding.controller_kind,
             permission_mode: binding.permission_mode,
+            controller_control_mode: binding.controller_control_mode,
             full_access_authorized_locally: local_permission_policy
                 .allows(binding.owner_id, PermissionMode::FullAccess),
         })
@@ -3919,6 +3922,7 @@ mod tests {
                 owner_id: test_owner_id(),
                 controller_kind: ControllerKind::Human,
                 permission_mode: PermissionMode::ApprovalRequired,
+                controller_control_mode: None,
                 binding_token: binding_token.clone(),
             }),
         )
@@ -4311,6 +4315,7 @@ mod tests {
             owner_id: test_owner_id(),
             controller_kind: ControllerKind::Ai,
             permission_mode: PermissionMode::ApprovalRequired,
+            controller_control_mode: None,
             binding_token: "relay-only-binding-token".to_owned(),
         }
     }
@@ -4340,6 +4345,73 @@ mod tests {
                 approval,
             },
         }
+    }
+
+    #[test]
+    fn controller_binding_events_forward_modes_and_clear_removed_bindings() {
+        let (sender, receiver) = std_mpsc::channel();
+        let controller_id = ControllerInstanceId::new();
+        let mut current = binding(SessionId::new(), controller_id);
+        let local_policy = LocalPermissionPolicy::default();
+        let mut bindings = BTreeMap::new();
+        for mode in [
+            Some(ControllerControlMode::FullAccess),
+            Some(ControllerControlMode::Expired),
+            Some(ControllerControlMode::StepByStep),
+            Some(ControllerControlMode::ReadOnly),
+            Some(ControllerControlMode::ExternalApproval),
+            None,
+        ] {
+            current.controller_control_mode = mode;
+            bindings.insert(controller_id, current.clone());
+            emit_controller_bindings(Some(&sender), &bindings, &local_policy);
+            let AgentEvent::ControllerBindingsChanged { bindings } = receiver.try_recv().unwrap()
+            else {
+                panic!("应发送绑定事件");
+            };
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].controller_control_mode, mode);
+            assert_eq!(
+                bindings[0].permission_mode,
+                PermissionMode::ApprovalRequired
+            );
+            assert!(!bindings[0].full_access_authorized_locally);
+        }
+        bindings.clear();
+        emit_controller_bindings(Some(&sender), &bindings, &local_policy);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ControllerBindingsChanged { bindings } if bindings.is_empty()
+        ));
+    }
+
+    #[test]
+    fn displayed_full_access_does_not_bypass_request_approval() {
+        let session_id = SessionId::new();
+        let controller_id = ControllerInstanceId::new();
+        let mut current = binding(session_id, controller_id);
+        current.controller_control_mode = Some(ControllerControlMode::FullAccess);
+        let bindings = BTreeMap::from([(controller_id, current)]);
+        let request = authorized_request(
+            session_id,
+            controller_id,
+            RemoteOperation::RunCommand {
+                shell: ShellKind::WindowsPowerShell,
+                command: "Set-Content -Path status.txt -Value ok".to_owned(),
+                readonly: false,
+            },
+            None,
+            ApprovalState::NotRequired,
+        );
+        assert!(
+            verify_authorized_request(
+                &DefaultPolicy::default(),
+                &LocalPermissionPolicy::default(),
+                &bindings,
+                request,
+            )
+            .is_err()
+        );
     }
 
     #[test]

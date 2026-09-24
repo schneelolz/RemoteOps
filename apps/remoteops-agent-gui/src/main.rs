@@ -30,7 +30,8 @@ use remoteops_agent::{
 use remoteops_domain::{AgentInstanceId, Capability, CapabilitySet, RequestId};
 use remoteops_i18n::{Language, Translator};
 use remoteops_protocol::{
-    connect_tls, load_native_client_config, load_pinned_client_config, probe_server_certificate,
+    ControllerControlMode, ControllerKind, connect_tls, load_native_client_config,
+    load_pinned_client_config, probe_server_certificate,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -437,8 +438,6 @@ struct RemoteOpsAgentApp {
     active_connections: usize,
     /// 当前 Owner、Controller 类型和权限绑定。
     controller_bindings: Vec<AgentControllerBinding>,
-    /// 仅演示模式展示权限样式，不参与授权。
-    permission_preview: bool,
     /// 最近的远程操作日志，按时间顺序保留有限条目。
     operation_logs: VecDeque<AgentOperationLog>,
     /// 是否打开右侧日志覆盖抽屉。
@@ -564,7 +563,6 @@ impl RemoteOpsAgentApp {
             pairing_code_expires_at: None,
             active_connections: 0,
             controller_bindings: Vec::new(),
-            permission_preview: false,
             operation_logs: VecDeque::new(),
             log_drawer_open: false,
             log_filter: LogFilter::All,
@@ -592,7 +590,6 @@ impl RemoteOpsAgentApp {
                 app.relay.clone_from(&config.relay);
                 app.permission_control = AgentPermissionControl::from_config(&config);
                 if startup_demo {
-                    app.permission_preview = true;
                     app.worker = Some(spawn_demo(
                         app.event_sender.clone(),
                         config,
@@ -614,6 +611,7 @@ impl RemoteOpsAgentApp {
     /// 按当前信任配置启动 TLS 预检或直接启动 Agent。
     fn begin_connect(&mut self, config: AgentConfig) {
         self.relay.clone_from(&config.relay);
+        self.clear_controller_state();
         self.status = UiStatus::Connecting;
         self.certificate_confirmation = None;
         if config.ca_cert.is_some() {
@@ -686,13 +684,17 @@ impl RemoteOpsAgentApp {
                 transfer_root,
                 capabilities,
             } => {
+                self.clear_controller_state();
                 self.agent_instance_id = Some(agent_instance_id);
                 self.relay = relay;
                 self.transfer_root = Some(transfer_root);
                 self.capabilities = capabilities;
                 self.status = UiStatus::Connecting;
             }
-            AgentEvent::Connecting => self.status = UiStatus::Connecting,
+            AgentEvent::Connecting => {
+                self.clear_controller_state();
+                self.status = UiStatus::Connecting;
+            }
             AgentEvent::Connected {
                 pairing_code,
                 lease_expires_at,
@@ -710,6 +712,9 @@ impl RemoteOpsAgentApp {
             }
             AgentEvent::ControllerCountChanged { active_connections } => {
                 self.active_connections = active_connections;
+                if active_connections == 0 {
+                    self.controller_bindings.clear();
+                }
                 if matches!(self.status, UiStatus::Waiting | UiStatus::Controlled) {
                     self.status = if active_connections > 0 {
                         UiStatus::Controlled
@@ -732,11 +737,15 @@ impl RemoteOpsAgentApp {
             AgentEvent::Reconnecting { message, .. } => {
                 self.diagnostics.record("agent_reconnecting");
                 self.diagnostics.record_detail("network_error", &message);
-                self.active_connections = 0;
+                self.clear_controller_state();
                 self.status = UiStatus::Reconnecting(message);
             }
-            AgentEvent::Stopped => self.status = UiStatus::Stopped,
+            AgentEvent::Stopped => {
+                self.clear_controller_state();
+                self.status = UiStatus::Stopped;
+            }
             AgentEvent::Failed { message } => {
+                self.clear_controller_state();
                 self.diagnostics.record("agent_failed");
                 self.diagnostics.record_detail("agent_error", &message);
                 self.status = UiStatus::Failed(message);
@@ -744,9 +753,36 @@ impl RemoteOpsAgentApp {
         }
     }
 
+    /// 丢弃旧连接的控制状态，避免重连期间展示过期权限。
+    fn clear_controller_state(&mut self) {
+        self.active_connections = 0;
+        self.controller_bindings.clear();
+    }
+
+    /// 仅显示当前 AI 绑定明确上报的控制模式。
+    fn controller_control_mode_label(&self) -> Option<String> {
+        if !matches!(self.status, UiStatus::Controlled) {
+            return None;
+        }
+        let binding = self
+            .controller_bindings
+            .iter()
+            .find(|binding| binding.controller_kind == ControllerKind::Ai)?;
+        let key = match binding.controller_control_mode {
+            Some(ControllerControlMode::StepByStep) => "status.step_by_step",
+            Some(ControllerControlMode::FullAccess) => "status.full_access_authorized",
+            Some(ControllerControlMode::Expired) => "status.full_access_expired",
+            Some(ControllerControlMode::ReadOnly) => "status.read_only",
+            Some(ControllerControlMode::ExternalApproval) => "status.approval",
+            None => "status.control_mode_unsynced",
+        };
+        Some(self.translator.text(key))
+    }
+
     /// 请求后台停止，并允许随后关闭窗口。
     fn stop_and_close(&mut self, ctx: &egui::Context) {
         let _ = self.shutdown.send(true);
+        self.clear_controller_state();
         self.status = UiStatus::Stopped;
         self.allow_close = true;
         self.show_stop_confirmation = false;
@@ -1641,16 +1677,12 @@ impl RemoteOpsAgentApp {
                                 .strong()
                                 .color(colors.text),
                         );
-                        if self.permission_preview && matches!(self.status, UiStatus::Controlled) {
+                        if let Some(mode_label) = self.controller_control_mode_label() {
                             ui.add_space(3.0 * scale);
                             ui.label(
-                                RichText::new(format!(
-                                    "{}  {}",
-                                    icons::SHIELD_CHECK,
-                                    self.translator.text("status.full_access_authorized")
-                                ))
-                                .size(12.0 * scale)
-                                .color(colors.secondary),
+                                RichText::new(format!("{}  {}", icons::SHIELD_CHECK, mode_label))
+                                    .size(12.0 * scale)
+                                    .color(colors.secondary),
                             );
                         }
                     });
@@ -2197,6 +2229,17 @@ fn spawn_live(
         .expect("应能启动 Agent 后台线程")
 }
 
+/// 演示使用与真实连接相同的绑定状态驱动权限展示。
+fn demo_controller_binding() -> AgentControllerBinding {
+    AgentControllerBinding {
+        owner_id: remoteops_domain::ControllerOwnerId::new(),
+        controller_kind: ControllerKind::Ai,
+        permission_mode: remoteops_domain::PermissionMode::ApprovalRequired,
+        controller_control_mode: Some(ControllerControlMode::FullAccess),
+        full_access_authorized_locally: false,
+    }
+}
+
 /// 启动不连接网络的视觉验收后台。
 fn spawn_demo(
     event_sender: AgentEventSender,
@@ -2230,6 +2273,9 @@ fn spawn_demo(
             });
             let _ = event_sender.send(AgentEvent::ControllerCountChanged {
                 active_connections: 1,
+            });
+            let _ = event_sender.send(AgentEvent::ControllerBindingsChanged {
+                bindings: vec![demo_controller_binding()],
             });
             let mut request_id = RequestId::new();
             for index in 0..30 {
@@ -2986,7 +3032,6 @@ mod tests {
             pairing_code_expires_at: None,
             active_connections: 1,
             controller_bindings: Vec::new(),
-            permission_preview: false,
             operation_logs: VecDeque::new(),
             log_drawer_open: false,
             log_filter: LogFilter::All,
@@ -3011,32 +3056,131 @@ mod tests {
         assert_eq!(test_app().controller_status_label(), "工程师已连接");
     }
     #[test]
+    fn controller_mode_labels_follow_ai_binding_in_both_languages() {
+        let cases = [
+            (
+                Some(ControllerControlMode::StepByStep),
+                "逐项确认",
+                "Step-by-step confirmation",
+            ),
+            (
+                Some(ControllerControlMode::FullAccess),
+                "完全控制已启用",
+                "Full control active",
+            ),
+            (
+                Some(ControllerControlMode::Expired),
+                "完全控制已过期，当前逐项确认",
+                "Full access expired; step-by-step confirmation",
+            ),
+            (
+                Some(ControllerControlMode::ReadOnly),
+                "当前仅允许只读",
+                "Read-only",
+            ),
+            (
+                Some(ControllerControlMode::ExternalApproval),
+                "写操作需审批",
+                "Approval required",
+            ),
+            (None, "控制模式未同步", "Control mode not synced"),
+        ];
+        for language in [Language::ZhCn, Language::EnUs] {
+            let mut app = test_app();
+            app.status = UiStatus::Controlled;
+            app.translator = Translator::new(language);
+            assert_eq!(app.controller_control_mode_label(), None);
+            for (mode, chinese, english) in cases {
+                let mut binding = demo_controller_binding();
+                binding.controller_control_mode = mode;
+                app.apply_event(AgentEvent::ControllerBindingsChanged {
+                    bindings: vec![binding],
+                });
+                let expected = if language == Language::ZhCn {
+                    chinese
+                } else {
+                    english
+                };
+                assert_eq!(
+                    app.controller_control_mode_label().as_deref(),
+                    Some(expected)
+                );
+            }
+            app.controller_bindings[0].controller_kind = ControllerKind::Human;
+            assert_eq!(app.controller_control_mode_label(), None);
+        }
+    }
+
+    #[test]
+    fn disconnected_and_unbound_controllers_clear_mode_display() {
+        for event in [
+            AgentEvent::Connecting,
+            AgentEvent::Reconnecting {
+                message: "test".into(),
+                retry_seconds: 1,
+            },
+            AgentEvent::Stopped,
+            AgentEvent::Failed {
+                message: "test".into(),
+            },
+            AgentEvent::ControllerCountChanged {
+                active_connections: 0,
+            },
+            AgentEvent::ControllerBindingsChanged {
+                bindings: Vec::new(),
+            },
+        ] {
+            let mut app = test_app();
+            app.status = UiStatus::Controlled;
+            app.controller_bindings = vec![demo_controller_binding()];
+            app.apply_event(event);
+            assert!(app.controller_bindings.is_empty());
+            assert_eq!(app.controller_control_mode_label(), None);
+            app.apply_event(AgentEvent::Connected {
+                pairing_code: "test".into(),
+                lease_expires_at: Utc::now(),
+            });
+            assert_eq!(app.controller_control_mode_label(), None);
+        }
+    }
+
+    #[test]
     fn localized_main_layout_fits_native_window() {
         for language in [Language::ZhCn, Language::EnUs] {
             for appearance in [Appearance::Light, Appearance::Dark] {
-                let ctx = egui::Context::default();
-                configure_fonts(&ctx);
-                install_style(&ctx);
-                appearance.apply(&ctx);
-                let mut app = test_app();
-                app.translator = Translator::new(language);
-                app.pairing_code = Some("482-915-307".into());
-                app.permission_preview = true;
-                app.status = UiStatus::Controlled;
-                let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, RUNNING_WINDOW_SIZE);
-                let _ = ctx.run_ui(
-                    egui::RawInput {
-                        screen_rect: Some(viewport),
-                        ..Default::default()
-                    },
-                    |ui| {
-                        let content = app.render_main(ui);
-                        assert!(
-                            viewport.contains_rect(content),
-                            "{language:?} {appearance:?}: {content:?}"
-                        );
-                    },
-                );
+                for mode in [
+                    None,
+                    Some(ControllerControlMode::StepByStep),
+                    Some(ControllerControlMode::FullAccess),
+                    Some(ControllerControlMode::Expired),
+                    Some(ControllerControlMode::ReadOnly),
+                    Some(ControllerControlMode::ExternalApproval),
+                ] {
+                    let ctx = egui::Context::default();
+                    configure_fonts(&ctx);
+                    install_style(&ctx);
+                    appearance.apply(&ctx);
+                    let mut app = test_app();
+                    app.translator = Translator::new(language);
+                    app.pairing_code = Some("482-915-307".into());
+                    app.controller_bindings = vec![demo_controller_binding()];
+                    app.controller_bindings[0].controller_control_mode = mode;
+                    app.status = UiStatus::Controlled;
+                    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, RUNNING_WINDOW_SIZE);
+                    let _ = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(viewport),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let content = app.render_main(ui);
+                            assert!(
+                                viewport.contains_rect(content),
+                                "{language:?} {appearance:?}: {content:?}"
+                            );
+                        },
+                    );
+                }
             }
         }
     }

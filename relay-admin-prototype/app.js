@@ -5,7 +5,11 @@
 
 // Global Application State
 const state = {
-  theme: localStorage.getItem('remoteops-theme') || 'dark',
+  theme: readThemePreference(),
+  selectedAgents: new Map(),
+  agentKeyword: '',
+  agentStatus: 'ALL',
+  shutdownBusy: false,
   currentTab: 'overview', // 'overview', 'sessions', 'agents', 'identity', 'settings', 'audit'
   isLoggedIn: false,
   demoMode: false,
@@ -296,6 +300,8 @@ function applyApiData(overview, identity, rawAgents, rawSessions, rawAudit) {
     generation: agent.connection_generation || 0
   })));
 
+  reconcileAgentSelection();
+
   sessions = (rawSessions || []).map(session => {
     const bindings = session.controller_bindings || [];
     const ai = bindings.find(binding => binding.kind === 'ai');
@@ -373,6 +379,7 @@ function loadDemoData() {
       lease_expires_at: demoTimestamp(9),
       last_seen: demoTimestamp(0),
       connection_generation: 12,
+      supports_agent_shutdown: true,
       ready: true,
       ever_paired: true,
       permission_mode: 'read_only'
@@ -388,6 +395,7 @@ function loadDemoData() {
       lease_expires_at: demoTimestamp(-12),
       last_seen: demoTimestamp(-1),
       connection_generation: 4,
+      supports_agent_shutdown: true,
       ready: false,
       ever_paired: false,
       permission_mode: 'read_only'
@@ -636,13 +644,29 @@ function copyToClipboard(text, label = '内容', targetEl = null) {
   });
 }
 
-function toggleTheme() {
-  state.theme = state.theme === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', state.theme);
+function readThemePreference() {
   try {
-    localStorage.setItem('remoteops-theme', state.theme);
-  } catch (_) {}
-  renderApp();
+    const value = localStorage.getItem('remoteops-theme');
+    return ['system', 'light', 'dark'].includes(value) ? value : 'system';
+  } catch (_) { return 'system'; }
+}
+
+function applyTheme() {
+  const dark = state.theme === 'dark' || (state.theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+}
+
+function setTheme(value) {
+  if (!['system', 'light', 'dark'].includes(value)) return;
+  state.theme = value;
+  try { localStorage.setItem('remoteops-theme', value); } catch (_) {}
+  applyTheme();
+  document.querySelectorAll('.theme-select').forEach(select => { select.value = value; });
+}
+
+function renderThemePicker() {
+  return `<select class="theme-select input" aria-label="界面主题" onchange="setTheme(this.value)">${[['system', '跟随系统'], ['light', '亮色'], ['dark', '暗色']].map(([value, label]) => `<option value="${value}" ${state.theme === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`;
 }
 
 function navigateTo(tabName) {
@@ -719,6 +743,15 @@ function closeSessionDrawer() {
 
 // Modal Controls
 function openModal(modalName, data = null) {
+  if (state.shutdownBusy) return;
+  if (modalName === 'shutdownAgent') {
+    const agent = agents.find(item => item.id === data?.id);
+    if (!canShutdownAgent(agent) || Number(agent.generation) !== Number(data.generation)) {
+      showToast('节点连接已变化，请刷新后重试', 'error');
+      return;
+    }
+    data = { targets: [snapshotAgent(agent)], results: null };
+  }
   state.activeModal = modalName;
   state.modalTargetData = data;
   state.stopInputText = '';
@@ -726,6 +759,7 @@ function openModal(modalName, data = null) {
 }
 
 function closeModal() {
+  if (state.shutdownBusy) return;
   state.activeModal = null;
   state.modalTargetData = null;
   state.stopInputText = '';
@@ -778,31 +812,91 @@ async function confirmEmergencyStop() {
   }
 }
 
+function canShutdownAgent(agent) {
+  return Boolean(agent && agent.status === 'online' && agent.supportsAgentShutdown && Number(agent.generation) > 0);
+}
+
+function snapshotAgent(agent) {
+  return { id: agent.id, generation: Number(agent.generation), hostname: agent.hostname };
+}
+
+function reconcileAgentSelection() {
+  for (const [id, generation] of state.selectedAgents) {
+    const current = agents.find(agent => agent.id === id);
+    if (!canShutdownAgent(current) || Number(current.generation) !== generation) state.selectedAgents.delete(id);
+  }
+}
+
+function filteredAgents() {
+  const keyword = state.agentKeyword.trim().toLowerCase();
+  return agents.filter(agent => (state.agentStatus === 'ALL' || agent.status === state.agentStatus) && (!keyword || [agent.hostname, agent.id, agent.os].some(value => String(value).toLowerCase().includes(keyword))));
+}
+
+function setAgentFilter(key, value) {
+  state[key] = value;
+  const input = document.getElementById('agent-search');
+  const focused = document.activeElement === input;
+  const position = input?.selectionStart;
+  renderApp();
+  if (focused) {
+    const next = document.getElementById('agent-search');
+    next?.focus();
+    next?.setSelectionRange(position, position);
+  }
+}
+
+function selectAgent(id, checked) {
+  const agent = agents.find(item => item.id === id);
+  if (checked && canShutdownAgent(agent)) state.selectedAgents.set(id, Number(agent.generation));
+  else state.selectedAgents.delete(id);
+  renderApp();
+}
+
+function selectVisibleAgents(checked) {
+  filteredAgents().filter(canShutdownAgent).forEach(agent => {
+    if (checked) state.selectedAgents.set(agent.id, Number(agent.generation));
+    else state.selectedAgents.delete(agent.id);
+  });
+  renderApp();
+}
+
+function openAgentShutdown(all = false) {
+  reconcileAgentSelection();
+  const targets = agents.filter(agent => canShutdownAgent(agent) && (all || state.selectedAgents.has(agent.id))).map(snapshotAgent);
+  if (targets.length) openModal('shutdownAgents', { targets, results: null, all });
+}
+
 async function confirmShutdownAgent() {
-  if (!state.modalTargetData?.id) return;
-  const agentId = state.modalTargetData.id;
-  const agentName = state.modalTargetData.agentName || '';
-  const generation = Number(state.modalTargetData.generation || 0);
-  closeModal();
+  if (state.shutdownBusy || !state.modalTargetData?.targets?.length || state.modalTargetData.results) return;
+  const data = state.modalTargetData;
+  state.shutdownBusy = true;
+  data.results = [];
+  renderModal();
+  // 固定确认时的连接代次，逐个请求避免误关新连接或瞬间放大负载。
   try {
-    if (!state.demoMode) {
-      await apiFetch(`/api/admin/agents/${encodeURIComponent(agentId)}/shutdown`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agent_instance_id: agentId, connection_generation: generation })
-      });
-      await refreshRealData();
-    } else {
-      const agent = agents.find(item => item.id === agentId);
-      if (agent) agent.status = 'offline';
-      const session = sessions.find(item => item.agentId === agentId);
-      if (session) session.agentStatus = 'offline';
+    for (const target of data.targets) {
+      const current = agents.find(agent => agent.id === target.id);
+      try {
+        if (!canShutdownAgent(current) || Number(current.generation) !== target.generation) throw new Error('连接已变化或离线，请刷新后重新选择');
+        if (!state.demoMode) {
+          await apiFetch(`/api/admin/agents/${encodeURIComponent(target.id)}/shutdown`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ agent_instance_id: target.id, connection_generation: target.generation })
+          });
+        } else { current.status = 'offline'; }
+        state.selectedAgents.delete(target.id);
+        data.results.push({ ...target, ok: true, message: '关闭指令已接受' });
+      } catch (error) { data.results.push({ ...target, ok: false, message: error.message }); }
+      renderModal();
     }
-    showToast(`Agent ${agentName} 已优雅退出`, 'success');
-    closeDrawer();
+    if (!state.demoMode) {
+      try { await refreshRealData(); } catch (error) { data.refreshError = error.message; }
+    }
+    reconcileAgentSelection();
+  } finally {
+    state.shutdownBusy = false;
     renderApp();
-  } catch (error) {
-    showToast(`关闭 Agent 失败：${error.message}`, 'error');
+    renderModal();
   }
 }
 
@@ -852,9 +946,7 @@ function renderTopBar() {
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
           <span>刷新</span>
         </button>
-        <button class="btn btn-secondary btn-sm" onclick="toggleTheme()" title="切换明亮/暗黑主题">
-          ${state.theme === 'dark' ? '☀️ 亮色' : '🌙 深色'}
-        </button>
+        ${renderThemePicker()}
         <div class="admin-pill">
           <span class="avatar">${escapeHtml((state.adminUser || 'A').charAt(0).toUpperCase())}</span>
           <span class="font-mono text-slate-300">${escapeHtml(state.adminUser || 'Admin')}</span>
@@ -922,9 +1014,9 @@ function renderSidebar() {
             <span class="pulse-dot"></span>
             <span>Relay 运行正常</span>
           </span>
-          <span class="badge badge-info" style="font-size:10.5px; padding:1px 6px;">v${escapeHtml(relayInfo.version)}</span>
+          <span class="badge badge-info" style="font-size:14px; padding:1px 6px;">v${escapeHtml(relayInfo.version)}</span>
         </div>
-        <div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+        <div style="font-size:14px; color:var(--text-muted); font-family:var(--font-mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
           ${escapeHtml(relayInfo.host)}
         </div>
       </div>
@@ -1067,9 +1159,9 @@ function renderOverviewView() {
           </div>
           <div style="display:flex; flex-direction:column; gap:10px; margin-top:14px;">
             ${recentEvents.length === 0 ? '<div class="table-muted-text" style="padding:16px 0;">暂无实时事件</div>' : recentEvents.map(evt => `
-              <div style="display:flex; align-items:flex-start; gap:10px; font-size:12.5px; padding:8px 0; border-bottom:1px solid var(--border-subtle);">
-                <span class="font-mono text-slate-400" style="font-size:11.5px; flex-shrink:0;">${escapeHtml(evt.time)}</span>
-                <span class="badge badge-${evt.badge}" style="font-size:11px; padding:1px 6px; flex-shrink:0;">${escapeHtml(evt.type)}</span>
+              <div style="display:flex; align-items:flex-start; gap:10px; font-size:14px; padding:8px 0; border-bottom:1px solid var(--border-subtle);">
+                <span class="font-mono text-slate-400" style="font-size:14px; flex-shrink:0;">${escapeHtml(evt.time)}</span>
+                <span class="badge badge-${evt.badge}" style="font-size:14px; padding:1px 6px; flex-shrink:0;">${escapeHtml(evt.type)}</span>
                 <span style="color:var(--text-primary); flex:1; line-height:1.4;">${escapeHtml(evt.desc)}</span>
               </div>
             `).join('')}
@@ -1301,6 +1393,10 @@ function renderSessionTable(tableSessions, scope = 'sessions') {
 function renderAgentsView() {
   if (state.api.error) return renderErrorState(`管理 API 请求失败：${state.api.error}`);
 
+  reconcileAgentSelection();
+  const displayed = filteredAgents();
+  const selectable = displayed.filter(canShutdownAgent);
+  const allSelected = selectable.length > 0 && selectable.every(agent => state.selectedAgents.has(agent.id));
   const onlineCount = agents.filter(agent => agent.status === 'online').length;
   const readyCount = agents.filter(agent => agent.status === 'online' && agent.ready).length;
   const codeCount = agents.filter(agent => agent.codeConfigured && isLeaseActive(agent.leaseExpiresAt)).length;
@@ -1352,12 +1448,19 @@ function renderAgentsView() {
           </div>
         </div>
 
+        <div class="agent-toolbar">
+          <input id="agent-search" class="input" type="search" aria-label="搜索节点" placeholder="搜索主机名、系统或 Agent ID" value="${escapeHtml(state.agentKeyword)}" oninput="setAgentFilter('agentKeyword', this.value)" />
+          <select class="input" aria-label="节点在线状态" onchange="setAgentFilter('agentStatus', this.value)">${[['ALL', '全部状态'], ['online', '在线'], ['offline', '离线']].map(([value, label]) => `<option value="${value}" ${state.agentStatus === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
+          <span>已选 ${state.selectedAgents.size} 台</span>
+          <button class="btn btn-danger" ${state.selectedAgents.size ? '' : 'disabled'} onclick="openAgentShutdown(false)">关闭所选</button>
+          <button class="btn btn-secondary" ${agents.some(canShutdownAgent) ? '' : 'disabled'} onclick="openAgentShutdown(true)" title="包括搜索和筛选之外的所有支持关闭的在线节点">关闭全部在线 Agent</button>
+        </div>
         <div class="table-container agent-table-container">
           <div class="table-header-bar">
             <div class="table-title">
               <svg width="16" height="16" class="text-blue-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
               <span>已注册 Agent 节点列表</span>
-              <span class="section-sub">${agents.length} 台设备</span>
+              <span class="section-sub">${displayed.length} / ${agents.length} 台设备</span>
             </div>
             <span class="table-helper-text">点击行查看节点详情</span>
           </div>
@@ -1365,6 +1468,7 @@ function renderAgentsView() {
             <table class="ops-table agent-ops-table">
               <thead>
                 <tr>
+                  <th class="agent-selection-cell"><input type="checkbox" aria-label="选择当前筛选结果中的可关闭节点" ${allSelected ? 'checked' : ''} ${selectable.length ? '' : 'disabled'} onchange="selectVisibleAgents(this.checked)" /></th>
                   ${hasColumn('connectionStatus') ? '<th>连接状态</th>' : ''}
                   ${hasColumn('hostname') ? '<th>计算机名</th>' : ''}
                   ${hasColumn('macAddress') ? '<th>MAC 地址</th>' : ''}
@@ -1381,12 +1485,13 @@ function renderAgentsView() {
                 </tr>
               </thead>
               <tbody>
-                ${agents.map(agt => {
+                ${displayed.map(agt => {
                   const isOnline = agt.status === 'online';
                   const isCodeActive = agt.codeConfigured && isLeaseActive(agt.leaseExpiresAt);
                   const connectionLabel = !isOnline ? '离线' : agt.ready ? '在线' : '重连中';
                   return `
-                    <tr class="agent-table-row" onclick="openAgentDrawer(${eventValue(agt.id)})">
+                    <tr class="agent-table-row ${state.selectedAgents.has(agt.id) ? 'selected-row' : ''}" onclick="openAgentDrawer(${eventValue(agt.id)})">
+                      <td class="agent-selection-cell" onclick="event.stopPropagation()"><input type="checkbox" aria-label="选择 ${escapeHtml(agt.hostname)}" ${state.selectedAgents.has(agt.id) ? 'checked' : ''} ${canShutdownAgent(agt) ? '' : 'disabled'} title="${canShutdownAgent(agt) ? '选择节点' : '离线或不支持关闭'}" onchange="selectAgent(${eventValue(agt.id)}, this.checked)" /></td>
                       ${hasColumn('connectionStatus') ? `<td><span class="badge ${isOnline && agt.ready ? 'badge-online' : isOnline ? 'badge-degraded' : 'badge-offline'}"><span class="badge-dot"></span>${connectionLabel}</span></td>` : ''}
                       ${hasColumn('hostname') ? `<td><div class="table-primary-text table-hostname">${escapeHtml(agt.hostname)}</div><div class="table-secondary-text">${escapeHtml(agt.os)}</div></td>` : ''}
                       ${hasColumn('macAddress') ? `<td><span class="font-mono table-secondary-text">${escapeHtml(agt.macAddress === '-' ? '未提供' : agt.macAddress)}</span></td>` : ''}
@@ -1403,6 +1508,7 @@ function renderAgentsView() {
                     </tr>
                   `;
                 }).join('')}
+                ${displayed.length ? '' : `<tr><td colspan="${visible.length + 2}">没有匹配的节点</td></tr>`}
               </tbody>
             </table>
           </div>
@@ -1474,7 +1580,7 @@ function renderIdentityView() {
           <!-- AI Controller Token Section -->
           <div class="credential-item">
             <div class="credential-title-group">
-              <span style="font-weight:600; font-size:13.5px; color:var(--text-primary);">AI Controller Token (MCP)</span>
+              <span style="font-weight:600; font-size:14px; color:var(--text-primary);">AI Controller Token (MCP)</span>
               <span class="badge ${relayInfo.aiTokenConfigured ? 'badge-online' : 'badge-offline'}">
                 <span class="badge-dot"></span>
                 ${relayInfo.aiTokenConfigured ? '已配置 (Configured)' : '未配置 (Not Configured)'}
@@ -1499,7 +1605,7 @@ function renderIdentityView() {
           <!-- Human Controller Token Compact Info Row -->
           <div class="credential-item" style="margin-top:16px; border-top:1px solid var(--border-subtle); padding-top:14px;">
             <div class="credential-title-group">
-              <span style="font-weight:600; font-size:13.5px; color:var(--text-primary);">Human Controller Token</span>
+              <span style="font-weight:600; font-size:14px; color:var(--text-primary);">Human Controller Token</span>
               <span class="badge ${relayInfo.humanTokenConfigured ? 'badge-online' : 'badge-offline'}">
                 <span class="badge-dot"></span>
                 ${relayInfo.humanTokenConfigured ? '已配置 (Configured)' : '未配置 (Not Configured)'}
@@ -1559,7 +1665,7 @@ function renderSettingsView() {
             <label class="input-label" for="confirm-admin-password">确认新密码 (Confirm New Password)</label>
             <input id="confirm-admin-password" type="password" class="input font-mono" minlength="12" autocomplete="new-password" placeholder="再次输入新密码" required />
           </div>
-          <div id="password-change-error" style="display:none; padding:10px 12px; background:var(--status-danger-bg); border:1px solid var(--status-danger-border); border-radius:var(--radius-md); color:var(--status-danger-text); font-size:12.5px;"></div>
+          <div id="password-change-error" style="display:none; padding:10px 12px; background:var(--status-danger-bg); border:1px solid var(--status-danger-border); border-radius:var(--radius-md); color:var(--status-danger-text); font-size:14px;"></div>
           <div class="settings-form-actions">
             <button id="password-change-submit" type="submit" class="btn btn-primary settings-submit">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-1.9 1.9-.06-.06A1.7 1.7 0 0 0 15.96 18a1.7 1.7 0 0 0-1.03 1.56V20h-2.7v-.09A1.7 1.7 0 0 0 11.2 18a1.7 1.7 0 0 0-1.88.34l-.06.06-1.9-1.9.06-.06A1.7 1.7 0 0 0 7.76 15a1.7 1.7 0 0 0-1.56-1.03H6v-2.7h.2A1.7 1.7 0 0 0 7.76 10a1.7 1.7 0 0 0-.34-1.88l-.06-.06 1.9-1.9.06.06a1.7 1.7 0 0 0 1.88.34 1.7 1.7 0 0 0 1.03-1.56V5h2.7v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 1.9 1.9-.06.06A1.7 1.7 0 0 0 19.4 10c.18.62.75 1.03 1.4 1.03h.2v2.7h-.2A1.7 1.7 0 0 0 19.4 15z"/></svg>
@@ -1664,7 +1770,7 @@ function renderAuditView() {
             </button>
           ` : ''}
         </div>
-        <div style="font-size:12.5px; color:var(--text-muted);">
+        <div style="font-size:14px; color:var(--text-muted);">
           共展示 <span class="font-mono" style="color:var(--text-primary); font-weight:600;">${logs.length}</span> 条审计记录
         </div>
       </div>
@@ -1687,7 +1793,7 @@ function renderAuditView() {
               <tbody>
                 ${logs.map(log => `
                   <tr>
-                    <td class="font-mono table-secondary-text" style="font-size:12px;">${escapeHtml(log.time)}</td>
+                    <td class="font-mono table-secondary-text" style="font-size:14px;">${escapeHtml(log.time)}</td>
                     <td class="font-mono table-primary-text">${escapeHtml(log.operator)}</td>
                     <td>
                       <span class="tag" style="font-weight:600;">${escapeHtml(log.action)}</span>
@@ -1700,7 +1806,7 @@ function renderAuditView() {
                       </span>
                     </td>
                     <td class="font-mono table-secondary-text">${escapeHtml(log.ip)}</td>
-                    <td style="color:var(--text-primary); font-size:13px;">${escapeHtml(log.details)}</td>
+                    <td style="color:var(--text-primary); font-size:14px;">${escapeHtml(log.details)}</td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -1738,8 +1844,9 @@ function renderLoginView() {
   return `
     <div class="login-screen">
       <div class="login-card">
+        <div class="login-theme">${renderThemePicker()}</div>
         <div class="login-brand">
-          <div class="brand-badge" style="width:38px; height:38px; font-size:18px;">R</div>
+          <div class="brand-badge">R</div>
           <div>
             <div class="login-kicker">REMOTEOPS RELAY</div>
             <h1>管理控制台</h1>
@@ -1875,7 +1982,7 @@ function renderDrawer() {
               ${s.agentStatus === 'online' ? 'Active' : 'Offline'}
             </span>
           </div>
-          <div class="font-mono text-slate-400" style="font-size:11.5px; margin-top:2px;">${escapeHtml(truncate(s.id, 10, 8))}</div>
+          <div class="font-mono text-slate-400" style="font-size:14px; margin-top:2px;">${escapeHtml(truncate(s.id, 10, 8))}</div>
         </div>
         <button class="btn btn-ghost btn-sm" onclick="closeDrawer()">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -1885,7 +1992,7 @@ function renderDrawer() {
       <div class="drawer-body">
         <!-- Section 0: Topology Visual Diagram -->
         <div class="topology-flow-card">
-          <div class="section-title" style="font-size:12.5px;">
+          <div class="section-title" style="font-size:14px;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
             <span>实时链路拓扑 (Link Topology)</span>
           </div>
@@ -2025,11 +2132,11 @@ function renderDrawer() {
           </div>
           <div class="grid-2" style="margin-top:12px; margin-bottom:0;">
             <div style="background:var(--bg-card-subtle); padding:12px; border-radius:var(--radius-md); border:1px solid var(--border-subtle);">
-              <div style="font-size:11.5px; color:var(--text-muted);">待处理特权审批</div>
+              <div style="font-size:14px; color:var(--text-muted);">待处理特权审批</div>
               <div style="font-size:22px; font-weight:700; font-family:var(--font-mono); color:${s.pendingApprovals > 0 ? 'var(--status-degraded-text)' : 'var(--text-primary)'};">${s.pendingApprovals}</div>
             </div>
             <div style="background:var(--bg-card-subtle); padding:12px; border-radius:var(--radius-md); border:1px solid var(--border-subtle);">
-              <div style="font-size:11.5px; color:var(--text-muted);">进行中交互请求</div>
+              <div style="font-size:14px; color:var(--text-muted);">进行中交互请求</div>
               <div style="font-size:22px; font-weight:700; font-family:var(--font-mono); color:var(--color-brand);">${s.inflightRequests}</div>
             </div>
           </div>
@@ -2041,30 +2148,30 @@ function renderDrawer() {
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
             <span>危险运维操作区 (Danger Zone)</span>
           </div>
-          <p style="font-size:12px; color:var(--text-secondary); line-height:1.4;">
+          <p style="font-size:14px; color:var(--text-secondary); line-height:1.4;">
             关闭会话将切断 Controller 控制权并清理会话上下文；紧急停止将向 Agent 发送强制阻断信号。所有高危动作均记入审计日志。
           </p>
 
           <div style="display:flex; flex-direction:column; gap:10px; margin-top:4px;">
             <div style="display:flex; justify-content:space-between; align-items:center;">
               <div>
-                <div style="font-size:13px; font-weight:600; color:var(--text-primary);">关闭当前会话</div>
-                <div style="font-size:11.5px; color:var(--text-muted);">断开 Controller 连接并清理会话状态</div>
+                <div style="font-size:14px; font-weight:600; color:var(--text-primary);">关闭当前会话</div>
+                <div style="font-size:14px; color:var(--text-muted);">断开 Controller 连接并清理会话状态</div>
               </div>
               <button class="btn btn-warning btn-sm" onclick="openModal('terminateSession', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })">关闭会话</button>
             </div>
 
             <div style="display:flex; justify-content:space-between; align-items:center; border-top:1px solid rgba(239,68,68,0.2); padding-top:10px;">
               <div>
-                <div style="font-size:13px; font-weight:600; color:var(--status-danger-text);">🛑 紧急停止 (Emergency Stop)</div>
-                <div style="font-size:11.5px; color:var(--text-muted);">强制阻断远程执行并立即断开链接</div>
+                <div style="font-size:14px; font-weight:600; color:var(--status-danger-text);">🛑 紧急停止 (Emergency Stop)</div>
+                <div style="font-size:14px; color:var(--text-muted);">强制阻断远程执行并立即断开链接</div>
               </div>
               <button class="btn btn-danger btn-sm" onclick="openModal('emergencyStop', { id: ${eventValue(s.id)}, agentName: ${eventValue(s.agentName)} })">紧急停止</button>
             </div>
             ${s.supportsAgentShutdown ? `<div style="display:flex; justify-content:space-between; align-items:center; border-top:1px solid rgba(239,68,68,0.2); padding-top:10px;">
               <div>
-                <div style="font-size:13px; font-weight:600; color:var(--status-danger-text);">关闭 Agent</div>
-                <div style="font-size:11.5px; color:var(--text-muted);">优雅清理资源并退出 Agent 进程（不关机）</div>
+                <div style="font-size:14px; font-weight:600; color:var(--status-danger-text);">关闭 Agent</div>
+                <div style="font-size:14px; color:var(--text-muted);">优雅清理资源并退出 Agent 进程（不关机）</div>
               </div>
               <button class="btn btn-danger btn-sm" onclick="openModal('shutdownAgent', { id: ${eventValue(s.agentId)}, agentName: ${eventValue(s.agentName)}, generation: ${s.agentGeneration} })">关闭 Agent</button>
             </div>` : ''}
@@ -2088,7 +2195,7 @@ function renderDrawer() {
               ${isOnline ? '在线' : '离线'}
             </span>
           </div>
-          <div class="font-mono text-slate-400" style="font-size:11.5px; margin-top:2px;">${escapeHtml(a.hostname)}</div>
+          <div class="font-mono text-slate-400" style="font-size:14px; margin-top:2px;">${escapeHtml(a.hostname)}</div>
         </div>
         <button class="btn btn-ghost btn-sm" onclick="closeDrawer()">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -2165,7 +2272,7 @@ function renderDrawer() {
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9M4 4a16 16 0 0 1 16 16"/></svg>
             <span>当前会话关联</span>
           </div>
-          <div style="margin-top:12px; font-size:13px;">
+          <div style="margin-top:12px; font-size:14px;">
             ${a.sessionId !== 'None' ? `
               <div style="display:flex; justify-content:space-between; align-items:center;">
                 <span class="copyable-text font-mono">${escapeHtml(a.sessionId)}</span>
@@ -2178,7 +2285,7 @@ function renderDrawer() {
         </div>
         ${a.supportsAgentShutdown ? `<div class="danger-zone" style="margin-top:16px;">
           <div class="danger-zone-title"><span>关闭 Agent</span></div>
-          <p style="font-size:12px; color:var(--text-secondary); line-height:1.4;">发送优雅退出指令，清理在途任务和持久资源后结束 Agent 进程；不会关闭操作系统。</p>
+          <p style="font-size:14px; color:var(--text-secondary); line-height:1.4;">发送优雅退出指令，清理在途任务和持久资源后结束 Agent 进程；不会关闭操作系统。</p>
           <button class="btn btn-danger btn-sm" ${isOnline ? '' : 'disabled'} onclick="openModal('shutdownAgent', { id: ${eventValue(a.id)}, agentName: ${eventValue(a.hostname)}, generation: ${a.generation} })">关闭 Agent</button>
         </div>` : ''}
       </div>
@@ -2194,6 +2301,10 @@ function renderDrawer() {
 // Modal Component (Terminate & Emergency Stop)
 function renderModal() {
   let backdrop = document.getElementById('modal-backdrop');
+  for (const id of ['app', 'drawer-panel']) {
+    const background = document.getElementById(id);
+    if (background) background.inert = Boolean(state.activeModal);
+  }
 
   if (!state.activeModal) {
     if (backdrop) backdrop.classList.remove('open');
@@ -2227,7 +2338,7 @@ function renderModal() {
           <div class="code-box">
             <span class="text-break font-mono" style="font-weight:600;">Session ID: ${escapeHtml(data?.id)}</span>
           </div>
-          <div style="font-size:12.5px; color:var(--text-secondary); line-height:1.5;">
+          <div style="font-size:14px; color:var(--text-secondary); line-height:1.5;">
             目标 Agent 节点: <strong class="text-slate-200">${escapeHtml(data?.agentName)}</strong><br/>
             关闭会话后，当前连接中的 AI / Human Controller 将立即失去控制权，未完成的交互指令将被中断。
           </div>
@@ -2249,10 +2360,10 @@ function renderModal() {
           <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
         </div>
         <div class="modal-body">
-          <div style="padding:10px 12px; background:var(--status-danger-bg); border:1px solid var(--status-danger-border); border-radius:var(--radius-md); color:var(--status-danger-text); font-size:12.5px; line-height:1.5;">
+          <div style="padding:10px 12px; background:var(--status-danger-bg); border:1px solid var(--status-danger-border); border-radius:var(--radius-md); color:var(--status-danger-text); font-size:14px; line-height:1.5;">
             <strong>高危风险警告：</strong> 此操作将通过 Relay 向 Agent 节点强推紧急停止信号，立即中断所有正在执行的远程操作并彻底断开会话！
           </div>
-          <div style="font-size:13px;">
+          <div style="font-size:14px;">
             目标会话: <span class="font-mono" style="font-weight:600; color:var(--text-primary);">${escapeHtml(truncate(data?.id, 8, 6))}</span> (${escapeHtml(data?.agentName)})
           </div>
           <div class="input-group">
@@ -2276,30 +2387,31 @@ function renderModal() {
         </div>
       </div>
     `;
-  } else if (mType === 'shutdownAgent') {
-    const expected = String(data?.agentName || '').trim();
+  } else if (mType === 'shutdownAgent' || mType === 'shutdownAgents') {
+    const results = data.results;
+    const done = Boolean(results) && !state.shutdownBusy;
     modalContent = `
-      <div class="modal" style="border-color:var(--status-danger-border);">
-        <div class="modal-header" style="background:rgba(239,68,68,0.08);">
-          <div class="modal-title" style="color:var(--status-danger-text);"><span>⚠️ 确认关闭 Agent</span></div>
-          <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="shutdown-title">
+        <div class="modal-header">
+          <div id="shutdown-title" class="modal-title">${done ? "Agent 关闭结果" : "关闭" + (data.all ? "全部在线" : "所选") + " " + data.targets.length + " 个 Agent？"}</div>
+          <button class="btn btn-ghost" aria-label="关闭弹窗" ${state.shutdownBusy ? "disabled" : ""} onclick="closeModal()">✕</button>
         </div>
         <div class="modal-body">
-          <div style="padding:10px 12px; background:var(--status-danger-bg); border:1px solid var(--status-danger-border); border-radius:var(--radius-md); color:var(--status-danger-text); font-size:12.5px; line-height:1.5;">
-            这是高风险管理操作。Agent 将中止在途任务、关闭持久 Shell/串口/文件资源并退出进程；不会关闭整台电脑。
-          </div>
-          <div style="font-size:13px; margin-top:12px;">目标主机：<strong>${escapeHtml(expected)}</strong></div>
-          <div class="input-group">
-            <label class="input-label" for="shutdown-agent-confirmation" style="color:var(--status-danger-text); font-weight:600;">请输入上面的完整主机名以确认：</label>
-            <input id="shutdown-agent-confirmation" type="text" class="input font-mono" placeholder="输入主机名" oninput="document.getElementById('shutdown-agent-btn').disabled = (this.value.trim() !== ${eventValue(expected)});" onkeydown="if (event.key === 'Enter' && this.value.trim() === ${eventValue(expected)}) confirmShutdownAgent();" autofocus />
-          </div>
+          <p>将结束远程任务并退出 Agent，不会关闭服务器。</p>
+          ${data.all ? "<p>包括搜索、筛选之外的所有可关闭在线节点；不支持关闭的旧版节点不包含在内。</p>" : ""}
+          <div class="shutdown-target-list">${data.targets.map(target => {
+            const result = results?.find(item => item.id === target.id);
+            return `<div class="shutdown-target"><strong>${escapeHtml(target.hostname)}</strong><span class="font-mono">${escapeHtml(truncate(target.id, 8, 6))} · #${target.generation}</span>${result ? `<span class="shutdown-result ${result.ok ? "text-green-400" : "text-red-400"}">${escapeHtml(result.message)}</span>` : ""}</div>`;
+          }).join("")}</div>
+          ${state.shutdownBusy ? `<p role="status">正在处理 ${results.length} / ${data.targets.length}，请稍候…</p>` : ""}
+          ${done ? `<p role="status">成功 ${results.filter(item => item.ok).length} 台，失败 ${results.filter(item => !item.ok).length} 台。${results.some(item => !item.ok) ? "请刷新节点状态，重新选择失败节点后重试。" : ""}</p>` : ""}
+          ${data.refreshError ? `<p>结果刷新失败：${escapeHtml(data.refreshError)}。请手动刷新节点状态。</p>` : ""}
         </div>
         <div class="modal-footer">
-          <button class="btn btn-secondary btn-sm" onclick="closeModal()">取消</button>
-          <button id="shutdown-agent-btn" class="btn btn-danger btn-sm" disabled onclick="confirmShutdownAgent()">确认关闭 Agent</button>
+          <button class="btn btn-secondary" ${state.shutdownBusy ? "disabled" : ""} onclick="closeModal()">${done ? "完成" : "取消"}</button>
+          ${done ? "" : `<button id="shutdown-agent-btn" class="btn btn-danger" ${state.shutdownBusy ? "disabled" : ""} onclick="confirmShutdownAgent()">${state.shutdownBusy ? "正在关闭…" : "确认关闭"}</button>`}
         </div>
-      </div>
-    `;
+      </div>`;
   } else if (mType === 'purgeClosedSessions') {
     const clearableCount = sessions.filter(session => session.isClosed && session.agentStatus !== 'online').length;
     modalContent = `
@@ -2328,9 +2440,14 @@ function renderModal() {
 
   backdrop.innerHTML = modalContent;
   setTimeout(() => {
+    if (!state.activeModal) return;
     backdrop.classList.add('open');
-    const input = document.getElementById('emergency-stop-confirmation') || document.getElementById('shutdown-agent-confirmation');
+    const input = document.getElementById('emergency-stop-confirmation') || backdrop.querySelector('button:not(:disabled)');
     if (input) input.focus();
+    else {
+      const dialog = backdrop.querySelector('.modal');
+      if (dialog) { dialog.tabIndex = -1; dialog.focus(); }
+    }
   }, 10);
 }
 
@@ -2417,7 +2534,10 @@ document.addEventListener('DOMContentLoaded', () => {
     document.body.appendChild(tc);
   }
 
-  document.documentElement.setAttribute('data-theme', state.theme);
+  applyTheme();
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (state.theme === 'system') applyTheme();
+  });
   restoreVisibleColumns();
   restoreSession();
 });

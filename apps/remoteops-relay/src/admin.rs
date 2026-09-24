@@ -237,6 +237,7 @@ pub(crate) async fn serve(
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
+        .route("/theme.js", get(theme_js))
         .route("/style.css", get(style_css))
         .layer(DefaultBodyLimit::max(8 * 1024))
         .with_state(state)
@@ -694,7 +695,7 @@ async fn index() -> Response {
     (
         [(
             axum::http::header::CONTENT_SECURITY_POLICY,
-            "default-src 'self'; script-src 'self'; script-src-attr 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            "default-src 'self'; script-src 'self'; script-src-attr 'unsafe-inline'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
         )],
         Html(include_str!("../../../relay-admin-prototype/index.html")),
     )
@@ -707,6 +708,17 @@ async fn app_js() -> Response {
             "application/javascript; charset=utf-8",
         )],
         include_str!("../../../relay-admin-prototype/app.js"),
+    )
+        .into_response()
+}
+/// 在样式表前提供同源主题初始化，保持脚本来源限制。
+async fn theme_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../../../relay-admin-prototype/theme.js"),
     )
         .into_response()
 }
