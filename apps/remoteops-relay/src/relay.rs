@@ -1308,13 +1308,10 @@ impl Relay {
                 Ok(WireMessage::AgentResumeCommitAck(ack))
                     if ack.connection_generation == connection_generation =>
                 {
-                    if let Some((update, bindings)) = self
+                    if let Some(update) = self
                         .finalize_agent_resume(agent_id, connection_generation)
                         .await
                     {
-                        for binding in bindings {
-                            let _ = sender.send(WireMessage::ControllerBinding(binding));
-                        }
                         self.forward_connection_update(update).await;
                         info!(
                             agent_instance_id = %agent_id,
@@ -1963,7 +1960,7 @@ impl Relay {
         &self,
         agent_id: AgentInstanceId,
         connection_generation: u64,
-    ) -> Option<(ConnectionDescriptor, Vec<ControllerBinding>)> {
+    ) -> Option<ConnectionDescriptor> {
         let mut state = self.state.lock().await;
         let (session_id, mut update) = {
             let agent = state.agents.get_mut(&agent_id)?;
@@ -1987,26 +1984,24 @@ impl Relay {
                 "Relay 无法清理已完成恢复握手的旧令牌；当前连接仍保持可用"
             );
         }
-        let bindings = state
-            .session_bindings
-            .get(&session_id)
-            .map(|bindings| {
-                bindings
-                    .all()
-                    .map(|binding| {
-                        controller_binding(
-                            session_id,
-                            binding,
-                            bindings.permission_mode_for(binding.controller_kind),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         if let Some(bindings) = state.session_bindings.get(&session_id) {
             apply_session_bindings(&mut update, bindings);
+            // 恢复快照与后续模式更新共用状态锁入队，避免旧快照覆盖新模式或解绑。
+            if let Some(sender) = state
+                .agents
+                .get(&agent_id)
+                .and_then(|agent| agent.sender.as_ref())
+            {
+                for binding in bindings.all() {
+                    let _ = sender.send(WireMessage::ControllerBinding(controller_binding(
+                        session_id,
+                        binding,
+                        bindings.permission_mode_for(binding.controller_kind),
+                    )));
+                }
+            }
         }
-        Some((update, bindings))
+        Some(update)
     }
 
     async fn renew_agent(
@@ -3760,7 +3755,7 @@ mod tests {
                 .commit_agent_resume(agent_id, registration.connection_generation)
                 .await
         );
-        let (descriptor, _) = relay
+        let descriptor = relay
             .finalize_agent_resume(agent_id, registration.connection_generation)
             .await
             .expect("Agent 恢复令牌应完成确认");
@@ -3911,11 +3906,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn agent_resume_orders_snapshot_before_control_mode_updates_and_release() {
+        let relay = relay(Duration::minutes(10));
+        let agent_id = AgentInstanceId::new();
+        let (agent, _receiver, session_id) = ready_agent(&relay, agent_id, None).await;
+        let (ai_id, generation, _controller_receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        let result = relay
+            .pair_controller(
+                ai_id,
+                generation,
+                PairRequest {
+                    request_id: RequestId::new(),
+                    pairing_code: agent.welcome.pairing_code.clone(),
+                    permission_mode: PermissionMode::FullAccess,
+                },
+            )
+            .await;
+        assert!(result.error.is_none());
 
         relay
             .mark_agent_disconnected(agent_id, agent.connection_generation)
             .await;
-        let (sender, _resumed_receiver) = test_channel();
+        let (sender, mut resumed_receiver) = test_channel();
         let resumed = relay
             .register_agent(hello(agent_id, Some(agent.welcome.resume_token)), sender)
             .await
@@ -3925,12 +3941,69 @@ mod tests {
                 .commit_agent_resume(agent_id, resumed.connection_generation)
                 .await
         );
-        let (_, bindings) = relay
+        assert!(
+            relay
+                .finalize_agent_resume(agent_id, agent.connection_generation)
+                .await
+                .is_none()
+        );
+        assert!(resumed_receiver.try_recv().is_err());
+        relay
             .finalize_agent_resume(agent_id, resumed.connection_generation)
             .await
             .expect("Agent 恢复应成功");
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].controller_control_mode, None);
+        // 暂不消费恢复快照，随后模式更新必须排在快照之后，重复心跳不应追加消息。
+        for _ in 0..2 {
+            relay
+                .update_controller_control_modes(
+                    ai_id,
+                    generation,
+                    vec![ControllerControlModeUpdate {
+                        session_id,
+                        mode: ControllerControlMode::FullAccess,
+                    }],
+                )
+                .await;
+        }
+        for expected_mode in [None, Some(ControllerControlMode::FullAccess)] {
+            let WireMessage::ControllerBinding(binding) = resumed_receiver
+                .try_recv()
+                .expect("恢复和模式更新应按顺序下发")
+            else {
+                panic!("预期 ControllerBinding");
+            };
+            assert_eq!(binding.controller_control_mode, expected_mode);
+        }
+        assert!(resumed_receiver.try_recv().is_err());
+        assert!(
+            relay
+                .release_controller_session(
+                    ai_id,
+                    generation,
+                    ReleaseSessionRequest {
+                        request_id: RequestId::new(),
+                        session_id,
+                    },
+                )
+                .await
+                .released
+        );
+        assert!(matches!(
+            resumed_receiver.try_recv().expect("恢复后解绑应通知 Agent"),
+            WireMessage::ControllerBindingRevoked { session_id: revoked_session, .. }
+                if revoked_session == session_id
+        ));
+        relay
+            .update_controller_control_modes(
+                ai_id,
+                generation,
+                vec![ControllerControlModeUpdate {
+                    session_id,
+                    mode: ControllerControlMode::StepByStep,
+                }],
+            )
+            .await;
+        assert!(resumed_receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3958,7 +4031,7 @@ mod tests {
         relay
             .mark_agent_disconnected(agent_id, agent.connection_generation)
             .await;
-        let (sender, _resumed_receiver) = test_channel();
+        let (sender, mut resumed_receiver) = test_channel();
         let resumed = relay
             .register_agent(hello(agent_id, Some(agent.welcome.resume_token)), sender)
             .await
@@ -3978,13 +4051,18 @@ mod tests {
                 .commit_agent_resume(agent_id, resumed.connection_generation)
                 .await
         );
-        let (_, bindings) = relay
+        relay
             .finalize_agent_resume(agent_id, resumed.connection_generation)
             .await
             .expect("Agent 恢复应成功");
-        assert_eq!(bindings.len(), 1);
+        let WireMessage::ControllerBinding(binding) =
+            resumed_receiver.try_recv().expect("恢复应下发绑定")
+        else {
+            panic!("预期 ControllerBinding");
+        };
+        assert!(resumed_receiver.try_recv().is_err());
         assert_eq!(
-            bindings[0].controller_control_mode,
+            binding.controller_control_mode,
             Some(ControllerControlMode::StepByStep)
         );
     }
@@ -4353,7 +4431,7 @@ mod tests {
                 .commit_agent_resume(agent_id, resumed.connection_generation)
                 .await
         );
-        let (descriptor, _) = relay
+        let descriptor = relay
             .finalize_agent_resume(agent_id, resumed.connection_generation)
             .await
             .expect("恢复握手应完成");
@@ -4399,7 +4477,7 @@ mod tests {
                 .commit_agent_resume(agent_id, registration.connection_generation)
                 .await
         );
-        let (descriptor, _) = relay
+        let descriptor = relay
             .finalize_agent_resume(agent_id, registration.connection_generation)
             .await
             .expect("恢复握手应完成");

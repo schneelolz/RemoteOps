@@ -1679,10 +1679,17 @@ impl RemoteOpsAgentApp {
                         );
                         if let Some(mode_label) = self.controller_control_mode_label() {
                             ui.add_space(3.0 * scale);
-                            ui.label(
-                                RichText::new(format!("{}  {}", icons::SHIELD_CHECK, mode_label))
-                                    .size(12.0 * scale)
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "{}  {}",
+                                        icons::SHIELD_CHECK,
+                                        mode_label
+                                    ))
+                                    .size(14.0)
                                     .color(colors.secondary),
+                                )
+                                .wrap(),
                             );
                         }
                     });
@@ -3058,6 +3065,7 @@ mod tests {
     #[test]
     fn controller_mode_labels_follow_ai_binding_in_both_languages() {
         let cases = [
+            (None, "控制模式未同步", "Control mode not synced"),
             (
                 Some(ControllerControlMode::StepByStep),
                 "逐项确认",
@@ -3083,7 +3091,6 @@ mod tests {
                 "写操作需审批",
                 "Approval required",
             ),
-            (None, "控制模式未同步", "Control mode not synced"),
         ];
         for language in [Language::ZhCn, Language::EnUs] {
             let mut app = test_app();
@@ -3167,7 +3174,7 @@ mod tests {
                     app.controller_bindings[0].controller_control_mode = mode;
                     app.status = UiStatus::Controlled;
                     let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, RUNNING_WINDOW_SIZE);
-                    let _ = ctx.run_ui(
+                    let output = ctx.run_ui(
                         egui::RawInput {
                             screen_rect: Some(viewport),
                             ..Default::default()
@@ -3180,6 +3187,30 @@ mod tests {
                             );
                         },
                     );
+                    let mode_label = app.controller_control_mode_label().unwrap();
+                    let text_shapes = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) => Some(text),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let mode_text = text_shapes
+                        .iter()
+                        .find(|text| text.galley.job.text.contains(&mode_label))
+                        .expect("应实际绘制控制模式文字");
+                    assert!(mode_text.galley.job.sections.iter().all(|section| {
+                        (section.format.font_id.size - 14.0).abs() < f32::EPSILON
+                    }));
+                    let mode_rect =
+                        egui::Rect::from_min_size(mode_text.pos, mode_text.galley.size());
+                    assert!(viewport.contains_rect(mode_rect), "{mode_rect:?}");
+                    let settings_text = text_shapes
+                        .iter()
+                        .find(|text| text.galley.job.text == icons::GEAR)
+                        .expect("应实际绘制设置按钮");
+                    assert!(mode_rect.right() < settings_text.pos.x);
                 }
             }
         }
