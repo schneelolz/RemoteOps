@@ -3906,6 +3906,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn agent_resume_orders_snapshot_before_control_mode_updates_and_release() {
+        let relay = relay(Duration::minutes(10));
+        let agent_id = AgentInstanceId::new();
+        let (agent, _receiver, session_id) = ready_agent(&relay, agent_id, None).await;
+        let (ai_id, generation, _controller_receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        let result = relay
+            .pair_controller(
+                ai_id,
+                generation,
+                PairRequest {
+                    request_id: RequestId::new(),
+                    pairing_code: agent.welcome.pairing_code.clone(),
+                    permission_mode: PermissionMode::FullAccess,
+                },
+            )
+            .await;
+        assert!(result.error.is_none());
 
         relay
             .mark_agent_disconnected(agent_id, agent.connection_generation)
