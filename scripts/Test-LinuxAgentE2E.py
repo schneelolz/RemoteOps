@@ -233,6 +233,28 @@ def main():
         def succeeded(value):
             return not value.get('isError') and value.get('status') == 'completed' and value.get('exit_code') in (0, None)
 
+        def verify_reconnect(name, timeout=40):
+            # 等待撤销后的同步状态，避免断线刚发生时仍读到旧连接的完全控制快照。
+            def restored():
+                mode = tool('get_control_mode')
+                return (mode.get('sync_status') == 'synced'
+                        and mode.get('mode') == 'step_by_step'
+                        and succeeded(tool('list_processes')))
+
+            wait_for(restored, timeout)
+            check(name+' online with synced step-by-step', True)
+            marker = fixture/('reconnect-denied-'+uuid.uuid4().hex)
+            previous_elicitations = mcp.elicitations
+            denied = command('touch '+str(marker))
+            check(name+' old full access revoked',
+                  denied.get('isError') and not marker.exists()
+                  and mcp.elicitations > previous_elicitations)
+            granted = tool('set_control_mode', mode='full_access')
+            check(name+' explicit full access renewed',
+                  granted.get('sync_status') == 'synced'
+                  and granted.get('mode') == 'full_access')
+            check(name+' command after renewal', succeeded(command('true')))
+
         def output():
             return json.dumps(tool('read_output', limit=500), ensure_ascii=False)
 
@@ -312,12 +334,12 @@ def main():
         agent = spawn(agent_args, 'agent')
         restarted = wait_for(paired_status)
         check('identity and pairing restored', restarted['agent_instance_id'] == initial['agent_instance_id'] and restarted['pairing_code'] == initial['pairing_code'])
-        wait_for(lambda: succeeded(command('true')))
+        verify_reconnect('Agent restart')
         check('existing MCP session restored', True)
         command('echo AFTER_AGENT_RESTART')
         check('incremental output after Agent restart', 'AFTER_AGENT_RESTART' in json.dumps(tool('read_output', after_sequence=cursor, limit=500)))
         link.drop()
-        wait_for(lambda: succeeded(command('true')))
+        verify_reconnect('short network interruption')
         check('short network interruption reconnect', True)
         sentinel = fixture/'mutation-count'
         def interrupt_mutation():
@@ -325,12 +347,12 @@ def main():
             link.drop()
         threading.Thread(target=interrupt_mutation, daemon=True).start()
         command(f'echo once >> {sentinel}; sleep 3')
-        wait_for(lambda: succeeded(command('true')))
+        verify_reconnect('in-flight mutation interruption')
         check('in-flight mutation not replayed', sentinel.read_text().splitlines() == ['once'])
         stop(relay)
         time.sleep(2)
         relay = spawn(relay_args, 'relay')
-        wait_for(lambda: succeeded(command('true')), 60)
+        verify_reconnect('Relay restart', 60)
         check('isolated Relay restart reconnect', True)
         link.listener.close()
         link.drop()
