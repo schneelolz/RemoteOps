@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-MCP_PACKAGE_VERSION="0.2.0-preview.11"
+MCP_PACKAGE_VERSION="0.2.0-preview.12"
 CREDENTIAL_PROMPT_VERSION="0.2.0-preview.5"
 KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"

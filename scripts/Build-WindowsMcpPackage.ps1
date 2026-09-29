@@ -59,6 +59,21 @@ if (-not $versionMatch.Success) {
     throw '无法确定 remoteops-controller-mcp 版本。'
 }
 $version = $versionMatch.Groups['version'].Value
+$credentialPromptPackageId = (& cargo pkgid `
+    --manifest-path (Join-Path $workspaceRoot 'Cargo.toml') `
+    --locked `
+    -p remoteops-credential-prompt 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw '读取 remoteops-credential-prompt 版本失败。'
+}
+$credentialPromptVersionMatch = [regex]::Match(
+    $credentialPromptPackageId,
+    '#(?:[^@#]+@)?(?<version>[^#\s]+)$'
+)
+if (-not $credentialPromptVersionMatch.Success) {
+    throw '无法确定 remoteops-credential-prompt 版本。'
+}
+$credentialPromptVersion = $credentialPromptVersionMatch.Groups['version'].Value
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $workspaceRoot "artifacts\release\$version\mcp"
 }
@@ -143,7 +158,7 @@ if ($LASTEXITCODE -ne 0 -or $actualVersion -notmatch [regex]::Escape($version)) 
     throw "打包程序版本不正确：$actualVersion"
 }
 $promptVersion = (& (Join-Path $packageDirectory 'remoteops-credential-prompt.exe') --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $promptVersion -notmatch [regex]::Escape($version)) {
+if ($LASTEXITCODE -ne 0 -or $promptVersion -notmatch [regex]::Escape($credentialPromptVersion)) {
     throw "凭据安全输入程序版本不正确：$promptVersion"
 }
 

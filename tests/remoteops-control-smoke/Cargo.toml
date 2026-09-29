@@ -1,0 +1,25 @@
+[package]
+name = "remoteops-control-smoke"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "remoteops-control-live"
+path = "src/live.rs"
+
+[dependencies]
+anyhow.workspace = true
+rmcp = { version = "3.0.1", features = ["client", "transport-child-process"] }
+serde_json.workspace = true
+remoteops-agent = { path = "../../apps/remoteops-agent" }
+tokio.workspace = true
+tokio-rustls.workspace = true
+remoteops-application = { path = "../../crates/remoteops-application" }
+remoteops-domain = { path = "../../crates/remoteops-domain" }
+remoteops-protocol = { path = "../../crates/remoteops-protocol" }
+
+[lints]
+workspace = true

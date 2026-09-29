@@ -17,7 +17,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$mcpVersion = '0.2.0-preview.11'
+$mcpVersion = '0.2.0-preview.12'
 $credentialPromptVersion = '0.2.0-preview.5'
 $tokenVariable = 'REMOTEOPS_CONTROLLER_TOKEN'
 $ownerVariable = 'REMOTEOPS_CONTROLLER_OWNER_ID'

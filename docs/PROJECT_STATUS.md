@@ -1,19 +1,19 @@
 # 项目状态
 
-更新时间：2026-08-25
+更新时间：2026-09-29
 
 ## 当前基线
 
 - 项目：RemoteOps
-- 当前源码版本：Agent `0.2.0-preview.7`，GUI `0.2.0-preview.9`，Relay/MCP `0.2.0-preview.5`
+- 当前源码版本：Agent `0.2.0-preview.26`，GUI `0.2.0-preview.27`，Relay `0.2.0-preview.6`，MCP `0.2.0-preview.12`
 - 首个计划公开版本：`0.2.0-preview.7`
-- 当前协议版本：`v14`
+- 当前协议版本：`v16`
 - 发布阶段：GitHub Technical Preview 准备中，尚未创建首个 GitHub Release
 - 现场端：Windows x64 Agent
 - Relay：Linux x64 + Docker
 - Codex MCP：Windows x64、Apple Silicon macOS
 
-公开版本以实际 GitHub Release 为准，当前源码候选版本为 Agent `0.2.0-preview.7`、GUI `0.2.0-preview.9`、Relay/MCP `0.2.0-preview.5`，尚未创建首个公开 Release。迁移前的 `4.x` 只代表内部开发和验收历史，不属于公开版本序列。v9 完成 Controller 会话释放、同 Owner 新实例接管和 MCP 授权修复；v10 取消普通 Agent 首次连接所需的入网码和部署级注册 Token；v11 增加大文件分块传输、权限状态修复、持久 Shell 显式关闭及完整 Windows 隐藏进程回归；v13 增加 Agent 租约续期事件；v14 将 SSH 密码改为控制端本机安全窗口输入和 MCP 到 Agent 的 HPKE 单次加密载荷。Agent、Relay 和 Controller 必须使用同一协议版本。
+公开版本以实际 GitHub Release 为准；上述源码候选版本不代表已部署或已公开发布。迁移前 `4.x` 属于内部开发历史。v14 引入 SSH 密码控制端安全输入及 HPKE 单次载荷；v16 引入 Relay 权威控制状态、现场授权和默认控制模式。Agent、Relay、Controller 必须使用同一协议版本。
 
 ## 已完成
 
@@ -22,7 +22,7 @@
 - Agent 主动出站连接 Relay，不要求现场开放公网入站端口。
 - Agent 首次连接不需要入网码或部署级注册 Token；GUI 普通流程只填写 Relay 地址并显示九位控制码。
 - Agent 上报脱敏 Windows 环境画像，包括系统、版本、架构、Shell、PowerShell、SSH 和能力集合。
-- MCP 按 Agent `session_id` 独立提供逐项确认和完全控制：默认逐项确认；完全控制仅保存在 MCP 内存，空闲一小时失效，成功操作滑动续期。
+- Relay 按会话与双方连接代次保存有效控制状态并同步 Agent/MCP；默认逐项确认。MCP 授权空闲一小时到期、成功操作续期；现场授权到连接结束或撤销失效。完整规则见[控制权限说明](control-permissions.md)。
 - Relay/Agent 使用 `ControllerApproved` 区分 MCP 已完成人机确认与 Agent 本地 `FullAccess`，Human Controller 不能申请该模式；底层身份、会话、能力、路径和结构化操作校验继续生效。
 - Human 与 AI 使用同一 `ControllerOwnerId` 协作，同一个 Agent Session 不允许两个独立 Owner 同时控制。
 - MCP、CLI 和 GUI 复用共享应用服务，协议消息、会话绑定、权限、审批和审计不在壳子中重复实现。
@@ -34,7 +34,7 @@
 - MCP 与 CLI 使用 1 MiB 分块上传和下载，单文件上限为 16 GiB；超过 1 GiB 时必须在读取、哈希和发送前单独确认。上传和本地下载覆盖使用同目录临时文件、分块与完整 SHA-256 校验和可恢复原子提交，失败时保留原文件。
 - Relay 分别保存 Human 与 AI 权限，Human 配对不再覆盖 AI 的 `ControllerApproved`；人工接管期间 AI 临时只读，释放后恢复。Agent GUI、Controller GUI、CLI 和 MCP 使用或显示同一有效权限来源。
 - MCP 与随包 `remoteops` skill 支持自然语言路由，RemoteOps 控制码会优先进入配对和受控远程诊断流程。
-- Agent GUI 已移除控制模式选择和 SSH 凭据管理入口；控制模式统一由使用者侧 MCP 管理。SSH 密码只在控制端本机安全窗口输入，可单次使用或在 MCP 内存固定缓存十分钟，并通过 HPKE 绑定精确请求发送；Agent 不建立密码仓库。运行页采用 `520 × 440` 固定窗口，突出会随在线心跳刷新的控制码租约倒计时、工程师连接状态和能力摘要，并保留停止确认和屏幕工作区居中。
+- Agent GUI 支持“控制权限”及默认模式设置。默认 `default_full_control=false`；保存默认完全控制后每个新绑定重新授权；现场手动撤销抑制本次运行后续自动授权。SSH 凭据仍只由控制端安全窗口输入，Agent 不建立密码仓库。当前运行页固定内容区为 `500 × 375`，状态文字保持 14 逻辑像素并显示授权来源。
 - Apple Silicon macOS MCP 已加入源码适配、Keychain Token、标准 macOS 数据目录、安装/检测/卸载脚本和 GitHub Actions 构建链路。
 - Relay 恢复后，Agent 可使用有效状态和恢复令牌重新认证；同一 MCP 进程会重试已知配对。审批和在途写操作不会自动重放。
 - 本地 MCP 编译和单元测试已通过；Windows、Linux 和 macOS 的完整首发产物仍需由干净 CI 生成并复核。
@@ -59,7 +59,7 @@
 6. 使用真实串口和交换机复核正式远程串口路径、分页、审批写入、拔插和重连。
 7. 决定 Windows Authenticode 和 macOS Developer ID/Notarization 策略，并在 Release 中披露未签名风险。
 8. 在 Windows Server Datacenter 26100 RDP 环境复测首发候选：自然语言调用 RemoteOps 完成只读诊断，连续调用期间不得闪现 PowerShell/CMD 黑框。
-9. 在 Windows Codex 和真实 Apple Silicon Mac 验证 MCP elicitation：默认逐项确认、拒绝不执行、每 Agent 隔离、完全控制一小时滑动过期、断线恢复和重启失效。
+9. 在 Windows Codex 和真实 Apple Silicon Mac 验证 MCP elicitation、现场授权、默认授权、撤销后的自动授权抑制、MCP 一小时滑动到期，以及三端协议 16 配套部署。
 10. 在真实 Windows Agent 上验证大文件双向传输、覆盖失败恢复、嵌套目录、超过 1 GiB 的读取前确认，以及 CMD/Windows PowerShell/PowerShell 7 中文输出、`exit`、`close_shell` 和无可见控制台窗口。
 
 ## 本地保留物

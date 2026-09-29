@@ -7,7 +7,7 @@ use remoteops_domain::{
 use serde::{Deserialize, Serialize};
 
 /// 当前线协议版本。
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 
 /// Controller 的受信任调用身份。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -237,6 +237,9 @@ pub struct ControllerBinding {
     /// Controller 上报的控制模式，仅供展示，不参与授权判断。
     #[serde(default)]
     pub controller_control_mode: Option<ControllerControlMode>,
+    /// Relay 确认的会话授权；旧展示模式不作为授权依据。
+    #[serde(default)]
+    pub control_state: Option<crate::SessionControlState>,
     /// 只在 Relay 与 Agent 之间传输的随机绑定令牌。
     pub binding_token: String,
 }
@@ -327,6 +330,9 @@ pub struct RemoteRequest {
     pub approval_id: Option<ApprovalId>,
     /// 文件等二进制内容使用的 Base64 负载；Relay 不解析。
     pub payload_base64: Option<String>,
+    /// 修改操作使用的精确绑定及授权依据。
+    #[serde(default)]
+    pub control_proof: Option<crate::ControlProof>,
 }
 
 /// Agent 完成一次请求后的结构化结果。
@@ -354,6 +360,12 @@ pub struct RemoteResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum WireMessage {
+    /// 查询或变更共享授权。
+    ControlStateRequest(crate::ControlStateRequest),
+    /// 共享授权查询或变更的确认。
+    ControlStateResult(crate::ControlStateResult),
+    /// Relay 推送有效授权快照。
+    ControlStateUpdated(crate::SessionControlState),
     /// 第一条角色声明消息。
     Hello(ClientHello),
     /// Agent 注册成功。
@@ -456,6 +468,7 @@ mod tests {
             controller_kind: ControllerKind::Ai,
             permission_mode: PermissionMode::ApprovalRequired,
             controller_control_mode: None,
+            control_state: None,
             binding_token: "binding-token".to_owned(),
         };
         for mode in [
@@ -494,6 +507,7 @@ mod tests {
             },
             approval_id: None,
             payload_base64: None,
+            control_proof: None,
         });
 
         let json = serde_json::to_vec(&request).expect("协议消息应可编码");
@@ -516,6 +530,7 @@ mod tests {
             },
             approval_id: None,
             payload_base64: None,
+            control_proof: None,
         };
         let message = WireMessage::AuthorizedRemoteRequest(AuthorizedRemoteRequest {
             request,
@@ -596,6 +611,7 @@ mod tests {
             operation: RemoteOperation::ListProcesses,
             approval_id: None,
             payload_base64: None,
+            control_proof: None,
         };
         let mut value = serde_json::to_value(&request).expect("请求应可编码");
         value.as_object_mut().expect("请求应为 JSON 对象").insert(

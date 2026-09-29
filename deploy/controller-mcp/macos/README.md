@@ -1,6 +1,6 @@
 # RemoteOps MCP macOS Apple Silicon 安装说明
 
-- 版本：`0.2.0-preview.11`
+- 版本：`0.2.0-preview.12`
 - 适用系统：macOS 13 或更高版本，Apple Silicon（arm64）
 - Codex MCP 名称：`remoteops`
 
@@ -22,7 +22,7 @@ chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.
 安装位置：
 
 ```text
-~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.11
+~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.12
 ~/.codex/remoteops/remoteops-credential-prompt
 ~/.codex/remoteops/launch-remoteops-controller-mcp.sh
 ~/.codex/remoteops/controller-config.json

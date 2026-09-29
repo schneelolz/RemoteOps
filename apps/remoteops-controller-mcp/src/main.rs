@@ -1,7 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -19,13 +19,13 @@ use remoteops_application::{
 use remoteops_audit::sha256_bytes;
 use remoteops_domain::{
     ApprovalId, Capability, ControllerInstanceId, ControllerOwnerId, EventSource, FileTransferId,
-    PairingCode, PermissionMode, PowerAction, RemoteOperation, SerialDataBits, SerialFlowControl,
-    SerialLineEnding, SerialParity, SerialSettings, SerialStopBits, SerialTerminalProfile,
-    ServiceAction, SessionId, ShellId, ShellKind, VisualTarget,
+    PairingCode, PermissionMode, PowerAction, RemoteOperation, RequestId, SerialDataBits,
+    SerialFlowControl, SerialLineEnding, SerialParity, SerialSettings, SerialStopBits,
+    SerialTerminalProfile, ServiceAction, SessionId, ShellId, ShellKind, VisualTarget,
 };
 use remoteops_protocol::{
-    ControllerControlMode, ControllerControlModeUpdate, CredentialEncryptionContext,
-    PROTOCOL_VERSION, seal_credential,
+    ControlBasis, ControlProof, ControlSource, ControlStateRequest, ControllerControlMode,
+    CredentialEncryptionContext, PROTOCOL_VERSION, SessionControlState, seal_credential,
 };
 use rmcp::{
     Json, RoleServer, ServerHandler, ServiceExt,
@@ -293,7 +293,7 @@ enum CommandMode {
     /// 由 Agent 本地权限选择决定是否逐项审批。
     #[default]
     AgentControlled,
-    /// 由可信 Human Owner 显式授权后执行，不逐项申请审批。
+    /// 兼容完全控制权限上限；协议16仍须 Relay 确认会话授权。
     FullAccess,
 }
 
@@ -302,8 +302,7 @@ impl From<CommandMode> for PermissionMode {
         match value {
             CommandMode::Readonly => Self::ReadOnly,
             CommandMode::Approval => Self::ApprovalRequired,
-            CommandMode::AgentControlled => Self::ControllerApproved,
-            CommandMode::FullAccess => Self::FullAccess,
+            CommandMode::AgentControlled | CommandMode::FullAccess => Self::ControllerApproved,
         }
     }
 }
@@ -321,14 +320,13 @@ struct RemoteOpsMcp {
     transfer_root: Arc<PathBuf>,
     command_mode: CommandMode,
     enable_test_ui: bool,
-    full_access_grants: Arc<Mutex<BTreeMap<SessionId, FullAccessGrant>>>,
-    control_modes: Arc<Mutex<BTreeMap<SessionId, ControllerControlMode>>>,
+    control_sync_failed: Arc<Mutex<BTreeSet<SessionId>>>,
+
     ssh_credential_cache: Arc<Mutex<BTreeMap<SshCredentialCacheKey, CachedSshCredential>>>,
     credential_prompt_lock: Arc<Mutex<()>>,
     credential_prompt: Arc<dyn CredentialPrompt>,
 }
 
-const FULL_ACCESS_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 const SSH_CREDENTIAL_CACHE_TIMEOUT: Duration = Duration::from_mins(10);
 const CREDENTIAL_PROMPT_TIMEOUT: Duration = Duration::from_mins(5);
 const ELICITATION_TIMEOUT: Duration = Duration::from_mins(2);
@@ -336,20 +334,40 @@ const FILE_CHUNK_BYTES: usize = 1024 * 1024;
 const LARGE_TRANSFER_CONFIRM_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_TRANSFER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug)]
-struct FullAccessGrant {
-    last_successful_use: Instant,
-}
-
-impl FullAccessGrant {
-    fn is_active_at(self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_successful_use) < FULL_ACCESS_IDLE_TIMEOUT
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Default)]
 struct WriteAuthorization {
     approval_id: Option<ApprovalId>,
+    proof: Option<ControlProof>,
+}
+
+/// 判定是否已有可复用授权；None 明确表示仍需本次逐项确认。
+fn authorization_without_prompt(
+    command_mode: CommandMode,
+    state: &SessionControlState,
+    approval_id: Option<ApprovalId>,
+) -> Result<Option<WriteAuthorization>, String> {
+    if command_mode == CommandMode::Readonly || state.mode == ControllerControlMode::ReadOnly {
+        return Err("当前连接仅允许只读操作".into());
+    }
+    let (basis, approval_id) = if command_mode == CommandMode::Approval
+        || state.mode == ControllerControlMode::ExternalApproval
+    {
+        (
+            ControlBasis::ExternalApproval,
+            Some(approval_id.ok_or("必须提供独立 Human Controller 批准的 approval_id")?),
+        )
+    } else if state.mode == ControllerControlMode::FullAccess {
+        (ControlBasis::FullAccess, None)
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(WriteAuthorization {
+        approval_id,
+        proof: Some(ControlProof {
+            state: state.clone(),
+            basis,
+        }),
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
@@ -373,6 +391,64 @@ struct ControlModeOutput {
     mode: String,
     idle_timeout_seconds: Option<u64>,
     message: String,
+    source: Option<String>,
+    revision: Option<u64>,
+    sync_status: String,
+    expires_at: Option<String>,
+}
+
+/// 两端采用同一份 Relay 确认快照，不把未知状态解释为逐项确认。
+fn control_output(state: &SessionControlState) -> ControlModeOutput {
+    let mode = match state.mode {
+        ControllerControlMode::StepByStep | ControllerControlMode::Expired => "step_by_step",
+        ControllerControlMode::FullAccess => "full_access",
+        ControllerControlMode::ReadOnly => "readonly",
+        ControllerControlMode::ExternalApproval => "external_approval",
+    };
+    let source = state.source.map(|source| {
+        match source {
+            ControlSource::Mcp => "mcp",
+            ControlSource::Local => "local",
+            ControlSource::LocalDefault => "local_default",
+        }
+        .to_owned()
+    });
+    ControlModeOutput {
+        session_id: state.session_id.to_string(),
+        mode: mode.into(),
+        idle_timeout_seconds: (state.mode == ControllerControlMode::FullAccess
+            && state.source == Some(ControlSource::Mcp))
+        .then_some(3600),
+        message: match state.mode {
+            ControllerControlMode::FullAccess => match state.source {
+                Some(ControlSource::Mcp) => "完全控制已确认；成功操作续期，空闲一小时失效",
+                Some(ControlSource::LocalDefault) => {
+                    "现场默认完全控制已确认；本连接无需 RemoteOps 逐项审批"
+                }
+                _ => "现场完全控制已确认；本连接无需 RemoteOps 逐项审批",
+            },
+            ControllerControlMode::ReadOnly => "当前连接仅允许只读操作",
+            ControllerControlMode::ExternalApproval => "当前连接强制要求独立人工审批",
+            ControllerControlMode::Expired => "完全控制已过期，当前逐项确认",
+            ControllerControlMode::StepByStep => "当前逐项确认；修改操作需确认",
+        }
+        .into(),
+        source,
+        revision: Some(state.revision),
+        sync_status: "synced".into(),
+        expires_at: state.expires_at.map(|at| at.to_rfc3339()),
+    }
+}
+
+/// 成功请求续期可改变到期时间，但不能改变授权身份或版本。
+fn control_snapshot_matches(current: &SessionControlState, expected: &SessionControlState) -> bool {
+    current.session_id == expected.session_id
+        && current.agent_generation == expected.agent_generation
+        && current.controller_id == expected.controller_id
+        && current.controller_generation == expected.controller_generation
+        && current.revision == expected.revision
+        && current.mode == expected.mode
+        && current.source == expected.source
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -982,6 +1058,9 @@ struct ConnectionOutput {
     role: String,
     permission_mode: String,
     control_mode: String,
+    control_source: Option<String>,
+    control_revision: Option<u64>,
+    control_sync_status: String,
     transfer_root: String,
     capabilities: Vec<String>,
 }
@@ -1177,14 +1256,19 @@ impl RemoteOpsMcp {
         command_mode: CommandMode,
         enable_test_ui: bool,
     ) -> Self {
+        if command_mode == CommandMode::FullAccess {
+            tracing::warn!(
+                "协议16 full-access 参数只声明权限上限；使用 set_control_mode 或现场授权确认本次连接"
+            );
+        }
         let mcp = Self {
             client,
             shells: Arc::new(Mutex::new(BTreeMap::new())),
             transfer_root: Arc::new(transfer_root),
             command_mode,
             enable_test_ui,
-            full_access_grants: Arc::new(Mutex::new(BTreeMap::new())),
-            control_modes: Arc::new(Mutex::new(BTreeMap::new())),
+            control_sync_failed: Arc::new(Mutex::new(BTreeSet::new())),
+
             ssh_credential_cache: Arc::new(Mutex::new(BTreeMap::new())),
             credential_prompt_lock: Arc::new(Mutex::new(())),
             credential_prompt: Arc::new(ProcessCredentialPrompt),
@@ -1203,43 +1287,22 @@ impl RemoteOpsMcp {
     }
 
     async fn report_current_control_modes(&self) {
-        let connections = self.client.list_connections().await;
-        let now = Instant::now();
-        let expired = {
-            let mut grants = self.full_access_grants.lock().await;
-            let expired = grants
-                .iter()
-                .filter_map(|(session_id, grant)| (!grant.is_active_at(now)).then_some(*session_id))
-                .collect::<Vec<_>>();
-            for session_id in &expired {
-                grants.remove(session_id);
-            }
-            expired
-        };
-        if !expired.is_empty() {
-            let mut modes = self.control_modes.lock().await;
-            for session_id in expired {
-                modes.insert(session_id, ControllerControlMode::Expired);
+        for connection in self.client.list_connections().await {
+            let session_id = connection.session_id;
+            match self.client.query_control_state(session_id).await {
+                Ok(state) => {
+                    if self.control_sync_failed.lock().await.remove(&session_id) {
+                        tracing::info!(revision = state.revision, mode = ?state.mode, "控制状态同步已恢复");
+                    }
+                }
+                Err(error) => {
+                    if self.control_sync_failed.lock().await.insert(session_id) {
+                        tracing::warn!(error = %error, "控制状态同步失败；不会推断或恢复完全控制");
+                    }
+                }
             }
         }
-        let modes = self.control_modes.lock().await;
-        let fallback = match self.command_mode {
-            CommandMode::Readonly => ControllerControlMode::ReadOnly,
-            CommandMode::Approval => ControllerControlMode::ExternalApproval,
-            CommandMode::FullAccess => ControllerControlMode::FullAccess,
-            CommandMode::AgentControlled => ControllerControlMode::StepByStep,
-        };
-        let updates = connections
-            .into_iter()
-            .map(|connection| {
-                let session_id = connection.session_id;
-                let mode = modes.get(&session_id).copied().unwrap_or(fallback);
-                ControllerControlModeUpdate { session_id, mode }
-            })
-            .collect();
-        let _ = self.client.report_controller_control_modes(updates).await;
     }
-
     fn runtime_tool_router(&self) -> ToolRouter<Self> {
         configured_tool_router(self.enable_test_ui)
     }
@@ -1470,58 +1533,21 @@ impl RemoteOpsMcp {
             .ok_or_else(|| "未找到 session_id 对应的连接；请先调用 list_connections".to_owned())
     }
 
-    async fn has_full_access(&self, session_id: SessionId) -> bool {
-        let mut grants = self.full_access_grants.lock().await;
-        let Some(grant) = grants.get(&session_id) else {
-            return false;
-        };
-        if !grant.is_active_at(Instant::now()) {
-            grants.remove(&session_id);
-            self.control_modes
-                .lock()
-                .await
-                .insert(session_id, ControllerControlMode::Expired);
-            return false;
-        }
-        true
-    }
-
-    async fn control_mode_name(&self, session_id: SessionId) -> &'static str {
-        match self.command_mode {
-            CommandMode::Readonly => "readonly",
-            CommandMode::Approval => "external_approval",
-            CommandMode::FullAccess => "full_access",
-            CommandMode::AgentControlled if self.has_full_access(session_id).await => "full_access",
-            CommandMode::AgentControlled => "step_by_step",
-        }
-    }
-
     async fn control_mode_output(&self, session_id: SessionId) -> ControlModeOutput {
-        let mode = self.control_mode_name(session_id).await;
-        let full_access = mode == "full_access";
-        ControlModeOutput {
-            session_id: session_id.to_string(),
-            mode: mode.to_owned(),
-            idle_timeout_seconds: (self.command_mode == CommandMode::AgentControlled
-                && full_access)
-                .then_some(FULL_ACCESS_IDLE_TIMEOUT.as_secs()),
-            message: match mode {
-                "readonly" => "MCP 启动参数固定为只读模式，拒绝修改操作".to_owned(),
-                "external_approval" => {
-                    "MCP 启动参数固定为外部审批模式，修改操作必须携带 Human Controller approval_id"
-                        .to_owned()
-                }
-                "full_access" if self.command_mode == CommandMode::FullAccess => {
-                    "MCP 启动参数固定为完全控制模式，不使用会话空闲过期".to_owned()
-                }
-                "full_access" => {
-                    "完全控制已开启；每次成功的远程操作都会把空闲有效期刷新为一小时".to_owned()
-                }
-                _ => "当前为逐项确认；只读检查直接执行，修改操作前询问".to_owned(),
+        match self.client.query_control_state(session_id).await {
+            Ok(state) => control_output(&state),
+            Err(error) => ControlModeOutput {
+                session_id: session_id.to_string(),
+                mode: "unsynced".into(),
+                idle_timeout_seconds: None,
+                message: format!("控制模式未同步：{error}"),
+                source: None,
+                revision: None,
+                sync_status: "failed".into(),
+                expires_at: None,
             },
         }
     }
-
     async fn elicit_confirmation(
         &self,
         context: &RequestContext<RoleServer>,
@@ -1535,7 +1561,7 @@ impl RemoteOpsMcp {
                     BooleanSchema::new()
                         .title(title)
                         .description(
-                            "在当前 MCP 确认界面点击允许即表示仅确认本次操作；这不是完全控制授权。Agent 端没有授权按钮",
+                            "在当前 MCP 确认界面点击允许即表示仅确认本次操作；这不是完全控制授权。协议 16 的 Agent 可由现场人员授权完全控制",
                         )
                         .with_default(true),
                 ),
@@ -1599,12 +1625,9 @@ impl RemoteOpsMcp {
         if self.command_mode == CommandMode::Readonly {
             return Err("当前 MCP 使用 readonly 模式，已拒绝文件上传".to_owned());
         }
-        let authorization = if self.command_mode == CommandMode::Approval {
-            self.authorize_mutation(context, session_id, "文件上传", approval_id)
-                .await?
-        } else {
-            WriteAuthorization { approval_id: None }
-        };
+        let authorization = self
+            .authorize_mutation(context, session_id, "文件上传", approval_id)
+            .await?;
         self.confirm_large_transfer(context, size, "上传").await?;
         Ok(authorization)
     }
@@ -1613,23 +1636,22 @@ impl RemoteOpsMcp {
         &self,
         session_id: SessionId,
         operation: RemoteOperation,
-        approval_id: Option<ApprovalId>,
+        authorization: WriteAuthorization,
         payload_base64: Option<String>,
     ) -> Result<OperationResult, String> {
         let result = self
             .client
-            .execute(
+            .execute_with_control(
                 &session_id.to_string(),
                 EventSource::Ai,
                 operation,
-                approval_id,
+                authorization.approval_id,
                 payload_base64,
                 None,
+                authorization.proof,
             )
             .await
             .map_err(application_error)?;
-        self.refresh_full_access_after_success(session_id, &result)
-            .await;
         Ok(result)
     }
 
@@ -1646,7 +1668,7 @@ impl RemoteOpsMcp {
                     remote_path: remote_path.to_owned(),
                     include_sha256,
                 },
-                None,
+                WriteAuthorization::default(),
                 None,
             )
             .await?;
@@ -1683,18 +1705,19 @@ impl RemoteOpsMcp {
         legacy_approval_id: Option<String>,
     ) -> Result<WriteAuthorization, String> {
         if self.command_mode == CommandMode::Readonly {
-            return Err("当前 MCP 使用 readonly 模式，已拒绝修改操作".to_owned());
+            return Err("当前 MCP 使用 readonly 模式，已拒绝修改操作".into());
         }
-        if self.command_mode == CommandMode::Approval {
-            let approval_id = parse_optional_approval(legacy_approval_id)?.ok_or_else(|| {
-                format!("{action}必须提供独立 Human Controller 批准的 approval_id")
-            })?;
-            return Ok(WriteAuthorization {
-                approval_id: Some(approval_id),
-            });
-        }
-        if self.command_mode == CommandMode::FullAccess || self.has_full_access(session_id).await {
-            return Ok(WriteAuthorization { approval_id: None });
+        let state = self
+            .client
+            .query_control_state(session_id)
+            .await
+            .map_err(application_error)?;
+        if let Some(authorization) = authorization_without_prompt(
+            self.command_mode,
+            &state,
+            parse_optional_approval(legacy_approval_id)?,
+        )? {
+            return Ok(authorization);
         }
         let confirmed = self
             .elicit_confirmation(
@@ -1705,30 +1728,17 @@ impl RemoteOpsMcp {
             .await?;
         if !confirmed {
             return Err(format!(
-                "当前 MCP 确认界面未允许本次操作：{action}，操作未执行；不得自动切换到完全控制；Agent 端没有授权按钮"
+                "当前 MCP 确认界面未允许本次操作：{action}，操作未执行；不得自动切换到完全控制"
             ));
         }
-        Ok(WriteAuthorization { approval_id: None })
+        Ok(WriteAuthorization {
+            approval_id: None,
+            proof: Some(ControlProof {
+                state,
+                basis: ControlBasis::SingleApproval,
+            }),
+        })
     }
-
-    async fn refresh_full_access_after_success(
-        &self,
-        session_id: SessionId,
-        result: &OperationResult,
-    ) {
-        if result.response.error_code.is_some()
-            || result
-                .response
-                .exit_code
-                .is_some_and(|exit_code| exit_code != 0)
-        {
-            return;
-        }
-        if let Some(grant) = self.full_access_grants.lock().await.get_mut(&session_id) {
-            grant.last_successful_use = Instant::now();
-        }
-    }
-
     /// 列出所有已配对连接及其不可变 `session_id`。
     #[tool(
         name = "list_connections",
@@ -1748,7 +1758,11 @@ impl RemoteOpsMcp {
             output.transfer_root = self.transfer_root.display().to_string();
             let session_id =
                 parse_session_id(&output.session_id).expect("Relay 返回的 session_id 必须有效");
-            output.control_mode = self.control_mode_name(session_id).await.to_owned();
+            let state = self.control_mode_output(session_id).await;
+            output.control_mode = state.mode;
+            output.control_source = state.source;
+            output.control_revision = state.revision;
+            output.control_sync_status = state.sync_status;
             connections.push(output);
         }
         self.report_current_control_modes().await;
@@ -1792,22 +1806,20 @@ impl RemoteOpsMcp {
             .find(|item| item.session_id == connection.session_id)
             .ok_or_else(|| "配对成功后未找到连接".to_owned())?;
         let session_id = connection.session_id;
-        self.full_access_grants.lock().await.remove(&session_id);
-        self.control_modes
-            .lock()
-            .await
-            .insert(session_id, ControllerControlMode::StepByStep);
-        self.report_current_control_modes().await;
         let mut output = connection_output(connection);
         output.transfer_root = self.transfer_root.display().to_string();
-        output.control_mode = self.control_mode_name(session_id).await.to_owned();
+        let state = self.control_mode_output(session_id).await;
+        output.control_mode = state.mode;
+        output.control_source = state.source;
+        output.control_revision = state.revision;
+        output.control_sync_status = state.sync_status;
         Ok(Json(output))
     }
 
     /// 查询指定 Agent 在本 MCP 进程中的控制模式。
     #[tool(
         name = "get_control_mode",
-        description = "查询精确 session_id 当前是逐项确认还是完全控制。完全控制仅保存在本机 MCP 内存，空闲一小时自动失效。",
+        description = "查询精确 session_id 当前是逐项确认还是完全控制。返回 Relay 确认的有效模式、来源、同步状态及修订号；现场授权也可免除 RemoteOps 逐项审批。",
         annotations(
             title = "查询控制模式",
             read_only_hint = true,
@@ -1828,7 +1840,7 @@ impl RemoteOpsMcp {
     /// 更改指定 Agent 在本 MCP 进程中的控制模式。
     #[tool(
         name = "set_control_mode",
-        description = "按精确 session_id 切换控制模式。默认保持 step_by_step；不得因为逐项确认界面不可用、超时或写操作被拒绝而调用 full_access。只有用户明确要求完全控制时才调用。调用 full_access 时只使用 Codex 对本工具的授权，不再嵌套弹出第二次确认；Agent 端没有完全控制按钮。切回逐项确认立即生效。",
+        description = "按精确 session_id 切换控制模式。默认保持 step_by_step；不得因为逐项确认界面不可用、超时或写操作被拒绝而调用 full_access。只有用户明确要求完全控制时才调用。调用 full_access 时只使用 Codex 对本工具的授权，不再嵌套弹出第二次确认；协议 16 的 Agent 支持现场授权；已生效时不要重复授权。切回逐项确认立即生效。",
         annotations(
             title = "切换控制模式",
             read_only_hint = false,
@@ -1843,42 +1855,34 @@ impl RemoteOpsMcp {
     ) -> Result<Json<ControlModeOutput>, String> {
         let session_id = parse_session_id(&input.session_id)?;
         self.ensure_connection_exists(session_id).await?;
-        if self.command_mode != CommandMode::AgentControlled {
-            let requested_full_access = matches!(input.mode, McpControlMode::FullAccess);
-            let already_full_access = self.command_mode == CommandMode::FullAccess;
-            if requested_full_access != already_full_access {
-                return Err(format!(
-                    "MCP 启动 command_mode={:?} 固定了有效权限，不能在会话内切换",
-                    self.command_mode
-                ));
-            }
-            return Ok(Json(self.control_mode_output(session_id).await));
+        if matches!(
+            self.command_mode,
+            CommandMode::Readonly | CommandMode::Approval
+        ) {
+            return Err("MCP 启动配置限制了会话权限，不能切换完全控制".into());
         }
-        match input.mode {
-            McpControlMode::StepByStep => {
-                self.full_access_grants.lock().await.remove(&session_id);
-                self.control_modes
-                    .lock()
-                    .await
-                    .insert(session_id, ControllerControlMode::StepByStep);
-            }
-            McpControlMode::FullAccess => {
-                self.full_access_grants.lock().await.insert(
-                    session_id,
-                    FullAccessGrant {
-                        last_successful_use: Instant::now(),
-                    },
-                );
-                self.control_modes
-                    .lock()
-                    .await
-                    .insert(session_id, ControllerControlMode::FullAccess);
-            }
-        }
-        self.report_current_control_modes().await;
-        Ok(Json(self.control_mode_output(session_id).await))
+        let expected = self
+            .client
+            .query_control_state(session_id)
+            .await
+            .map_err(application_error)?;
+        let mode = match input.mode {
+            McpControlMode::StepByStep => ControllerControlMode::StepByStep,
+            McpControlMode::FullAccess => ControllerControlMode::FullAccess,
+        };
+        let state = self
+            .client
+            .request_control_state(ControlStateRequest {
+                request_id: RequestId::new(),
+                session_id,
+                expected: Some(expected),
+                mode: Some(mode),
+                source: Some(ControlSource::Mcp),
+            })
+            .await
+            .map_err(application_error)?;
+        Ok(Json(control_output(&state)))
     }
-
     /// 读取单个连接的主机、系统、能力和状态。
     #[tool(
         name = "get_target_info",
@@ -1929,7 +1933,11 @@ impl RemoteOpsMcp {
             refresh_visual_capability(&mut output.capabilities, initialized);
         }
         output.transfer_root = self.transfer_root.display().to_string();
-        output.control_mode = self.control_mode_name(session_id).await.to_owned();
+        let state = self.control_mode_output(session_id).await;
+        output.control_mode = state.mode;
+        output.control_source = state.source;
+        output.control_revision = state.revision;
+        output.control_sync_status = state.sync_status;
         Ok(Json(output))
     }
 
@@ -2028,8 +2036,6 @@ impl RemoteOpsMcp {
             .await
             .map_err(application_error)?;
         self.shells.lock().await.remove(&shell_id);
-        self.refresh_full_access_after_success(session_id, &result)
-            .await;
         Ok(Json(action_output(session_id, result)))
     }
 
@@ -2100,7 +2106,7 @@ impl RemoteOpsMcp {
             .execute_raw(
                 session_id,
                 command_operation(shell, input.command, false),
-                authorization.approval_id,
+                authorization,
                 None,
             )
             .await?;
@@ -2761,7 +2767,7 @@ impl RemoteOpsMcp {
         };
         match self
             .client
-            .execute(
+            .execute_with_control(
                 &session_id.to_string(),
                 EventSource::Ai,
                 RemoteOperation::OpenSerial {
@@ -2775,17 +2781,14 @@ impl RemoteOpsMcp {
                     ),
                     writable: input.writable,
                 },
-                authorization.and_then(|value| value.approval_id),
+                authorization.as_ref().and_then(|value| value.approval_id),
                 None,
                 None,
+                authorization.and_then(|value| value.proof),
             )
             .await
         {
-            Ok(result) => {
-                self.refresh_full_access_after_success(session_id, &result)
-                    .await;
-                Ok(Json(action_output(session_id, result)))
-            }
+            Ok(result) => Ok(Json(action_output(session_id, result))),
             Err(error) => Ok(Json(error_action_output(session_id, error))),
         }
     }
@@ -3055,7 +3058,7 @@ impl RemoteOpsMcp {
         let transfer_id = FileTransferId::new();
         let begin_result = self
             .client
-            .execute(
+            .execute_with_control(
                 &session_id.to_string(),
                 EventSource::Ai,
                 RemoteOperation::BeginUploadFile {
@@ -3068,13 +3071,11 @@ impl RemoteOpsMcp {
                 authorization.approval_id,
                 None,
                 None,
+                authorization.proof.clone(),
             )
             .await;
         match begin_result {
-            Ok(result) => {
-                self.refresh_full_access_after_success(session_id, &result)
-                    .await;
-            }
+            Ok(_) => {}
             Err(error) => return Ok(Json(error_action_output(session_id, error))),
         }
 
@@ -3101,7 +3102,7 @@ impl RemoteOpsMcp {
                         size: read as u64,
                         sha256: sha256_bytes(chunk),
                     },
-                    None,
+                    authorization.clone(),
                     Some(BASE64.encode(chunk)),
                 )
                 .await?;
@@ -3117,7 +3118,7 @@ impl RemoteOpsMcp {
             self.execute_raw(
                 session_id,
                 RemoteOperation::CompleteUploadFile { transfer_id },
-                None,
+                authorization.clone(),
                 None,
             )
             .await
@@ -3173,30 +3174,22 @@ impl RemoteOpsMcp {
             return Err("控制端目标文件已存在，未设置 overwrite_local".to_owned());
         }
         let overwrite_authorization = if input.overwrite_local {
-            let authorization = if large_transfer_requires_confirmation(size)
-                && self.command_mode != CommandMode::Approval
-            {
-                if self.command_mode == CommandMode::Readonly {
-                    return Err("当前 MCP 使用 readonly 模式，已拒绝覆盖控制端下载文件".to_owned());
-                }
-                WriteAuthorization { approval_id: None }
-            } else {
-                self.authorize_mutation(
+            let authorization = self
+                .authorize_mutation(
                     &context,
                     session_id,
                     "覆盖控制端下载文件",
                     input.approval_id,
                 )
-                .await?
-            };
+                .await?;
             Some(authorization)
         } else {
             None
         };
-        if let Some(authorization) = overwrite_authorization {
+        if let Some(authorization) = &overwrite_authorization {
             let authorization_result = self
                 .client
-                .execute(
+                .execute_with_control(
                     &session_id.to_string(),
                     EventSource::Ai,
                     RemoteOperation::AuthorizeDownloadFile {
@@ -3206,13 +3199,11 @@ impl RemoteOpsMcp {
                     authorization.approval_id,
                     None,
                     None,
+                    authorization.proof.clone(),
                 )
                 .await;
             match authorization_result {
-                Ok(result) => {
-                    self.refresh_full_access_after_success(session_id, &result)
-                        .await;
-                }
+                Ok(_) => {}
                 Err(error) => return Ok(Json(error_action_output(session_id, error))),
             }
         }
@@ -3229,7 +3220,7 @@ impl RemoteOpsMcp {
                             offset,
                             max_bytes: FILE_CHUNK_BYTES as u64,
                         },
-                        None,
+                        WriteAuthorization::default(),
                         None,
                     )
                     .await?;
@@ -3290,6 +3281,25 @@ impl RemoteOpsMcp {
                 return Err(error);
             }
         };
+        if let Some(proof) = overwrite_authorization
+            .as_ref()
+            .and_then(|authorization| authorization.proof.as_ref())
+        {
+            let validation = self
+                .client
+                .query_control_state(session_id)
+                .await
+                .map_err(application_error)
+                .and_then(|current| {
+                    control_snapshot_matches(&current, &proof.state)
+                        .then_some(())
+                        .ok_or_else(|| "下载期间授权已变更，未覆盖本地文件；请重新确认".to_owned())
+                });
+            if let Err(error) = validation {
+                let _ = tokio::fs::remove_file(&temporary_path).await;
+                return Err(error);
+            }
+        }
         commit_local_download(&temporary_path, &local_path, input.overwrite_local).await?;
         let mut output = action_output(session_id, result);
         output.summary = format!("已分块下载并校验 {size} 字节");
@@ -3372,8 +3382,7 @@ impl RemoteOpsMcp {
             .lock()
             .await
             .retain(|_, handle| handle.session_id != session_id);
-        self.full_access_grants.lock().await.remove(&session_id);
-        self.control_modes.lock().await.remove(&session_id);
+
         self.report_current_control_modes().await;
         self.clear_cached_ssh_credentials_for_session(session_id)
             .await;
@@ -3400,11 +3409,7 @@ impl RemoteOpsMcp {
             )
             .await
         {
-            Ok(result) => {
-                self.refresh_full_access_after_success(session_id, &result)
-                    .await;
-                Ok(Json(action_output(session_id, result)))
-            }
+            Ok(result) => Ok(Json(action_output(session_id, result))),
             Err(error) => Ok(Json(error_action_output(session_id, error))),
         }
     }
@@ -3418,21 +3423,18 @@ impl RemoteOpsMcp {
     ) -> Result<Json<ActionOutput>, String> {
         match self
             .client
-            .execute(
+            .execute_with_control(
                 &session_id.to_string(),
                 EventSource::Ai,
                 operation,
                 authorization.approval_id,
                 payload_base64,
                 None,
+                authorization.proof,
             )
             .await
         {
-            Ok(result) => {
-                self.refresh_full_access_after_success(session_id, &result)
-                    .await;
-                Ok(Json(action_output(session_id, result)))
-            }
+            Ok(result) => Ok(Json(action_output(session_id, result))),
             Err(error) => Ok(Json(error_action_output(session_id, error))),
         }
     }
@@ -3682,7 +3684,7 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
     router = self.runtime_tool_router(),
     name = "remoteops-controller",
     version = "0.2.0-preview.5",
-    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。配对后默认逐项确认，Agent 端没有逐项确认或完全控制按钮，绝对不要引导用户去 Agent 点击授权。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制按 session_id 独立保存在 MCP 内存，空闲一小时自动失效，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
+    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。全新配置默认逐项确认；协议16及以上Agent支持现场临时授权和默认完全控制。配对后先查询有效模式，已生效的现场授权无需再次调用set_control_mode或逐项审批；旧组件无此能力时不得引导点击不存在的按钮。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制由 Relay 确认并按当前连接绑定生效；MCP 授权空闲一小时失效，现场授权有效至连接结束，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
 )]
 impl ServerHandler for RemoteOpsMcp {}
 
@@ -4117,7 +4119,10 @@ fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> Conn
         state: format!("{:?}", connection.state).to_lowercase(),
         role: format!("{:?}", connection.role).to_lowercase(),
         permission_mode: format!("{:?}", connection.permission_mode).to_lowercase(),
-        control_mode: "step_by_step".to_owned(),
+        control_mode: "unsynced".to_owned(),
+        control_source: None,
+        control_revision: None,
+        control_sync_status: "pending".into(),
         transfer_root: String::new(),
         capabilities: connection
             .capabilities
@@ -4504,17 +4509,52 @@ mod tests {
     }
 
     #[test]
-    fn full_access_grant_expires_after_one_hour_of_inactivity() {
-        let started = Instant::now();
-        let grant = FullAccessGrant {
-            last_successful_use: started,
+    fn confirmed_local_grants_skip_prompt_and_revocation_requires_confirmation() {
+        let mut state = SessionControlState {
+            session_id: SessionId::new(),
+            agent_generation: 4,
+            controller_id: remoteops_domain::ControllerInstanceId::new(),
+            controller_generation: 8,
+            revision: 17,
+            mode: ControllerControlMode::FullAccess,
+            source: Some(ControlSource::Local),
+            expires_at: None,
         };
-        // Windows 新启动的 runner 不一定支持将 Instant 向过去回退一小时。
-        // 从授权时间向未来推进，避免测试依赖宿主机已运行多久。
-        assert!(grant.is_active_at(started));
-        assert!(grant.is_active_at(started + Duration::from_secs(3_599)));
-        assert!(!grant.is_active_at(started + Duration::from_hours(1)));
-        assert!(!grant.is_active_at(started + Duration::from_secs(3_601)));
+        for source in [
+            ControlSource::Local,
+            ControlSource::LocalDefault,
+            ControlSource::Mcp,
+        ] {
+            state.source = Some(source);
+            let authorization =
+                authorization_without_prompt(CommandMode::AgentControlled, &state, None)
+                    .unwrap()
+                    .expect("权威完全控制无需弹窗");
+            let proof = authorization.proof.unwrap();
+            assert_eq!(proof.state, state);
+            assert_eq!(proof.basis, ControlBasis::FullAccess);
+            let output = control_output(&state);
+            assert_eq!(output.mode, "full_access");
+            assert_eq!(output.revision, Some(17));
+            assert_eq!(output.sync_status, "synced");
+            assert_eq!(
+                output.idle_timeout_seconds,
+                (source == ControlSource::Mcp).then_some(3600)
+            );
+        }
+        assert!(authorization_without_prompt(CommandMode::Readonly, &state, None).is_err());
+        assert!(authorization_without_prompt(CommandMode::Approval, &state, None).is_err());
+        let original = state.clone();
+        state.mode = ControllerControlMode::StepByStep;
+        state.source = None;
+        state.revision += 1;
+        assert!(
+            authorization_without_prompt(CommandMode::AgentControlled, &state, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(original.revision, 17, "之前的审批快照不能被覆盖为新版本");
+        assert_eq!(control_output(&state).mode, "step_by_step");
     }
 
     #[test]

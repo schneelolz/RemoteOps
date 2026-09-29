@@ -1,6 +1,11 @@
 //! Agent、Relay 和 Controller 共用的版本化线协议。
 
 mod codec;
+mod control;
+pub use control::{
+    ControlBasis, ControlProof, ControlSource, ControlStateRequest, ControlStateResult,
+    SessionControlState,
+};
 mod credential;
 mod message;
 mod tls;

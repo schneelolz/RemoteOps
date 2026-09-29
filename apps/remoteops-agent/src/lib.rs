@@ -40,10 +40,11 @@ use remoteops_domain::{
 use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel};
 use remoteops_protocol::{
     AgentHello, AgentLeaseRenewed, AgentPermissionModeChanged, AgentResumeCommitAck,
-    AgentWelcomeAck, AuthorizedRemoteRequest, ClientHello, ControllerBinding,
-    ControllerControlMode, CredentialEncryptionContext, CredentialEncryptionKeyPair,
-    EncryptedCredentialPayload, PROTOCOL_VERSION, RemoteRequest, RemoteResponse, WireMessage,
-    connect_tls, load_client_config, load_native_client_config, load_pinned_client_config,
+    AgentWelcomeAck, AuthorizedRemoteRequest, ClientHello, ControlBasis, ControlSource,
+    ControlStateRequest, ControlStateResult, ControllerBinding, ControllerControlMode,
+    CredentialEncryptionContext, CredentialEncryptionKeyPair, EncryptedCredentialPayload,
+    PROTOCOL_VERSION, RemoteRequest, RemoteResponse, SessionControlState, WireMessage, connect_tls,
+    load_client_config, load_native_client_config, load_pinned_client_config,
     normalize_certificate_fingerprint, open_credential, read_frame, write_frame,
 };
 use remoteops_serial::{
@@ -79,6 +80,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 可以安全写入普通 JSON 文件的 Agent 配置。
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AgentFileConfig {
+    /// 新绑定的默认控制偏好；旧配置保持逐项确认。
+    #[serde(default)]
+    pub default_full_control: bool,
     /// Relay TLS 地址，例如 `relay.example.com:7443`。
     pub relay: Option<String>,
     /// Relay 证书中的 DNS 名称或 IP；省略时从 Relay 地址推导。
@@ -110,6 +114,8 @@ pub struct TrustedOwnerAuthorization {
 /// Agent 运行参数，由 CLI 和 GUI 共同使用。
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
+    /// 新绑定是否请求现场默认完全控制。
+    pub default_full_control: bool,
     /// Relay TLS 地址。
     pub relay: String,
     /// Relay 证书中的 DNS 名称或 IP。
@@ -135,6 +141,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            default_full_control: false,
             relay: String::new(),
             server_name: String::new(),
             ca_cert: None,
@@ -179,6 +186,7 @@ impl AgentConfig {
         config.ca_cert = file_config
             .ca_cert
             .map(|path| resolve_config_path(base_directory, path));
+        config.default_full_control = file_config.default_full_control;
         config.tls_fingerprint = file_config.tls_fingerprint;
         if let Some(retry_seconds) = file_config.retry_seconds {
             config.retry_seconds = retry_seconds;
@@ -211,6 +219,7 @@ impl AgentConfig {
     /// 当父目录无法创建、JSON 无法序列化或文件无法替换时返回错误。
     pub fn save_file(&self, path: &Path) -> anyhow::Result<()> {
         let file_config = AgentFileConfig {
+            default_full_control: self.default_full_control,
             relay: Some(self.relay.clone()),
             server_name: (!self.server_name.is_empty()).then(|| self.server_name.clone()),
             ca_cert: self.ca_cert.clone(),
@@ -363,6 +372,10 @@ fn infer_server_name(relay: &str) -> anyhow::Result<String> {
 /// Agent 向表现层报告的生命周期事件。
 #[derive(Clone, Debug)]
 pub enum AgentEvent {
+    /// Relay 已确认或拒绝现场控制权限请求。
+    ControlStateResult(ControlStateResult),
+    /// 自动授权已发出，等待 Relay 确认。
+    ControlStatePending(RequestId),
     /// 本地状态与设备能力已经初始化。
     Started {
         /// 跨进程保持不变的 Agent 标识。
@@ -445,6 +458,8 @@ pub struct AgentOperationLog {
 /// Agent 向本地表现层公开的 Controller 绑定摘要。
 #[derive(Clone, Debug)]
 pub struct AgentControllerBinding {
+    /// Relay 确认的有效会话授权，缺失时不能视为已授权。
+    pub control_state: Option<SessionControlState>,
     /// Controller 的稳定 Owner。
     pub owner_id: ControllerOwnerId,
     /// Human 或 AI Controller 类型。
@@ -462,6 +477,11 @@ pub struct AgentControllerBinding {
 pub struct AgentPermissionControl {
     /// 向 Agent 运行时广播权限模式变化。
     sender: watch::Sender<PermissionMode>,
+    // 本地变更请求独立于旧 Owner 权限。
+    control_requests: tokio::sync::broadcast::Sender<ControlStateRequest>,
+    default_full: Arc<AtomicBool>,
+    auto_suppressed: Arc<AtomicBool>,
+    locally_revoked: Arc<RwLock<Option<SessionControlState>>>,
 }
 
 impl AgentPermissionControl {
@@ -469,7 +489,13 @@ impl AgentPermissionControl {
     #[must_use]
     pub fn new(permission_mode: PermissionMode) -> Self {
         let (sender, _) = watch::channel(permission_mode);
-        Self { sender }
+        Self {
+            sender,
+            control_requests: tokio::sync::broadcast::channel(16).0,
+            default_full: Arc::new(AtomicBool::new(false)),
+            auto_suppressed: Arc::new(AtomicBool::new(false)),
+            locally_revoked: Arc::new(RwLock::new(None)),
+        }
     }
 
     /// 根据 Agent 配置中的既有 Owner 授权确定初始模式。
@@ -482,9 +508,48 @@ impl AgentPermissionControl {
         } else {
             PermissionMode::FullAccess
         };
-        Self::new(permission_mode)
+        let control = Self::new(permission_mode);
+        control.set_default_full_control(config.default_full_control);
+        control
     }
 
+    /// 更新已成功保存的默认偏好，不改变当前授权。
+    pub fn set_default_full_control(&self, enabled: bool) {
+        self.default_full.store(enabled, Ordering::SeqCst);
+    }
+    /// 读取默认偏好。
+    #[must_use]
+    pub fn default_full_control(&self) -> bool {
+        self.default_full.load(Ordering::SeqCst)
+    }
+    /// 提交现场变更；逐项确认立即抑制本进程自动授权。
+    ///
+    /// # Errors
+    ///
+    /// Agent 尚未连接、运行时已停止或无法接收请求时返回错误。
+    pub fn request_control(
+        &self,
+        state: SessionControlState,
+        mode: ControllerControlMode,
+    ) -> anyhow::Result<RequestId> {
+        if mode == ControllerControlMode::StepByStep {
+            self.auto_suppressed.store(true, Ordering::SeqCst);
+            if let Ok(mut revoked) = self.locally_revoked.write() {
+                *revoked = Some(state.clone());
+            }
+        }
+        let request_id = RequestId::new();
+        self.control_requests
+            .send(ControlStateRequest {
+                request_id,
+                session_id: state.session_id,
+                expected: Some(state),
+                mode: Some(mode),
+                source: Some(ControlSource::Local),
+            })
+            .map_err(|_| anyhow!("Agent 未连接"))?;
+        Ok(request_id)
+    }
     /// 返回当前本地权限模式。
     #[must_use]
     pub fn permission_mode(&self) -> PermissionMode {
@@ -1222,7 +1287,7 @@ where
         },
     );
 
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (reader, mut writer) = tokio::io::split(stream);
     let (sender, mut receiver) = mpsc::unbounded_channel::<WireMessage>();
     let _ = sender.send(WireMessage::AgentPermissionModeChanged(
         AgentPermissionModeChanged {
@@ -1254,6 +1319,11 @@ where
         BTreeMap::<FileTransferId, FileUploadRuntime>::new(),
     ));
     let mut controller_bindings = BTreeMap::<ControllerInstanceId, ControllerBinding>::new();
+    let execution_bindings = Arc::new(RwLock::new(controller_bindings.clone()));
+    let mut control_requests = local_permission_policy
+        .permission_control
+        .control_requests
+        .subscribe();
     let policy = DefaultPolicy::default();
     let heartbeat_sender = sender.clone();
     let heartbeat_seconds = welcome.heartbeat_interval_seconds.max(1);
@@ -1274,9 +1344,15 @@ where
     });
 
     let mut graceful_shutdown = false;
+    // 本地事件只能暂停读取，不能丢弃已经消费了部分帧的 future。
+    let mut incoming_future = Box::pin(read_agent_frame(reader));
     let connection_error = loop {
         let incoming = tokio::select! {
-            result = read_frame::<WireMessage, _>(&mut reader) => Some(result),
+            result = &mut incoming_future => Some(result),
+            request = control_requests.recv() => {
+                if let Ok(request) = request { let _ = sender.send(WireMessage::ControlStateRequest(request)); }
+                continue;
+            },
             _changed = async {
                 if permission_mode_updates.changed().await.is_err() {
                     std::future::pending::<()>().await;
@@ -1295,17 +1371,66 @@ where
             },
             () = wait_for_shutdown(&mut shutdown) => None,
         };
-        let Some(incoming) = incoming else {
+        let Some((reader, incoming)) = incoming else {
             break None;
         };
+        incoming_future = Box::pin(read_agent_frame(reader));
         match incoming {
-            Ok(WireMessage::ControllerBinding(binding)) => {
+            Ok(WireMessage::ControllerBinding(mut binding)) => {
                 info!(
                     session_id = %binding.session_id,
                     controller_instance_id = %binding.controller_instance_id,
                     "Agent 已更新 Controller 绑定"
                 );
+                if let Some(old) = controller_bindings.get(&binding.controller_instance_id)
+                    && same_control_binding(
+                        old.control_state.as_ref(),
+                        binding.control_state.as_ref(),
+                    )
+                    && old.control_state.as_ref().is_some_and(|old_state| {
+                        binding
+                            .control_state
+                            .as_ref()
+                            .is_none_or(|new_state| new_state.revision < old_state.revision)
+                    })
+                {
+                    binding.control_state = old.control_state.clone();
+                }
+                let new_binding = controller_bindings
+                    .get(&binding.controller_instance_id)
+                    .is_none_or(|old| {
+                        !same_control_binding(
+                            old.control_state.as_ref(),
+                            binding.control_state.as_ref(),
+                        )
+                    });
+                if new_binding
+                    && local_permission_policy
+                        .permission_control
+                        .default_full_control()
+                    && !local_permission_policy
+                        .permission_control
+                        .auto_suppressed
+                        .load(Ordering::SeqCst)
+                    && binding.controller_kind == remoteops_protocol::ControllerKind::Ai
+                    && let Some(state) = &binding.control_state
+                    && !matches!(
+                        state.mode,
+                        ControllerControlMode::ReadOnly | ControllerControlMode::ExternalApproval
+                    )
+                {
+                    let request_id = RequestId::new();
+                    let _ = sender.send(WireMessage::ControlStateRequest(ControlStateRequest {
+                        request_id,
+                        session_id: state.session_id,
+                        expected: Some(state.clone()),
+                        mode: Some(ControllerControlMode::FullAccess),
+                        source: Some(ControlSource::LocalDefault),
+                    }));
+                    emit_agent_event(event_sender, AgentEvent::ControlStatePending(request_id));
+                }
                 controller_bindings.insert(binding.controller_instance_id, binding);
+                publish_execution_bindings(&execution_bindings, &controller_bindings);
                 update_active_owner(&local_permission_policy, &controller_bindings);
                 emit_agent_event(
                     event_sender,
@@ -1319,6 +1444,27 @@ where
                     &local_permission_policy,
                 );
             }
+            Ok(WireMessage::ControlStateUpdated(state)) => {
+                apply_control_state(&mut controller_bindings, &state);
+                publish_execution_bindings(&execution_bindings, &controller_bindings);
+                emit_controller_bindings(
+                    event_sender,
+                    &controller_bindings,
+                    &local_permission_policy,
+                );
+            }
+            Ok(WireMessage::ControlStateResult(result)) => {
+                if let Some(state) = &result.state {
+                    apply_control_state(&mut controller_bindings, state);
+                    publish_execution_bindings(&execution_bindings, &controller_bindings);
+                }
+                emit_controller_bindings(
+                    event_sender,
+                    &controller_bindings,
+                    &local_permission_policy,
+                );
+                emit_agent_event(event_sender, AgentEvent::ControlStateResult(result));
+            }
             Ok(WireMessage::AgentLeaseRenewed(AgentLeaseRenewed { lease_expires_at })) => {
                 emit_agent_event(event_sender, AgentEvent::LeaseRenewed { lease_expires_at });
             }
@@ -1327,6 +1473,7 @@ where
                 binding_token,
             }) => {
                 if revoke_controller_binding(&mut controller_bindings, session_id, &binding_token) {
+                    publish_execution_bindings(&execution_bindings, &controller_bindings);
                     if !controller_bindings
                         .values()
                         .any(|binding| binding.session_id == session_id)
@@ -1391,6 +1538,7 @@ where
                     session_id = %authorized.request.session_id,
                     "Agent 已收到 Relay 授权请求"
                 );
+                let authorization_at_execution = authorized.clone();
                 let request = match verify_authorized_request(
                     &policy,
                     &local_permission_policy,
@@ -1522,8 +1670,30 @@ where
                 let interactive_shell = pending_interactive_shell(&request, &shell_sessions).await;
                 let terminal_clone = terminal.clone();
                 let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
+                let execution_bindings = execution_bindings.clone();
+                let execution_policy = local_permission_policy.clone();
                 let task = tokio::spawn(async move {
                     if start_receiver.await.is_err() {
+                        return;
+                    }
+                    let validation = execution_bindings
+                        .read()
+                        .map_err(|_| anyhow!("控制状态锁不可用"))
+                        .and_then(|snapshot| {
+                            verify_authorized_request(
+                                &DefaultPolicy::default(),
+                                &execution_policy,
+                                &snapshot,
+                                authorization_at_execution,
+                            )
+                        });
+                    if let Err(error) = validation {
+                        let _ = sender_clone.send(WireMessage::Error {
+                            code: "control_authorization_changed".into(),
+                            message: error.to_string(),
+                            request_id: Some(request_id),
+                        });
+                        tasks_clone.lock().await.remove(&request_id);
                         return;
                     }
                     let final_terminal = execute_request(
@@ -1599,6 +1769,106 @@ where
     }
 }
 
+async fn read_agent_frame<R: AsyncRead + Unpin>(
+    mut reader: R,
+) -> (R, Result<WireMessage, remoteops_protocol::FrameError>) {
+    let message = read_frame(&mut reader).await;
+    (reader, message)
+}
+
+// 在任何 await 之前发布已接收的撤销，避免等待清理时任务读取旧快照。
+fn publish_execution_bindings(
+    target: &RwLock<BTreeMap<ControllerInstanceId, ControllerBinding>>,
+    current: &BTreeMap<ControllerInstanceId, ControllerBinding>,
+) {
+    if let Ok(mut snapshot) = target.write() {
+        *snapshot = current.clone();
+    }
+}
+
+fn same_control_binding(
+    left: Option<&SessionControlState>,
+    right: Option<&SessionControlState>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.session_id == right.session_id
+                && left.controller_id == right.controller_id
+                && left.agent_generation == right.agent_generation
+                && left.controller_generation == right.controller_generation
+        }
+        _ => false,
+    }
+}
+
+fn apply_control_state(
+    bindings: &mut BTreeMap<ControllerInstanceId, ControllerBinding>,
+    state: &SessionControlState,
+) {
+    if let Some(binding) = bindings.get_mut(&state.controller_id)
+        && binding.session_id == state.session_id
+        && binding.control_state.as_ref().is_some_and(|old| {
+            old.agent_generation == state.agent_generation
+                && old.controller_generation == state.controller_generation
+                && old.revision <= state.revision
+        })
+    {
+        binding.control_state = Some(state.clone());
+    }
+}
+
+fn verify_control_proof(
+    local_permission_policy: &LocalPermissionPolicy,
+    binding: &ControllerBinding,
+    request: &RemoteRequest,
+) -> anyhow::Result<()> {
+    let proof = request
+        .control_proof
+        .as_ref()
+        .ok_or_else(|| anyhow!("修改请求缺少控制授权依据"))?;
+    let current = binding
+        .control_state
+        .as_ref()
+        .ok_or_else(|| anyhow!("控制状态尚未同步"))?;
+    if local_permission_policy
+        .permission_control
+        .locally_revoked
+        .read()
+        .is_ok_and(|revoked| {
+            revoked.as_ref().is_some_and(|revoked| {
+                revoked.controller_id == current.controller_id
+                    && revoked.agent_generation == current.agent_generation
+                    && revoked.controller_generation == current.controller_generation
+                    && current.revision <= revoked.revision
+            })
+        })
+    {
+        bail!("现场已撤销当前授权，请等待同步后重新确认");
+    }
+    let mut expected = proof.state.clone();
+    expected.expires_at = current.expires_at;
+    if &expected != current {
+        bail!("控制授权已变更，请重新确认操作");
+    }
+    if proof.basis == ControlBasis::FullAccess
+        && (current.mode != ControllerControlMode::FullAccess
+            || current
+                .expires_at
+                .is_some_and(|expiry| expiry <= Utc::now()))
+    {
+        bail!("完全控制授权已撤销或到期");
+    }
+    if current.mode == ControllerControlMode::ReadOnly {
+        bail!("只读模式禁止修改操作");
+    }
+    if current.mode == ControllerControlMode::ExternalApproval
+        && proof.basis != ControlBasis::ExternalApproval
+    {
+        bail!("必须使用独立外部审批");
+    }
+    Ok(())
+}
+
 fn verify_authorized_request(
     policy: &DefaultPolicy,
     local_permission_policy: &LocalPermissionPolicy,
@@ -1623,6 +1893,20 @@ fn verify_authorized_request(
     let request = authorized.request;
     if request.source != binding.controller_kind.event_source() {
         bail!("请求来源与 Relay 已认证的 Controller 身份不匹配");
+    }
+    let modifying = matches!(
+        policy.evaluate_with_mode(
+            PermissionMode::ApprovalRequired,
+            request.source,
+            &request.operation
+        ),
+        PolicyDecision::RequireApproval { .. }
+    ) || matches!(
+        request.operation,
+        RemoteOperation::UploadFileChunk { .. } | RemoteOperation::CompleteUploadFile { .. }
+    );
+    if binding.controller_kind == remoteops_protocol::ControllerKind::Ai && modifying {
+        verify_control_proof(local_permission_policy, binding, &request)?;
     }
     if !local_permission_policy.allows(binding.owner_id, binding.permission_mode) {
         bail!(
@@ -1669,6 +1953,7 @@ fn emit_controller_bindings(
             controller_kind: binding.controller_kind,
             permission_mode: binding.permission_mode,
             controller_control_mode: binding.controller_control_mode,
+            control_state: binding.control_state.clone(),
             full_access_authorized_locally: local_permission_policy
                 .allows(binding.owner_id, PermissionMode::FullAccess),
         })
@@ -3553,6 +3838,11 @@ fn print_agent_event(event: &AgentEvent) {
                 );
             }
         }
+        AgentEvent::ControlStatePending(_) => println!("正在同步现场控制权限"),
+        AgentEvent::ControlStateResult(result) => println!(
+            "控制状态确认：{}",
+            result.error.as_deref().unwrap_or("成功")
+        ),
         AgentEvent::OperationLog(log) => {
             println!("{}：{}", log.occurred_at.to_rfc3339(), log.message);
         }
@@ -3616,6 +3906,7 @@ mod tests {
         payload_base64: Option<String>,
     ) -> anyhow::Result<RemoteResponse> {
         let request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Ai,
@@ -3810,6 +4101,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_events_do_not_discard_partial_incoming_frames() {
+        use tokio::io::AsyncWriteExt;
+        for split in [2, 9] {
+            let message = WireMessage::Heartbeat {
+                sent_at: Utc::now(),
+                controller_modes: Vec::new(),
+            };
+            let mut encoded = Vec::new();
+            write_frame(&mut encoded, &message).await.unwrap();
+            let (mut relay, agent) = tokio::io::duplex(4096);
+            relay.write_all(&encoded[..split]).await.unwrap();
+            let mut incoming = Box::pin(read_agent_frame(agent));
+            for _ in 0..3 {
+                // 优先轮询读帧使其消费现有字节，再模拟本地权限事件胜出。
+                tokio::select! {
+                    biased;
+                    _ = &mut incoming => panic!("不完整的帧不能完成"),
+                    () = std::future::ready(()) => {},
+                }
+            }
+            relay.write_all(&encoded[split..]).await.unwrap();
+            let (agent, decoded) = incoming.await;
+            assert_eq!(decoded.unwrap(), message);
+            write_frame(&mut relay, &message).await.unwrap();
+            assert_eq!(read_agent_frame(agent).await.1.unwrap(), message);
+        }
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn keeps_heartbeat_and_remote_requests_independent() {
         let (agent_stream, mut relay_stream) = tokio::io::duplex(64 * 1024);
@@ -3923,6 +4243,7 @@ mod tests {
                 controller_kind: ControllerKind::Human,
                 permission_mode: PermissionMode::ApprovalRequired,
                 controller_control_mode: None,
+                control_state: None,
                 binding_token: binding_token.clone(),
             }),
         )
@@ -3937,6 +4258,7 @@ mod tests {
             &mut relay_stream,
             &WireMessage::AuthorizedRemoteRequest(AuthorizedRemoteRequest {
                 request: RemoteRequest {
+                    control_proof: None,
                     request_id: response_request_id,
                     session_id,
                     source: EventSource::Human,
@@ -4020,6 +4342,7 @@ mod tests {
             ShellKind::System
         };
         let request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id: SessionId::new(),
             source: EventSource::Human,
@@ -4305,6 +4628,22 @@ mod tests {
         assert!(tasks.lock().await.is_empty());
     }
 
+    fn test_control_state(
+        session_id: SessionId,
+        controller_id: ControllerInstanceId,
+    ) -> SessionControlState {
+        SessionControlState {
+            session_id,
+            controller_id,
+            agent_generation: 1,
+            controller_generation: 1,
+            revision: 1,
+            mode: ControllerControlMode::StepByStep,
+            source: None,
+            expires_at: None,
+        }
+    }
+
     fn binding(
         session_id: SessionId,
         controller_instance_id: remoteops_domain::ControllerInstanceId,
@@ -4316,6 +4655,7 @@ mod tests {
             controller_kind: ControllerKind::Ai,
             permission_mode: PermissionMode::ApprovalRequired,
             controller_control_mode: None,
+            control_state: Some(test_control_state(session_id, controller_instance_id)),
             binding_token: "relay-only-binding-token".to_owned(),
         }
     }
@@ -4329,6 +4669,14 @@ mod tests {
     ) -> AuthorizedRemoteRequest {
         AuthorizedRemoteRequest {
             request: RemoteRequest {
+                control_proof: Some(remoteops_protocol::ControlProof {
+                    state: test_control_state(session_id, controller_instance_id),
+                    basis: if approval == ApprovalState::Approved {
+                        ControlBasis::ExternalApproval
+                    } else {
+                        ControlBasis::SingleApproval
+                    },
+                }),
                 request_id: RequestId::new(),
                 session_id,
                 source: EventSource::Ai,
@@ -4345,6 +4693,128 @@ mod tests {
                 approval,
             },
         }
+    }
+
+    #[test]
+    fn default_control_preference_survives_atomic_config_round_trip() {
+        let path =
+            std::env::temp_dir().join(format!("remoteops-default-{}.json", RequestId::new()));
+        let config = AgentConfig {
+            default_full_control: true,
+            ..AgentConfig::default()
+        };
+        config.save_file(&path).unwrap();
+        assert!(
+            AgentConfig::load_file(Some(&path))
+                .unwrap()
+                .default_full_control
+        );
+        let mut config = config;
+        config.default_full_control = false;
+        config.save_file(&path).unwrap();
+        assert!(
+            !AgentConfig::load_file(Some(&path))
+                .unwrap()
+                .default_full_control
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn default_control_is_opt_in_and_revocation_survives_manual_regrant() {
+        let old: AgentFileConfig = serde_json::from_str("{}").unwrap();
+        assert!(!old.default_full_control);
+        let config = AgentConfig {
+            default_full_control: true,
+            ..AgentConfig::default()
+        };
+        let control = AgentPermissionControl::from_config(&config);
+        let mut receiver = control.control_requests.subscribe();
+        let state = test_control_state(SessionId::new(), ControllerInstanceId::new());
+        control
+            .request_control(state.clone(), ControllerControlMode::StepByStep)
+            .unwrap();
+        assert!(control.auto_suppressed.load(Ordering::SeqCst));
+        control
+            .request_control(state, ControllerControlMode::FullAccess)
+            .unwrap();
+        assert!(control.auto_suppressed.load(Ordering::SeqCst));
+        assert!(control.default_full_control());
+        assert_eq!(
+            receiver.try_recv().unwrap().mode,
+            Some(ControllerControlMode::StepByStep)
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap().mode,
+            Some(ControllerControlMode::FullAccess)
+        );
+        assert!(
+            !AgentPermissionControl::from_config(&config)
+                .auto_suppressed
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn outdated_control_snapshot_and_generation_cannot_roll_back_authority() {
+        let controller = ControllerInstanceId::new();
+        let current = binding(SessionId::new(), controller);
+        let mut state = current.control_state.clone().unwrap();
+        let mut bindings = BTreeMap::from([(controller, current)]);
+        state.revision = 2;
+        state.mode = ControllerControlMode::FullAccess;
+        state.source = Some(ControlSource::Local);
+        apply_control_state(&mut bindings, &state);
+        let mut outdated = state.clone();
+        outdated.revision = 1;
+        outdated.mode = ControllerControlMode::StepByStep;
+        apply_control_state(&mut bindings, &outdated);
+        assert_eq!(bindings[&controller].control_state.as_ref(), Some(&state));
+        outdated.revision = 10;
+        outdated.controller_generation += 1;
+        apply_control_state(&mut bindings, &outdated);
+        assert_eq!(bindings[&controller].control_state.as_ref(), Some(&state));
+    }
+
+    #[test]
+    fn missing_stale_and_locally_revoked_write_proofs_are_rejected() {
+        let controller = ControllerInstanceId::new();
+        let session = SessionId::new();
+        let mut current = binding(session, controller);
+        current.permission_mode = PermissionMode::ControllerApproved;
+        let mut request = authorized_request(
+            session,
+            controller,
+            RemoteOperation::RunCommand {
+                shell: ShellKind::WindowsPowerShell,
+                command: "Set-Content status.txt ok".into(),
+                readonly: false,
+            },
+            None,
+            ApprovalState::NotRequired,
+        );
+        request.authorization.permission_mode = PermissionMode::ControllerApproved;
+        let state = current.control_state.clone().unwrap();
+        let mut bindings = BTreeMap::from([(controller, current)]);
+        let policy = DefaultPolicy::default();
+        let local = LocalPermissionPolicy::default();
+        assert!(verify_authorized_request(&policy, &local, &bindings, request.clone()).is_ok());
+        let mut missing = request.clone();
+        missing.request.control_proof = None;
+        assert!(verify_authorized_request(&policy, &local, &bindings, missing).is_err());
+        local
+            .permission_control
+            .request_control(state, ControllerControlMode::StepByStep)
+            .ok();
+        assert!(verify_authorized_request(&policy, &local, &bindings, request.clone()).is_err());
+        bindings
+            .get_mut(&controller)
+            .unwrap()
+            .control_state
+            .as_mut()
+            .unwrap()
+            .revision += 1;
+        assert!(verify_authorized_request(&policy, &local, &bindings, request).is_err());
     }
 
     #[test]
@@ -4922,6 +5392,7 @@ mod tests {
         )
         .expect("测试密码应可加密");
         let request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Ai,

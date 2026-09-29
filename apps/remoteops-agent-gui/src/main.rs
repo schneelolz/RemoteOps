@@ -30,8 +30,8 @@ use remoteops_agent::{
 use remoteops_domain::{AgentInstanceId, Capability, CapabilitySet, RequestId};
 use remoteops_i18n::{Language, Translator};
 use remoteops_protocol::{
-    ControllerControlMode, ControllerKind, connect_tls, load_native_client_config,
-    load_pinned_client_config, probe_server_certificate,
+    ControlSource, ControllerControlMode, ControllerKind, SessionControlState, connect_tls,
+    load_native_client_config, load_pinned_client_config, probe_server_certificate,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -183,6 +183,18 @@ struct Args {
     /// 图形渲染器；Windows 默认使用 DirectX 12，glow 仅用于兼容性诊断。
     #[arg(long, env = "REMOTEOPS_RENDERER", default_value_t = default_renderer())]
     renderer: eframe::Renderer,
+}
+
+#[derive(Default)]
+struct ControlUi {
+    config: Option<AgentConfig>,
+    open: bool,
+    confirm_default: bool,
+    confirm_local: bool,
+    pending: Option<(RequestId, Instant)>,
+    // 保留超时请求标识，允许迟到的权威确认修复失败显示。
+    last_request: Option<RequestId>,
+    error: Option<String>,
 }
 
 /// 被控端 GUI 保存的非敏感界面设置。
@@ -448,6 +460,7 @@ struct RemoteOpsAgentApp {
     log_unread: usize,
     /// 与后台运行时共享的 Agent 本地权限控制器。
     permission_control: AgentPermissionControl,
+    control_ui: ControlUi,
     /// 当前进程是否已提升权限。
     elevated: Option<bool>,
     /// 共享界面翻译器。
@@ -568,6 +581,7 @@ impl RemoteOpsAgentApp {
             log_filter: LogFilter::All,
             log_unread: 0,
             permission_control: AgentPermissionControl::default(),
+            control_ui: ControlUi::default(),
             elevated: detect_elevated(),
             translator,
             appearance: saved_settings.appearance,
@@ -588,6 +602,7 @@ impl RemoteOpsAgentApp {
             } => {
                 app.config_path = config_path;
                 app.relay.clone_from(&config.relay);
+                app.control_ui.config = Some(config.clone());
                 app.permission_control = AgentPermissionControl::from_config(&config);
                 if startup_demo {
                     app.worker = Some(spawn_demo(
@@ -623,6 +638,7 @@ impl RemoteOpsAgentApp {
 
     /// 启动真实 Agent 运行时。
     fn start_live(&mut self, config: AgentConfig) {
+        self.control_ui.config = Some(config.clone());
         self.permission_control = AgentPermissionControl::from_config(&config);
         self.worker = Some(spawn_live(
             self.event_sender.clone(),
@@ -726,6 +742,17 @@ impl RemoteOpsAgentApp {
             AgentEvent::ControllerBindingsChanged { bindings } => {
                 self.controller_bindings = bindings;
             }
+            AgentEvent::ControlStatePending(id) => {
+                self.control_ui.last_request = Some(id);
+                self.control_ui.pending = Some((id, Instant::now()));
+                self.control_ui.error = None;
+            }
+            AgentEvent::ControlStateResult(result) => {
+                if self.control_ui.last_request == Some(result.request_id) {
+                    self.control_ui.pending = None;
+                    self.control_ui.error = result.error;
+                }
+            }
             AgentEvent::OperationLog(log) => {
                 store_operation_log(
                     &mut self.operation_logs,
@@ -757,6 +784,10 @@ impl RemoteOpsAgentApp {
     fn clear_controller_state(&mut self) {
         self.active_connections = 0;
         self.controller_bindings.clear();
+        self.control_ui.pending = None;
+        self.control_ui.last_request = None;
+        self.control_ui.error = None;
+        self.control_ui.confirm_local = false;
     }
 
     /// 仅显示当前 AI 绑定明确上报的控制模式。
@@ -768,7 +799,13 @@ impl RemoteOpsAgentApp {
             .controller_bindings
             .iter()
             .find(|binding| binding.controller_kind == ControllerKind::Ai)?;
-        let key = match binding.controller_control_mode {
+        if self.control_ui.pending.is_some() {
+            return Some(self.translator.text("control.syncing"));
+        }
+        if self.control_ui.error.is_some() {
+            return Some(self.translator.text("control.failed"));
+        }
+        let key = match binding.control_state.as_ref().map(|state| state.mode) {
             Some(ControllerControlMode::StepByStep) => "status.step_by_step",
             Some(ControllerControlMode::FullAccess) => "status.full_access_authorized",
             Some(ControllerControlMode::Expired) => "status.full_access_expired",
@@ -776,7 +813,19 @@ impl RemoteOpsAgentApp {
             Some(ControllerControlMode::ExternalApproval) => "status.approval",
             None => "status.control_mode_unsynced",
         };
-        Some(self.translator.text(key))
+        let mut label = self.translator.text(key);
+        if let Some(state) = &binding.control_state
+            && state.mode == ControllerControlMode::FullAccess
+        {
+            let source = match state.source {
+                Some(ControlSource::Local) => "control.source.local",
+                Some(ControlSource::LocalDefault) => "control.source.default",
+                _ => "control.source.mcp",
+            };
+            label.push_str(" · ");
+            label.push_str(&self.translator.text(source));
+        }
+        Some(label)
     }
 
     /// 请求后台停止，并允许随后关闭窗口。
@@ -1679,7 +1728,7 @@ impl RemoteOpsAgentApp {
                         );
                         if let Some(mode_label) = self.controller_control_mode_label() {
                             ui.add_space(3.0 * scale);
-                            ui.add(
+                            let response = ui.add(
                                 egui::Label::new(
                                     RichText::new(format!(
                                         "{}  {}",
@@ -1689,8 +1738,15 @@ impl RemoteOpsAgentApp {
                                     .size(14.0)
                                     .color(colors.secondary),
                                 )
-                                .wrap(),
+                                .wrap()
+                                .sense(egui::Sense::click()),
                             );
+                            if response
+                                .on_hover_text(self.translator.text("control.title"))
+                                .clicked()
+                            {
+                                self.control_ui.open = true;
+                            }
                         }
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1744,10 +1800,162 @@ impl RemoteOpsAgentApp {
                 }
             }
             ui.separator();
+            if ui.button(self.translator.text("control.title")).clicked() {
+                self.control_ui.open = true;
+            }
+            ui.separator();
             ui.weak(format!("v{}", env!("CARGO_PKG_VERSION")));
         })
         .response
         .on_hover_text(self.translator.text("agent.preferences.title"));
+    }
+
+    fn current_control_state(&self) -> Option<SessionControlState> {
+        self.controller_bindings
+            .iter()
+            .find(|binding| binding.controller_kind == ControllerKind::Ai)
+            .and_then(|binding| binding.control_state.clone())
+    }
+
+    fn request_local_control(&mut self, mode: ControllerControlMode) {
+        if self.control_ui.pending.is_some() {
+            return;
+        }
+        self.control_ui.confirm_local = false;
+        let Some(state) = self.current_control_state() else {
+            return;
+        };
+        match self.permission_control.request_control(state, mode) {
+            Ok(id) => {
+                self.control_ui.last_request = Some(id);
+                self.control_ui.pending = Some((id, Instant::now()));
+                self.control_ui.error = None;
+            }
+            Err(error) => {
+                self.diagnostics
+                    .record_detail("control_request_error", error.to_string());
+                self.control_ui.error = Some(self.translator.text("control.unavailable"));
+            }
+        }
+    }
+
+    fn save_default_control(&mut self, full: bool) {
+        let Some(mut config) = self.control_ui.config.clone() else {
+            return;
+        };
+        config.default_full_control = full;
+        match config.save_file(&self.config_path) {
+            Ok(()) => {
+                self.control_ui.config = Some(config);
+                self.permission_control.set_default_full_control(full);
+                self.control_ui.error = None;
+            }
+            Err(error) => self.control_ui.error = Some(error.to_string()),
+        }
+    }
+
+    fn expire_control_request(&mut self) {
+        if self
+            .control_ui
+            .pending
+            .as_ref()
+            .is_some_and(|(_, start)| start.elapsed() >= Duration::from_secs(5))
+        {
+            self.control_ui.pending = None;
+            self.control_ui.error = Some(self.translator.text("control.failed"));
+        }
+    }
+
+    fn render_control_permissions(&mut self, ctx: &egui::Context) {
+        self.expire_control_request();
+        if !self.control_ui.open {
+            return;
+        }
+        egui::Modal::new(egui::Id::new("control-permissions")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading(self.translator.text("control.title"));
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        self.controller_control_mode_label()
+                            .unwrap_or_else(|| self.translator.text("control.waiting")),
+                    );
+                    let enabled = self.current_control_state().is_some_and(|state| {
+                        !matches!(
+                            state.mode,
+                            ControllerControlMode::ReadOnly
+                                | ControllerControlMode::ExternalApproval
+                        )
+                    }) && self.control_ui.pending.is_none();
+                    ui.add_enabled_ui(enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(self.translator.text("status.step_by_step"))
+                                .clicked()
+                            {
+                                self.request_local_control(ControllerControlMode::StepByStep);
+                            }
+                            if ui.button(self.translator.text("control.full")).clicked() {
+                                self.control_ui.confirm_local = true;
+                                self.control_ui.confirm_default = false;
+                            }
+                        });
+                    });
+                    if self.control_ui.confirm_local {
+                        ui.label(self.translator.text("control.confirm_local"));
+                        ui.horizontal(|ui| {
+                            if ui.button(self.translator.text("control.confirm")).clicked() {
+                                self.control_ui.confirm_local = false;
+                                self.request_local_control(ControllerControlMode::FullAccess);
+                            }
+                            if ui.button(self.translator.text("control.cancel")).clicked() {
+                                self.control_ui.confirm_local = false;
+                            }
+                        });
+                    }
+                    ui.separator();
+                    ui.label(self.translator.text("control.default"));
+                    let full = self.permission_control.default_full_control();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(!full, self.translator.text("status.step_by_step"))
+                            .clicked()
+                        {
+                            self.save_default_control(false);
+                        }
+                        if ui
+                            .selectable_label(full, self.translator.text("control.full"))
+                            .clicked()
+                            && !full
+                        {
+                            self.control_ui.confirm_default = true;
+                            self.control_ui.confirm_local = false;
+                        }
+                    });
+                    ui.label(self.translator.text("control.default_hint"));
+                    if self.control_ui.confirm_default {
+                        ui.label(self.translator.text("control.confirm_default"));
+                        ui.horizontal(|ui| {
+                            if ui.button(self.translator.text("control.confirm")).clicked() {
+                                self.control_ui.confirm_default = false;
+                                self.save_default_control(true);
+                            }
+                            if ui.button(self.translator.text("control.cancel")).clicked() {
+                                self.control_ui.confirm_default = false;
+                            }
+                        });
+                    }
+                    if let Some(error) = &self.control_ui.error {
+                        ui.colored_label(Palette::current(ctx).danger, error);
+                    }
+                });
+            if ui.button(self.translator.text("control.close")).clicked() {
+                self.control_ui.open = false;
+                self.control_ui.confirm_default = false;
+                self.control_ui.confirm_local = false;
+            }
+        });
     }
 
     /// 渲染停止确认框。
@@ -2071,6 +2279,7 @@ impl eframe::App for RemoteOpsAgentApp {
         } else {
             self.render_main(ui);
         }
+        self.render_control_permissions(&ctx);
         self.render_stop_confirmation(&ctx);
         self.render_advanced_settings(&ctx);
         self.render_certificate_confirmation(&ctx);
@@ -2243,6 +2452,16 @@ fn demo_controller_binding() -> AgentControllerBinding {
         controller_kind: ControllerKind::Ai,
         permission_mode: remoteops_domain::PermissionMode::ApprovalRequired,
         controller_control_mode: Some(ControllerControlMode::FullAccess),
+        control_state: Some(SessionControlState {
+            session_id: remoteops_domain::SessionId::new(),
+            controller_id: remoteops_domain::ControllerInstanceId::new(),
+            agent_generation: 1,
+            controller_generation: 1,
+            revision: 1,
+            mode: ControllerControlMode::FullAccess,
+            source: Some(ControlSource::Mcp),
+            expires_at: None,
+        }),
         full_access_authorized_locally: false,
     }
 }
@@ -2645,10 +2864,22 @@ fn run_gui(args: Args, diagnostics: &StartupDiagnostics) -> std::process::ExitCo
     diagnostics.record("ui_thread_started");
     let renderer = args.renderer;
     let requested_language = args.lang;
+    // 显式演示配置使用独立偏好文件，不读取或覆盖日常 Agent 的界面设置。
+    let demo_persistence = args
+        .demo
+        .then(|| {
+            args.config
+                .as_ref()
+                .map(|path| path.with_file_name("demo-gui.ron"))
+        })
+        .flatten();
     let startup = args.into_startup();
     let initial_setup = matches!(&startup, StartupState::Setup(_));
     diagnostics.record_detail("renderer", renderer);
-    let native_options = agent_native_options(renderer, initial_setup);
+    let mut native_options = agent_native_options(renderer, initial_setup);
+    if let Some(path) = demo_persistence {
+        native_options.persistence_path = Some(path);
+    }
     diagnostics.record("event_loop_configured");
     let mut translator = Translator::detect();
     if let Ok(path) = std::env::var("REMOTEOPS_LANG_FILE") {
@@ -3044,6 +3275,7 @@ mod tests {
             log_filter: LogFilter::All,
             log_unread: 0,
             permission_control: AgentPermissionControl::default(),
+            control_ui: ControlUi::default(),
             elevated: Some(true),
             translator: Translator::new(remoteops_i18n::Language::ZhCn),
             appearance: Appearance::default(),
@@ -3056,6 +3288,61 @@ mod tests {
             layout_is_setup: None,
             window_centering: WindowCenteringState::default(),
         }
+    }
+
+    #[test]
+    fn control_request_timeout_and_ack_do_not_claim_unconfirmed_success() {
+        let mut app = test_app();
+        app.status = UiStatus::Controlled;
+        app.controller_bindings = vec![demo_controller_binding()];
+        let id = RequestId::new();
+        app.apply_event(AgentEvent::ControlStatePending(id));
+        assert_eq!(
+            app.controller_control_mode_label().as_deref(),
+            Some("正在同步")
+        );
+        app.control_ui.pending = Some((
+            id,
+            Instant::now().checked_sub(Duration::from_secs(6)).unwrap(),
+        ));
+        app.render_control_permissions(&egui::Context::default());
+        assert!(app.control_ui.pending.is_none());
+        assert_eq!(
+            app.controller_control_mode_label().as_deref(),
+            Some("同步失败，可重试")
+        );
+        app.apply_event(AgentEvent::ControlStateResult(
+            remoteops_protocol::ControlStateResult {
+                request_id: id,
+                state: app.current_control_state(),
+                error: None,
+            },
+        ));
+        assert!(app.control_ui.error.is_none());
+        app.apply_event(AgentEvent::ControlStatePending(id));
+        app.apply_event(AgentEvent::ControlStateResult(
+            remoteops_protocol::ControlStateResult {
+                request_id: id,
+                state: None,
+                error: Some("conflict".into()),
+            },
+        ));
+        assert_eq!(app.control_ui.error.as_deref(), Some("conflict"));
+    }
+
+    #[test]
+    fn failed_default_save_does_not_change_runtime_preference() {
+        let mut app = test_app();
+        app.control_ui.config = Some(AgentConfig::default());
+        let blocker =
+            std::env::temp_dir().join(format!("remoteops-default-test-{}", RequestId::new()));
+        std::fs::write(&blocker, b"file blocks parent directory").unwrap();
+        app.config_path = blocker.join("settings.json");
+        app.save_default_control(true);
+        assert!(!app.permission_control.default_full_control());
+        assert!(!app.control_ui.config.as_ref().unwrap().default_full_control);
+        assert!(app.control_ui.error.is_some());
+        std::fs::remove_file(blocker).unwrap();
     }
 
     #[test]
@@ -3073,8 +3360,8 @@ mod tests {
             ),
             (
                 Some(ControllerControlMode::FullAccess),
-                "完全控制已启用",
-                "Full control active",
+                "完全控制已启用 · 控制端授权",
+                "Full control active · Controller grant",
             ),
             (
                 Some(ControllerControlMode::Expired),
@@ -3099,6 +3386,11 @@ mod tests {
             assert_eq!(app.controller_control_mode_label(), None);
             for (mode, chinese, english) in cases {
                 let mut binding = demo_controller_binding();
+                binding.control_state = mode.map(|mode| {
+                    let mut state = binding.control_state.clone().unwrap();
+                    state.mode = mode;
+                    state
+                });
                 binding.controller_control_mode = mode;
                 app.apply_event(AgentEvent::ControllerBindingsChanged {
                     bindings: vec![binding],
@@ -3152,6 +3444,54 @@ mod tests {
     }
 
     #[test]
+    fn control_permissions_confirmations_fit_both_languages_and_themes() {
+        for language in [Language::ZhCn, Language::EnUs] {
+            for appearance in [Appearance::Light, Appearance::Dark] {
+                for default_confirmation in [false, true] {
+                    let ctx = egui::Context::default();
+                    configure_fonts(&ctx);
+                    install_style(&ctx);
+                    appearance.apply(&ctx);
+                    let mut app = test_app();
+                    app.translator = Translator::new(language);
+                    app.status = UiStatus::Controlled;
+                    app.controller_bindings = vec![demo_controller_binding()];
+                    app.control_ui.open = true;
+                    app.control_ui.confirm_default = default_confirmation;
+                    app.control_ui.confirm_local = !default_confirmation;
+                    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, RUNNING_WINDOW_SIZE);
+                    for _ in 0..2 {
+                        let output = ctx.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(viewport),
+                                ..Default::default()
+                            },
+                            |ui| {
+                                app.render_main(ui);
+                                app.render_control_permissions(&ctx);
+                            },
+                        );
+                        let close = app.translator.text("control.close");
+                        for shape in &output.shapes {
+                            if let egui::Shape::Text(text) = &shape.shape
+                                && text.galley.job.text == close
+                            {
+                                assert!(
+                                    viewport.contains_rect(egui::Rect::from_min_size(
+                                        text.pos,
+                                        text.galley.size()
+                                    )),
+                                    "close button clipped: {language:?} {appearance:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn localized_main_layout_fits_native_window() {
         for language in [Language::ZhCn, Language::EnUs] {
             for appearance in [Appearance::Light, Appearance::Dark] {
@@ -3171,6 +3511,11 @@ mod tests {
                     app.translator = Translator::new(language);
                     app.pairing_code = Some("482-915-307".into());
                     app.controller_bindings = vec![demo_controller_binding()];
+                    app.controller_bindings[0].control_state = mode.map(|mode| {
+                        let mut state = app.controller_bindings[0].control_state.clone().unwrap();
+                        state.mode = mode;
+                        state
+                    });
                     app.controller_bindings[0].controller_control_mode = mode;
                     app.status = UiStatus::Controlled;
                     let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, RUNNING_WINDOW_SIZE);

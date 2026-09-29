@@ -12,6 +12,7 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 
 - [Relay 部署说明](Relay部署说明.md)
 - [现场被控端 GUI 使用说明](现场被控端GUI使用说明.md)
+- [控制权限与默认模式](control-permissions.md)
 - [Agent Windows Service 部署说明](../deploy/agent-service/windows/README.md)
 - Linux Headless Agent：`deploy/agent-service/linux`（Ubuntu 24.04 x86_64，systemd）
 - [RemoteOps MCP 使用手册](RemoteOpsMCP使用手册.md)
@@ -50,7 +51,9 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 - Token、密码、私钥、控制码、恢复令牌和客户信息不得进入源码、文档、日志或安装包。
 - Agent 只主动出站连接 Relay，不监听客户公网端口。
 - 同一 Agent Session 只允许一个 `ControllerOwnerId`；Human 和 AI 可以作为同一 Owner 的不同角色协作，不能形成两个互相独立的控制者。
-- MCP 使用本地 STDIO；默认按每个 Agent 的 `session_id` 逐项确认，用户可临时开启一小时空闲 TTL 的完全控制。独立 Human Controller 审批保留为兼容和后续多人协作流程。
+- MCP 使用本地 STDIO；全新 Agent 默认逐项确认。协议 16 配套部署支持现场临时授权和持久默认模式，详见[控制权限与默认模式](control-permissions.md)。MCP 授权保留一小时空闲 TTL；只读、外部审批及宿主独立授权仍然有效。
 - 所有目标操作绑定不可变 `session_id`，不能根据主机名或别名猜测目标。
 - 发布包由 CI 从源码构建，并附带 SHA-256；`artifacts` 只是本地临时目录。
 - `target`、运行状态文件、审计日志、控制码、恢复令牌、TLS 私钥和任何本地 Token 都不属于公开发布内容。
+
+- [控制权限修复交付记录](control-permissions-delivery.md)：构建版本、验证结果及部署边界。
