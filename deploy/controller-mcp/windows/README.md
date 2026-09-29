@@ -1,6 +1,6 @@
 # RemoteOps MCP Windows x64 安装说明
 
-- 版本：`0.2.0-preview.11`
+- 版本：`0.2.0-preview.12`
 - 适用系统：Windows x64
 - Codex MCP 名称：`remoteops`
 - 许可证：`AGPL-3.0-only`
@@ -66,7 +66,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.p
 安装内容：
 
 ```text
-%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.11.exe
+%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.12.exe
 %USERPROFILE%\.codex\remoteops\remoteops-credential-prompt.exe
 %USERPROFILE%\.codex\remoteops\controller-config.json
 %USERPROFILE%\.codex\config.toml
@@ -110,7 +110,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-RemoteOpsMcp.ps1 
 
 Codex 应自动通过 RemoteOps 配对并使用远程工具。若当前任务没有加载 RemoteOps MCP，skill 会要求刷新 Codex，不会改用远程桌面或本机命令假装完成远程检查。
 
-`-CommandMode agent-controlled` 是默认模式：配对后直接使用逐项确认，不弹出控制方式选择。只有用户明确要求时才调用 `set_control_mode` 开启完全控制；Codex 对该工具的授权是唯一确认，不再嵌套弹出第二次确认。完全控制只对当前 `session_id` 生效，空闲一小时自动失效。Agent 端没有逐项确认或完全控制按钮，不要让现场人员去 Agent 查找授权入口。`readonly` 和 `approval` 可用于 Controller 主动降权。
+`-CommandMode agent-controlled` 是推荐默认模式：未获有效授权时逐项确认。MCP 可通过 `set_control_mode` 授权，也可由现场在 Agent“控制权限”中授权；Relay 确认后无需重复 RemoteOps 审批。MCP 授权空闲一小时到期，现场授权到连接结束或撤销失效。Agent 默认 `default_full_control=false`；默认完全控制为新绑定自动授权，现场切回逐项确认会抑制本次运行的自动授权。`readonly`、`approval` 仍是权限上限，协议 16 的 `full-access` 不会自动授权。详见[控制权限说明](../../../docs/control-permissions.md)。
 
 全新 Agent 首次运行只需填写 Relay 地址并等待九位控制码，不需要让 Codex 生成入网码，也不需要部署级 Agent 注册 Token。MCP 只在工程师本机使用 AI Controller Token 完成自身认证和后续配对。
 
@@ -128,7 +128,7 @@ Codex 应自动通过 RemoteOps 配对并使用远程工具。若当前任务没
 
 - `run_readonly_command` 只使用一次性 Shell 执行只读诊断；持久 Shell 的所有命令必须走 `run_command`；
 - 逐项确认时，`run_command` 由当前 Codex 的 MCP 授权弹窗确认；
-- 完全控制必须由当前用户在 Codex 弹窗允许，Agent 端不提供授权按钮；
+- 完全控制可由 MCP 用户或 Agent 现场人员明确授予，Relay 确认后生效；仅免除 RemoteOps 内部逐项审批，不覆盖 Codex 宿主工具授权；
 - SSH 密码不得写入 Codex 对话或 MCP 参数；`run_ssh` 设置 `use_password=true` 后，由本机安全窗口直接输入并用 Agent HPKE 公钥加密；
 - 安全窗口可由用户显式选择在 MCP 内存中记住 10 分钟，默认仅本次使用；缓存不写磁盘，可用 `clear_ssh_credential_cache` 清除；
 - 不要把 Token、Owner UUID、证书私钥、客户地址或控制码写入聊天、日志、截图和 Git 仓库；

@@ -29,16 +29,16 @@ RemoteOps 只启动本地 STDIO MCP，不开放公网 MCP HTTP。公网只部署
 
 ## 二、控制模式
 
-普通使用推荐保持安装器默认的 `agent-controlled`。配对完成后直接进入逐项确认，不弹出控制方式选择。只有用户明确要求完全控制时才调用 `set_control_mode`；Codex 对该工具的授权是唯一一次确认，MCP 不再嵌套弹出第二次确认。Agent GUI 没有逐项确认或完全控制按钮，不应要求现场人员去 Agent 点击。`set_control_mode` 返回 `full_access` 后应立即继续任务，不得再次索要授权。
+普通使用推荐保持安装器默认的 `agent-controlled`。未获得有效授权时采用逐项确认，不弹出控制方式选择。用户可通过 `set_control_mode` 明确授予完全控制，也可在 Agent“控制权限”中现场授权；Relay 确认后两端使用同一有效状态。`set_control_mode` 不再嵌套第二次 MCP 确认。现场授权生效后无需再调用它审批，Codex 宿主独立的工具授权规则仍有效。完整规则见[控制权限说明](control-permissions.md)。
 
 | 选择 | 行为 |
 |---|---|
 | 逐项确认（默认、推荐） | 只读检查直接执行；写入、终止进程、服务控制、重启、文件变更、可写串口等修改操作前由 MCP 询问当前用户 |
-| 完全控制 | 当前 `session_id` 的修改操作不再逐项询问；授权只保存在 MCP 内存，空闲一小时失效，成功远程操作后重新计时 |
+| 完全控制 | 修改操作免除 RemoteOps 逐项确认；MCP 来源空闲一小时失效并在成功操作后续期，现场来源有效至本次连接结束或撤销 |
 
-每台 Agent 按不可变 `session_id` 独立保存控制模式，连接两个 Agent 时不会互相继承完全控制。Agent 短暂掉线并以原 `session_id` 恢复时授权保留；Agent 重启产生新 `session_id`、MCP/Codex 重启、主动断开、用户切回逐项确认后立即失效。
+授权绑定精确 `session_id`、Agent 连接代次及 Controller 实例和代次，由 Relay 确认并同步；不同 Agent 不能继承授权。断线、解绑、控制方变化或进程重启使原绑定授权失效。Agent 默认 `default_full_control=false`；保存默认完全控制后，新连接/重连会创建新的现场默认授权。现场手动切回逐项确认会撤销双方授权，并抑制本次 Agent 运行期间后续自动授权；手动再授权不解除抑制，重启后重新按默认值执行。
 
-`readonly`、`approval` 和 `full-access` 启动参数保留给兼容或受控部署：`readonly` 禁止修改；`approval` 继续使用独立 Human Controller 的一次性 `approval_id`；`full-access` 是显式的无人值守部署选项。普通首版 MCP 不依赖 Human Controller。
+`readonly`、`approval` 和 `full-access` 启动参数保留给受控部署：`readonly` 禁止修改；`approval` 强制独立 Human Controller 的一次性审批；协议 16 的 `full-access` 仅表示权限上限，不会自动授予完全控制或绕过现场撤销。默认使用 `agent-controlled`，如需重连自动授权请由现场保存默认偏好。
 
 ## 三、推荐安装和配置
 
@@ -64,7 +64,7 @@ macOS 安装器把 Token 保存到当前用户 Keychain，由 `~/.codex/remoteop
 approval_policy = { granular = { sandbox_approval = true, rules = true, mcp_elicitations = true, request_permissions = false, skill_approval = false } }
 
 [mcp_servers.remoteops]
-command = 'C:\Users\<用户名>\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.11.exe'
+command = 'C:\Users\<用户名>\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.12.exe'
 args = ['--config', 'C:\Users\<用户名>\.codex\remoteops\controller-config.json', '--command-mode', 'agent-controlled']
 env_vars = ['REMOTEOPS_CONTROLLER_TOKEN', 'REMOTEOPS_CONTROLLER_OWNER_ID']
 startup_timeout_sec = 15
@@ -159,9 +159,9 @@ $env:REMOTEOPS_CONTROLLER_OWNER_ID = '<与 AI MCP 相同的 Owner UUID>'
 调用 get_target_info，确认目标主机和 power_shell 能力。
 只读诊断使用一次性 Shell 的 run_readonly_command。
 需要保持目录、变量或模块状态时，以 power_shell 打开持久 Shell；持久 Shell 的所有命令都通过 run_command，并接受逐项确认或完全控制约束。
-配对后保持默认逐项确认；仅在用户明确要求时开启完全控制。
+配对后通过 get_control_mode 读取 Relay 确认的有效状态；未授权时保持逐项确认。现场已授权完全控制时无需再次调用 set_control_mode。
 逐项确认下调用修改工具时，MCP 会向当前用户确认本次操作；拒绝、关闭或超时后停止。
-完全控制下无需逐项确认，但只对当前 session_id 生效，空闲一小时后恢复逐项确认。
+完全控制下免除 RemoteOps 逐项确认，绑定当前连接；MCP 来源空闲一小时到期，现场来源至断线或撤销失效。
 用户在聊天中要求切换时调用 set_control_mode；Codex 对该工具的授权是唯一确认，不再嵌套 MCP 交互确认。
 通过 read_output 查看人工、AI、系统和远端输出。
 SSH 密码不能写进对话；需要密码时让 run_ssh 设置 use_password=true，并在控制端本机安全窗口输入。

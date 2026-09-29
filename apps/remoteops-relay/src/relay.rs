@@ -1,3 +1,10 @@
+#[path = "relay_control.rs"]
+mod control;
+use control::{broadcast_control_state, refresh_control_state};
+use remoteops_protocol::{
+    ControlBasis, ControlSource, ControlStateRequest, ControlStateResult, SessionControlState,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
@@ -146,6 +153,8 @@ struct SessionBinding {
     binding_token: String,
     // MCP 本地控制模式，仅用于界面展示。
     controller_control_mode: Option<ControllerControlMode>,
+    // Relay 权威授权，断线时清除且不持久化。
+    control_state: Option<SessionControlState>,
 }
 
 #[derive(Default)]
@@ -289,6 +298,8 @@ struct InFlightRequest {
     source: EventSource,
     approval: ApprovalState,
     previous_takeover: Option<bool>,
+    // 成功操作仅续期发起时仍有效的授权版本。
+    control_state: Option<SessionControlState>,
 }
 
 struct AgentRegistration {
@@ -809,6 +820,7 @@ impl Relay {
             };
             let request_id = RequestId::new();
             let request = RemoteRequest {
+                control_proof: None,
                 request_id,
                 session_id,
                 source: binding.controller_kind.event_source(),
@@ -840,6 +852,7 @@ impl Relay {
             state.in_flight.insert(
                 request_id,
                 InFlightRequest {
+                    control_state: None,
                     agent_id: agent.hello.agent_instance_id,
                     session_id,
                     controller_id: binding.controller_id,
@@ -1330,7 +1343,18 @@ impl Relay {
                         let _ = sender.send(WireMessage::HeartbeatAck {
                             received_at: Utc::now(),
                         });
+                        self.sync_agent_control_state(agent_id, connection_generation)
+                            .await;
                     }
+                }
+                Ok(WireMessage::ControlStateRequest(request)) => {
+                    self.handle_agent_control_state(
+                        agent_id,
+                        connection_generation,
+                        request,
+                        &sender,
+                    )
+                    .await;
                 }
                 Ok(WireMessage::AgentPermissionModeChanged(update)) => {
                     self.update_agent_permission_mode(
@@ -1451,6 +1475,15 @@ impl Relay {
                 result = read_frame::<WireMessage, _>(reader) => result,
             };
             match message {
+                Ok(WireMessage::ControlStateRequest(request)) => {
+                    self.handle_controller_control_state(
+                        controller_id,
+                        connection_generation,
+                        request,
+                        &sender,
+                    )
+                    .await;
+                }
                 Ok(WireMessage::PairRequest(request)) => {
                     let result = self
                         .pair_controller(controller_id, connection_generation, request)
@@ -1587,6 +1620,7 @@ impl Relay {
         }
         let controller_kind = controller.kind;
         let controller_owner_id = controller.owner_id;
+        refresh_control_state(&mut state, request.session_id);
         let Some(binding) = state
             .session_bindings
             .get(&request.session_id)
@@ -1984,6 +2018,7 @@ impl Relay {
                 "Relay 无法清理已完成恢复握手的旧令牌；当前连接仍保持可用"
             );
         }
+        refresh_control_state(&mut state, session_id);
         if let Some(bindings) = state.session_bindings.get(&session_id) {
             apply_session_bindings(&mut update, bindings);
             // 恢复快照与后续模式更新共用状态锁入队，避免旧快照覆盖新模式或解绑。
@@ -2111,6 +2146,7 @@ impl Relay {
         }
         let session_id = agent.session_id;
         let agent_permission_mode = agent.permission_mode;
+        let agent_generation = agent.connection_generation;
         let mut connection = descriptor(agent, ConnectionState::Online);
         let agent_sender = agent.sender.clone();
         let Some(controller) = state.controllers.get(&controller_id) else {
@@ -2179,11 +2215,13 @@ impl Relay {
                     permission_mode: request.permission_mode,
                     binding_token: new_secret_token(),
                     controller_control_mode: None,
+                    control_state: None,
                 });
             } else if let Some(binding) = bindings.get_mut(controller_kind) {
                 binding.permission_mode = request.permission_mode;
             }
 
+            control::initialize_binding_state(bindings, session_id, agent_generation);
             (
                 bindings
                     .all()
@@ -2351,7 +2389,11 @@ impl Relay {
             };
             if let Some(bindings) = state.session_bindings.get_mut(&session_id) {
                 bindings.agent_permission_mode = permission_mode;
+                if let Some(binding) = bindings.ai.as_mut() {
+                    binding.control_state = None;
+                }
             }
+            refresh_control_state(&mut state, session_id);
             let binding_messages = state
                 .session_bindings
                 .get(&session_id)
@@ -2421,6 +2463,12 @@ impl Relay {
             || controller.kind != ControllerKind::Ai
         {
             return;
+        }
+        let sessions = controller.sessions.iter().copied().collect::<Vec<_>>();
+        for session_id in sessions {
+            if let Some(current) = refresh_control_state(&mut state, session_id) {
+                broadcast_control_state(&state, &current);
+            }
         }
         for update in updates {
             let Some(bindings) = state.session_bindings.get_mut(&update.session_id) else {
@@ -2674,6 +2722,22 @@ impl Relay {
             }
         }
 
+        if controller_kind == ControllerKind::Ai
+            && control::requires_control_proof(&self.policy, &request.operation)
+        {
+            match control::validate_control_proof(&binding, permission_mode, &request) {
+                Ok(mode) => permission_mode = mode,
+                Err(reason) => {
+                    send_request_error(
+                        controller_sender,
+                        &request,
+                        "control_authorization_required",
+                        reason,
+                    );
+                    return;
+                }
+            }
+        }
         let approval = match self.policy.evaluate_with_mode(
             permission_mode,
             request.source,
@@ -2752,13 +2816,18 @@ impl Relay {
                 .expect("Controller 角色绑定已在同一锁内验证");
             let previous = bindings.human_takeover;
             bindings.human_takeover = next_state;
+            if let Some(binding) = bindings.ai.as_mut() {
+                binding.control_state = None;
+            }
             Some(previous)
         } else {
             None
         };
+        refresh_control_state(&mut state, request.session_id);
         state.in_flight.insert(
             request.request_id,
             InFlightRequest {
+                control_state: binding.control_state.clone(),
                 agent_id,
                 session_id: request.session_id,
                 controller_id,
@@ -2920,6 +2989,7 @@ impl Relay {
                 senders.push(human_controller.sender.clone());
             }
             if terminal && let Some(completed) = state.in_flight.remove(&request_id) {
+                control::renew_after_success(&mut state, &completed, &message);
                 let failed = matches!(
                     &message,
                     WireMessage::RemoteResponse(response)
@@ -2979,6 +3049,7 @@ impl Relay {
                         && let Some(binding) = bindings.ai.as_mut()
                     {
                         binding.controller_control_mode = None;
+                        binding.control_state = None;
                     }
                     Some((session_id, update))
                 } else {
@@ -3093,6 +3164,7 @@ impl Relay {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn cleanup_expired(&self) {
         let now = Utc::now();
         let (notifications, failures) = {
@@ -3124,6 +3196,7 @@ impl Relay {
                     && let Some(binding) = bindings.ai.as_mut()
                 {
                     binding.controller_control_mode = None;
+                    binding.control_state = None;
                 }
                 if let Some(bindings) = state.session_bindings.get(&session_id) {
                     apply_session_bindings(&mut update, bindings);
@@ -3551,6 +3624,7 @@ fn controller_binding(
         permission_mode,
         binding_token: binding.binding_token.clone(),
         controller_control_mode: binding.controller_control_mode,
+        control_state: binding.control_state.clone(),
     }
 }
 
@@ -3654,6 +3728,7 @@ fn new_secret_token() -> String {
 
 #[cfg(test)]
 mod tests {
+    include!("relay_control_tests.rs");
     use std::path::PathBuf;
 
     use remoteops_domain::{
@@ -3850,12 +3925,12 @@ mod tests {
             )
             .await;
         assert!(result.error.is_none());
-        let initial_binding = match receiver.try_recv().expect("配对应下发绑定") {
+        let initial_binding = match try_recv_legacy(&mut receiver).expect("配对应下发绑定") {
             WireMessage::ControllerBinding(binding) => binding,
             other => panic!("预期绑定，实际为 {other:?}"),
         };
         assert_eq!(initial_binding.controller_control_mode, None);
-        while receiver.try_recv().is_ok() {}
+        while try_recv_legacy(&mut receiver).is_ok() {}
 
         let (other_ai, other_generation, _other_receiver) =
             register_controller(&relay, ControllerKind::Ai).await;
@@ -3876,7 +3951,7 @@ mod tests {
                     }],
                 )
                 .await;
-            assert!(receiver.try_recv().is_err());
+            assert!(try_recv_legacy(&mut receiver).is_err());
         }
 
         for mode in [
@@ -3893,10 +3968,10 @@ mod tests {
                     )
                     .await;
                 if duplicate {
-                    assert!(receiver.try_recv().is_err());
+                    assert!(try_recv_legacy(&mut receiver).is_err());
                 } else {
                     let WireMessage::ControllerBinding(binding) =
-                        receiver.try_recv().expect("模式变化应通知 Agent")
+                        try_recv_legacy(&mut receiver).expect("模式变化应通知 Agent")
                     else {
                         panic!("预期 ControllerBinding");
                     };
@@ -3947,7 +4022,7 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(resumed_receiver.try_recv().is_err());
+        assert!(try_recv_legacy(&mut resumed_receiver).is_err());
         relay
             .finalize_agent_resume(agent_id, resumed.connection_generation)
             .await
@@ -3966,15 +4041,14 @@ mod tests {
                 .await;
         }
         for expected_mode in [None, Some(ControllerControlMode::FullAccess)] {
-            let WireMessage::ControllerBinding(binding) = resumed_receiver
-                .try_recv()
-                .expect("恢复和模式更新应按顺序下发")
+            let WireMessage::ControllerBinding(binding) =
+                try_recv_legacy(&mut resumed_receiver).expect("恢复和模式更新应按顺序下发")
             else {
                 panic!("预期 ControllerBinding");
             };
             assert_eq!(binding.controller_control_mode, expected_mode);
         }
-        assert!(resumed_receiver.try_recv().is_err());
+        assert!(try_recv_legacy(&mut resumed_receiver).is_err());
         assert!(
             relay
                 .release_controller_session(
@@ -3989,7 +4063,7 @@ mod tests {
                 .released
         );
         assert!(matches!(
-            resumed_receiver.try_recv().expect("恢复后解绑应通知 Agent"),
+            try_recv_legacy(&mut resumed_receiver).expect("恢复后解绑应通知 Agent"),
             WireMessage::ControllerBindingRevoked { session_id: revoked_session, .. }
                 if revoked_session == session_id
         ));
@@ -4003,7 +4077,7 @@ mod tests {
                 }],
             )
             .await;
-        assert!(resumed_receiver.try_recv().is_err());
+        assert!(try_recv_legacy(&mut resumed_receiver).is_err());
     }
 
     #[tokio::test]
@@ -4344,13 +4418,36 @@ mod tests {
         assert!(state.agents.contains_key(&paired_id));
     }
 
+    fn try_recv_legacy(
+        receiver: &mut mpsc::Receiver<WireMessage>,
+    ) -> Result<WireMessage, mpsc::error::TryRecvError> {
+        loop {
+            match receiver.try_recv()? {
+                WireMessage::ControlStateUpdated(_) => {}
+                message => return Ok(message),
+            }
+        }
+    }
+
+    async fn test_control_proof(
+        relay: &Relay,
+        session_id: SessionId,
+        basis: ControlBasis,
+    ) -> Option<remoteops_protocol::ControlProof> {
+        let mut state = relay.state.lock().await;
+        Some(remoteops_protocol::ControlProof {
+            state: refresh_control_state(&mut state, session_id).expect("测试应有当前AI授权"),
+            basis,
+        })
+    }
+
     async fn recv_authorized(
         receiver: &mut mpsc::Receiver<WireMessage>,
     ) -> AuthorizedRemoteRequest {
         loop {
             match receiver.recv().await.expect("Agent 应收到 Relay 消息") {
                 WireMessage::AuthorizedRemoteRequest(request) => return request,
-                WireMessage::ControllerBinding(_) => {}
+                WireMessage::ControllerBinding(_) | WireMessage::ControlStateUpdated(_) => {}
                 other => panic!("Agent 应收到授权请求，实际为 {other:?}"),
             }
         }
@@ -5049,6 +5146,7 @@ mod tests {
         ));
 
         let takeover_request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Ai,
@@ -5079,6 +5177,7 @@ mod tests {
         }
 
         let ai_read_request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Human,
@@ -5103,6 +5202,7 @@ mod tests {
         );
 
         let release_request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Ai,
@@ -5135,6 +5235,8 @@ mod tests {
         }
 
         let ai_write_request = RemoteRequest {
+            control_proof: test_control_proof(&relay, session_id, ControlBasis::SingleApproval)
+                .await,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Human,
@@ -5254,6 +5356,7 @@ mod tests {
         relay.state.lock().await.in_flight.insert(
             stopped_request_id,
             InFlightRequest {
+                control_state: None,
                 agent_id,
                 session_id,
                 controller_id: ai_id,
@@ -5273,6 +5376,7 @@ mod tests {
                 human_id,
                 human_generation,
                 RemoteRequest {
+                    control_proof: None,
                     request_id: emergency_request_id,
                     session_id,
                     source: EventSource::Ai,
@@ -5332,6 +5436,7 @@ mod tests {
         relay.state.lock().await.in_flight.insert(
             stopped_request_id,
             InFlightRequest {
+                control_state: None,
                 agent_id,
                 session_id,
                 controller_id: ai_id,
@@ -5363,6 +5468,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 RemoteRequest {
+                    control_proof: None,
                     request_id: RequestId::new(),
                     session_id,
                     source: EventSource::Ai,
@@ -5642,6 +5748,7 @@ mod tests {
         ));
         let (error_sender, mut error_receiver) = test_channel();
         let request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Human,
@@ -5764,6 +5871,8 @@ mod tests {
         assert_eq!(approved.state, ApprovalState::Approved);
 
         let request = RemoteRequest {
+            control_proof: test_control_proof(&relay, session_id, ControlBasis::ExternalApproval)
+                .await,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Human,
@@ -5852,6 +5961,7 @@ mod tests {
         ));
 
         let ai_read_request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Human,
@@ -5893,6 +6003,7 @@ mod tests {
 
         let human_sender = human_sender(&relay, human_id).await;
         let takeover_request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Ai,
@@ -5917,6 +6028,7 @@ mod tests {
         }
 
         let ai_write = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Human,
@@ -5938,6 +6050,7 @@ mod tests {
         ));
 
         let release_request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Ai,
@@ -5959,6 +6072,7 @@ mod tests {
         }
 
         let ai_write_after_release = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Human,
@@ -5976,10 +6090,11 @@ mod tests {
             .await;
         assert!(matches!(
             ai_receiver.recv().await,
-            Some(WireMessage::Error { ref code, .. }) if code == "approval_required"
+            Some(WireMessage::Error { ref code, .. }) if code == "control_authorization_required"
         ));
 
         let ai_read_after_takeover = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Human,
@@ -5999,6 +6114,7 @@ mod tests {
         let _ = recv_authorized(&mut agent_receiver).await;
 
         let cancel = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id,
             source: EventSource::Ai,
@@ -6065,6 +6181,7 @@ mod tests {
             .sender
             .clone();
         let request = RemoteRequest {
+            control_proof: None,
             request_id: RequestId::new(),
             session_id: first_session,
             source: EventSource::Human,

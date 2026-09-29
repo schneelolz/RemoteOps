@@ -24,9 +24,10 @@ use remoteops_domain::{
 use remoteops_policy::{DefaultPolicy, PolicyDecision};
 pub use remoteops_protocol::ControllerKind;
 use remoteops_protocol::{
-    ApprovalDecision, ApprovalRequest, ApprovalResult, ClientHello, ControllerControlModeUpdate,
-    ControllerHello, PROTOCOL_VERSION, PairResult, ReleaseSessionRequest, ReleaseSessionResult,
-    RemoteRequest, RemoteResponse, WireMessage, connect_tls, load_client_config,
+    ApprovalDecision, ApprovalRequest, ApprovalResult, ClientHello, ControlProof,
+    ControlStateRequest, ControlStateResult, ControllerControlModeUpdate, ControllerHello,
+    PROTOCOL_VERSION, PairResult, ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest,
+    RemoteResponse, SessionControlState, WireMessage, connect_tls, load_client_config,
     load_native_client_config, load_pinned_client_config, read_frame, write_frame,
 };
 use remoteops_session::ConnectionRegistry;
@@ -178,6 +179,7 @@ impl ControllerCore {
             operation,
             approval_id,
             payload_base64: None,
+            control_proof: None,
         })
     }
 }
@@ -247,6 +249,8 @@ struct ClientInner {
     release_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ReleaseSessionResult>>>,
     approval_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ApprovalResult>>>,
     controller_modes: Mutex<Vec<ControllerControlModeUpdate>>,
+    control_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ControlStateResult>>>,
+    control_states: Mutex<BTreeMap<SessionId, SessionControlState>>,
     known_pairings: Mutex<BTreeMap<PairingCode, Option<SessionId>>>,
     automatic_pair_pending: Mutex<BTreeMap<RequestId, PairingCode>>,
     events: broadcast::Sender<RemoteEvent>,
@@ -319,6 +323,8 @@ impl RelayClient {
             release_pending: Mutex::new(BTreeMap::new()),
             approval_pending: Mutex::new(BTreeMap::new()),
             controller_modes: Mutex::new(Vec::new()),
+            control_pending: Mutex::new(BTreeMap::new()),
+            control_states: Mutex::new(BTreeMap::new()),
             known_pairings: Mutex::new(BTreeMap::new()),
             automatic_pair_pending: Mutex::new(BTreeMap::new()),
             events,
@@ -536,6 +542,71 @@ impl RelayClient {
         self.inner.core.lock().await.list_connections()
     }
 
+    /// 查询或变更共享授权，必须等待 Relay 确认；不从本地缓存推断成功。
+    pub async fn request_control_state(
+        &self,
+        request: ControlStateRequest,
+    ) -> Result<SessionControlState, ApplicationError> {
+        let request_id = request.request_id;
+        let session_id = request.session_id;
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .control_pending
+            .lock()
+            .await
+            .insert(request_id, sender);
+        if let Err(error) = self
+            .send_wire(WireMessage::ControlStateRequest(request))
+            .await
+        {
+            self.inner.control_pending.lock().await.remove(&request_id);
+            return Err(error);
+        }
+        let result = receive_pending(
+            &self.inner.control_pending,
+            request_id,
+            receiver,
+            TokioDuration::from_secs(5),
+            "授权确认通道已关闭",
+        )
+        .await?;
+        if let Some(error) = result.error {
+            return Err(ApplicationError::Remote {
+                code: "control_sync_failed".into(),
+                message: error,
+            });
+        }
+        result
+            .state
+            .filter(|state| state.session_id == session_id)
+            .ok_or_else(|| ApplicationError::Transport("授权确认缺少匹配的会话状态".into()))
+    }
+
+    /// 从 Relay 读取当前有效授权及修订号。
+    pub async fn query_control_state(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionControlState, ApplicationError> {
+        self.request_control_state(ControlStateRequest {
+            request_id: RequestId::new(),
+            session_id,
+            expected: None,
+            mode: None,
+            source: None,
+        })
+        .await
+    }
+
+    /// 返回最后确认的快照，仅用于展示，不用于执行授权。
+    pub async fn cached_control_state(&self, session_id: SessionId) -> Option<SessionControlState> {
+        self.inner
+            .control_states
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+    }
+
     /// 向 Relay 上报 MCP 本地控制模式，仅用于管理界面展示。
     pub async fn report_controller_control_modes(
         &self,
@@ -679,6 +750,56 @@ impl RelayClient {
         payload_base64: Option<String>,
         secret: Option<String>,
     ) -> Result<PendingOperation, ApplicationError> {
+        self.start_execute_with_control(
+            target,
+            source,
+            operation,
+            approval_id,
+            payload_base64,
+            secret,
+            None,
+        )
+        .await
+    }
+
+    /// 使用审批时的授权快照执行操作，不能用发送时的新快照替换。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_with_control(
+        &self,
+        target: &str,
+        source: EventSource,
+        operation: RemoteOperation,
+        approval_id: Option<ApprovalId>,
+        payload_base64: Option<String>,
+        secret: Option<String>,
+        control_proof: Option<ControlProof>,
+    ) -> Result<OperationResult, ApplicationError> {
+        self.start_execute_with_control(
+            target,
+            source,
+            operation,
+            approval_id,
+            payload_base64,
+            secret,
+            control_proof,
+        )
+        .await?
+        .wait()
+        .await
+    }
+
+    /// 发送携带精确授权快照的请求并返回等待句柄。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_execute_with_control(
+        &self,
+        target: &str,
+        source: EventSource,
+        operation: RemoteOperation,
+        approval_id: Option<ApprovalId>,
+        payload_base64: Option<String>,
+        secret: Option<String>,
+        control_proof: Option<ControlProof>,
+    ) -> Result<PendingOperation, ApplicationError> {
         if secret.is_some() {
             return Err(ApplicationError::PolicyDenied(
                 "RemoteOps 协议不允许传递远端秘密".to_owned(),
@@ -686,36 +807,37 @@ impl RelayClient {
         }
         let mut core = self.inner.core.lock().await;
         let session_id = core.resolve_target(target)?;
-        let request = match core.prepare_request(session_id, source, operation.clone(), approval_id)
-        {
-            Ok(request) => request,
-            Err(error) => {
-                let (approval, result) = match &error {
-                    ApplicationError::ApprovalRequired { reason, .. } => {
-                        (ApprovalState::Pending, reason.clone())
-                    }
-                    ApplicationError::PolicyDenied(reason) => {
-                        (ApprovalState::Rejected, reason.clone())
-                    }
-                    _ => (ApprovalState::Rejected, error.to_string()),
-                };
-                drop(core);
-                self.append_audit(AuditEvent {
-                    session_id,
-                    request_id: None,
-                    owner_id: Some(self.inner.config.owner_id),
-                    controller_instance_id: Some(self.inner.controller_instance_id),
-                    source,
-                    action: audit_operation(&operation),
-                    result,
-                    approval,
-                    permission_mode: self.inner.config.permission_mode,
-                    occurred_at: Utc::now(),
-                })?;
-                return Err(error);
-            }
-        };
+        let mut request =
+            match core.prepare_request(session_id, source, operation.clone(), approval_id) {
+                Ok(request) => request,
+                Err(error) => {
+                    let (approval, result) = match &error {
+                        ApplicationError::ApprovalRequired { reason, .. } => {
+                            (ApprovalState::Pending, reason.clone())
+                        }
+                        ApplicationError::PolicyDenied(reason) => {
+                            (ApprovalState::Rejected, reason.clone())
+                        }
+                        _ => (ApprovalState::Rejected, error.to_string()),
+                    };
+                    drop(core);
+                    self.append_audit(AuditEvent {
+                        session_id,
+                        request_id: None,
+                        owner_id: Some(self.inner.config.owner_id),
+                        controller_instance_id: Some(self.inner.controller_instance_id),
+                        source,
+                        action: audit_operation(&operation),
+                        result,
+                        approval,
+                        permission_mode: self.inner.config.permission_mode,
+                        occurred_at: Utc::now(),
+                    })?;
+                    return Err(error);
+                }
+            };
         drop(core);
+        request.control_proof = control_proof;
         self.queue_request(request, payload_base64, secret).await
     }
 
@@ -1226,6 +1348,8 @@ async fn set_transport_disconnected(inner: &ClientInner, cause: Option<Applicati
 }
 
 async fn fail_pending_requests(inner: &ClientInner, message: &str) {
+    inner.control_states.lock().await.clear();
+    inner.control_pending.lock().await.clear();
     let pending = std::mem::take(&mut *inner.pending.lock().await);
     for (_, pending) in pending {
         let _ = pending
@@ -1255,6 +1379,22 @@ fn set_connected(sender: &watch::Sender<bool>, connected: bool) {
 #[allow(clippy::too_many_lines)]
 async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
     match message {
+        WireMessage::ControlStateUpdated(state) => {
+            cache_control_state(inner, state).await;
+        }
+        WireMessage::ControlStateResult(result) => {
+            if let Some(state) = result.state.clone() {
+                cache_control_state(inner, state).await;
+            }
+            if let Some(sender) = inner
+                .control_pending
+                .lock()
+                .await
+                .remove(&result.request_id)
+            {
+                let _ = sender.send(result);
+            }
+        }
         WireMessage::PairResult(result) => {
             let automatic_pairing = inner
                 .automatic_pair_pending
@@ -1389,6 +1529,7 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
             inner.core.lock().await.upsert_connection(connection);
         }
         WireMessage::ConnectionRemoved { session_id, reason } => {
+            inner.control_states.lock().await.remove(&session_id);
             forget_session_pairing(inner, session_id).await;
             let _ = inner.core.lock().await.remove_connection(session_id);
             let pending = {
@@ -1426,6 +1567,21 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
         }
         _ => {}
     }
+}
+
+/// 同一绑定只接受更新修订；传输重建时缓存由断线清理。
+async fn cache_control_state(inner: &ClientInner, state: SessionControlState) {
+    let mut states = inner.control_states.lock().await;
+    if states.get(&state.session_id).is_some_and(|old| {
+        old.controller_id == state.controller_id
+            && old.controller_generation == state.controller_generation
+            && (old.agent_generation > state.agent_generation
+                || (old.agent_generation == state.agent_generation
+                    && old.revision > state.revision))
+    }) {
+        return;
+    }
+    states.insert(state.session_id, state);
 }
 
 fn outgoing_approval_state(request: &RemoteRequest) -> ApprovalState {
@@ -1666,6 +1822,8 @@ mod tests {
             release_pending: Mutex::new(BTreeMap::new()),
             approval_pending: Mutex::new(BTreeMap::new()),
             controller_modes: Mutex::new(Vec::new()),
+            control_pending: Mutex::new(BTreeMap::new()),
+            control_states: Mutex::new(BTreeMap::new()),
             known_pairings: Mutex::new(BTreeMap::new()),
             automatic_pair_pending: Mutex::new(BTreeMap::new()),
             events,
@@ -1692,6 +1850,80 @@ mod tests {
 
         assert_eq!(request.session_id, session_id);
         assert_eq!(request.source, EventSource::Ai);
+    }
+
+    fn control_fixture() -> SessionControlState {
+        SessionControlState {
+            session_id: SessionId::new(),
+            agent_generation: 2,
+            controller_id: remoteops_domain::ControllerInstanceId::new(),
+            controller_generation: 3,
+            revision: 7,
+            mode: remoteops_protocol::ControllerControlMode::FullAccess,
+            source: Some(remoteops_protocol::ControlSource::Local),
+            expires_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn control_cache_never_rolls_back_and_disconnect_forgets_grants() {
+        let inner = transport_test_inner();
+        let full = control_fixture();
+        let mut revoked = full.clone();
+        revoked.revision += 1;
+        revoked.mode = remoteops_protocol::ControllerControlMode::StepByStep;
+        revoked.source = None;
+        handle_wire_message(&inner, WireMessage::ControlStateUpdated(revoked.clone())).await;
+        handle_wire_message(&inner, WireMessage::ControlStateUpdated(full.clone())).await;
+        assert_eq!(
+            inner.control_states.lock().await.get(&full.session_id),
+            Some(&revoked)
+        );
+        let mut old_connection = full.clone();
+        old_connection.agent_generation -= 1;
+        old_connection.revision += 100;
+        handle_wire_message(&inner, WireMessage::ControlStateUpdated(old_connection)).await;
+        assert_eq!(
+            inner.control_states.lock().await.get(&full.session_id),
+            Some(&revoked)
+        );
+        fail_pending_requests(&inner, "test disconnect").await;
+        assert!(inner.control_states.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_confirmation_is_correlated_and_failure_does_not_become_success() {
+        let inner = transport_test_inner();
+        let request_id = RequestId::new();
+        let (sender, receiver) = oneshot::channel();
+        inner
+            .control_pending
+            .lock()
+            .await
+            .insert(request_id, sender);
+        let state = control_fixture();
+        handle_wire_message(
+            &inner,
+            WireMessage::ControlStateResult(ControlStateResult {
+                request_id: RequestId::new(),
+                state: Some(state.clone()),
+                error: None,
+            }),
+        )
+        .await;
+        assert!(inner.control_pending.lock().await.contains_key(&request_id));
+        handle_wire_message(
+            &inner,
+            WireMessage::ControlStateResult(ControlStateResult {
+                request_id,
+                state: Some(state),
+                error: Some("revision conflict".into()),
+            }),
+        )
+        .await;
+        let result = receiver.await.unwrap();
+        assert_eq!(result.error.as_deref(), Some("revision conflict"));
+        assert!(inner.control_pending.lock().await.is_empty());
     }
 
     #[test]

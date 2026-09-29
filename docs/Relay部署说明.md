@@ -106,7 +106,7 @@ Relay 部署完成后：
 1. 在工程师本机安装 Windows x64 MCP，配置相同的 Relay 地址和 Owner UUID；
 2. 在现场 Windows 电脑运行 `remoteops-agent-gui.exe`，首次只填写 Relay 地址并读取临时控制码；
 3. 先完成一次只读配对和目标核对；
-4. 修改操作由当前 Codex 逐项确认，或由用户在当前 Codex 中为精确 `session_id` 开启临时完全控制；Agent 端没有授权按钮。
+4. 修改操作默认由当前 Codex 逐项确认，或通过 MCP/Agent 现场入口授予当前连接完全控制。协议 16 要求 Agent、MCP、Relay 配套升级；默认偏好、撤销与重连规则见[控制权限说明](control-permissions.md)。
 
 公网 CA 证书不需要向 Agent 分发文件。Relay 自动生成自签名证书时，Agent GUI 会在发送 RemoteOps 凭据前显示叶证书 SHA-256 指纹；部署管理员应通过独立可信渠道提供正确指纹，由现场用户核对后保存。CLI、Service 和 MCP 没有证书确认界面，必须预置 CA PEM 或已核对指纹。
 

@@ -24,6 +24,7 @@ members = [
     "apps/remoteops-controller-gui",
     "apps/remoteops-serial-demo",
     "tests/remoteops-mcp-smoke",
+    "tests/remoteops-control-smoke",
 ]
 
 [workspace.package]

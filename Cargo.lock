@@ -3736,7 +3736,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.25"
+version = "0.2.0-preview.26"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.26"
+version = "0.2.0-preview.27"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3847,6 +3847,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "remoteops-control-smoke"
+version = "0.2.0-preview.5"
+dependencies = [
+ "anyhow",
+ "remoteops-agent",
+ "remoteops-application",
+ "remoteops-domain",
+ "remoteops-protocol",
+ "rmcp",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "remoteops-controller-cli"
 version = "0.2.0-preview.5"
 dependencies = [
@@ -3897,7 +3912,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-mcp"
-version = "0.2.0-preview.11"
+version = "0.2.0-preview.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4009,7 +4024,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-protocol"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.6"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4032,7 +4047,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-relay"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.6"
 dependencies = [
  "anyhow",
  "argon2",

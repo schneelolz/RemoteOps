@@ -157,7 +157,9 @@ fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: Agen
         }
         AgentEvent::ControllerBindingsChanged { .. } => {}
         // 操作日志不改变服务状态，避免按输出行重复写入状态文件。
-        AgentEvent::OperationLog(_) => return,
+        AgentEvent::OperationLog(_)
+        | AgentEvent::ControlStatePending(_)
+        | AgentEvent::ControlStateResult(_) => return,
         AgentEvent::Reconnecting { .. } => {
             "reconnecting".clone_into(&mut status.status);
             status.active_connections = 0;

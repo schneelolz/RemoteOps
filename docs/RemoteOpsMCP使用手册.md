@@ -19,7 +19,7 @@ artifacts\release\0.2.0-preview.5\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.5.
 解压后运行 `Install-RemoteOpsMcp.ps1`。安装后的默认程序和配置位置为：
 
 ```text
-%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.11.exe
+%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.12.exe
 %USERPROFILE%\.codex\remoteops\controller-config.json
 %USERPROFILE%\.codex\config.toml
 ```
@@ -62,7 +62,7 @@ GUI 窗口必须保持运行。窗口会显示连接状态、临时控制码、�
 
 全新机器首次运行只需填写 Relay 地址，不需要先启动 Codex、申请入网码或获取部署级 Agent 注册 Token。Agent 显示九位控制码后，再由已安装并已认证的 RemoteOps MCP 完成配对。
 
-MCP 配对后默认使用“逐项确认”，不弹出控制方式选择：只读检查直接执行，修改、终止进程、服务控制、重启、文件变更、可写串口等操作前由 MCP 向当前用户确认。用户明确要求时可调用一次 `set_control_mode` 为单个 `session_id` 开启“完全控制”；Codex 对该工具的授权是唯一确认，不再嵌套弹出第二次确认。Agent 端没有逐项确认或完全控制按钮。授权只保存在 MCP 内存，空闲一小时自动失效，成功操作后滑动续期。Agent 短暂掉线并以原会话恢复时保留，MCP/Codex 重启、Agent 重启生成新会话、主动断开或切回逐项确认后失效。
+MCP 未获得有效授权时使用“逐项确认”：只读检查直接执行，修改操作前向当前用户确认。用户可通过 `set_control_mode` 授予单个连接完全控制，也可由现场在 Agent“控制权限”中确认授权；现场授权生效后无需再调用 MCP 审批。授权由 Relay 确认并同步至两端，绑定会话及连接代次。MCP 来源空闲一小时到期，成功操作续期；现场来源到连接结束或撤销失效。断线恢复不保留旧绑定授权；默认完全控制可在新绑定重新授权。完整规则见[控制权限说明](control-permissions.md)。
 
 `remoteops-agent.exe` 继续保留，供命令行自动化和故障排查使用，不作为普通现场人员的默认入口。
 
@@ -74,7 +74,7 @@ Agent 状态和文件传输目录默认位于：
 
 不要公开或随意删除 `agent-state.json`，其中包含 Agent 身份和恢复信息。
 
-Relay 临时中断或长时间停机时保持 Agent 运行即可。只要 `agent-state.json` 中的恢复令牌仍有效，Relay 恢复后 Agent 会自动重新认证并保留原控制码和 `session_id`；同一 MCP 进程会持续重试已知配对，不需要现场再次确认。断线前审批和在途写操作不会自动重放。
+Relay 临时中断或长时间停机时保持 Agent 运行即可。有效恢复令牌可用于恢复控制码和 `session_id`，同一 MCP 进程会重试已知配对；这不代表旧连接的完全控制仍然有效。Agent 默认 `default_full_control=false`；只有已保存默认完全控制且本次运行未手动撤销时，才为新绑定自动重新授权。断线前审批和在途写操作不会自动重放。
 
 ## 四、在 Codex 中配对
 
@@ -163,7 +163,7 @@ Get-NetIPAddress -AddressFamily IPv4
 --command-mode agent-controlled
 ```
 
-安装器设置 `default_tools_approval_mode = "approve"`、`set_control_mode.approval_mode = "prompt"` 和当前 Codex 支持的内联 `approval_policy = { granular = { ... mcp_elicitations = true ... } }`。普通写操作由 MCP 逐项确认；开启完全控制只使用 `set_control_mode` 的 Codex 工具确认，避免静态工具审批与嵌套 MCP 确认重复弹窗。
+安装器设置 `default_tools_approval_mode = "approve"`、`set_control_mode.approval_mode = "prompt"` 和当前 Codex 支持的内联 `approval_policy = { granular = { ... mcp_elicitations = true ... } }`。未获完全控制时写操作由 MCP 逐项确认；MCP 主动授权使用 `set_control_mode` 工具确认，现场授权使用 Agent 一次确认。RemoteOps 内部免审批不改变宿主独立的工具授权规则。推荐保持 `agent-controlled`；协议 16 的 `full-access` 启动参数仅设置上限，不自动授权。
 
 规则如下：
 
@@ -172,7 +172,7 @@ Get-NetIPAddress -AddressFamily IPv4
 - 持久 Shell 保留目录、变量、函数和模块状态，不能声明为免确认只读；其中所有命令都通过 `run_command`，并接受逐项确认或完全控制约束；
 - 逐项确认模式下，MCP 通过 MCP elicitation 向当前用户确认本次完整操作；拒绝、关闭或超时后不执行；
 - 完全控制模式下，MCP 写工具无需逐项询问，但仍受 TLS、单 Owner、目标绑定、结构化策略、审计和停止边界约束；
-- 切回逐项确认或 TTL 过期后，新写操作立即再次询问；
+- 切回逐项确认或 MCP 授权 TTL 过期后，新写操作再次询问；现场切回逐项确认同时抑制本次 Agent 运行后续自动授权，重启才恢复保存的默认行为；
 - `request_action_approval` 仅用于显式 `--command-mode approval` 或独立 Human Controller 兼容流程，普通首版 MCP 不依赖它；
 - MCP 不能通过自然语言提升 Agent 本地 FullAccess，也不能绕过 Relay/Agent 的结构化校验。
 
@@ -290,7 +290,7 @@ Test-NetConnection relay.example.com -Port 7443
 - 不公开 `agent-state.json`；
 - Agent 使用低权限账户运行；
 - 只读诊断优先使用 `run_readonly_command`；
-- 修改操作默认逐项确认；仅在使用者通过 MCP 明确为当前 `session_id` 开启完全控制后免除逐项确认；
+- 修改操作默认逐项确认；Relay 确认当前绑定的 MCP、现场临时或现场默认完全控制后才免除 RemoteOps 逐项审批；
 - 完成协助后关闭 Agent即可停止远程入口；
 - 试点稳定后收紧 Relay `7443` 的安全组来源范围。
 
