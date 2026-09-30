@@ -585,12 +585,14 @@ struct PortInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RemotePathInput {
     session_id: String,
+    /// Agent 自己的 `transfer-root` 内的相对文件路径；不能传绝对路径或 `..`。
     remote_path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MutatingRemotePathInput {
     session_id: String,
+    /// Agent 自己的 `transfer-root` 内的相对文件路径；不能传绝对路径或 `..`。
     remote_path: String,
     approval_id: Option<String>,
 }
@@ -598,7 +600,9 @@ struct MutatingRemotePathInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MoveFileInput {
     session_id: String,
+    /// Agent 自己的 `transfer-root` 内的相对源文件路径。
     source_path: String,
+    /// Agent 自己的 `transfer-root` 内的相对目标文件路径。
     destination_path: String,
     overwrite: bool,
     approval_id: Option<String>,
@@ -839,9 +843,9 @@ struct PromptWireResponse {
 struct UploadInput {
     /// `list_connections` 返回的不可变 `session_id`。
     session_id: String,
-    /// `transfer-root` 内的相对文件路径。
+    /// MCP 本地 `transfer-root` 内已存在文件的相对路径；源文件须先放入该目录。
     local_path: String,
-    /// Agent 目标文件路径。
+    /// Agent 自己的 `transfer-root` 内的相对目标路径；不能传绝对路径或 `..`。
     remote_path: String,
     /// 是否覆盖现有文件。
     overwrite: bool,
@@ -853,9 +857,9 @@ struct UploadInput {
 struct DownloadInput {
     /// `list_connections` 返回的不可变 `session_id`。
     session_id: String,
-    /// Agent 文件路径。
+    /// Agent 自己的 `transfer-root` 内的相对源文件路径；不能传绝对路径或 `..`。
     remote_path: String,
-    /// `transfer-root` 内的相对保存路径。
+    /// MCP 本地 `transfer-root` 内的相对保存路径；与 Agent 的交换目录各自独立。
     local_path: String,
     /// 是否覆盖本地文件。
     overwrite_local: bool,
@@ -904,28 +908,33 @@ enum ApprovalActionInput {
     },
     /// 申请上传控制端受控目录中的文件。
     UploadFile {
-        /// `transfer-root` 内的相对文件路径。
+        /// MCP 本地 `transfer-root` 内已存在文件的相对路径；源文件须先放入该目录。
         local_path: String,
-        /// Agent 目标文件路径。
+        /// Agent 自己的 `transfer-root` 内的相对目标路径；不能传绝对路径或 `..`。
         remote_path: String,
         /// 是否覆盖现有文件。
         overwrite: bool,
     },
     /// 申请下载文件并覆盖控制端受控目录中的现有文件。
     DownloadFile {
-        /// Agent 文件路径。
+        /// Agent 自己的 `transfer-root` 内的相对源文件路径；不能传绝对路径或 `..`。
         remote_path: String,
         /// 必须为 true 才会触发本地覆盖审批。
         overwrite_local: bool,
     },
     /// 申请移动或重命名文件。
     MoveFile {
+        /// Agent 自己的 `transfer-root` 内的相对源文件路径。
         source_path: String,
+        /// Agent 自己的 `transfer-root` 内的相对目标文件路径。
         destination_path: String,
         overwrite: bool,
     },
     /// 申请删除单个普通文件。
-    DeleteFile { remote_path: String },
+    DeleteFile {
+        /// Agent 自己的 `transfer-root` 内的相对文件路径。
+        remote_path: String,
+    },
     /// 申请向指定 TCP 目标发送精确数据。
     TcpExchange {
         host: String,
@@ -1061,6 +1070,7 @@ struct ConnectionOutput {
     control_source: Option<String>,
     control_revision: Option<u64>,
     control_sync_status: String,
+    /// MCP 本地（控制端）的实际文件交换目录，供 `local_path` 使用；不是 Agent 远端目录。
     transfer_root: String,
     capabilities: Vec<String>,
 }
@@ -1742,7 +1752,7 @@ impl RemoteOpsMcp {
     /// 列出所有已配对连接及其不可变 `session_id`。
     #[tool(
         name = "list_connections",
-        description = "列出 RemoteOps 当前连接。后续每个工具必须使用这里返回的不可变 session_id；不要根据别名猜测。",
+        description = "列出 RemoteOps 当前连接。后续每个工具必须使用这里返回的不可变 session_id；不要根据别名猜测。transfer_root 是 MCP 本地（控制端）交换目录，供 local_path 使用，不是 Agent 远端目录。",
         annotations(
             title = "列出远程连接",
             read_only_hint = true,
@@ -1886,7 +1896,7 @@ impl RemoteOpsMcp {
     /// 读取单个连接的主机、系统、能力和状态。
     #[tool(
         name = "get_target_info",
-        description = "按精确 session_id 获取目标详情。别名只用于展示，不能代替 session_id。",
+        description = "按精确 session_id 获取目标详情。别名只用于展示，不能代替 session_id。transfer_root 是 MCP 本地（控制端）交换目录，供 local_path 使用，不是 Agent 远端目录。",
         annotations(
             title = "读取目标信息",
             read_only_hint = true,
@@ -3027,7 +3037,7 @@ impl RemoteOpsMcp {
     /// 上传控制端本机文件到 Agent。
     #[tool(
         name = "upload_file",
-        description = "从受控 transfer-root 以 1 MiB 分块上传文件到精确 session_id，并校验分块及完整 SHA-256；超过 1 GiB 时在读取文件前单独确认。",
+        description = "从 MCP 本地 transfer-root 以 1 MiB 分块上传文件到精确 session_id。local_path 必须是本地交换目录内已存在文件的相对路径，remote_path 必须是 Agent 自己交换目录内的相对目标路径；双方根目录可不同，拒绝绝对路径、.. 和链接逃逸。校验分块及完整 SHA-256；超过 1 GiB 时在读取文件前单独确认。",
         annotations(
             title = "上传诊断文件",
             read_only_hint = false,
@@ -3144,7 +3154,7 @@ impl RemoteOpsMcp {
     /// 下载 Agent 文件到控制端本机。
     #[tool(
         name = "download_file",
-        description = "从精确 session_id 以 1 MiB 分块下载文件，仅写入受控 transfer-root；逐块和整文件校验后原子提交，超过 1 GiB 时在远端哈希和读取前单独确认。",
+        description = "从精确 session_id 以 1 MiB 分块下载文件。remote_path 必须是 Agent 自己交换目录内的相对源文件路径，local_path 必须是 MCP 本地 transfer-root 内的相对保存路径；双方根目录可不同，拒绝绝对路径、.. 和链接逃逸。逐块和整文件校验后原子提交，超过 1 GiB 时在远端哈希和读取前单独确认。",
         annotations(
             title = "下载诊断文件",
             read_only_hint = false,
@@ -3684,7 +3694,7 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
     router = self.runtime_tool_router(),
     name = "remoteops-controller",
     version = "0.2.0-preview.5",
-    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。全新配置默认逐项确认；协议16及以上Agent支持现场临时授权和默认完全控制。配对后先查询有效模式，已生效的现场授权无需再次调用set_control_mode或逐项审批；旧组件无此能力时不得引导点击不存在的按钮。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制由 Relay 确认并按当前连接绑定生效；MCP 授权空闲一小时失效，现场授权有效至连接结束，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
+    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。全新配置默认逐项确认；协议16及以上Agent支持现场临时授权和默认完全控制。配对后先查询有效模式，已生效的现场授权无需再次调用set_control_mode或逐项审批；旧组件无此能力时不得引导点击不存在的按钮。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制由 Relay 确认并按当前连接绑定生效；MCP 授权空闲一小时失效，现场授权有效至连接结束，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。文件传输的 local_path 必须是 MCP 进程所在机器和账号的本地 transfer-root 内的相对路径，上传源文件须已放入该目录；remote_path 必须是 Agent 自己 transfer-root 内的相对路径，双方根目录可以不同。连接结果中的 transfer_root 始终是 MCP 本地目录，不是 Agent 远端目录；远端实际目录可在 Agent GUI 的连接详情中查看。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
 )]
 impl ServerHandler for RemoteOpsMcp {}
 
@@ -4003,9 +4013,21 @@ async fn commit_local_download(
 
 async fn resolve_existing_transfer_file(root: &Path, value: &str) -> Result<PathBuf, String> {
     let relative = parse_transfer_relative_path(value)?;
-    let candidate = tokio::fs::canonicalize(root.join(relative))
+    let source = root.join(relative);
+    let candidate = tokio::fs::canonicalize(&source)
         .await
-        .map_err(|error| format!("无法读取 transfer-root 内文件：{error}"))?;
+        .map_err(|error| {
+            let hint = if error.kind() == std::io::ErrorKind::NotFound {
+                "请先将源文件放入该 MCP 本地交换目录，再将 local_path 设置为目录内的相对路径；也可通过 --transfer-root 指定其他本地交换目录"
+            } else {
+                "请检查 MCP 运行账号对该路径的访问权限及文件是否可读取"
+            };
+            format!(
+                "无法读取 MCP 本地上传源文件：{error}；MCP 本地 transfer-root：{}；按 local_path 解析的路径：{}；{hint}",
+                root.display(),
+                source.display(),
+            )
+        })?;
     if !candidate.starts_with(root) {
         return Err("文件路径通过链接逃逸了 transfer-root".to_owned());
     }
@@ -4651,6 +4673,83 @@ mod tests {
         assert_eq!(
             parse_transfer_relative_path("tools/diag.exe").expect("相对路径应有效"),
             PathBuf::from("tools").join("diag.exe")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_upload_source_reports_actual_root_and_expected_path() {
+        let test_root =
+            std::env::temp_dir().join(format!("remoteops-mcp-missing-source-{}", SessionId::new()));
+        tokio::fs::create_dir_all(&test_root)
+            .await
+            .expect("应创建测试目录");
+        let canonical_root = tokio::fs::canonicalize(&test_root)
+            .await
+            .expect("应解析自定义交换目录");
+        let relative = "nested/diagnostic.txt";
+        let error = resolve_existing_transfer_file(&canonical_root, relative)
+            .await
+            .expect_err("文件尚未放入交换目录时应拒绝上传");
+        assert!(error.contains(&canonical_root.display().to_string()));
+        assert!(error.contains(&canonical_root.join(relative).display().to_string()));
+        assert!(error.contains("请先将源文件放入"));
+        assert!(error.contains("local_path"));
+        assert!(error.contains("--transfer-root"));
+
+        tokio::fs::create_dir_all(canonical_root.join("nested"))
+            .await
+            .expect("应创建源文件所在目录");
+        tokio::fs::write(canonical_root.join(relative), b"diagnostic")
+            .await
+            .expect("应放入上传源文件");
+        let resolved = resolve_existing_transfer_file(&canonical_root, relative)
+            .await
+            .expect("源文件放入交换目录后应可解析");
+        assert_eq!(resolved, canonical_root.join(relative));
+        assert!(
+            resolve_existing_transfer_file(&canonical_root, "nested")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_existing_transfer_file(&canonical_root, "../outside.txt")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_existing_transfer_file(&canonical_root, &resolved.display().to_string())
+                .await
+                .is_err()
+        );
+        let _ = tokio::fs::remove_dir_all(test_root).await;
+    }
+
+    #[test]
+    fn transfer_schemas_distinguish_controller_and_agent_roots() {
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(UploadInput)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(DownloadInput)).unwrap(),
+        ] {
+            let local = schema["properties"]["local_path"]["description"]
+                .as_str()
+                .unwrap();
+            let remote = schema["properties"]["remote_path"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(local.contains("MCP 本地"));
+            assert!(remote.contains("Agent 自己"));
+            assert!(local.contains("相对"));
+            assert!(remote.contains("相对"));
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(ConnectionOutput)).unwrap();
+        let description = schema["properties"]["transfer_root"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("MCP 本地"));
+        assert!(description.contains("不是 Agent"));
+        assert!(
+            schema["properties"].get("remote_transfer_root").is_none(),
+            "本轮不扩展远端协议或修改输出字段"
         );
     }
 
