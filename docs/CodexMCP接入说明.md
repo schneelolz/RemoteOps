@@ -95,7 +95,19 @@ Windows 配置使用 STDIO MCP 的 `env_vars` 转发已有用户环境变量，�
 
 同一预览版本反复更新时，Windows 可能仍锁定正在运行的旧 MCP。安装器会改用带 12 位构建哈希的旁路文件名并更新 Codex 配置，不会强制结束当前 Codex 或 MCP 进程；完全重启 Codex 后新任务使用新版程序，再次运行安装器可清理旧文件。
 
-`upload_file` 和 `download_file` 只能使用 `transfer-root` 内的相对路径。绝对路径、`..` 跳转以及通过符号链接逃逸目录都会被拒绝。MCP 与 CLI 使用 1 MiB 分块，单文件硬上限为 16 GiB；超过 1 GiB 时必须在读取、哈希或发送前单独确认。上传和下载覆盖均先写同目录临时文件，校验每块及完整 SHA-256 后再可恢复地原子提交，失败时保留原文件。
+MCP 的 `upload_file` 和 `download_file` 中，`local_path` 必须是 **MCP 进程所在机器、运行账号下实际 `transfer-root` 内的相对路径**。Windows 默认目录为 `%LOCALAPPDATA%\RemoteOps\transfers`，可通过 MCP 启动参数 `--transfer-root` 覆盖。上传源文件必须真实放入该目录；MCP 不会自动从任意目录复制或搬运文件。
+
+`remote_path` 必须是 **Agent 自己的 `transfer-root` 内的相对路径**。双方根目录可以不同，连接输出中的 `transfer_root` 指 MCP 本地目录，不能据此推断远端路径；远端实际目录可在 Agent GUI 的“连接详情”中查看。绝对路径、`..` 跳转以及通过符号链接逃逸受控目录都会被拒绝。
+
+例如调用 `upload_file`（将占位符替换为配对返回的 `session_id`）：
+
+```json
+{"session_id":"<session_id>","local_path":"package.zip","remote_path":"incoming/package.zip","overwrite":false}
+```
+
+如果 MCP 本地根目录是 `%LOCALAPPDATA%\RemoteOps\transfers`，Agent 根目录是 `D:\Support\transfers`，则读取本地根目录中的 `package.zip`，写入远端 `D:\Support\transfers\incoming\package.zip`。
+
+CLI 的 `upload` / `download` 使用普通本地文件路径，`local_path` 不受 MCP 本地 `transfer-root` 限制；远端路径仍受 Agent 的交换目录限制。MCP 与 CLI 使用 1 MiB 分块，单文件硬上限为 16 GiB；超过 1 GiB 时必须在读取、哈希或发送前单独确认。上传和下载覆盖均先写同目录临时文件，校验每块及完整 SHA-256 后再可恢复地原子提交，失败时保留原文件。
 
 ## 四、独立 Human Controller（预留兼容）
 

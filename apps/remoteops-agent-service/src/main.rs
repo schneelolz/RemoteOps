@@ -158,6 +158,7 @@ fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: Agen
         AgentEvent::ControllerBindingsChanged { .. } => {}
         // 操作日志不改变服务状态，避免按输出行重复写入状态文件。
         AgentEvent::OperationLog(_)
+        | AgentEvent::OperationStateChanged { .. }
         | AgentEvent::ControlStatePending(_)
         | AgentEvent::ControlStateResult(_) => return,
         AgentEvent::Reconnecting { .. } => {
@@ -473,5 +474,21 @@ mod operation_log_tests {
         );
         assert_eq!(status.status, "controlled");
         assert!(!path.exists());
+        for state in [
+            remoteops_agent::AgentOperationState::Running,
+            remoteops_agent::AgentOperationState::Succeeded,
+            remoteops_agent::AgentOperationState::Failed,
+        ] {
+            update_status_from_event(
+                &path,
+                &mut status,
+                AgentEvent::OperationStateChanged {
+                    request_id: remoteops_domain::RequestId::new(),
+                    state,
+                },
+            );
+            assert_eq!(status.status, "controlled");
+            assert!(!path.exists());
+        }
     }
 }

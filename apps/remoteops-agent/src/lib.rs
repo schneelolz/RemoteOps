@@ -413,6 +413,13 @@ pub enum AgentEvent {
     },
     /// 远程操作的本地展示日志。
     OperationLog(AgentOperationLog),
+    /// 远程请求的真实执行阶段发生变化，独立于输出日志级别。
+    OperationStateChanged {
+        /// 对应远程请求，便于区分并发操作。
+        request_id: RequestId,
+        /// 当前执行阶段。
+        state: AgentOperationState,
+    },
     /// 连接中断，等待自动重试。
     Reconnecting {
         /// 面向现场人员的简短原因。
@@ -427,6 +434,17 @@ pub enum AgentEvent {
         /// 可用于现场排查的脱敏错误信息。
         message: String,
     },
+}
+
+/// 供本地表现层跟踪的远程请求执行阶段。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentOperationState {
+    /// 操作已经开始执行。
+    Running,
+    /// 操作已成功完成。
+    Succeeded,
+    /// 操作执行失败、被拒绝或被中断。
+    Failed,
 }
 
 /// GUI 中显示的远程操作日志级别。
@@ -3843,6 +3861,7 @@ fn print_agent_event(event: &AgentEvent) {
             "控制状态确认：{}",
             result.error.as_deref().unwrap_or("成功")
         ),
+        AgentEvent::OperationStateChanged { .. } => {}
         AgentEvent::OperationLog(log) => {
             println!("{}：{}", log.occurred_at.to_rfc3339(), log.message);
         }

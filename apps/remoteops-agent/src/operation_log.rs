@@ -10,7 +10,10 @@ use remoteops_audit::Redactor;
 use remoteops_domain::{EventPayload, RemoteEvent, RemoteOperation, RequestId, SessionId};
 use remoteops_protocol::{RemoteRequest, WireMessage};
 
-use crate::{AgentEvent, AgentEventSender, AgentLogLevel, AgentOperationLog, emit_agent_event};
+use crate::{
+    AgentEvent, AgentEventSender, AgentLogLevel, AgentOperationLog, AgentOperationState,
+    emit_agent_event,
+};
 
 /// 单行输出超过此长度时整行隐藏，避免截断后泄漏部分凭据。
 const MAX_LINE_BYTES: usize = 8192;
@@ -194,6 +197,7 @@ impl LogObserver {
                     AgentLogLevel::Error,
                     &response.summary,
                 );
+                self.emit_state(response.request_id, AgentOperationState::Failed);
             }
             _ => {}
         }
@@ -209,12 +213,15 @@ impl LogObserver {
                 if self
                     .interrupted_requests
                     .contains(&(event.session_id, request_id)) => {}
-            EventPayload::OperationStarted => self.emit(
-                Some(request_id),
-                event.occurred_at,
-                AgentLogLevel::Running,
-                "开始执行",
-            ),
+            EventPayload::OperationStarted => {
+                self.emit(
+                    Some(request_id),
+                    event.occurred_at,
+                    AgentLogLevel::Running,
+                    "开始执行",
+                );
+                self.emit_state(request_id, AgentOperationState::Running);
+            }
             EventPayload::OutputChunk { stderr, text } => {
                 let key = (event.session_id, request_id, *stderr);
                 if self
@@ -248,30 +255,7 @@ impl LogObserver {
                 }
             }
             EventPayload::OperationCompleted { exit_code, summary } => {
-                let streamed = self.flush(event.session_id, request_id, event.occurred_at);
-                if !streamed && !summary.is_empty() {
-                    self.emit(
-                        Some(request_id),
-                        event.occurred_at,
-                        AgentLogLevel::Info,
-                        summary,
-                    );
-                }
-                let failed = exit_code.is_some_and(|code| code != 0);
-                let message = exit_code.map_or_else(
-                    || "执行完成".to_owned(),
-                    |code| format!("执行完成 · 退出码 {code}"),
-                );
-                self.emit(
-                    Some(request_id),
-                    event.occurred_at,
-                    if failed {
-                        AgentLogLevel::Error
-                    } else {
-                        AgentLogLevel::Success
-                    },
-                    &message,
-                );
+                self.complete_operation(event, request_id, *exit_code, summary);
             }
             EventPayload::OperationFailed { message, .. } => {
                 self.flush(event.session_id, request_id, event.occurred_at);
@@ -281,6 +265,7 @@ impl LogObserver {
                     AgentLogLevel::Error,
                     &format!("执行失败：{message}"),
                 );
+                self.emit_state(request_id, AgentOperationState::Failed);
             }
             EventPayload::OperationCancelled => {
                 self.flush(event.session_id, request_id, event.occurred_at);
@@ -290,9 +275,52 @@ impl LogObserver {
                     AgentLogLevel::Error,
                     "操作已中断",
                 );
+                self.emit_state(request_id, AgentOperationState::Failed);
             }
             _ => {}
         }
+    }
+
+    /// 先提交剩余输出，再根据真实退出码发布完成日志和执行终态。
+    fn complete_operation(
+        &mut self,
+        event: &RemoteEvent,
+        request_id: RequestId,
+        exit_code: Option<i32>,
+        summary: &str,
+    ) {
+        let streamed = self.flush(event.session_id, request_id, event.occurred_at);
+        if !streamed && !summary.is_empty() {
+            self.emit(
+                Some(request_id),
+                event.occurred_at,
+                AgentLogLevel::Info,
+                summary,
+            );
+        }
+        let failed = exit_code.is_some_and(|code| code != 0);
+        let message = exit_code.map_or_else(
+            || "执行完成".to_owned(),
+            |code| format!("执行完成 · 退出码 {code}"),
+        );
+        self.emit(
+            Some(request_id),
+            event.occurred_at,
+            if failed {
+                AgentLogLevel::Error
+            } else {
+                AgentLogLevel::Success
+            },
+            &message,
+        );
+        self.emit_state(
+            request_id,
+            if failed {
+                AgentOperationState::Failed
+            } else {
+                AgentOperationState::Succeeded
+            },
+        );
     }
 
     /// 记录 Agent 终止在途请求，并丢弃迟到的输出分片。
@@ -311,6 +339,15 @@ impl LogObserver {
         }
         self.interrupted_requests.insert((session_id, request_id));
         self.emit(Some(request_id), occurred_at, AgentLogLevel::Error, message);
+        self.emit_state(request_id, AgentOperationState::Failed);
+    }
+
+    /// 只在真实执行阶段变化时通知本地表现层，标准错误输出不改变执行状态。
+    fn emit_state(&self, request_id: RequestId, state: AgentOperationState) {
+        emit_agent_event(
+            self.sender.as_ref(),
+            AgentEvent::OperationStateChanged { request_id, state },
+        );
     }
 
     /// 请求结束时提交最后一行并释放两个输出流的缓冲。
@@ -466,6 +503,177 @@ mod tests {
         }
     }
 
+    /// 仅收集执行阶段，验证输出日志不会被误判成终态。
+    fn states(
+        receiver: &std::sync::mpsc::Receiver<AgentEvent>,
+    ) -> Vec<(RequestId, AgentOperationState)> {
+        receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                AgentEvent::OperationStateChanged { request_id, state } => {
+                    Some((request_id, state))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stderr_output_keeps_request_running_until_real_completion() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut observer = LogObserver::new(Some(sender));
+        let session = SessionId::new();
+        let request = RequestId::new();
+        observe(
+            &mut observer,
+            session,
+            request,
+            EventPayload::OperationStarted,
+        );
+        assert_eq!(states(&receiver), [(request, AgentOperationState::Running)]);
+        observe(
+            &mut observer,
+            session,
+            request,
+            EventPayload::OutputChunk {
+                stderr: true,
+                text: "warning\npending warning".to_owned(),
+            },
+        );
+        let events: Vec<_> = receiver.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::OperationLog(AgentOperationLog {
+                level: AgentLogLevel::Error,
+                ..
+            })
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::OperationStateChanged { .. }))
+        );
+        observe(
+            &mut observer,
+            session,
+            request,
+            EventPayload::OperationCompleted {
+                exit_code: Some(0),
+                summary: String::new(),
+            },
+        );
+        assert_eq!(
+            states(&receiver),
+            [(request, AgentOperationState::Succeeded)]
+        );
+    }
+
+    #[test]
+    fn terminal_states_cover_failure_cancellation_and_interruption() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut observer = LogObserver::new(Some(sender));
+        let session = SessionId::new();
+        let first = RequestId::new();
+        let second = RequestId::new();
+        observe(
+            &mut observer,
+            session,
+            first,
+            EventPayload::OperationStarted,
+        );
+        observe(
+            &mut observer,
+            session,
+            second,
+            EventPayload::OperationStarted,
+        );
+        assert_eq!(
+            states(&receiver),
+            [
+                (first, AgentOperationState::Running),
+                (second, AgentOperationState::Running),
+            ]
+        );
+        observe(
+            &mut observer,
+            session,
+            first,
+            EventPayload::OperationCompleted {
+                exit_code: Some(2),
+                summary: String::new(),
+            },
+        );
+        assert_eq!(states(&receiver), [(first, AgentOperationState::Failed)]);
+        observe(
+            &mut observer,
+            session,
+            second,
+            EventPayload::OperationCancelled,
+        );
+        assert_eq!(states(&receiver), [(second, AgentOperationState::Failed)]);
+        let failed = RequestId::new();
+        observe(
+            &mut observer,
+            session,
+            failed,
+            EventPayload::OperationFailed {
+                code: "failed".to_owned(),
+                message: "failed".to_owned(),
+            },
+        );
+        assert_eq!(states(&receiver), [(failed, AgentOperationState::Failed)]);
+        let interrupted = RequestId::new();
+        observer.interrupt(session, interrupted, Utc::now(), "连接中断");
+        assert_eq!(
+            states(&receiver),
+            [(interrupted, AgentOperationState::Failed)]
+        );
+        observe(
+            &mut observer,
+            session,
+            interrupted,
+            EventPayload::OperationStarted,
+        );
+        observe(
+            &mut observer,
+            session,
+            interrupted,
+            EventPayload::OperationCompleted {
+                exit_code: Some(0),
+                summary: String::new(),
+            },
+        );
+        assert!(states(&receiver).is_empty());
+    }
+
+    #[test]
+    fn rejected_response_reports_failure_without_duplicate_execution_failure() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut observer = LogObserver::new(Some(sender));
+        let session = SessionId::new();
+        let request = RequestId::new();
+        for error_code in ["agent_request_limit_reached", "agent_operation_failed"] {
+            observer.observe(&WireMessage::RemoteResponse(
+                remoteops_protocol::RemoteResponse {
+                    request_id: request,
+                    session_id: session,
+                    exit_code: None,
+                    summary: "请求被拒绝".to_owned(),
+                    error_code: Some(error_code.to_owned()),
+                    payload_base64: None,
+                    sha256: None,
+                    details: None,
+                },
+            ));
+            let expected = if error_code == "agent_operation_failed" {
+                Vec::new()
+            } else {
+                vec![(request, AgentOperationState::Failed)]
+            };
+            assert_eq!(states(&receiver), expected);
+        }
+    }
+
     #[test]
     fn combines_split_secrets_and_flushes_last_line_on_completion() {
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -486,9 +694,9 @@ mod tests {
         );
         let logs: Vec<_> = receiver
             .try_iter()
-            .map(|event| match event {
-                AgentEvent::OperationLog(log) => log,
-                _ => panic!("应只包含日志"),
+            .filter_map(|event| match event {
+                AgentEvent::OperationLog(log) => Some(log),
+                _ => None,
             })
             .collect();
         assert_eq!(logs.len(), 3);
@@ -689,7 +897,10 @@ mod tests {
                 summary: String::new(),
             },
         );
-        let logs: Vec<_> = receiver.try_iter().collect();
+        let logs: Vec<_> = receiver
+            .try_iter()
+            .filter(|event| matches!(event, AgentEvent::OperationLog(_)))
+            .collect();
         assert_eq!(logs.len(), MAX_OUTPUT_LINES + 2);
         assert!(matches!(
             logs.last(),

@@ -2,7 +2,7 @@
 
 use std::{
     backtrace::Backtrace,
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     env,
     fmt::Write as _,
     io::Write as _,
@@ -24,8 +24,9 @@ use eframe::egui::{
 use egui_phosphor::regular as icons;
 use remoteops_agent::{
     AgentConfig, AgentControllerBinding, AgentEvent, AgentEventSender, AgentLogLevel,
-    AgentOperationLog, AgentPermissionControl, active_agent_config_path, default_agent_config_path,
-    initialize_tracing, legacy_agent_config_path, run_agent_with_visual_provider,
+    AgentOperationLog, AgentOperationState, AgentPermissionControl, active_agent_config_path,
+    default_agent_config_path, initialize_tracing, legacy_agent_config_path,
+    run_agent_with_visual_provider,
 };
 use remoteops_domain::{AgentInstanceId, Capability, CapabilitySet, RequestId};
 use remoteops_i18n::{Language, Translator};
@@ -452,6 +453,10 @@ struct RemoteOpsAgentApp {
     controller_bindings: Vec<AgentControllerBinding>,
     /// 最近的远程操作日志，按时间顺序保留有限条目。
     operation_logs: VecDeque<AgentOperationLog>,
+    // 按请求标识跟踪执行状态，独立于日志级别和历史记录。
+    running_operations: BTreeSet<RequestId>,
+    // 最近一次明确完成或失败的操作及接收时间。
+    last_operation_result: Option<(AgentOperationState, DateTime<Utc>)>,
     /// 是否打开右侧日志覆盖抽屉。
     log_drawer_open: bool,
     /// 日志抽屉当前筛选级别。
@@ -577,6 +582,8 @@ impl RemoteOpsAgentApp {
             active_connections: 0,
             controller_bindings: Vec::new(),
             operation_logs: VecDeque::new(),
+            running_operations: BTreeSet::new(),
+            last_operation_result: None,
             log_drawer_open: false,
             log_filter: LogFilter::All,
             log_unread: 0,
@@ -730,6 +737,8 @@ impl RemoteOpsAgentApp {
                 self.active_connections = active_connections;
                 if active_connections == 0 {
                     self.controller_bindings.clear();
+                    self.running_operations.clear();
+                    self.last_operation_result = None;
                 }
                 if matches!(self.status, UiStatus::Waiting | UiStatus::Controlled) {
                     self.status = if active_connections > 0 {
@@ -751,6 +760,19 @@ impl RemoteOpsAgentApp {
                 if self.control_ui.last_request == Some(result.request_id) {
                     self.control_ui.pending = None;
                     self.control_ui.error = result.error;
+                }
+            }
+            AgentEvent::OperationStateChanged { request_id, state } => {
+                if matches!(self.status, UiStatus::Controlled) {
+                    match state {
+                        AgentOperationState::Running => {
+                            self.running_operations.insert(request_id);
+                        }
+                        AgentOperationState::Succeeded | AgentOperationState::Failed => {
+                            self.running_operations.remove(&request_id);
+                            self.last_operation_result = Some((state, Utc::now()));
+                        }
+                    }
                 }
             }
             AgentEvent::OperationLog(log) => {
@@ -784,6 +806,8 @@ impl RemoteOpsAgentApp {
     fn clear_controller_state(&mut self) {
         self.active_connections = 0;
         self.controller_bindings.clear();
+        self.running_operations.clear();
+        self.last_operation_result = None;
         self.control_ui.pending = None;
         self.control_ui.last_request = None;
         self.control_ui.error = None;
@@ -1240,7 +1264,115 @@ impl RemoteOpsAgentApp {
         self.translator.text(key)
     }
 
-    /// 渲染紧凑的能力可用性摘要。
+    /// 返回当前操作状态摘要；连接不可用时优先显示生命周期状态。
+    fn operation_status_label(&self) -> String {
+        let key = match self.status {
+            UiStatus::Starting => "status.starting",
+            UiStatus::Connecting => "status.connecting",
+            UiStatus::Waiting => "agent.engineer.waiting",
+            UiStatus::Reconnecting(_) => "status.reconnecting",
+            UiStatus::Stopped => "status.stopped",
+            UiStatus::Failed(_) => "status.failed",
+            UiStatus::Controlled if !self.running_operations.is_empty() => {
+                return self.translator.text_with(
+                    "agent.operation.running",
+                    &[("count", &self.running_operations.len().to_string())],
+                );
+            }
+            UiStatus::Controlled
+                if matches!(
+                    self.last_operation_result,
+                    Some((AgentOperationState::Failed, _))
+                ) =>
+            {
+                "agent.operation.failed"
+            }
+            UiStatus::Controlled => "agent.operation.idle",
+        };
+        self.translator.text(key)
+    }
+
+    /// 返回最近结果的简短文案，完整输出保留在实时日志页。
+    fn operation_result_label(&self) -> String {
+        self.last_operation_result.map_or_else(
+            || self.translator.text("agent.operation.log_hint"),
+            |(state, time)| {
+                let key = if state == AgentOperationState::Failed {
+                    "agent.operation.result_failed"
+                } else {
+                    "agent.operation.result_succeeded"
+                };
+                format!(
+                    "{} · {}",
+                    time.with_timezone(&Local).format("%H:%M:%S"),
+                    self.translator.text(key),
+                )
+            },
+        )
+    }
+
+    /// 渲染固定两行状态区，点击后进入完整日志页。
+    fn render_operation_status(&mut self, ui: &mut egui::Ui) {
+        let scale = ui.available_width() / 544.0;
+        let colors = Palette::current(ui.ctx());
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), 48.0 * scale),
+            egui::Sense::click(),
+        );
+        let failed = matches!(self.status, UiStatus::Failed(_))
+            || (matches!(self.status, UiStatus::Controlled)
+                && self.running_operations.is_empty()
+                && matches!(
+                    self.last_operation_result,
+                    Some((AgentOperationState::Failed, _))
+                ));
+        let color = if failed { colors.danger } else { colors.accent };
+        ui.painter().circle_filled(
+            rect.left_top() + Vec2::new(5.0 * scale, 10.0 * scale),
+            3.0 * scale,
+            color,
+        );
+        let mut content = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_max(
+                    rect.left_top() + Vec2::new(18.0 * scale, 0.0),
+                    rect.right_bottom(),
+                ))
+                .layout(Layout::top_down(Align::Min)),
+        );
+        content.spacing_mut().item_spacing.y = 4.0 * scale;
+        let status_response = content.add(
+            egui::Label::new(
+                RichText::new(self.operation_status_label())
+                    .size(15.0 * scale)
+                    .color(colors.text),
+            )
+            .truncate()
+            .halign(Align::Min)
+            .sense(egui::Sense::click()),
+        );
+        let result_response = content.add(
+            egui::Label::new(
+                RichText::new(self.operation_result_label())
+                    .size(13.0 * scale)
+                    .color(colors.secondary),
+            )
+            .truncate()
+            .halign(Align::Min)
+            .sense(egui::Sense::click()),
+        );
+        if response
+            .union(status_response)
+            .union(result_response)
+            .on_hover_text(self.translator.text("agent.operation.log_hint"))
+            .clicked()
+        {
+            self.log_drawer_open = true;
+            self.log_unread = 0;
+        }
+    }
+
+    /// 在连接详情中展示能力可用性。
     fn render_capabilities(&mut self, ui: &mut egui::Ui) {
         let scale = ui.available_width() / 544.0;
         let colors = Palette::current(ui.ctx());
@@ -1543,6 +1675,10 @@ impl RemoteOpsAgentApp {
                 ui.add_space(4.0);
                 ui.label(RichText::new(error).size(11.0).color(colors.danger));
             }
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            self.render_capabilities(ui);
         });
     }
 
@@ -1757,9 +1893,9 @@ impl RemoteOpsAgentApp {
                 self.render_status_card(ui);
                 ui.add_space((ui.available_height() - 151.0 * scale).max(25.0 * scale));
                 ui.separator();
-                ui.add_space(21.0 * scale);
-                self.render_capabilities(ui);
-                ui.add_space(21.0 * scale);
+                ui.add_space(12.0 * scale);
+                self.render_operation_status(ui);
+                ui.add_space(12.0 * scale);
                 ui.separator();
                 ui.add_space((ui.available_height() - 44.0 * scale).max(16.0 * scale));
                 self.render_action_bar(ui);
@@ -2503,31 +2639,51 @@ fn spawn_demo(
             let _ = event_sender.send(AgentEvent::ControllerBindingsChanged {
                 bindings: vec![demo_controller_binding()],
             });
-            let mut request_id = RequestId::new();
-            for index in 0..30 {
+            // 保留空闲时间，并循环演示执行、成功与失败，便于观察固定布局。
+            std::thread::sleep(Duration::from_secs(6));
+            for index in 0_u32.. {
                 if *shutdown_receiver.borrow() {
                     break;
                 }
-                let level = match index % 3 {
-                    0 => AgentLogLevel::Running,
-                    2 => AgentLogLevel::Success,
-                    _ => AgentLogLevel::Info,
-                };
-                if index % 3 == 0 {
-                    request_id = RequestId::new();
-                }
-                let message = match index % 3 {
-                    0 => "发送模拟命令：echo RemoteOps ready".to_owned(),
-                    1 => "模拟输出：RemoteOps ready".to_owned(),
-                    _ => format!("模拟命令执行完成（检查 #{:02}）", index + 1),
-                };
+                let request_id = RequestId::new();
+                let _ = event_sender.send(AgentEvent::OperationStateChanged {
+                    request_id,
+                    state: AgentOperationState::Running,
+                });
                 let _ = event_sender.send(AgentEvent::OperationLog(AgentOperationLog {
                     request_id: Some(request_id),
                     occurred_at: Utc::now(),
-                    level,
-                    message,
+                    level: AgentLogLevel::Running,
+                    message: "模拟操作开始：检查设备环境".to_owned(),
                 }));
-                std::thread::sleep(Duration::from_secs(2));
+                std::thread::sleep(Duration::from_secs(4));
+                if *shutdown_receiver.borrow() {
+                    break;
+                }
+                let failed = index % 3 == 2;
+                let _ = event_sender.send(AgentEvent::OperationLog(AgentOperationLog {
+                    request_id: Some(request_id),
+                    occurred_at: Utc::now(),
+                    level: if failed {
+                        AgentLogLevel::Error
+                    } else {
+                        AgentLogLevel::Success
+                    },
+                    message: if failed {
+                        "模拟操作失败：设备未响应（仅演示）".to_owned()
+                    } else {
+                        "模拟操作完成：设备环境检查通过".to_owned()
+                    },
+                }));
+                let _ = event_sender.send(AgentEvent::OperationStateChanged {
+                    request_id,
+                    state: if failed {
+                        AgentOperationState::Failed
+                    } else {
+                        AgentOperationState::Succeeded
+                    },
+                });
+                std::thread::sleep(Duration::from_secs(6));
             }
         })
         .expect("应能启动 Agent 演示线程")
@@ -3271,6 +3427,8 @@ mod tests {
             active_connections: 1,
             controller_bindings: Vec::new(),
             operation_logs: VecDeque::new(),
+            running_operations: BTreeSet::new(),
+            last_operation_result: None,
             log_drawer_open: false,
             log_filter: LogFilter::All,
             log_unread: 0,
@@ -3287,6 +3445,225 @@ mod tests {
             copied_until: None,
             layout_is_setup: None,
             window_centering: WindowCenteringState::default(),
+        }
+    }
+
+    #[test]
+    fn operation_status_tracks_concurrency_without_treating_stderr_as_completion() {
+        let mut app = test_app();
+        app.status = UiStatus::Controlled;
+        let first = RequestId::new();
+        let second = RequestId::new();
+        for request_id in [first, first, second] {
+            app.apply_event(AgentEvent::OperationStateChanged {
+                request_id,
+                state: AgentOperationState::Running,
+            });
+        }
+        assert_eq!(app.running_operations.len(), 2);
+        app.apply_event(AgentEvent::OperationLog(AgentOperationLog {
+            request_id: Some(first),
+            occurred_at: Utc::now(),
+            level: AgentLogLevel::Error,
+            message: "stderr 输出，操作尚未结束".into(),
+        }));
+        assert_eq!(app.running_operations.len(), 2);
+        assert!(app.last_operation_result.is_none());
+        app.apply_event(AgentEvent::OperationStateChanged {
+            request_id: first,
+            state: AgentOperationState::Failed,
+        });
+        assert_eq!(app.operation_status_label(), "正在执行操作（1 项）");
+        app.operation_logs.clear();
+        assert_eq!(app.running_operations.len(), 1);
+        app.apply_event(AgentEvent::OperationStateChanged {
+            request_id: second,
+            state: AgentOperationState::Succeeded,
+        });
+        assert_eq!(app.operation_status_label(), "系统就绪，等待操作");
+        assert!(app.operation_result_label().ends_with("最近操作执行成功"));
+    }
+
+    #[test]
+    fn disconnect_clears_operation_state_and_ignores_late_completions() {
+        for disconnected in [
+            AgentEvent::ControllerCountChanged {
+                active_connections: 0,
+            },
+            AgentEvent::Reconnecting {
+                message: "断线".into(),
+                retry_seconds: 1,
+            },
+            AgentEvent::Stopped,
+            AgentEvent::Failed {
+                message: "无法连接".into(),
+            },
+        ] {
+            let mut app = test_app();
+            app.status = UiStatus::Controlled;
+            let request_id = RequestId::new();
+            app.apply_event(AgentEvent::OperationStateChanged {
+                request_id,
+                state: AgentOperationState::Running,
+            });
+            app.apply_event(AgentEvent::ControllerCountChanged {
+                active_connections: 1,
+            });
+            assert_eq!(app.running_operations.len(), 1);
+            app.apply_event(disconnected);
+            app.apply_event(AgentEvent::OperationStateChanged {
+                request_id,
+                state: AgentOperationState::Failed,
+            });
+            assert!(app.running_operations.is_empty());
+            assert!(app.last_operation_result.is_none());
+        }
+    }
+
+    #[test]
+    fn operation_status_layout_fits_window_for_all_states_and_languages() {
+        for language in [Language::ZhCn, Language::EnUs] {
+            for appearance in [Appearance::Light, Appearance::Dark] {
+                for pixels_per_point in [1.0, 1.25, 1.5] {
+                    for state in [
+                        None,
+                        Some(AgentOperationState::Running),
+                        Some(AgentOperationState::Succeeded),
+                        Some(AgentOperationState::Failed),
+                    ] {
+                        let ctx = egui::Context::default();
+                        configure_fonts(&ctx);
+                        install_style(&ctx);
+                        appearance.apply(&ctx);
+                        let mut app = test_app();
+                        app.translator = Translator::new(language);
+                        app.status = UiStatus::Controlled;
+                        app.pairing_code = Some("482-915-307".into());
+                        app.controller_bindings = vec![demo_controller_binding()];
+                        if let Some(state) = state {
+                            app.apply_event(AgentEvent::OperationStateChanged {
+                                request_id: RequestId::new(),
+                                state,
+                            });
+                        }
+                        let expected = app.operation_status_label();
+                        let viewport =
+                            egui::Rect::from_min_size(egui::Pos2::ZERO, RUNNING_WINDOW_SIZE);
+                        let mut input = egui::RawInput {
+                            screen_rect: Some(viewport),
+                            ..Default::default()
+                        };
+                        input
+                            .viewports
+                            .get_mut(&egui::ViewportId::ROOT)
+                            .unwrap()
+                            .native_pixels_per_point = Some(pixels_per_point);
+                        let output = ctx.run_ui(
+                            input,
+                            |ui| {
+                                let content = app.render_main(ui);
+                                assert!(viewport.contains_rect(content), "{language:?} {appearance:?} {pixels_per_point} {state:?}: {content:?}");
+                            },
+                        );
+                        let status_text = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::Shape::Text(text) if text.galley.job.text == expected => {
+                                    Some(text)
+                                }
+                                _ => None,
+                            })
+                            .expect("应实际绘制操作状态");
+                        assert!(viewport.contains_rect(egui::Rect::from_min_size(
+                            status_text.pos,
+                            status_text.galley.size()
+                        )));
+                        assert!(status_text.pos.x < 50.0, "操作状态应靠左对齐");
+                        assert!(
+                            !status_text.galley.elided,
+                            "默认状态文案不应截断：{expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_operation_status_text_opens_logs_and_clears_unread() {
+        let ctx = egui::Context::default();
+        configure_fonts(&ctx);
+        install_style(&ctx);
+        let mut app = test_app();
+        app.status = UiStatus::Controlled;
+        app.log_unread = 3;
+        let position = egui::pos2(45.0, 12.0);
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    RUNNING_WINDOW_SIZE,
+                )),
+                ..Default::default()
+            },
+            |ui| app.render_operation_status(ui),
+        );
+        for pressed in [true, false] {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        RUNNING_WINDOW_SIZE,
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| app.render_operation_status(ui),
+            );
+        }
+        assert!(app.log_drawer_open);
+        assert_eq!(app.log_unread, 0);
+    }
+
+    #[test]
+    fn connection_details_with_capabilities_fit_both_languages() {
+        for language in [Language::ZhCn, Language::EnUs] {
+            let ctx = egui::Context::default();
+            configure_fonts(&ctx);
+            install_style(&ctx);
+            let mut app = test_app();
+            app.translator = Translator::new(language);
+            app.show_advanced_settings = true;
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, RUNNING_WINDOW_SIZE);
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.render_main(ui);
+                    app.render_advanced_settings(&ctx);
+                },
+            );
+            for shape in &output.shapes {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    assert!(
+                        viewport
+                            .contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size())),
+                        "{language:?}: {}",
+                        text.galley.job.text
+                    );
+                }
+            }
         }
     }
 

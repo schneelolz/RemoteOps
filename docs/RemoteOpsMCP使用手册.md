@@ -190,9 +190,22 @@ Get-NetIPAddress -AddressFamily IPv4
 
 ### 大文件传输
 
-`upload_file` 和 `download_file` 只允许访问双方各自 `transfer-root` 内的受控路径。MCP 与 CLI 默认按 1 MiB 分块传输，单文件硬上限为 16 GiB。文件大于 1 GiB 时，MCP 会在读取本地文件、计算完整哈希或开始远程下载之前单独请求确认；CLI 上传使用 `--approve`，下载使用 `--approve-large`。
+MCP 的 `upload_file` 和 `download_file` 只允许访问双方各自 `transfer-root` 内的相对路径：
 
-上传开始时会声明目标路径、大小、完整 SHA-256 和覆盖标志，每个分块再校验 SHA-256，并按连续偏移写入同目录临时文件。只有大小和完整哈希均匹配才原子提交；断线、取消、解绑或紧急停止会清理未完成临时上传。下载也先写同目录临时文件并验证完整哈希，覆盖失败时恢复或保留原文件，不会先删除目标文件。嵌套目标目录会在受控根目录内按需创建，绝对路径、`..`、符号链接逃逸和目录覆盖都会被拒绝。
+- `local_path` 相对于 MCP 进程所在机器、运行账号下实际使用的交换目录。Windows 默认是 `%LOCALAPPDATA%\RemoteOps\transfers`，可通过 MCP 启动参数 `--transfer-root` 覆盖。上传源文件必须真实放入该目录，MCP 不会自动从其他目录复制或搬运文件。
+- `remote_path` 相对于 Agent 自己的交换目录，双方根目录可以不同。连接输出中的 `transfer_root` 是 MCP 本地目录，不能据此推断远端目录；远端实际目录可在 Agent GUI 的“连接详情”中查看。
+
+例如调用 `upload_file`（将占位符替换为配对返回的 `session_id`）：
+
+```json
+{"session_id":"<session_id>","local_path":"package.zip","remote_path":"incoming/package.zip","overwrite":false}
+```
+
+假设 MCP 本地根目录为 `%LOCALAPPDATA%\RemoteOps\transfers`，Agent 根目录为 `D:\Support\transfers`，则本地源文件是 `%LOCALAPPDATA%\RemoteOps\transfers\package.zip`，远端目标是 `D:\Support\transfers\incoming\package.zip`。
+
+CLI 的 `upload` / `download` 使用普通本地文件路径，`local_path` 不受 MCP 本地 `transfer-root` 限制；远端路径仍受 Agent 的交换目录限制。MCP 与 CLI 默认按 1 MiB 分块传输，单文件硬上限为 16 GiB。文件大于 1 GiB 时，MCP 会在读取本地文件、计算完整哈希或开始远程下载之前单独请求确认；CLI 上传使用 `--approve`，下载使用 `--approve-large`。
+
+上传开始时会声明目标路径、大小、完整 SHA-256 和覆盖标志，每个分块再校验 SHA-256，并按连续偏移写入同目录临时文件。只有大小和完整哈希均匹配才原子提交；断线、取消、解绑或紧急停止会清理未完成临时上传。下载也先写同目录临时文件并验证完整哈希，覆盖失败时恢复或保留原文件，不会先删除目标文件。嵌套目标目录会在受控根目录内按需创建；MCP 本地路径和 Agent 远端路径均拒绝绝对路径、`..`、符号链接逃逸和目录覆盖。
 
 ### SSH 密码安全输入
 
