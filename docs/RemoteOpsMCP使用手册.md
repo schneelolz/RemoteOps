@@ -176,6 +176,16 @@ Get-NetIPAddress -AddressFamily IPv4
 - `request_action_approval` 仅用于显式 `--command-mode approval` 或独立 Human Controller 兼容流程，普通首版 MCP 不依赖它；
 - MCP 不能通过自然语言提升 Agent 本地 FullAccess，也不能绕过 Relay/Agent 的结构化校验。
 
+`run_readonly_command` 仅支持白名单中的单条查询，最长 4096 字节；命令文本不得包含换行、分号、管道、重定向、命令连接符或反引号。PowerShell 参数只接受字面量，不支持变量展开、子表达式、脚本块或会写入变量的参数。即使会话已获完全控制，本工具仍执行相同的只读校验。
+
+例如查看 `%LOCALAPPDATA%` 下的应用目录，应先单独调用 `$env:LOCALAPPDATA`，再将返回的实际路径作为字面量用于下一次调用：
+
+```powershell
+Get-ChildItem -LiteralPath 'C:\Users\example\AppData\Local\A HUB' -Recurse -Depth 2 -ErrorAction SilentlyContinue
+```
+
+上述路径仅为示例，必须使用目标主机查询返回的路径。多个目录分别调用；名称过滤、字段选择和输出格式化在控制端完成，不拼接 `Where-Object`、`Select-Object`、`Format-Table` 或 `Out-String` 管道。只读查询被拒绝时按限制改写或拆分，不要仅因此自动改走审批命令或切换完全控制。
+
 ### MCP 本地输入界面测试
 
 需要验证当前 MCP 客户端是否支持输入表单时，可临时使用 `--enable-test-ui` 或设置 `REMOTEOPS_ENABLE_TEST_UI=true` 启动 MCP。该开关只注册 `test_prompt_text` 和 `test_prompt_password` 两个本地测试工具，不访问 Relay、不操作 Agent；默认关闭。密码测试结果只返回提交状态、长度和 SHA-256，不返回密码明文，也不会写入日志。

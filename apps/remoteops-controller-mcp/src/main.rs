@@ -518,7 +518,11 @@ struct RunReadonlyCommandInput {
     session_id: String,
     /// 用于本次命令的一次性 Shell。
     shell: Option<McpShell>,
-    /// 只读诊断命令。策略检测到修改行为时会拒绝。
+    /// 白名单中的单条只读查询，最长 4096 字节。不得包含换行、分号、管道、
+    /// 重定向或命令连接符。PowerShell 参数只接受字面量，不支持变量展开、
+    /// 子表达式或脚本块；环境变量可单独查询，例如 `$env:LOCALAPPDATA`。
+    /// 先读取环境变量，再将返回的实际路径作为字面量用于下一次查询；
+    /// 多个目录分别调用，筛选和格式化在控制端完成。
     command: String,
 }
 
@@ -2052,7 +2056,7 @@ impl RemoteOpsMcp {
     /// 执行只读诊断命令。
     #[tool(
         name = "run_readonly_command",
-        description = "在精确 session_id 上执行只读命令。检测到删除、写文件、服务修改、重启或执行策略修改时拒绝。",
+        description = "在精确 session_id 上通过一次性 Shell 执行白名单中的单条只读查询，最长 4096 字节；并非任意只读脚本都可执行。命令文本不得包含换行、分号、管道、重定向、命令连接符或反引号；PowerShell 参数只接受字面量，不支持变量展开、子表达式、脚本块或会写入变量的参数。可单独查询 $env:LOCALAPPDATA，再将返回的实际路径作为字面量传给 Get-ChildItem -LiteralPath '实际路径' -Recurse -Depth 2；多个目录分别调用，筛选和格式化在控制端完成，不使用 Where-Object、Select-Object、Format-Table 或 Out-String 管道。被拒绝时按限制改写或拆分查询，不要仅因此自动改走审批命令或切换完全控制；完全控制也不会放宽本工具的白名单。",
         annotations(
             title = "执行只读命令",
             read_only_hint = true,
@@ -3694,7 +3698,7 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
     router = self.runtime_tool_router(),
     name = "remoteops-controller",
     version = "0.2.0-preview.5",
-    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。全新配置默认逐项确认；协议16及以上Agent支持现场临时授权和默认完全控制。配对后先查询有效模式，已生效的现场授权无需再次调用set_control_mode或逐项审批；旧组件无此能力时不得引导点击不存在的按钮。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command；持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制由 Relay 确认并按当前连接绑定生效；MCP 授权空闲一小时失效，现场授权有效至连接结束，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。文件传输的 local_path 必须是 MCP 进程所在机器和账号的本地 transfer-root 内的相对路径，上传源文件须已放入该目录；remote_path 必须是 Agent 自己 transfer-root 内的相对路径，双方根目录可以不同。连接结果中的 transfer_root 始终是 MCP 本地目录，不是 Agent 远端目录；远端实际目录可在 Agent GUI 的连接详情中查看。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
+    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。全新配置默认逐项确认；协议16及以上Agent支持现场临时授权和默认完全控制。配对后先查询有效模式，已生效的现场授权无需再次调用set_control_mode或逐项审批；旧组件无此能力时不得引导点击不存在的按钮。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command。run_readonly_command 只接受白名单中的单条查询，最长4096字节；命令文本不得包含换行、分号、管道、重定向、命令连接符或反引号。PowerShell参数只接受字面量，不支持变量展开、子表达式、脚本块或会写入变量的参数；环境变量先单独查询（如 $env:LOCALAPPDATA），再将返回的实际路径作为字面量传给下一条查询。多个目录分别调用，筛选和格式化在控制端完成。被拒绝时按限制改写或拆分，不要仅因此自动改走审批命令或切换完全控制；完全控制也不会放宽只读白名单。持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制由 Relay 确认并按当前连接绑定生效；MCP 授权空闲一小时失效，现场授权有效至连接结束，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。文件传输的 local_path 必须是 MCP 进程所在机器和账号的本地 transfer-root 内的相对路径，上传源文件须已放入该目录；remote_path 必须是 Agent 自己 transfer-root 内的相对路径，双方根目录可以不同。连接结果中的 transfer_root 始终是 MCP 本地目录，不是 Agent 远端目录；远端实际目录可在 Agent GUI 的连接详情中查看。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
 )]
 impl ServerHandler for RemoteOpsMcp {}
 
