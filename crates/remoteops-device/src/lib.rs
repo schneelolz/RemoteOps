@@ -4100,7 +4100,7 @@ mod unix_inventory_tests {
         let result = device.list_processes().await.unwrap();
         let data: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         let items = data["items"].as_array().unwrap();
-        assert!(!items.is_empty());
+        assert_ne!(items.as_slice(), &[] as &[serde_json::Value]);
         assert!(items.iter().all(|item| item["Id"].as_u64().is_some()));
         assert_eq!(data["returned"], items.len());
         assert!(device.run(ShellKind::Cmd, "echo wrong", 5).await.is_err());

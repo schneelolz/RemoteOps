@@ -643,7 +643,10 @@ mod tests {
                 summary: String::new(),
             },
         );
-        assert!(states(&receiver).is_empty());
+        assert_eq!(
+            states(&receiver),
+            [] as [(remoteops_domain::RequestId, AgentOperationState); 0]
+        );
     }
 
     #[test]
@@ -716,15 +719,13 @@ mod tests {
             buffer.push("-----BEGIN PRIVATE KEY-----\nmaterial\n", &redactor),
             ["[REDACTED PRIVATE KEY]"]
         );
-        assert!(
-            buffer
-                .push("more material\n-----END PRIVATE KEY-----\n", &redactor)
-                .is_empty()
+        assert_eq!(
+            buffer.push("more material\n-----END PRIVATE KEY-----\n", &redactor),
+            [] as [std::string::String; 0]
         );
-        assert!(
-            buffer
-                .push(&"界".repeat(MAX_LINE_BYTES), &redactor)
-                .is_empty()
+        assert_eq!(
+            buffer.push(&"界".repeat(MAX_LINE_BYTES), &redactor),
+            [] as [std::string::String; 0]
         );
         assert!(buffer.pending.len() <= MAX_LINE_BYTES);
         assert_eq!(buffer.push("\n", &redactor), ["[单行输出过长，内容已隐藏]"]);
@@ -739,8 +740,14 @@ mod tests {
             "{}-----BEGIN PRIVATE KEY-----\n",
             "x".repeat(MAX_LINE_BYTES)
         );
-        assert!(buffer.push(&oversized_marker, &redactor).is_empty());
-        assert!(buffer.push("secret material\n", &redactor).is_empty());
+        assert_eq!(
+            buffer.push(&oversized_marker, &redactor),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            buffer.push("secret material\n", &redactor),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(
             buffer.push("-----END PRIVATE KEY-----\nvisible\n", &redactor),
             ["visible"]
@@ -752,10 +759,19 @@ mod tests {
     fn split_oversized_private_key_marker_keeps_boundary_state() {
         let redactor = Redactor::default();
         let mut buffer = OutputBuffer::default();
-        assert!(buffer.push("-----BEGIN PRIVATE ", &redactor).is_empty());
+        assert_eq!(
+            buffer.push("-----BEGIN PRIVATE ", &redactor),
+            [] as [std::string::String; 0]
+        );
         let oversized_tail = format!("KEY-----{}\n", "x".repeat(MAX_LINE_BYTES));
-        assert!(buffer.push(&oversized_tail, &redactor).is_empty());
-        assert!(buffer.push("secret material\n", &redactor).is_empty());
+        assert_eq!(
+            buffer.push(&oversized_tail, &redactor),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            buffer.push("secret material\n", &redactor),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(
             buffer.push("-----END PRIVATE KEY-----\nnext\n", &redactor),
             ["next"]
@@ -766,19 +782,20 @@ mod tests {
     fn oversized_tail_tracks_begin_marker_across_later_small_chunks() {
         let redactor = Redactor::default();
         let mut buffer = OutputBuffer::default();
-        assert!(
-            buffer
-                .push(&"x".repeat(MAX_LINE_BYTES + 1), &redactor)
-                .is_empty()
+        assert_eq!(
+            buffer.push(&"x".repeat(MAX_LINE_BYTES + 1), &redactor),
+            [] as [std::string::String; 0]
         );
-        assert!(buffer.push("-----BEGIN ", &redactor).is_empty());
-        assert!(
-            buffer
-                .push(
-                    "PRIVATE KEY-----\nsecret material\n-----END PRIVATE KEY-----\n",
-                    &redactor,
-                )
-                .is_empty()
+        assert_eq!(
+            buffer.push("-----BEGIN ", &redactor),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            buffer.push(
+                "PRIVATE KEY-----\nsecret material\n-----END PRIVATE KEY-----\n",
+                &redactor,
+            ),
+            [] as [std::string::String; 0]
         );
         assert_eq!(buffer.push("next\n", &redactor), ["next"]);
     }
@@ -787,19 +804,20 @@ mod tests {
     fn pending_tail_is_replaced_by_oversized_tail_for_split_marker() {
         let redactor = Redactor::default();
         let mut buffer = OutputBuffer::default();
-        assert!(
-            buffer
-                .push(&"x".repeat(MAX_LINE_BYTES), &redactor)
-                .is_empty()
+        assert_eq!(
+            buffer.push(&"x".repeat(MAX_LINE_BYTES), &redactor),
+            [] as [std::string::String; 0]
         );
-        assert!(buffer.push("-----BEGIN ", &redactor).is_empty());
-        assert!(
-            buffer
-                .push(
-                    "PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
-                    &redactor,
-                )
-                .is_empty()
+        assert_eq!(
+            buffer.push("-----BEGIN ", &redactor),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            buffer.push(
+                "PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+                &redactor,
+            ),
+            [] as [std::string::String; 0]
         );
         assert_eq!(buffer.push("visible\n", &redactor), ["visible"]);
     }
