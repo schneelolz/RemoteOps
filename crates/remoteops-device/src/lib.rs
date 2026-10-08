@@ -3386,7 +3386,8 @@ mod tests {
                 .await
         });
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // CI 上首次启动 PowerShell 可能较慢；等待测试就绪与取消后的退出时限分开。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let process_id = loop {
             if let Ok(text) = std::fs::read_to_string(&process_id_path)
                 && let Ok(process_id) = text.trim().parse::<u32>()
@@ -3450,7 +3451,8 @@ mod tests {
                 .await
         });
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // 与取消测试使用相同的启动等待上限，不放宽后续进程树回收断言。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let process_id = loop {
             if let Ok(text) = std::fs::read_to_string(&process_id_path)
                 && let Ok(process_id) = text.trim().parse::<u32>()
