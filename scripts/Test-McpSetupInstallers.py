@@ -55,7 +55,9 @@ fn main() {
     io::stdin().read_to_string(&mut input).unwrap();
     let expected = fs::read_to_string(env::var("INSTALLER_TEST_EXPECTED").unwrap()).unwrap();
     if input.trim() != expected.trim() || input.trim() == "invalid" {
-        eprintln!("invalid setup input (redacted)"); std::process::exit(2);
+        eprintln!("invalid setup input (redacted; utf8_bom={}, expected_bytes={}, actual_bytes={})",
+            input.starts_with('\u{feff}'), expected.trim().len(), input.trim().len());
+        std::process::exit(2);
     }
     if args.iter().any(|a| a == "--setup-preview") {
         println!("{{\"relay\":\"relay.example.com:7443\",\"server_name\":\"relay.example.com\",\"enrollment_url\":\"https://relay.example.com/controller-enrollment\",\"expires_at\":2000000000,\"uses_private_ca\":false}}");
@@ -75,6 +77,27 @@ fn main() {
     println!("{{\"enrolled\":true,\"relay_verified\":true}}");
 }
 '''
+
+
+# macOS plutil -lint is a property-list validator, not a JSON validator. This
+# stub intentionally refuses it even for valid JSON, matching the native CI
+# failure. Extraction parses all JSON, including null-valued sibling fields.
+PLUTIL_SOURCE = """#!/usr/bin/env python3
+import json
+import sys
+
+if len(sys.argv) < 2 or sys.argv[1] != "-extract":
+    sys.exit(1)
+try:
+    with open(sys.argv[-1], encoding="utf-8") as source:
+        data = json.load(source)
+    value = data[sys.argv[2]]
+    if value is None or isinstance(value, (dict, list)):
+        sys.exit(1)
+    print(str(value).lower() if isinstance(value, bool) else value)
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+"""
 
 
 class InstallerTests(unittest.TestCase):
@@ -124,6 +147,11 @@ class InstallerTests(unittest.TestCase):
                          '# trailing comment belongs to the other server\n')
         self.config.write_bytes(self.original.encode())
         self.env = os.environ.copy()
+        # Do not inject PowerShell 7 module paths into Windows PowerShell 5.1.
+        # Each selected shell must construct its own built-in module search path.
+        for key in list(self.env):
+            if key.lower() == "psmodulepath":
+                self.env.pop(key)
         self.env.update(HOME=str(self.home), USERPROFILE=str(self.home), CODEX_HOME=str(self.codex),
                         INSTALLER_TEST_CALLS=str(self.calls), INSTALLER_TEST_EXPECTED=str(self.expected),
                         INSTALLER_TEST_CODEX_HELPER=str(self.real_helper))
@@ -143,11 +171,11 @@ class InstallerTests(unittest.TestCase):
                 uname.write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo arm64;; *) exit 1;; esac\n')
                 uname.chmod(0o755)
                 plutil = commands / "plutil"
-                plutil.write_text('#!/usr/bin/env python3\nimport json,sys\ntry:\n data=json.load(open(sys.argv[-1])); print(str(data[sys.argv[2]]).lower() if isinstance(data.get(sys.argv[2] if len(sys.argv) > 2 else ""), bool) else data[sys.argv[2]] if sys.argv[1] == "-extract" else "OK")\nexcept (OSError,ValueError,KeyError): sys.exit(1)\n')
+                plutil.write_text(PLUTIL_SOURCE)
                 plutil.chmod(0o755)
             self.env["PATH"] = str(commands) + os.pathsep + self.env["PATH"]
 
-    def run_installer(self, *, stdin=False, code=False, confirm=True, input_content=None, extra=()):
+    def run_installer(self, *, stdin=False, code=False, confirm=True, input_content=None, extra=(), console_encoding=None):
         if self.target == "windows":
             command = [self.powershell, "-NoProfile", "-NonInteractive" if confirm else "-NoLogo",
                        "-ExecutionPolicy", "Bypass", "-File", str(self.package / "Install-RemoteOpsMcp.ps1")]
@@ -158,10 +186,24 @@ class InstallerTests(unittest.TestCase):
                 # Secure Read-Host needs a real terminal on Windows. This scope
                 # mock asserts -AsSecureString, without putting grant in argv.
                 self.env["INSTALLER_TEST_SCRIPT"] = str(self.package / "Install-RemoteOpsMcp.ps1")
-                wrapper = ("function Read-Host { param($Prompt, [switch]$AsSecureString); "
+                wrapper = ("$ErrorActionPreference = 'Stop'; function Read-Host { param($Prompt, [switch]$AsSecureString); "
                            "if (-not $AsSecureString) { throw 'Expected secure setup prompt' }; "
-                           "ConvertTo-SecureString ([IO.File]::ReadAllText($env:INSTALLER_TEST_EXPECTED)) -AsPlainText -Force }; "
+                           "$secure = [Security.SecureString]::new(); "
+                           "foreach ($character in ([IO.File]::ReadAllText($env:INSTALLER_TEST_EXPECTED)).ToCharArray()) { $secure.AppendChar($character) }; "
+                           "$secure.MakeReadOnly(); return $secure }; "
                            "& $env:INSTALLER_TEST_SCRIPT -SetupCode -ConfirmEnrollment")
+                command = [self.powershell, "-NoProfile", "-NonInteractive", "-Command", wrapper]
+            if console_encoding is not None:
+                self.env["INSTALLER_TEST_SCRIPT"] = str(self.package / "Install-RemoteOpsMcp.ps1")
+                self.env["INSTALLER_TEST_SETUP_FILE"] = str(self.setup_file)
+                encoding = "[Text.UTF8Encoding]::new($true)" if console_encoding == "utf8-bom" else "[Text.Encoding]::GetEncoding(437)"
+                source_args = "-SetupStdin" if stdin else "-SetupFile $env:INSTALLER_TEST_SETUP_FILE"
+                wrapper = ("$ErrorActionPreference = 'Stop'; [Console]::InputEncoding = " + encoding + "; "
+                           "$before = [Console]::InputEncoding; "
+                           "& $env:INSTALLER_TEST_SCRIPT " + source_args + " -ConfirmEnrollment; "
+                           "if ([Console]::InputEncoding.CodePage -ne $before.CodePage -or "
+                           "[Console]::InputEncoding.GetPreamble().Length -ne $before.GetPreamble().Length) { "
+                           "throw 'Installer changed host console encoding' }")
                 command = [self.powershell, "-NoProfile", "-NonInteractive", "-Command", wrapper]
         else:
             command = ["bash", str(self.package / "install-remoteops-mcp.sh")]
@@ -214,6 +256,14 @@ class InstallerTests(unittest.TestCase):
     def test_stdin_install(self):
         self.assert_success(self.run_installer(stdin=True))
 
+    def test_windows_console_encodings_do_not_change_setup_bytes(self):
+        if self.target != "windows":
+            self.skipTest("Windows/.NET Framework stdin encoding regression")
+        for encoding in ["utf8-bom", "oem"]:
+            for stdin in [False, True]:
+                with self.subTest(encoding=encoding, stdin=stdin):
+                    self.assert_success(self.run_installer(stdin=stdin, console_encoding=encoding))
+
     def test_hidden_setup_prompt(self):
         self.assert_success(self.run_installer(code=True, input_content=SETUP + "\n"))
 
@@ -236,6 +286,28 @@ class InstallerTests(unittest.TestCase):
     def test_installed_verifier_uses_native_credential_helper(self):
         self.assert_success(self.run_installer())
         self.assert_verifier_success()
+
+    def test_verifier_accepts_json_nulls_without_modification(self):
+        self.assert_success(self.run_installer())
+        connection_path = self.codex / "remoteops/controller-config.json"
+        connection = json.loads(connection_path.read_text())
+        connection.update(ca_cert=None, tls_fingerprint=None)
+        connection_path.write_text(json.dumps(connection, indent=2))
+        original = connection_path.read_bytes()
+        self.assert_verifier_success()
+        self.assertEqual(connection_path.read_bytes(), original)
+
+    def test_verifier_rejects_malformed_connection_json_without_modification(self):
+        self.assert_success(self.run_installer())
+        connection_path = self.codex / "remoteops/controller-config.json"
+        valid = connection_path.read_bytes()
+        # An otherwise valid owner_id is not enough: the complete JSON must parse.
+        for malformed in [valid + b" trailing-data", valid[:-1], b"{not-json}"]:
+            with self.subTest(malformed=malformed):
+                connection_path.write_bytes(malformed)
+                result = self.run_verifier()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(connection_path.read_bytes(), malformed)
 
     def test_verifier_rejects_command_outside_installation(self):
         self.assert_success(self.run_installer())

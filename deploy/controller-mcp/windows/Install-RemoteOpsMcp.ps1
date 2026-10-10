@@ -113,7 +113,17 @@ function Invoke-SetupHelper {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     try {
-        if (-not $process.Start()) { throw '无法启动一次性设置程序。' }
+        # .NET Framework creates an AutoFlush StreamWriter during Start using
+        # Console.InputEncoding, which can emit a BOM before BaseStream is used.
+        # Capture a BOM-free encoding for this child only, then restore the host.
+        $previousInputEncoding = [Console]::InputEncoding
+        try {
+            [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+            if (-not $process.Start()) { throw '无法启动一次性设置程序。' }
+        }
+        finally {
+            [Console]::InputEncoding = $previousInputEncoding
+        }
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
         # Write UTF-8 bytes directly for Windows PowerShell 5.1 as well as 7;
@@ -260,7 +270,13 @@ if ($setupMode) {
             $setupInput = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $SetupFile).Path)
         }
         elseif ($SetupStdin) {
-            $setupInput = [Console]::In.ReadToEnd()
+            # Read redirected setup as UTF-8 independently of the Windows OEM
+            # console code page. The source is consumed only once.
+            $setupReader = [IO.StreamReader]::new(
+                [Console]::OpenStandardInput(), [Text.UTF8Encoding]::new($false, $true), $true
+            )
+            try { $setupInput = $setupReader.ReadToEnd() }
+            finally { $setupReader.Dispose() }
         }
         else {
             $secureSetup = Read-Host '请粘贴一次性设置码（输入内容不会显示）' -AsSecureString

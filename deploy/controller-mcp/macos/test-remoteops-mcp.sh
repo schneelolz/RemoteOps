@@ -79,9 +79,11 @@ if [[ -f "$CONFIG_PATH" && -x "$BINARY" ]] && "$BINARY" --inspect-codex "$CONFIG
 else
   fail "无法解析 Codex remoteops 配置。"
 fi
-if [[ -f "$CONNECTION_CONFIG" ]] && plutil -lint "$CONNECTION_CONFIG" >/dev/null; then
-  pass "RemoteOps 连接配置是有效 JSON。"
-  owner_id="$(plutil -extract owner_id raw "$CONNECTION_CONFIG" 2>/dev/null || true)"
+# Parse the JSON through a required field rather than plist-only -lint or XML
+# conversion. JSON null (for example ca_cert) is not a property-list value.
+# Extraction still rejects malformed input and does not modify the source file.
+if [[ -f "$CONNECTION_CONFIG" ]] && owner_id="$(plutil -extract owner_id raw "$CONNECTION_CONFIG" 2>/dev/null)"; then
+  pass "RemoteOps 连接配置已解析。"
   if [[ "$owner_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ && "$owner_id" != "00000000-0000-0000-0000-000000000000" ]]; then
     pass "统一 Controller Owner 已配置（不会显示其值）。"
   else
