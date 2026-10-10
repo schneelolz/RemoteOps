@@ -27,6 +27,7 @@ struct NativeFixture {
     credentials: Mutex<Vec<Uuid>>,
     admin_url: String,
     admin_token: String,
+    log_secrets: Vec<String>,
     owner_id: ControllerOwnerId,
     endpoints: AdvertisedEndpoints,
     http: reqwest::Client,
@@ -86,6 +87,7 @@ impl NativeFixture {
             credentials: Mutex::new(Vec::new()),
             admin_url: String::new(),
             admin_token: format!("isolated-test-admin-{}", Uuid::new_v4()),
+            log_secrets: Vec::new(),
             owner_id: ControllerOwnerId::new(),
             endpoints: AdvertisedEndpoints {
                 enrollment_url: String::new(),
@@ -102,6 +104,12 @@ impl NativeFixture {
         };
         fs::create_dir(&fixture.root)?;
         fixture.owns_root = true;
+        // macOS temp paths commonly traverse /var -> /private/var. Keep SQLite's
+        // production NOFOLLOW policy intact by using this owned directory's real path.
+        #[cfg(unix)]
+        {
+            fixture.root = fs::canonicalize(&fixture.root)?;
+        }
         let certificate =
             rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
         let certificate_path = fixture.root.join("relay-cert.pem");
@@ -140,6 +148,21 @@ impl NativeFixture {
             admin_address,
         )));
 
+        let human_token = format!("isolated-test-human-{}", Uuid::new_v4());
+        let ai_token = format!("isolated-test-ai-{}", Uuid::new_v4());
+        fixture.log_secrets = vec![
+            fixture.admin_token.clone(),
+            human_token.clone(),
+            ai_token.clone(),
+        ];
+        let mut stderr_options = OpenOptions::new();
+        stderr_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            stderr_options.mode(0o600);
+        }
+        let stderr_file = stderr_options.open(fixture.root.join("relay-stderr.log"))?;
         let mut command = Command::new(executable);
         // Never inherit an operator's Relay configuration or credentials into this test child.
         for (name, _) in std::env::vars_os() {
@@ -167,17 +190,13 @@ impl NativeFixture {
                 fixture.owner_id.to_string(),
             )
             .env("REMOTEOPS_ADMIN_TOKEN", &fixture.admin_token)
-            .env(
-                "REMOTEOPS_HUMAN_CONTROLLER_TOKEN",
-                format!("isolated-test-human-{}", Uuid::new_v4()),
-            )
-            .env(
-                "REMOTEOPS_AI_CONTROLLER_TOKEN",
-                format!("isolated-test-ai-{}", Uuid::new_v4()),
-            )
+            .env("REMOTEOPS_HUMAN_CONTROLLER_TOKEN", &human_token)
+            .env("REMOTEOPS_AI_CONTROLLER_TOKEN", &ai_token)
+            .env("RUST_LOG", "remoteops_relay=info")
+            .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(stderr_file));
         drop((business, admin, health));
         fixture.relay = Some(
             command
@@ -197,7 +216,10 @@ impl NativeFixture {
                 .context("Relay child missing")?
                 .try_wait()?
             {
-                bail!("isolated Relay exited before readiness: {status}");
+                bail!(
+                    "isolated Relay exited before readiness: {status}; stderr: {}",
+                    self.stderr_summary()
+                );
             }
             if let Ok(response) = self
                 .http
@@ -211,9 +233,24 @@ impl NativeFixture {
             }
             ensure!(
                 tokio::time::Instant::now() < deadline,
-                "isolated Relay readiness timed out"
+                "isolated Relay readiness timed out; stderr: {}",
+                self.stderr_summary()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn stderr_summary(&self) -> String {
+        let read = (|| -> std::io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            File::open(self.root.join("relay-stderr.log"))?
+                .take(8193)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })();
+        match read {
+            Ok(bytes) => sanitize_relay_stderr(&bytes, &self.log_secrets),
+            Err(_) => "<Relay stderr unavailable>".to_owned(),
         }
     }
 
@@ -478,6 +515,101 @@ impl NativeFixture {
         ensure!(failures.is_empty(), "{}", failures.join("; "));
         Ok(())
     }
+}
+
+/// Only report a bounded, redacted diagnostic; the owned raw file is deleted with the fixture.
+fn sanitize_relay_stderr(bytes: &[u8], secrets: &[String]) -> String {
+    let input_truncated = bytes.len() > 8192;
+    let mut bounded = &bytes[..bytes.len().min(8192)];
+    if input_truncated {
+        // Do not echo a secret fragment if the byte cap cuts through the final log line.
+        bounded = bounded
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(&[][..], |last| &bounded[..=last]);
+    }
+    let text = String::from_utf8_lossy(bounded);
+    let mut inside_key = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if line.contains("-----BEGIN ") && line.contains("PRIVATE KEY-----") {
+            inside_key = true;
+            lines.push("[REDACTED PRIVATE KEY]".to_owned());
+        }
+        if inside_key {
+            if line.contains("-----END ") && line.contains("PRIVATE KEY-----") {
+                inside_key = false;
+            }
+            continue;
+        }
+        let mut line: String = line
+            .chars()
+            .filter(|character| !character.is_control() || *character == '\t')
+            .collect();
+        for secret in secrets {
+            if !secret.is_empty() {
+                line = line.replace(secret, "[REDACTED]");
+            }
+        }
+        lines.push(
+            line.split_whitespace()
+                .map(|word| {
+                    if word.contains("roc1.") || word.contains("remoteops-setup-v1.") {
+                        "[REDACTED]"
+                    } else {
+                        word
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    let mut summary = lines.join("\n");
+    let output_truncated = summary.len() > 4096;
+    if output_truncated {
+        let cut = summary
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= 4096)
+            .last()
+            .unwrap_or(0);
+        summary.truncate(cut);
+    }
+    if input_truncated || output_truncated {
+        summary.push_str("\n[stderr truncated]");
+    }
+    if summary.trim().is_empty() {
+        "<no Relay stderr output>".to_owned()
+    } else {
+        summary
+    }
+}
+
+#[test]
+fn relay_startup_diagnostics_redact_credentials_and_private_keys() {
+    let secret = "isolated-test-admin-do-not-echo".to_owned();
+    let input = format!(
+        "Error: SQLite refused symlink\nTOKEN={secret}\nroc1.abc.secret remoteops-setup-v1.secret\n-----BEGIN PRIVATE KEY-----\nprivate-key-body\n-----END PRIVATE KEY-----\nready\u{001b}"
+    );
+    let result = sanitize_relay_stderr(input.as_bytes(), std::slice::from_ref(&secret));
+    assert!(result.contains("SQLite refused symlink"));
+    assert!(result.contains("[REDACTED]"));
+    assert!(!result.contains(&secret));
+    assert!(!result.contains("roc1."));
+    assert!(!result.contains("remoteops-setup-v1."));
+    assert!(!result.contains("private-key-body"));
+    assert!(!result.contains('\u{001b}'));
+}
+
+#[test]
+fn relay_startup_diagnostics_bound_output_and_drop_partial_lines() {
+    let result = sanitize_relay_stderr(
+        format!("visible\n{}", "sensitive-tail".repeat(1000)).as_bytes(),
+        &[],
+    );
+    assert_eq!(result, "visible\n[stderr truncated]");
+    let result = sanitize_relay_stderr("long diagnostic line\n".repeat(300).as_bytes(), &[]);
+    assert!(result.len() <= 4096 + "\n[stderr truncated]".len());
 }
 
 impl Drop for NativeFixture {
