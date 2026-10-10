@@ -267,10 +267,16 @@ class InstallerTests(unittest.TestCase):
     def test_hidden_setup_prompt(self):
         self.assert_success(self.run_installer(code=True, input_content=SETUP + "\n"))
 
-    def run_verifier(self):
+    def run_verifier(self, *, output_encoding=None):
         if self.target == "windows":
             command = [self.powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
                        str(self.package / "Test-RemoteOpsMcp.ps1"), "-SkipNetwork"]
+            if output_encoding is not None:
+                self.env["INSTALLER_TEST_VERIFIER"] = str(self.package / "Test-RemoteOpsMcp.ps1")
+                wrapper = ("$ErrorActionPreference = 'Stop'; "
+                           "[Console]::OutputEncoding = [Text.Encoding]::GetEncoding(" + str(output_encoding) + "); "
+                           "& $env:INSTALLER_TEST_VERIFIER -SkipNetwork")
+                command = [self.powershell, "-NoProfile", "-NonInteractive", "-Command", wrapper]
         else:
             command = ["bash", str(self.package / "test-remoteops-mcp.sh"), "--skip-network"]
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env, timeout=30)
@@ -286,6 +292,15 @@ class InstallerTests(unittest.TestCase):
     def test_installed_verifier_uses_native_credential_helper(self):
         self.assert_success(self.run_installer())
         self.assert_verifier_success()
+
+    def test_windows_verifier_reads_utf8_independently_of_console_encoding(self):
+        if self.target != "windows":
+            self.skipTest("Windows native UTF-8 inspection decoding regression")
+        self.assert_success(self.run_installer())
+        for code_page in [437, 1252]:
+            with self.subTest(code_page=code_page):
+                result = self.run_verifier(output_encoding=code_page)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_verifier_accepts_json_nulls_without_modification(self):
         self.assert_success(self.run_installer())

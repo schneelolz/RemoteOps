@@ -28,6 +28,48 @@ else {
 $compatSkillPath = Join-Path $CodexHome 'skills\remoteops\SKILL.md'
 $failures = [System.Collections.Generic.List[string]]::new()
 
+function Read-CodexInspection {
+    param(
+        [Parameter(Mandatory)][string]$Executable,
+        [Parameter(Mandatory)][string]$CodexConfig
+    )
+
+    # Rust always emits UTF-8. A native PowerShell pipeline instead uses the
+    # console output code page, corrupting non-ASCII installation paths.
+    $quotedPath = '"' + ([regex]::Replace(
+        [regex]::Replace($CodexConfig, '(\\*)"', '$1$1\"'),
+        '(\\+)$', '$1$1'
+    )) + '"'
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Executable
+    $startInfo.Arguments = '--inspect-codex ' + $quotedPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw '无法启动 Codex 配置检查。' }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(30000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            throw 'Codex 配置检查超时。'
+        }
+        $outputText = $stdout.GetAwaiter().GetResult()
+        $null = $stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw 'Codex remoteops 配置解析失败。' }
+        return $outputText
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 if (-not (Test-Path -LiteralPath $credentialPromptPath -PathType Leaf)) {
     $failures.Add("未找到 SSH 密码安全输入程序：$credentialPromptPath")
 }
@@ -107,8 +149,7 @@ else {
     }
     else {
         try {
-            $inspectionText = (& $inspectionExecutable --inspect-codex $configPath | Out-String)
-            if ($LASTEXITCODE -ne 0) { throw 'Codex remoteops 配置解析失败。' }
+            $inspectionText = Read-CodexInspection -Executable $inspectionExecutable -CodexConfig $configPath
             $inspection = $inspectionText | ConvertFrom-Json
             $candidate = [IO.Path]::GetFullPath([string]$inspection.command)
             $expectedDirectory = [IO.Path]::GetFullPath($installDirectory).TrimEnd('\')
