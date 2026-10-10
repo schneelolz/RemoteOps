@@ -1,0 +1,25 @@
+[package]
+name = "remoteops-enrollment-store"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+rand.workspace = true
+remoteops-domain = { path = "../remoteops-domain" }
+remoteops-enrollment = { path = "../remoteops-enrollment" }
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle = "2.6"
+thiserror.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

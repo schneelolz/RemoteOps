@@ -10,7 +10,7 @@ const state = {
   agentKeyword: '',
   agentStatus: 'ALL',
   shutdownBusy: false,
-  currentTab: 'overview', // 'overview', 'sessions', 'agents', 'identity', 'settings', 'audit'
+  currentTab: 'overview', // 'overview', 'sessions', 'agents', 'mcp', 'identity', 'settings', 'audit'
   isLoggedIn: false,
   demoMode: false,
   adminUser: '',
@@ -19,6 +19,27 @@ const state = {
   activeModal: null, // 'terminateSession', 'emergencyStop', 'shutdownAgent', 'purgeClosedSessions'
   modalTargetData: null,
   stopInputText: '',
+  mcp: {
+    epoch: 0,
+    modalEpoch: 0,
+    refreshSequence: 0,
+    settings: null,
+    settingsDraft: null,
+    settingsDirty: false,
+    setups: [],
+    clients: [],
+    loaded: false,
+    loading: false,
+    error: null,
+    saving: false,
+    creating: false,
+    createAttempted: false,
+    revoking: new Set(),
+    freshSetup: null,
+    setupName: '',
+    setupExpiry: 24,
+    modalError: null
+  },
   filters: {
     keyword: '',
     status: 'ALL',
@@ -80,7 +101,8 @@ function escapeHtml(value) {
 }
 
 function safeEventValue(value) {
-  return encodeURIComponent(String(value ?? ''));
+  // encodeURIComponent leaves apostrophes intact, which would break inline JS strings.
+  return encodeURIComponent(String(value ?? '')).replace(/'/g, '%27');
 }
 
 function eventValue(value) {
@@ -575,10 +597,11 @@ async function restoreSession() {
     await refreshRealData();
     state.isLoggedIn = true;
     const hashMatch = window.location.hash.match(/tab=([a-z]+)/);
-    if (hashMatch && ['overview', 'sessions', 'agents', 'identity', 'settings', 'audit'].includes(hashMatch[1])) {
+    if (hashMatch && ['overview', 'sessions', 'agents', 'mcp', 'identity', 'settings', 'audit'].includes(hashMatch[1])) {
       state.currentTab = hashMatch[1];
     }
     renderApp();
+    if (state.currentTab === 'mcp') void refreshMcpData();
     return;
   }
 
@@ -590,7 +613,7 @@ async function restoreSession() {
     await refreshRealData();
     state.isLoggedIn = true;
     const hashMatch = window.location.hash.match(/tab=([a-z]+)/);
-    if (hashMatch && ['overview', 'sessions', 'agents', 'identity', 'settings', 'audit'].includes(hashMatch[1])) {
+    if (hashMatch && ['overview', 'sessions', 'agents', 'mcp', 'identity', 'settings', 'audit'].includes(hashMatch[1])) {
       state.currentTab = hashMatch[1];
     }
   } catch (_) {
@@ -598,6 +621,7 @@ async function restoreSession() {
     state.api.connected = false;
   }
   renderApp();
+  if (state.isLoggedIn && state.currentTab === 'mcp') void refreshMcpData();
 }
 
 async function handleManualRefresh() {
@@ -605,6 +629,7 @@ async function handleManualRefresh() {
   if (btn) btn.classList.add('refreshing');
   try {
     await refreshRealData();
+    if (state.currentTab === 'mcp' && !await refreshMcpData()) return;
     showToast('控制台数据已刷新', 'success');
   } catch (error) {
     showToast(`刷新失败：${error.message}`, 'error');
@@ -669,10 +694,13 @@ function renderThemePicker() {
   return `<select class="theme-select input" aria-label="界面主题" onchange="setTheme(this.value)">${[['system', '跟随系统'], ['light', '亮色'], ['dark', '暗色']].map(([value, label]) => `<option value="${value}" ${state.theme === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`;
 }
 
-function navigateTo(tabName) {
+function navigateTo(tabName, updateHistory = true) {
+  if (!['overview', 'sessions', 'agents', 'mcp', 'identity', 'settings', 'audit'].includes(tabName)) return;
+  invalidateMcpView();
   state.currentTab = tabName;
-  window.history.replaceState(null, '', `#tab=${tabName}`);
+  if (updateHistory) window.history.replaceState(null, '', `#tab=${tabName}`);
   renderApp();
+  if (tabName === 'mcp' && state.isLoggedIn) void refreshMcpData();
 }
 
 function enterDemoMode() {
@@ -688,7 +716,15 @@ function enterDemoMode() {
 }
 
 async function logout() {
-  if (!state.demoMode) {
+  const wasDemoMode = state.demoMode;
+  // Clear transient setup credentials before waiting for the logout network request.
+  invalidateMcpView(true);
+  state.isLoggedIn = false;
+  state.activeModal = null;
+  state.modalTargetData = null;
+  renderModal();
+  renderApp();
+  if (!wasDemoMode) {
     try {
       await apiFetch('/api/admin/logout', { method: 'POST' });
     } catch (_) {}
@@ -744,6 +780,7 @@ function closeSessionDrawer() {
 // Modal Controls
 function openModal(modalName, data = null) {
   if (state.shutdownBusy) return;
+  clearMcpSecret();
   if (modalName === 'shutdownAgent') {
     const agent = agents.find(item => item.id === data?.id);
     if (!canShutdownAgent(agent) || Number(agent.generation) !== Number(data.generation)) {
@@ -760,6 +797,7 @@ function openModal(modalName, data = null) {
 
 function closeModal() {
   if (state.shutdownBusy) return;
+  clearMcpSecret();
   state.activeModal = null;
   state.modalTargetData = null;
   state.stopInputText = '';
@@ -973,6 +1011,7 @@ function renderSidebar() {
     { id: 'overview', name: '系统概览', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>' },
     { id: 'sessions', name: '会话管理', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>', badge: activeCount },
     { id: 'agents', name: 'Agent 节点', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>', badge: agentCount },
+    { id: 'mcp', name: 'MCP 客户端接入', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="12" rx="2"/><path d="M8 21h8M12 15v6M8 8h8M12 5v6"/></svg>' },
     { id: 'identity', name: 'Relay 身份凭据', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="11" r="3"/></svg>' },
     { id: 'settings', name: '安全设置', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-1.9 1.9-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V20h-2.7v-.09a1.7 1.7 0 0 0-1.03-1.56 1.7 1.7 0 0 0-1.88.34l-.06.06-1.9-1.9.06-.06A1.7 1.7 0 0 0 7.76 15a1.7 1.7 0 0 0-1.56-1.03H6v-2.7h.2A1.7 1.7 0 0 0 7.76 10a1.7 1.7 0 0 0-.34-1.88l-.06-.06 1.9-1.9.06.06a1.7 1.7 0 0 0 1.88.34 1.7 1.7 0 0 0 1.03-1.56V5h2.7v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 1.9 1.9-.06.06A1.7 1.7 0 0 0 19.4 10c.18.62.75 1.03 1.4 1.03h.2v2.7h-.2A1.7 1.7 0 0 0 19.4 15z"/></svg>' },
     { id: 'audit', name: '审计日志', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>', badge: auditCount }
@@ -1518,6 +1557,370 @@ function renderAgentsView() {
   `;
 }
 
+// Views: MCP Client Onboarding
+// MCP onboarding keeps one-time setup credentials only in the current, fresh dialog.
+// List APIs deliberately contain metadata only; closing the dialog is irreversible.
+function clearMcpSecret() {
+  state.mcp.freshSetup = null;
+  state.mcp.modalError = null;
+  state.mcp.modalEpoch++;
+  const secretField = document.getElementById('mcp-setup-code');
+  if (secretField) { secretField.value = ''; secretField.textContent = ''; }
+}
+
+function invalidateMcpView(clearMetadata = false) {
+  state.mcp.epoch++;
+  state.mcp.refreshSequence++;
+  state.mcp.loading = false;
+  clearMcpSecret();
+  if (['mcpCreate', 'mcpFresh', 'mcpRevoke'].includes(state.activeModal)) {
+    state.activeModal = null;
+    state.modalTargetData = null;
+    renderModal();
+  }
+  if (clearMetadata) {
+    state.mcp.settings = null;
+    state.mcp.settingsDraft = null;
+    state.mcp.settingsDirty = false;
+    state.mcp.setups = [];
+    state.mcp.clients = [];
+    state.mcp.loaded = false;
+    state.mcp.error = null;
+    state.mcp.setupName = '';
+    state.mcp.setupExpiry = 24;
+  }
+}
+
+function isMcpContext(epoch) {
+  return state.isLoggedIn && state.currentTab === 'mcp' && state.mcp.epoch === epoch;
+}
+
+function finishMcpOperation(epoch) {
+  if (!state.isLoggedIn || state.currentTab !== 'mcp') return;
+  // Releasing a request lock must also unlock a newer visit to this page. Its data
+  // comes from a new read, never from the discarded response or prior dialog.
+  renderApp();
+  renderModal();
+  if (state.mcp.epoch !== epoch) void refreshMcpData();
+}
+
+function mcpSettingsDraft(settings) {
+  return Object.fromEntries(['relay', 'server_name', 'enrollment_url', 'relay_ca_pem', 'enrollment_ca_pem']
+    .map(key => [key, String(settings?.[key] ?? '')]));
+}
+
+function updateMcpSetting(key, value) {
+  if (!['relay', 'server_name', 'enrollment_url', 'relay_ca_pem', 'enrollment_ca_pem'].includes(key)) return;
+  if (!state.mcp.settingsDraft) state.mcp.settingsDraft = mcpSettingsDraft(state.mcp.settings);
+  state.mcp.settingsDraft[key] = value;
+  state.mcp.settingsDirty = true;
+  const createButton = document.getElementById('mcp-new-setup');
+  if (createButton) createButton.disabled = true;
+}
+
+function validateMcpSettings(draft) {
+  const settings = mcpSettingsDraft(draft);
+  for (const key of Object.keys(settings)) settings[key] = settings[key].trim();
+  const hostPort = settings.relay.match(/^(\[[0-9a-fA-F:.]+\]|[^\s/:?#@]+):(\d+)$/);
+  if (!hostPort || Number(hostPort[2]) < 1 || Number(hostPort[2]) > 65535) {
+    throw new Error('请填写客户端可访问的 Relay TLS host:port（IPv6 地址使用方括号）。');
+  }
+  let relayUrl;
+  try { relayUrl = new URL(`https://${settings.relay}`); } catch (_) { throw new Error('Relay TLS 地址无效。'); }
+  if (['0.0.0.0', '[::]', '*'].includes(relayUrl.hostname)) {
+    throw new Error('监听地址不能用于客户端接入，请填写实际可访问的 Relay 主机名或 IP。');
+  }
+  if (!settings.server_name || /[\s/?#@]/.test(settings.server_name) || settings.server_name.includes('://')) {
+    throw new Error('请填写 Relay TLS 证书对应的 server_name。');
+  }
+  let enrollmentUrl;
+  try { enrollmentUrl = new URL(settings.enrollment_url); } catch (_) { throw new Error('请填写完整的 HTTPS 注册地址。'); }
+  if (enrollmentUrl.protocol !== 'https:' || !enrollmentUrl.hostname || enrollmentUrl.username || enrollmentUrl.password || enrollmentUrl.search || enrollmentUrl.hash || ['0.0.0.0', '[::]'].includes(enrollmentUrl.hostname)) {
+    throw new Error('注册地址必须为可访问的 HTTPS URL，不得包含用户名、密码、查询参数或片段。');
+  }
+  for (const key of ['relay_ca_pem', 'enrollment_ca_pem']) {
+    const pem = settings[key];
+    if (pem && (!pem.includes('-----BEGIN CERTIFICATE-----') || !pem.includes('-----END CERTIFICATE-----') || /PRIVATE KEY/i.test(pem))) {
+      throw new Error('信任证书只接受公开的 PEM 证书，不得粘贴私钥。');
+    }
+    settings[key] = pem || null;
+  }
+  return settings;
+}
+
+async function refreshMcpData() {
+  if (!state.isLoggedIn || state.currentTab !== 'mcp' || state.mcp.saving) return false;
+  const epoch = state.mcp.epoch;
+  const sequence = ++state.mcp.refreshSequence;
+  state.mcp.loading = true;
+  state.mcp.error = null;
+  renderApp();
+  try {
+    const [settings, setups, clients] = state.demoMode ? [null, [], []] : await Promise.all([
+      apiFetch('/api/admin/mcp/settings'),
+      apiFetch('/api/admin/mcp/setups'),
+      apiFetch('/api/admin/mcp/clients')
+    ]);
+    if (!isMcpContext(epoch) || sequence !== state.mcp.refreshSequence) return false;
+    state.mcp.settings = settings;
+    if (!state.mcp.settingsDirty) state.mcp.settingsDraft = mcpSettingsDraft(settings);
+    // Whitelist public metadata. Never retain a secret even if a server adds extra fields.
+    state.mcp.setups = (Array.isArray(setups) ? setups : []).map(item => ({
+      grant_id: String(item.grant_id), client_name: item.client_name,
+      created_at: item.created_at, expires_at: item.expires_at,
+      state: item.state, installation_id: item.installation_id
+    }));
+    state.mcp.clients = (Array.isArray(clients) ? clients : []).map(item => ({
+      installation_id: String(item.installation_id), client_name: item.client_name,
+      created_at: item.created_at, last_seen: item.last_seen, revoked: Boolean(item.revoked)
+    }));
+    state.mcp.loaded = true;
+    return true;
+  } catch (_) {
+    if (isMcpContext(epoch) && sequence === state.mcp.refreshSequence) {
+      state.mcp.error = 'MCP 接入数据加载失败。请检查管理会话与网络，然后刷新重试。';
+    }
+    return false;
+  } finally {
+    if (isMcpContext(epoch) && sequence === state.mcp.refreshSequence) {
+      state.mcp.loading = false;
+      renderApp();
+    }
+  }
+}
+
+async function saveMcpSettings(event) {
+  event?.preventDefault();
+  if (!state.isLoggedIn || state.currentTab !== 'mcp' || state.demoMode || state.mcp.saving || state.mcp.loading || !state.mcp.loaded) return;
+  let settings;
+  try { settings = validateMcpSettings(state.mcp.settingsDraft); }
+  catch (error) { state.mcp.error = error.message; renderApp(); return; }
+  const epoch = state.mcp.epoch;
+  state.mcp.saving = true;
+  state.mcp.error = null;
+  ++state.mcp.refreshSequence;
+  renderApp();
+  try {
+    const saved = await apiFetch('/api/admin/mcp/settings', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings)
+    });
+    if (!isMcpContext(epoch)) return;
+    state.mcp.settings = saved;
+    state.mcp.settingsDraft = mcpSettingsDraft(saved);
+    state.mcp.settingsDirty = false;
+    showToast('客户端接入地址与公开信任证书已保存', 'success');
+  } catch (_) {
+    if (isMcpContext(epoch)) state.mcp.error = '保存失败。请检查 HTTPS 地址、TLS 名称及公开 PEM 证书，确认管理会话有效后重试。';
+  } finally {
+    state.mcp.saving = false;
+    finishMcpOperation(epoch);
+  }
+}
+
+function openMcpSetup() {
+  if (!state.isLoggedIn || state.currentTab !== 'mcp' || state.demoMode || !state.mcp.settings || state.mcp.creating || state.mcp.saving || state.mcp.settingsDirty || state.mcp.loading) return;
+  state.mcp.setupName = '';
+  state.mcp.setupExpiry = 24;
+  state.mcp.createAttempted = false;
+  openModal('mcpCreate');
+}
+
+async function createMcpSetup(event) {
+  event?.preventDefault();
+  if (!state.isLoggedIn || state.currentTab !== 'mcp' || state.activeModal !== 'mcpCreate' || state.demoMode || state.mcp.creating || state.mcp.createAttempted || !state.mcp.settings) return;
+  const expiry = Number(state.mcp.setupExpiry);
+  if (![1, 24, 168].includes(expiry)) return;
+  const name = state.mcp.setupName.trim();
+  if (name.length > 128) { state.mcp.modalError = '客户端名称最多 128 个字符。'; renderModal(); return; }
+  const epoch = state.mcp.epoch;
+  const modalEpoch = state.mcp.modalEpoch;
+  state.mcp.creating = true;
+  state.mcp.createAttempted = true;
+  state.mcp.modalError = null;
+  renderModal();
+  try {
+    const response = await apiFetch('/api/admin/mcp/setups', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_name: name || null, expires_in_hours: expiry })
+    });
+    if (!isMcpContext(epoch) || state.mcp.modalEpoch !== modalEpoch || state.activeModal !== 'mcpCreate') return;
+    if (!response?.setup || typeof response.setup_code !== 'string' || response.setup.version !== 1 || !response.setup.grant_id || !response.setup.grant_secret) {
+      throw new Error('Invalid setup response');
+    }
+    // Both transfer formats come from this same response. Neither is placed in a URL,
+    // persistent storage, an event handler, a log, or a later list/detail response.
+    state.mcp.freshSetup = { setup: response.setup, setup_code: response.setup_code };
+    state.activeModal = 'mcpFresh';
+    renderModal();
+    await refreshMcpData();
+  } catch (_) {
+    if (isMcpContext(epoch) && state.mcp.modalEpoch === modalEpoch && state.activeModal === 'mcpCreate') {
+      state.mcp.modalError = '未能取得设置代码，结果可能尚未确认。请先刷新设置记录；如已有待使用记录，请撤销后再新建。服务端不会再次返回该代码。';
+    }
+  } finally {
+    state.mcp.creating = false;
+    finishMcpOperation(epoch);
+  }
+}
+
+async function copyMcpSetupCode() {
+  if (!state.isLoggedIn || state.currentTab !== 'mcp' || state.activeModal !== 'mcpFresh' || !state.mcp.freshSetup) return;
+  const epoch = state.mcp.epoch;
+  const modalEpoch = state.mcp.modalEpoch;
+  try {
+    await navigator.clipboard.writeText(state.mcp.freshSetup.setup_code);
+    if (isMcpContext(epoch) && state.mcp.modalEpoch === modalEpoch) showToast('设置代码已复制，请只交给目标客户端', 'success');
+  } catch (_) {
+    if (isMcpContext(epoch) && state.mcp.modalEpoch === modalEpoch) showToast('复制失败，请在弹窗中手动选择设置代码', 'error');
+  }
+}
+
+function downloadMcpSetup() {
+  if (!state.isLoggedIn || state.currentTab !== 'mcp' || state.activeModal !== 'mcpFresh' || !state.mcp.freshSetup) return;
+  const blob = new Blob([JSON.stringify(state.mcp.freshSetup.setup, null, 2) + '\n'], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'remoteops.remoteops-setup';
+  try {
+    document.body.appendChild(link);
+    link.click();
+  } finally {
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+}
+
+function openMcpRevoke(kind, id) {
+  if (!state.isLoggedIn || state.currentTab !== 'mcp' || state.demoMode || !['setups', 'clients'].includes(kind) || state.mcp.revoking.has(`${kind}:${id}`)) return;
+  const item = kind === 'setups' ? state.mcp.setups.find(row => row.grant_id === id) : state.mcp.clients.find(row => row.installation_id === id);
+  if (!item || (kind === 'setups' ? item.state === 'revoked' : item.revoked)) return;
+  openModal('mcpRevoke', { kind, id, name: item.client_name || '未命名客户端' });
+}
+
+async function confirmMcpRevoke() {
+  if (!state.isLoggedIn || state.currentTab !== 'mcp' || state.activeModal !== 'mcpRevoke' || state.demoMode) return;
+  const data = state.modalTargetData;
+  if (!data || !['setups', 'clients'].includes(data.kind)) return;
+  const key = `${data.kind}:${data.id}`;
+  if (state.mcp.revoking.has(key) || data.done) return;
+  const epoch = state.mcp.epoch;
+  const modalEpoch = state.mcp.modalEpoch;
+  state.mcp.revoking.add(key);
+  state.mcp.modalError = null;
+  renderModal();
+  try {
+    await apiFetch(`/api/admin/mcp/${data.kind}/${encodeURIComponent(data.id)}/revoke`, { method: 'POST' });
+    if (!isMcpContext(epoch) || state.mcp.modalEpoch !== modalEpoch || state.activeModal !== 'mcpRevoke') return;
+    data.done = true;
+    const item = data.kind === 'setups' ? state.mcp.setups.find(row => row.grant_id === data.id) : state.mcp.clients.find(row => row.installation_id === data.id);
+    if (item) { if (data.kind === 'setups') item.state = 'revoked'; else item.revoked = true; }
+    closeModal();
+    showToast(data.kind === 'setups' ? '一次性设置已撤销' : '客户端访问凭据已撤销', 'success');
+    await refreshMcpData();
+  } catch (_) {
+    if (isMcpContext(epoch) && state.mcp.modalEpoch === modalEpoch) state.mcp.modalError = '撤销结果尚未确认，请刷新列表核对状态后再重试。';
+  } finally {
+    state.mcp.revoking.delete(key);
+    finishMcpOperation(epoch);
+  }
+}
+
+function mcpStateBadge(value) {
+  const states = {
+    pending: ['badge-degraded', '待使用 · Pending'],
+    redeemed: ['badge-online', '已兑换 · Redeemed'],
+    expired: ['badge-offline', '已过期 · Expired'],
+    revoked: ['badge-danger', '已撤销 · Revoked']
+  };
+  const [style, label] = Object.prototype.hasOwnProperty.call(states, value) ? states[value] : ['badge-offline', '未知状态'];
+  return `<span class="badge ${style}"><span class="badge-dot"></span>${label}</span>`;
+}
+
+function renderMcpView() {
+  const mcp = state.mcp;
+  const draft = mcp.settingsDraft || mcpSettingsDraft(mcp.settings);
+  const disabled = state.demoMode || mcp.loading || mcp.saving || !mcp.loaded;
+  const canCreate = mcp.settings && !disabled && !mcp.settingsDirty && !mcp.creating;
+  return `<div class="content-container mcp-onboarding">
+    <div class="page-header">
+      <div><h1 class="page-title"><span>MCP 客户端接入</span><span class="page-title-sub">One-time Setup</span></h1>
+      <div class="page-desc">配置一次接入地址，然后为每台 Codex 客户端生成一个一次性设置。</div></div>
+      <button class="btn btn-primary" ${canCreate ? '' : 'disabled'} id="mcp-new-setup" onclick="openMcpSetup()">${mcp.creating ? '正在生成…' : '新建一次性设置'}</button>
+    </div>
+    <div class="mcp-notice"><strong>仅配置 Codex MCP</strong><span>设置不会配对 Agent，也不会授予 FullAccess（完全控制）。连接 Agent 后仍需按原有流程配对与授权。</span></div>
+    ${state.demoMode ? '<p class="mcp-note" role="status">演示模式仅预览界面，不保存配置、不生成代码或凭据。</p>' : ''}
+    ${mcp.error ? `<div class="mcp-error" role="alert">${escapeHtml(mcp.error)} <button class="btn btn-secondary btn-sm" onclick="refreshMcpData()" ${mcp.loading ? 'disabled' : ''}>刷新核对</button></div>` : ''}
+    ${mcp.loading ? '<p class="mcp-note" role="status">正在读取 MCP 接入状态…</p>' : ''}
+    <section class="card" aria-labelledby="mcp-endpoints-title">
+      <div class="section-title" id="mcp-endpoints-title">1. 客户端可访问的接入地址 <span class="badge ${mcp.settings ? 'badge-online' : 'badge-offline'}">${mcp.settings ? '已配置' : '尚未配置'}</span></div>
+      <p class="section-desc">填写实际对外提供的地址。监听地址（如 0.0.0.0）不可用于客户端；管理页面地址与 Relay TLS 地址可能不同，不会自动推导。更改仅用于之后新建的设置。</p>
+      <form class="mcp-settings-form" onsubmit="saveMcpSettings(event)">
+        <fieldset class="mcp-fields" ${disabled ? 'disabled' : ''}>
+          <div class="mcp-endpoint-grid">
+            <div class="input-group"><label class="input-label" for="mcp-relay">Relay TLS host:port</label><input id="mcp-relay" class="input font-mono" required autocomplete="off" spellcheck="false" placeholder="relay.example.com:7443" value="${escapeHtml(draft.relay)}" oninput="updateMcpSetting('relay', this.value)" /><span class="mcp-note">包含明确端口；IPv6 使用 [地址]:端口。</span></div>
+            <div class="input-group"><label class="input-label" for="mcp-server-name">TLS 证书名称 · server_name</label><input id="mcp-server-name" class="input font-mono" required autocomplete="off" spellcheck="false" placeholder="relay.example.com" value="${escapeHtml(draft.server_name)}" oninput="updateMcpSetting('server_name', this.value)" /><span class="mcp-note">必须匹配 Relay TLS 证书的主机名或 IP。</span></div>
+            <div class="input-group mcp-full-width"><label class="input-label" for="mcp-enrollment-url">HTTPS 注册地址 · enrollment_url</label><input id="mcp-enrollment-url" type="url" class="input font-mono" required autocomplete="off" spellcheck="false" placeholder="https://relay.example.com/api/mcp/enroll" value="${escapeHtml(draft.enrollment_url)}" oninput="updateMcpSetting('enrollment_url', this.value)" /><span class="mcp-note">客户端可访问的完整 HTTPS 注册接口，可含独立端口。</span></div>
+          </div>
+          <details class="mcp-trust-details" ${draft.relay_ca_pem || draft.enrollment_ca_pem ? 'open' : ''}><summary>自定义公开信任证书（可选）</summary>
+            <p class="section-desc">使用公共 CA 签发的证书时留空。私有 CA 或自签名部署可粘贴对应公开 PEM 证书，绝不能粘贴私钥。</p>
+            <div class="mcp-endpoint-grid">${[['relay_ca_pem', 'Relay TLS 信任 PEM'], ['enrollment_ca_pem', 'HTTPS 注册服务信任 PEM']].map(([key, label]) => `<div class="input-group"><label class="input-label" for="mcp-${key}">${label}</label><textarea id="mcp-${key}" class="input font-mono mcp-pem" rows="5" autocomplete="off" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----" oninput="updateMcpSetting('${key}', this.value)">${escapeHtml(draft[key])}</textarea></div>`).join('')}</div>
+          </details>
+          <div class="mcp-form-actions"><span class="mcp-note">${mcp.settingsDirty ? '有未保存的修改，保存后才可生成设置。' : '接入地址与公开证书保存到 Relay；无需在每台客户端重复填写。'}</span><button class="btn btn-secondary" type="submit">${mcp.saving ? '正在保存…' : '保存接入配置'}</button></div>
+        </fieldset>
+      </form>
+    </section>
+    <section class="table-container" aria-labelledby="mcp-setups-title">
+      <div class="table-header-bar"><div><h2 class="table-title" id="mcp-setups-title">2. 一次性设置记录</h2><p class="section-desc mcp-table-desc">有效期只限制首次兑换。已兑换的同一安装实例可在过期后重试或续接；始终不能注册第二台客户端。撤销设置会阻止后续兑换与续接。</p></div></div>
+      ${mcp.setups.length ? `<div class="table-wrapper"><table class="ops-table mcp-table"><thead><tr><th>客户端 / 设置 ID</th><th>状态</th><th>创建时间</th><th>首次兑换截止</th><th>安装实例</th><th>操作</th></tr></thead><tbody>${mcp.setups.map(item => `<tr><td><div class="table-primary-text">${escapeHtml(item.client_name || '未命名客户端')}</div><div class="font-mono table-secondary-text">${escapeHtml(item.grant_id)}</div></td><td>${mcpStateBadge(item.state)}</td><td>${escapeHtml(formatApiDate(item.created_at))}</td><td>${escapeHtml(formatApiDate(item.expires_at))}</td><td class="font-mono">${escapeHtml(item.installation_id || '尚未兑换')}</td><td><button class="btn btn-secondary btn-sm" ${state.demoMode || item.state === 'revoked' || mcp.revoking.has(`setups:${item.grant_id}`) ? 'disabled' : ''} onclick="openMcpRevoke('setups', ${eventValue(item.grant_id)})">撤销设置</button></td></tr>`).join('')}</tbody></table></div>` : renderEmptyState('暂无一次性设置', '先保存接入配置，再为目标客户端新建一次性设置。')}
+      <p class="mcp-table-note">这里只保留状态与标识，不可重新查看或下载历史设置代码。已注册客户端的凭据请在下方单独撤销。</p>
+    </section>
+    <section class="table-container" aria-labelledby="mcp-clients-title">
+      <div class="table-header-bar"><div><h2 class="table-title" id="mcp-clients-title">3. 已注册客户端</h2><p class="section-desc mcp-table-desc">每台安装实例拥有独立凭据；“最后在线”为空表示还没有客户端连接记录。</p></div></div>
+      ${mcp.clients.length ? `<div class="table-wrapper"><table class="ops-table mcp-table"><thead><tr><th>客户端 / 安装实例</th><th>凭据状态</th><th>注册时间</th><th>最后在线</th><th>操作</th></tr></thead><tbody>${mcp.clients.map(item => `<tr><td><div class="table-primary-text">${escapeHtml(item.client_name || '未命名客户端')}</div><div class="font-mono table-secondary-text">${escapeHtml(item.installation_id)}</div></td><td>${item.revoked ? mcpStateBadge('revoked') : '<span class="badge badge-online"><span class="badge-dot"></span>凭据有效</span>'}</td><td>${escapeHtml(formatApiDate(item.created_at))}</td><td>${escapeHtml(item.last_seen ? formatApiDate(item.last_seen) : '尚未连接')}</td><td><button class="btn btn-secondary btn-sm" ${state.demoMode || item.revoked || mcp.revoking.has(`clients:${item.installation_id}`) ? 'disabled' : ''} onclick="openMcpRevoke('clients', ${eventValue(item.installation_id)})">撤销客户端</button></td></tr>`).join('')}</tbody></table></div>` : renderEmptyState('暂无已注册客户端', '目标客户端首次兑换设置后，将出现在这里。')}
+    </section>
+  </div>`;
+}
+
+function renderMcpModal() {
+  const mcp = state.mcp;
+  const error = mcp.modalError ? `<p class="mcp-error" role="alert">${escapeHtml(mcp.modalError)}</p>` : '';
+  if (state.activeModal === 'mcpCreate') {
+    return `<div class="modal mcp-modal" role="dialog" aria-modal="true" aria-labelledby="mcp-modal-title">
+      <div class="modal-header"><h2 class="modal-title" id="mcp-modal-title">新建一次性设置</h2><button class="btn btn-ghost" aria-label="关闭弹窗" onclick="closeModal()">✕</button></div>
+      <form onsubmit="createMcpSetup(event)"><div class="modal-body">
+        <p>仅为一台 Codex 客户端生成设置。设置代码和文件包含一次性凭据，请通过安全渠道交给目标使用者。</p>
+        <div class="input-group"><label class="input-label" for="mcp-setup-name">客户端名称（可选）</label><input id="mcp-setup-name" class="input" maxlength="128" autocomplete="off" placeholder="例如：运维 MacBook" value="${escapeHtml(mcp.setupName)}" ${mcp.creating ? 'disabled' : ''} oninput="state.mcp.setupName = this.value" /></div>
+        <div class="input-group"><label class="input-label" for="mcp-setup-expiry">首次兑换有效期</label><select id="mcp-setup-expiry" class="input" ${mcp.creating ? 'disabled' : ''} onchange="state.mcp.setupExpiry = Number(this.value)">${[[1, '1 小时'], [24, '24 小时（默认）'], [168, '7 天']].map(([value, label]) => `<option value="${value}" ${mcp.setupExpiry === value ? 'selected' : ''}>${label}</option>`).join('')}</select></div>
+        <p class="mcp-note">期限只限制首次兑换。同一已兑换安装实例可在过期后重试或续接，不能用于第二次注册。仅安装 Codex MCP，不配对 Agent、不授予 FullAccess。</p>
+        ${mcp.creating ? '<p role="status">正在生成。若现在关闭，服务端可能仍会创建记录；届时请刷新并撤销未使用的记录。</p>' : ''}${error}
+      </div><div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button><button type="submit" class="btn btn-primary" ${mcp.createAttempted ? 'disabled' : ''}>${mcp.creating ? '正在生成…' : mcp.createAttempted ? '请关闭后核对记录' : '生成设置'}</button></div></form>
+    </div>`;
+  }
+  if (state.activeModal === 'mcpFresh' && mcp.freshSetup) {
+    return `<div class="modal mcp-modal" role="dialog" aria-modal="true" aria-labelledby="mcp-modal-title">
+      <div class="modal-header"><h2 class="modal-title" id="mcp-modal-title">一次性设置已生成</h2><button class="btn btn-ghost" aria-label="关闭并清除设置代码" onclick="closeModal()">✕</button></div>
+      <div class="modal-body"><div class="mcp-notice"><strong>仅此一次显示</strong><span>请现在复制代码或下载文件。关闭弹窗、离开页面或退出登录后不可重新查看。</span></div>
+        <p>在目标客户端安装程序中粘贴代码或选择 .remoteops-setup 文件，两者包含同一份设置。文件与剪贴板均含一次性凭据，请妥善保管，并在完成后移除自己保存的副本。</p>
+        <div class="input-group"><label class="input-label" for="mcp-setup-code">一次性设置代码</label><textarea id="mcp-setup-code" class="input font-mono mcp-setup-code" rows="6" readonly autocomplete="off" spellcheck="false">${escapeHtml(mcp.freshSetup.setup_code)}</textarea></div>
+        <p class="mcp-note">首次兑换截止：${escapeHtml(formatApiDate(mcp.freshSetup.setup.expires_at))}。同一安装实例已兑换后可在过期后继续重试或续接；不能注册第二个客户端。</p>
+        <p class="mcp-note">不会配对 Agent 或授予 FullAccess。撤销此设置不会替代“撤销客户端”。</p>
+      </div><div class="modal-footer"><button class="btn btn-secondary" onclick="downloadMcpSetup()">下载 .remoteops-setup</button><button class="btn btn-primary" onclick="copyMcpSetupCode()">复制设置代码</button><button class="btn btn-secondary" onclick="closeModal()">完成并清除</button></div>
+    </div>`;
+  }
+  if (state.activeModal === 'mcpRevoke' && state.modalTargetData) {
+    const data = state.modalTargetData;
+    const busy = mcp.revoking.has(`${data.kind}:${data.id}`);
+    return `<div class="modal" role="dialog" aria-modal="true" aria-labelledby="mcp-modal-title">
+      <div class="modal-header"><h2 class="modal-title" id="mcp-modal-title">${data.kind === 'setups' ? '撤销一次性设置？' : '撤销客户端凭据？'}</h2><button class="btn btn-ghost" aria-label="关闭弹窗" onclick="closeModal()">✕</button></div>
+      <div class="modal-body"><strong>${escapeHtml(data.name)}</strong><span class="font-mono text-break">${escapeHtml(data.id)}</span>
+        <p>${data.kind === 'setups' ? '撤销后不能首次兑换，也不能用该设置重试或续接。若已注册客户端，须在客户端列表中另行撤销其访问凭据。' : '该安装实例将失去 Relay 访问权限，无法继续使用其独立凭据。此操作不能撤回，重新接入需要新的设置。'}</p>${error}</div>
+      <div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal()">取消</button><button class="btn btn-danger" ${busy ? 'disabled' : ''} onclick="confirmMcpRevoke()">${busy ? '正在撤销…' : '确认撤销'}</button></div>
+    </div>`;
+  }
+  return '';
+}
+
 // Views: Relay Identity & Credentials
 function renderIdentityView() {
   if (state.api.error) return renderErrorState(`管理 API 请求失败：${state.api.error}`);
@@ -1701,6 +2104,7 @@ async function handleChangePassword(event) {
         body: JSON.stringify({ current_password: currentPassword, new_password: newPassword, confirm_password: confirmPassword })
       });
     }
+    invalidateMcpView(true);
     state.isLoggedIn = false;
     state.api.connected = false;
     state.api.token = '';
@@ -2307,7 +2711,8 @@ function renderModal() {
   }
 
   if (!state.activeModal) {
-    if (backdrop) backdrop.classList.remove('open');
+    // Remove dismissed dialog contents, including any displayed one-time credentials.
+    if (backdrop) { backdrop.innerHTML = ''; backdrop.remove(); }
     return;
   }
 
@@ -2323,7 +2728,9 @@ function renderModal() {
 
   let modalContent = '';
 
-  if (mType === 'terminateSession') {
+  if (['mcpCreate', 'mcpFresh', 'mcpRevoke'].includes(mType)) {
+    modalContent = renderMcpModal();
+  } else if (mType === 'terminateSession') {
     modalContent = `
       <div class="modal">
         <div class="modal-header">
@@ -2493,6 +2900,7 @@ function renderApp() {
     case 'overview': contentHtml = renderOverviewView(); break;
     case 'sessions': contentHtml = renderSessionsView(); break;
     case 'agents': contentHtml = renderAgentsView(); break;
+    case 'mcp': contentHtml = renderMcpView(); break;
     case 'identity': contentHtml = renderIdentityView(); break;
     case 'settings': contentHtml = renderSettingsView(); break;
     case 'audit': contentHtml = renderAuditView(); break;
@@ -2512,6 +2920,7 @@ function renderApp() {
   if (state.activeDrawerSession || state.activeDrawerAgent) {
     renderDrawer();
   }
+  if (state.activeModal) renderModal();
 }
 
 // Keyboard global handler for Escape key
@@ -2540,4 +2949,15 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   restoreVisibleColumns();
   restoreSession();
+});
+
+// Browser history navigation must discard a fresh setup just like sidebar navigation.
+window.addEventListener?.('hashchange', () => {
+  const match = window.location.hash.match(/^#tab=([a-z]+)$/);
+  const tab = match && ['overview', 'sessions', 'agents', 'mcp', 'identity', 'settings', 'audit'].includes(match[1]) ? match[1] : 'overview';
+  if (state.isLoggedIn) navigateTo(tab, false);
+});
+window.addEventListener?.('pagehide', () => { invalidateMcpView(true); });
+window.addEventListener?.('pageshow', event => {
+  if (event.persisted && state.isLoggedIn && state.currentTab === 'mcp') void refreshMcpData();
 });

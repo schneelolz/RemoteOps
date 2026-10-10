@@ -3133,7 +3133,7 @@ mod tests {
         assert_eq!(options.viewport.maximize_button, Some(false));
         let icon = options.viewport.icon.expect("原生窗口应显式加载品牌图标");
         assert_eq!((icon.width, icon.height), (256, 256));
-        assert!(!icon.rgba.is_empty());
+        assert_ne!(icon.rgba.len(), 0);
         #[cfg(target_os = "windows")]
         assert!(options.event_loop_builder.is_some());
     }

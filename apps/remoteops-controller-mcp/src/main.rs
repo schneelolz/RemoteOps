@@ -1,5 +1,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod codex_config;
+mod setup;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -56,6 +59,8 @@ use zeroize::{Zeroize as _, Zeroizing};
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
+    #[command(flatten)]
+    setup: setup::SetupArgs,
     /// MCP JSON 配置文件；默认读取 `Codex` 用户目录下的 `RemoteOps` 配置。
     #[arg(long, env = "REMOTEOPS_MCP_CONFIG")]
     config: Option<PathBuf>,
@@ -118,6 +123,8 @@ struct Args {
 /// 可以安全写入普通 JSON 文件的 MCP 连接配置。
 #[derive(Clone, Debug, Default, Deserialize)]
 struct McpFileConfig {
+    /// Independent installation credential reference; the secret stays in the OS store.
+    credential_id: Option<uuid::Uuid>,
     /// Relay TLS 地址，例如 `relay.example.com:7443`。
     relay: Option<String>,
     /// TLS 证书中的服务名或 IP；省略时从 Relay 地址推导。
@@ -151,6 +158,13 @@ struct ResolvedArgs {
 
 impl Args {
     fn resolve(self) -> anyhow::Result<ResolvedArgs> {
+        self.resolve_with_credential_loader(setup::credential_token)
+    }
+
+    fn resolve_with_credential_loader(
+        mut self,
+        load: impl FnOnce(uuid::Uuid) -> anyhow::Result<String>,
+    ) -> anyhow::Result<ResolvedArgs> {
         let explicit_config = self.config.is_some();
         let config_path = self.config.unwrap_or_else(default_mcp_config_path);
         let config_exists = config_path.is_file();
@@ -162,16 +176,29 @@ impl Args {
         } else {
             McpFileConfig::default()
         };
+        // An enrolled credential is bound to its reviewed file configuration. Legacy
+        // ambient variables must never redirect it or silently substitute a shared token.
+        if file_config.credential_id.is_some() {
+            self.relay = None;
+            self.server_name = None;
+            self.ca_cert = None;
+            self.tls_fingerprint = None;
+            self.controller_token = None;
+            self.owner_id = None;
+        }
         let base_directory = config_path.parent().unwrap_or_else(|| Path::new("."));
         let relay = self
             .relay
             .or(file_config.relay)
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
-        let controller_token = self
-            .controller_token
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
+        let controller_token = if let Some(id) = file_config.credential_id {
+            Some(load(id)?)
+        } else {
+            self.controller_token
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
         let mut missing = Vec::new();
         if explicit_config && !config_exists {
             missing.push("指定的 MCP 配置文件不存在");
@@ -3707,6 +3734,10 @@ async fn main() {
 }
 
 async fn run_mcp() -> anyhow::Result<()> {
+    let args = Args::parse();
+    if args.setup.requested() {
+        return args.setup.run(args.config.as_deref()).await;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -3718,7 +3749,7 @@ async fn run_mcp() -> anyhow::Result<()> {
         .compact()
         .init();
 
-    let args = Args::parse().resolve()?;
+    let args = args.resolve()?;
     tokio::fs::create_dir_all(&args.transfer_root)
         .await
         .with_context(|| format!("无法创建 MCP 文件交换目录 {}", args.transfer_root.display()))?;
@@ -4443,6 +4474,7 @@ mod tests {
 
     fn test_args(config: PathBuf) -> Args {
         Args {
+            setup: setup::SetupArgs::default(),
             config: Some(config),
             relay: None,
             server_name: None,
@@ -4457,6 +4489,43 @@ mod tests {
             enable_test_ui: false,
             pairs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn enrolled_config_ignores_legacy_identity_and_endpoint_overrides() {
+        let path = std::env::temp_dir().join(format!(
+            "remoteops-enrolled-config-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let owner = ControllerOwnerId::new();
+        let credential = uuid::Uuid::new_v4();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "credential_id":credential,"owner_id":owner,"relay":"enrolled.example.test:7443",
+                "server_name":"enrolled.example.test"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut args = test_args(path.clone());
+        args.relay = Some("legacy.example.test:7443".into());
+        args.server_name = Some("legacy.example.test".into());
+        args.owner_id = Some(ControllerOwnerId::new());
+        args.controller_token = Some("legacy-controller-token-for-test-only".into());
+        args.tls_fingerprint = Some("legacy-fingerprint".into());
+        let resolved = args
+            .resolve_with_credential_loader(|id| {
+                assert_eq!(id, credential);
+                Ok("per-install-token-for-test-only".into())
+            })
+            .unwrap();
+        assert_eq!(resolved.owner_id, owner);
+        assert_eq!(resolved.relay, "enrolled.example.test:7443");
+        assert_eq!(resolved.server_name, "enrolled.example.test");
+        assert_eq!(resolved.controller_token, "per-install-token-for-test-only");
+        assert!(resolved.tls_fingerprint.is_none());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

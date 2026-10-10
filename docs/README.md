@@ -17,6 +17,7 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 - Linux Headless Agent：`deploy/agent-service/linux`（Ubuntu 24.04 x86_64，systemd）
 - [RemoteOps MCP 使用手册](RemoteOpsMCP使用手册.md)
 - [Codex MCP 接入说明](CodexMCP接入说明.md)
+- [MCP 一次性安装码与配置文件](mcp-one-time-setup.md)
 - [macOS MCP 接入说明](macOSMCP接入说明.md)
 - [控制端 GUI 使用说明](远程AI运维协助GUI使用说明.md)
 - [本地串口 AI 交互 Demo](本地串口AI交互Demo.md)

@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
+    [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [switch]$SkipNetwork,
     [switch]$CredentialPromptSmokeTest
 )
@@ -8,7 +8,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$expectedMcpVersion = '0.2.0-preview.12'
+$expectedMcpVersion = '0.2.0-preview.13'
 $expectedCredentialPromptVersion = '0.2.0-preview.5'
 $expectedToolTimeoutSec = 360
 $configPath = Join-Path $CodexHome 'config.toml'
@@ -89,76 +89,57 @@ else {
         $failures.Add("Relay 配置不是有效 JSON：$connectionConfigPath")
     }
 }
+$usesCredentialStore = $null -ne $connectionConfig -and
+    $null -ne $connectionConfig.PSObject.Properties['credential_id'] -and
+    -not [string]::IsNullOrWhiteSpace($connectionConfig.credential_id)
 if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
     $failures.Add("未找到 Codex 配置：$configPath")
 }
 else {
-    $config = [IO.File]::ReadAllText($configPath)
-    $section = [regex]::Match(
-        $config,
-        '(?ms)^\[mcp_servers\.remoteops\]\s*\r?\n(?<body>.*?)(?=^\[|\z)'
-    )
-    if (-not $section.Success) {
-        $failures.Add('config.toml 缺少 [mcp_servers.remoteops]。')
+    # Inspect using only a known package/installation path. Never execute a path
+    # taken from Codex config before constraining it to this installation.
+    $inspectionExecutable = Join-Path $PSScriptRoot 'remoteops-controller-mcp.exe'
+    if (-not (Test-Path -LiteralPath $inspectionExecutable -PathType Leaf)) {
+        $inspectionExecutable = Join-Path $installDirectory "remoteops-controller-mcp-$expectedMcpVersion.exe"
+    }
+    if (-not (Test-Path -LiteralPath $inspectionExecutable -PathType Leaf)) {
+        $failures.Add('缺少可信的当前版本 MCP 程序，无法解析 Codex 配置。')
     }
     else {
-        $command = [regex]::Match(
-            $section.Groups['body'].Value,
-            '(?m)^command\s*=\s*(?<literal>"(?:\\.|[^"\\])*")\s*$'
-        )
-        if (-not $command.Success) {
-            $failures.Add('RemoteOps MCP 配置缺少有效的 command。')
-        }
-        else {
-            try {
-                $installedExecutable = $command.Groups['literal'].Value | ConvertFrom-Json
+        try {
+            $inspectionText = (& $inspectionExecutable --inspect-codex $configPath | Out-String)
+            if ($LASTEXITCODE -ne 0) { throw 'Codex remoteops 配置解析失败。' }
+            $inspection = $inspectionText | ConvertFrom-Json
+            $candidate = [IO.Path]::GetFullPath([string]$inspection.command)
+            $expectedDirectory = [IO.Path]::GetFullPath($installDirectory).TrimEnd('\')
+            if ([IO.Path]::GetDirectoryName($candidate).TrimEnd('\') -ne $expectedDirectory -or
+                [IO.Path]::GetFileName($candidate) -notmatch
+                "^remoteops-controller-mcp-$([regex]::Escape($expectedMcpVersion))(?:-[0-9a-f]{12})?\.exe$") {
+                $failures.Add('Codex remoteops 命令不属于当前安装目录；不会执行未知命令。')
             }
-            catch {
-                $failures.Add('RemoteOps MCP command 不是有效的 TOML 基本字符串。')
+            else {
+                $installedExecutable = $candidate
+            }
+            if ([string]::IsNullOrWhiteSpace($inspection.args_config) -or
+                [IO.Path]::GetFullPath([string]$inspection.args_config) -ne [IO.Path]::GetFullPath($connectionConfigPath)) {
+                $failures.Add('RemoteOps MCP 连接配置参数不匹配。')
+            }
+            if ($null -eq $inspection.legacy_env -or [bool]$inspection.legacy_env -eq $usesCredentialStore) {
+                $failures.Add('RemoteOps MCP 凭据模式与旧环境变量转发配置不匹配。')
+            }
+            if ($null -eq $inspection.tool_timeout_sec -or [long]$inspection.tool_timeout_sec -lt $expectedToolTimeoutSec) {
+                $failures.Add("RemoteOps MCP tool_timeout_sec 必须至少为 $expectedToolTimeoutSec 秒。")
+            }
+            if ($inspection.default_tools_approval_mode -ne 'approve' -or
+                $inspection.set_control_mode_approval_mode -ne 'prompt') {
+                $failures.Add('RemoteOps 工具审批或 set_control_mode 独立确认配置不完整。')
+            }
+            else {
+                Write-Host '[通过] RemoteOps 工具审批已配置；全局 Codex 策略由用户管理。'
             }
         }
-        if (
-            $section.Groups['body'].Value -notmatch
-                '(?m)^env_vars\s*=\s*\["REMOTEOPS_CONTROLLER_TOKEN",\s*"REMOTEOPS_CONTROLLER_OWNER_ID"\]\s*$'
-        ) {
-            $failures.Add('RemoteOps MCP 配置没有安全转发 Controller Token 和统一 Owner 环境变量。')
-        }
-        else {
-            Write-Host '[通过] Codex MCP 配置存在，且 Token 与统一 Owner 仅通过环境变量转发。'
-        }
-        $toolTimeout = [regex]::Match(
-            $section.Groups['body'].Value,
-            '(?m)^tool_timeout_sec\s*=\s*(?<value>\d+)\s*$'
-        )
-        if (-not $toolTimeout.Success -or [int]$toolTimeout.Groups['value'].Value -lt $expectedToolTimeoutSec) {
-            $failures.Add("RemoteOps MCP tool_timeout_sec 必须至少为 $expectedToolTimeoutSec 秒。")
-        }
-        else {
-            Write-Host "[通过] RemoteOps MCP 工具超时：$($toolTimeout.Groups['value'].Value) 秒"
-        }
-        if (
-            $section.Groups['body'].Value -notmatch
-                '(?m)^default_tools_approval_mode\s*=\s*"approve"\s*$'
-        ) {
-            $failures.Add('RemoteOps MCP 未配置为由自身统一处理交互确认。')
-        }
-        elseif (
-            $config -notmatch
-                '(?m)^approval_policy\s*=\s*\{\s*granular\s*=\s*\{[^}]*mcp_elicitations\s*=\s*true[^}]*\}\s*\}\s*$'
-        ) {
-            $failures.Add('Codex 未启用 MCP elicitation，无法显示 RemoteOps 逐项确认。')
-        }
-        else {
-            Write-Host '[通过] RemoteOps MCP 交互确认已启用，且不会重复触发 Codex 静态工具审批。'
-        }
-        if (
-            $config -notmatch
-                '(?ms)^\[mcp_servers\.remoteops\.tools\.set_control_mode\]\s*\r?\napproval_mode\s*=\s*"prompt"\s*$'
-        ) {
-            $failures.Add('set_control_mode 未配置独立 Codex 工具确认。')
-        }
-        else {
-            Write-Host '[通过] 完全控制仅通过 set_control_mode 的 Codex 工具确认启用。'
+        catch {
+            $failures.Add('无法安全解析 Codex remoteops 配置。')
         }
     }
 }
@@ -185,30 +166,50 @@ else {
     }
 }
 
-$userToken = [Environment]::GetEnvironmentVariable('REMOTEOPS_CONTROLLER_TOKEN', 'User')
-if ([string]::IsNullOrWhiteSpace($userToken)) {
-    $failures.Add('当前用户尚未设置 REMOTEOPS_CONTROLLER_TOKEN。')
-}
-elseif ($userToken.Length -lt 32) {
-    $failures.Add('REMOTEOPS_CONTROLLER_TOKEN 长度不足 32 个字符。')
+if ($usesCredentialStore) {
+    if ($installedExecutable -and (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
+        & $installedExecutable --check-credential --config $connectionConfigPath | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            $failures.Add('无法读取此安装的 Windows Credential Manager 凭据；请保留设置状态并重新运行安装器。')
+        }
+        else {
+            Write-Host '[通过] 独立 Controller 凭据存在于 Windows Credential Manager（未读取到脚本）。'
+        }
+    }
+    $parsedOwner = [guid]::Empty
+    if ($null -eq $connectionConfig.PSObject.Properties['owner_id'] -or
+        -not [guid]::TryParse([string]$connectionConfig.owner_id, [ref]$parsedOwner) -or
+        $parsedOwner -eq [guid]::Empty) {
+        $failures.Add('连接配置缺少有效的非空 Owner UUID。')
+    }
 }
 else {
-    Write-Host '[通过] Controller Token 已设置（不会显示其内容）。'
-}
+    $userToken = [Environment]::GetEnvironmentVariable('REMOTEOPS_CONTROLLER_TOKEN', 'User')
+    if ([string]::IsNullOrWhiteSpace($userToken)) {
+        $failures.Add('当前用户尚未设置 REMOTEOPS_CONTROLLER_TOKEN。')
+    }
+    elseif ($userToken.Length -lt 32) {
+        $failures.Add('REMOTEOPS_CONTROLLER_TOKEN 长度不足 32 个字符。')
+    }
+    else {
+        Write-Host '[通过] Controller Token 已设置（不会显示其内容）。'
+    }
 
-$userOwner = [Environment]::GetEnvironmentVariable(
-    'REMOTEOPS_CONTROLLER_OWNER_ID',
-    'User'
-)
-$parsedOwner = [guid]::Empty
-if ([string]::IsNullOrWhiteSpace($userOwner)) {
-    $failures.Add('当前用户尚未设置 REMOTEOPS_CONTROLLER_OWNER_ID。')
-}
-elseif (-not [guid]::TryParse($userOwner, [ref]$parsedOwner) -or $parsedOwner -eq [guid]::Empty) {
-    $failures.Add('REMOTEOPS_CONTROLLER_OWNER_ID 不是有效的非空 UUID。')
-}
-else {
-    Write-Host '[通过] 统一 Controller Owner 已设置（不会显示其值）。'
+    $userOwner = [Environment]::GetEnvironmentVariable(
+        'REMOTEOPS_CONTROLLER_OWNER_ID',
+        'User'
+    )
+    $parsedOwner = [guid]::Empty
+    if ([string]::IsNullOrWhiteSpace($userOwner)) {
+        $failures.Add('当前用户尚未设置 REMOTEOPS_CONTROLLER_OWNER_ID。')
+    }
+    elseif (-not [guid]::TryParse($userOwner, [ref]$parsedOwner) -or $parsedOwner -eq [guid]::Empty) {
+        $failures.Add('REMOTEOPS_CONTROLLER_OWNER_ID 不是有效的非空 UUID。')
+    }
+    else {
+        Write-Host '[通过] 统一 Controller Owner 已设置（不会显示其值）。'
+    }
+
 }
 
 if (-not $SkipNetwork) {

@@ -34,6 +34,10 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Test Relay admin setup flows
+        run: node scripts/test-relay-admin.mjs
+      - name: Test isolated macOS and Windows setup installer flows
+        run: python3 scripts/Test-McpSetupInstallers.py --platform all
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --locked
       - run: cargo clippy --workspace --exclude remoteops-agent-gui --exclude remoteops-controller-gui --all-targets --locked -- -D warnings
@@ -79,6 +83,10 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: cargo check --workspace --locked
       - run: cargo test --workspace --locked -- --test-threads=1
+      - name: Test setup installer on Windows PowerShell 5.1
+        run: python scripts/Test-McpSetupInstallers.py --platform windows --powershell powershell.exe
+      - name: Test setup installer on PowerShell 7
+        run: python scripts/Test-McpSetupInstallers.py --platform windows --powershell pwsh
       - name: Test control permission lifecycle
         shell: pwsh
         run: ./scripts/Test-ControlPermissions.ps1
@@ -99,6 +107,8 @@ jobs:
           cargo check -p remoteops-controller-mcp --locked
           cargo test -p remoteops-controller-mcp --locked
           bash -n deploy/controller-mcp/macos/*.sh scripts/Build-MacosMcp.sh
+      - name: Test isolated setup installer on native macOS
+        run: python3 scripts/Test-McpSetupInstallers.py --platform macos
       - name: Build Apple Silicon MCP package
         run: bash ./scripts/Build-MacosMcp.sh ./release/macos-arm64
       - name: Check macOS release artifacts

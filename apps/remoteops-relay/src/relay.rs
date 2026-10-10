@@ -22,6 +22,7 @@ use remoteops_domain::{
     ControllerInstanceId, ControllerOwnerId, EventSource, PairingCode, PairingLease,
     PermissionMode, RemoteOperation, RequestId, SessionId, SessionRole,
 };
+use remoteops_enrollment_store::{EnrollmentStore, StoreError};
 use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel, approval_operations_match};
 use remoteops_protocol::{
     AgentHello, AgentLeaseRenewed, AgentResumeCommitted, AgentWelcome, ApprovalDecision,
@@ -134,6 +135,8 @@ struct PendingResume {
 }
 
 struct ControllerRecord {
+    /// Durable MCP credential; legacy token connections have no installation.
+    installation_id: Option<Uuid>,
     sender: Sender,
     last_seen: time::Instant,
     sessions: BTreeSet<SessionId>,
@@ -389,6 +392,9 @@ type ShutdownWaiters = Arc<Mutex<BTreeMap<RequestId, ShutdownWaiter>>>;
 pub struct Relay {
     state: Arc<Mutex<RelayState>>,
     state_path: Option<PathBuf>,
+    enrollment_store: Option<Arc<EnrollmentStore>>,
+    /// Serializes credential validation + registration against durable revoke + disconnect.
+    enrollment_gate: Mutex<()>,
     lease_lifetime: Duration,
     approval_lifetime: Duration,
     heartbeat_seconds: u64,
@@ -413,6 +419,8 @@ impl Relay {
         Self {
             state: Arc::new(Mutex::new(RelayState::default())),
             state_path: None,
+            enrollment_store: None,
+            enrollment_gate: Mutex::new(()),
             lease_lifetime: if lease_lifetime <= Duration::zero() {
                 Duration::seconds(1)
             } else {
@@ -1107,6 +1115,10 @@ impl Relay {
         load_persisted_state(&state_path, &mut restored)?;
         save_persisted_state(&state_path, &restored)?;
         relay.state = Arc::new(Mutex::new(restored));
+        relay.enrollment_store = Some(Arc::new(EnrollmentStore::open(
+            enrollment_database_path(&state_path),
+            controller_owner_id,
+        )?));
         Ok(relay)
     }
 
@@ -1443,19 +1455,11 @@ impl Relay {
         if hello.protocol_version != PROTOCOL_VERSION {
             bail!("Controller 协议版本不兼容：{}", hello.protocol_version);
         }
-        self.authenticate_controller(&hello)?;
         let controller_id = hello.controller_instance_id;
         let owner_id = hello.owner_id;
         let controller_kind = hello.kind;
         let connection_generation = self
-            .register_controller(
-                controller_id,
-                owner_id,
-                controller_kind,
-                hello.hostname.clone(),
-                hello.mac_address.clone(),
-                sender.clone(),
-            )
+            .authenticate_and_register_controller(&hello, sender.clone())
             .await?;
         if sender
             .send(WireMessage::ControllerWelcome {
@@ -1563,7 +1567,7 @@ impl Relay {
         Ok(())
     }
 
-    fn authenticate_controller(&self, hello: &ControllerHello) -> anyhow::Result<()> {
+    fn authenticate_controller(&self, hello: &ControllerHello) -> anyhow::Result<Option<Uuid>> {
         if hello.owner_id != self.controller_owner_id {
             bail!("Controller Owner 身份不匹配");
         }
@@ -1571,12 +1575,113 @@ impl Relay {
             ControllerKind::Human => &self.human_controller_token,
             ControllerKind::Ai => &self.ai_controller_token,
         };
-        if !constant_time_eq(hello.auth_token.as_bytes(), expected.as_bytes()) {
-            bail!("Controller 认证失败");
+        // Preserve arbitrary configured legacy token values, including a coincidental roc1 prefix.
+        if !expected.is_empty()
+            && constant_time_eq(hello.auth_token.as_bytes(), expected.as_bytes())
+        {
+            return Ok(None);
         }
-        Ok(())
+        if hello.auth_token.starts_with("roc1.") {
+            if hello.kind != ControllerKind::Ai {
+                bail!("MCP 安装凭据仅允许 AI Controller 角色");
+            }
+            let identity = self
+                .enrollment_store()?
+                .authenticate_token(&hello.auth_token, Utc::now())?;
+            if identity.owner_id != self.controller_owner_id {
+                bail!("Controller Owner 身份不匹配");
+            }
+            return Ok(Some(identity.installation_id));
+        }
+        bail!("Controller 认证失败");
     }
 
+    pub(crate) fn enrollment_store(&self) -> Result<&EnrollmentStore, StoreError> {
+        self.enrollment_store
+            .as_deref()
+            .ok_or(StoreError::NotConfigured)
+    }
+
+    /// The gate remains held until the newly authenticated connection is visible to revoke.
+    async fn authenticate_and_register_controller(
+        &self,
+        hello: &ControllerHello,
+        sender: Sender,
+    ) -> anyhow::Result<u64> {
+        let _gate = self.enrollment_gate.lock().await;
+        let installation_id = self.authenticate_controller(hello)?;
+        self.register_controller_record(
+            hello.controller_instance_id,
+            ControllerRecord {
+                installation_id,
+                sender,
+                last_seen: time::Instant::now(),
+                sessions: BTreeSet::new(),
+                owner_id: hello.owner_id,
+                kind: hello.kind,
+                connection_generation: 0,
+                hostname: hello.hostname.clone(),
+                mac_address: hello.mac_address.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Include recent activity of live connections without writing SQLite on every heartbeat.
+    pub(crate) async fn mcp_clients(
+        &self,
+    ) -> Result<Vec<remoteops_enrollment::ClientSummary>, StoreError> {
+        let mut clients = self.enrollment_store()?.list_clients()?;
+        let state = self.state.lock().await;
+        let now = Utc::now();
+        for client in &mut clients {
+            for controller in state
+                .controllers
+                .values()
+                .filter(|controller| controller.installation_id == Some(client.installation_id))
+            {
+                if let Ok(elapsed) = Duration::from_std(controller.last_seen.elapsed()) {
+                    let last_seen = now - elapsed;
+                    if client.last_seen.is_none_or(|saved| saved < last_seen) {
+                        client.last_seen = Some(last_seen);
+                    }
+                }
+            }
+        }
+        Ok(clients)
+    }
+
+    /// Commit revocation before removing every live connection under the same registration gate.
+    pub(crate) async fn revoke_mcp_client(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        let _gate = self.enrollment_gate.lock().await;
+        // Acquire the state lock before committing. No await may intervene between the durable
+        // revoke and live cleanup, even if the requesting HTTP connection gets cancelled.
+        let mut state = self.state.lock().await;
+        let changed = self.enrollment_store()?.revoke_client(installation_id)?;
+        let connections = state
+            .controllers
+            .iter()
+            .filter(|(_, controller)| controller.installation_id == Some(installation_id))
+            .map(|(id, controller)| (*id, controller.connection_generation))
+            .collect::<Vec<_>>();
+        let mut revocations = Vec::new();
+        for (id, generation) in connections {
+            revocations.extend(remove_controller_locked(&mut state, id, generation, None));
+        }
+        drop(state);
+        for (sender, session_id, binding_token) in revocations {
+            let _ = sender.send(WireMessage::ControllerBindingRevoked {
+                session_id,
+                binding_token,
+            });
+        }
+        Ok(changed)
+    }
+
+    #[cfg(test)]
     async fn register_controller(
         &self,
         controller_id: ControllerInstanceId,
@@ -1585,6 +1690,28 @@ impl Relay {
         hostname: Option<String>,
         mac_address: Option<String>,
         sender: Sender,
+    ) -> anyhow::Result<u64> {
+        self.register_controller_record(
+            controller_id,
+            ControllerRecord {
+                installation_id: None,
+                sender,
+                last_seen: time::Instant::now(),
+                sessions: BTreeSet::new(),
+                owner_id,
+                kind,
+                connection_generation: 0,
+                hostname,
+                mac_address,
+            },
+        )
+        .await
+    }
+
+    async fn register_controller_record(
+        &self,
+        controller_id: ControllerInstanceId,
+        mut controller: ControllerRecord,
     ) -> anyhow::Result<u64> {
         let mut state = self.state.lock().await;
         if state.controllers.contains_key(&controller_id) {
@@ -1595,19 +1722,8 @@ impl Relay {
             .checked_add(1)
             .ok_or_else(|| anyhow!("Controller 连接代次已经耗尽"))?;
         let connection_generation = state.next_controller_generation;
-        state.controllers.insert(
-            controller_id,
-            ControllerRecord {
-                sender,
-                last_seen: time::Instant::now(),
-                sessions: BTreeSet::new(),
-                owner_id,
-                kind,
-                connection_generation,
-                hostname,
-                mac_address,
-            },
-        );
+        controller.connection_generation = connection_generation;
+        state.controllers.insert(controller_id, controller);
         Ok(connection_generation)
     }
 
@@ -3158,63 +3274,12 @@ impl Relay {
     ) {
         let revocations = {
             let mut state = self.state.lock().await;
-            if state
-                .controllers
-                .get(&controller_id)
-                .is_none_or(|controller| {
-                    controller.connection_generation != connection_generation
-                        || stale_before.is_some_and(|deadline| controller.last_seen > deadline)
-                })
-            {
-                return;
-            }
-            let controller = state
-                .controllers
-                .remove(&controller_id)
-                .expect("Controller 已在同一锁内验证");
-            controller.sender.slow_consumer.notify_one();
-            let mut revocations = Vec::new();
-            for session_id in controller.sessions {
-                let removed_binding =
-                    state
-                        .session_bindings
-                        .get_mut(&session_id)
-                        .and_then(|bindings| {
-                            bindings.remove_owned(
-                                controller.kind,
-                                controller_id,
-                                connection_generation,
-                            )
-                        });
-                if let Some(binding) = removed_binding
-                    && let Some(agent_sender) = state
-                        .agents
-                        .values()
-                        .find(|agent| agent.session_id == session_id && agent.ready)
-                        .and_then(|agent| agent.sender.clone())
-                {
-                    revocations.push((agent_sender, session_id, binding.binding_token));
-                }
-                if let Some(bindings) = state.session_bindings.get_mut(&session_id) {
-                    if controller.kind == ControllerKind::Human {
-                        bindings.human_takeover = false;
-                    }
-                    if bindings.is_empty() {
-                        state.session_bindings.remove(&session_id);
-                        // 最后一个绑定被撤销时，沿用 Agent 的整 session 清理边界。
-                        state
-                            .in_flight
-                            .retain(|_, request| request.session_id != session_id);
-                    }
-                }
-                send_session_connection_update(&state, session_id, None);
-            }
-            state.approvals.retain(|_, approval| {
-                approval.controller_id != controller_id
-                    || approval.controller_generation != connection_generation
-            });
-            // 保留在途请求的原代次；断线不等于 Agent 已确认取消。
-            revocations
+            remove_controller_locked(
+                &mut state,
+                controller_id,
+                connection_generation,
+                stale_before,
+            )
         };
         for (sender, session_id, binding_token) in revocations {
             let _ = sender.send(WireMessage::ControllerBindingRevoked {
@@ -3374,6 +3439,75 @@ fn append_audit(
         let remove = state.audit_log.len() - MAX_AUDIT_EVENTS;
         state.audit_log.drain(0..remove);
     }
+}
+
+/// The existing disconnect cleanup, shared with atomic installation revocation.
+fn remove_controller_locked(
+    state: &mut RelayState,
+    controller_id: ControllerInstanceId,
+    connection_generation: u64,
+    stale_before: Option<time::Instant>,
+) -> Vec<(Sender, SessionId, String)> {
+    if state
+        .controllers
+        .get(&controller_id)
+        .is_none_or(|controller| {
+            controller.connection_generation != connection_generation
+                || stale_before.is_some_and(|deadline| controller.last_seen > deadline)
+        })
+    {
+        return Vec::new();
+    }
+    let controller = state
+        .controllers
+        .remove(&controller_id)
+        .expect("Controller 已在同一锁内验证");
+    controller.sender.slow_consumer.notify_one();
+    let mut revocations = Vec::new();
+    for session_id in controller.sessions {
+        let removed_binding = state
+            .session_bindings
+            .get_mut(&session_id)
+            .and_then(|bindings| {
+                bindings.remove_owned(controller.kind, controller_id, connection_generation)
+            });
+        if let Some(binding) = removed_binding
+            && let Some(agent_sender) = state
+                .agents
+                .values()
+                .find(|agent| agent.session_id == session_id && agent.ready)
+                .and_then(|agent| agent.sender.clone())
+        {
+            revocations.push((agent_sender, session_id, binding.binding_token));
+        }
+        if let Some(bindings) = state.session_bindings.get_mut(&session_id) {
+            if controller.kind == ControllerKind::Human {
+                bindings.human_takeover = false;
+            }
+            if bindings.is_empty() {
+                state.session_bindings.remove(&session_id);
+                // 最后一个绑定被撤销时，沿用 Agent 的整 session 清理边界。
+                state
+                    .in_flight
+                    .retain(|_, request| request.session_id != session_id);
+            }
+        }
+        send_session_connection_update(state, session_id, None);
+    }
+    state.approvals.retain(|_, approval| {
+        approval.controller_id != controller_id
+            || approval.controller_generation != connection_generation
+    });
+    // 保留在途请求的原代次；断线不等于 Agent 已确认取消。
+    revocations
+}
+
+/// Append to the complete JSON filename, including its extension, so arbitrary legacy
+/// state filenames cannot collide with the separate enrollment database.
+fn enrollment_database_path(state_path: &Path) -> PathBuf {
+    let mut filename = state_path.as_os_str().to_os_string();
+    filename.push(".mcp.sqlite3");
+    PathBuf::from(filename)
 }
 
 fn token_fingerprint(token: &str) -> Option<String> {
@@ -3821,6 +3955,7 @@ fn new_secret_token() -> String {
 #[cfg(test)]
 mod tests {
     include!("relay_control_tests.rs");
+    include!("relay_enrollment_tests.rs");
     use std::path::PathBuf;
 
     use remoteops_domain::{

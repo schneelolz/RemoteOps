@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-EXPECTED_MCP_VERSION="0.2.0-preview.12"
+EXPECTED_MCP_VERSION="0.2.0-preview.13"
 EXPECTED_CREDENTIAL_PROMPT_VERSION="0.2.0-preview.5"
 KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"
@@ -28,42 +28,56 @@ CREDENTIAL_PROMPT="$CODEX_HOME/remoteops/remoteops-credential-prompt"
 [[ -x "$BINARY" ]] && pass "MCP 程序存在且可执行。" || fail "未找到当前版本 MCP：$BINARY"
 [[ -x "$CREDENTIAL_PROMPT" ]] && pass "SSH 密码安全输入程序存在且可执行。" || fail "缺少 SSH 密码安全输入程序。"
 if [[ -x "$BINARY" ]]; then
-  version_output="$($BINARY --version 2>&1 || true)"
+  version_output="$("$BINARY" --version 2>&1 || true)"
   [[ "$version_output" == *"$EXPECTED_MCP_VERSION"* ]] && pass "MCP 版本：$version_output" || fail "MCP 版本不正确：$version_output"
 fi
 if [[ -x "$CREDENTIAL_PROMPT" ]]; then
-  prompt_version_output="$($CREDENTIAL_PROMPT --version 2>&1 || true)"
+  prompt_version_output="$("$CREDENTIAL_PROMPT" --version 2>&1 || true)"
   [[ "$prompt_version_output" == *"$EXPECTED_CREDENTIAL_PROMPT_VERSION"* ]] && pass "SSH 密码安全输入程序版本：$prompt_version_output" || fail "SSH 密码安全输入程序版本不正确：$prompt_version_output"
 fi
-[[ -x "$LAUNCHER" ]] && pass "Keychain 启动脚本存在。" || fail "缺少 MCP 启动脚本。"
-security find-generic-password -a "$CURRENT_USER" -s "$KEYCHAIN_SERVICE" -w >/dev/null 2>&1 && pass "Controller Token 已存在于 Keychain。" || fail "Keychain 中没有 Controller Token。"
+credential_id="$(plutil -extract credential_id raw "$CONNECTION_CONFIG" 2>/dev/null || true)"
+MCP_COMMAND="$LAUNCHER"
+if [[ -n "$credential_id" ]]; then
+  MCP_COMMAND="$BINARY"
+  if "$BINARY" --check-credential --config "$CONNECTION_CONFIG" >/dev/null; then
+    pass "独立 Controller 凭据存在于 macOS Keychain（未读取到脚本）。"
+  else
+    fail "无法读取此安装的 Keychain 凭据；请保留设置状态并重新运行安装器。"
+  fi
+else
+  [[ -x "$LAUNCHER" ]] && pass "Keychain 启动脚本存在。" || fail "缺少 MCP 启动脚本。"
+  security find-generic-password -a "$CURRENT_USER" -s "$KEYCHAIN_SERVICE" -w >/dev/null 2>&1 && pass "Controller Token 已存在于 Keychain。" || fail "Keychain 中没有 Controller Token。"
+fi
 
-if [[ -f "$CONFIG_PATH" ]] && grep -Fq '[mcp_servers.remoteops]' "$CONFIG_PATH" && grep -Fq "$LAUNCHER" "$CONFIG_PATH"; then
-  pass "Codex MCP 配置已指向当前启动脚本。"
+INSPECTION="$(mktemp "${TMPDIR:-/tmp}/remoteops-inspection.XXXXXX")"
+trap 'rm -f "$INSPECTION"' EXIT
+if [[ -f "$CONFIG_PATH" && -x "$BINARY" ]] && "$BINARY" --inspect-codex "$CONFIG_PATH" > "$INSPECTION"; then
+  configured_command="$(plutil -extract command raw "$INSPECTION" 2>/dev/null || true)"
+  configured_config="$(plutil -extract args_config raw "$INSPECTION" 2>/dev/null || true)"
+  if [[ "$configured_command" == "$MCP_COMMAND" && "$configured_config" == "$CONNECTION_CONFIG" ]]; then
+    pass "Codex MCP 配置已指向当前安装的程序与连接配置。"
+  else
+    fail "Codex remoteops 路径或参数不匹配；不会执行配置中的未知命令。"
+  fi
+  tool_timeout="$(plutil -extract tool_timeout_sec raw "$INSPECTION" 2>/dev/null || true)"
+  if [[ "$tool_timeout" =~ ^[0-9]+$ && "$tool_timeout" -ge 360 ]]; then
+    pass "RemoteOps MCP 工具超时至少为 360 秒。"
+  else
+    fail "RemoteOps MCP tool_timeout_sec 必须至少为 360 秒。"
+  fi
+  approval_mode="$(plutil -extract default_tools_approval_mode raw "$INSPECTION" 2>/dev/null || true)"
+  control_mode_approval="$(plutil -extract set_control_mode_approval_mode raw "$INSPECTION" 2>/dev/null || true)"
+  if [[ "$approval_mode" == 'approve' && "$control_mode_approval" == 'prompt' ]]; then
+    pass "RemoteOps 工具审批与 set_control_mode 独立确认已配置；全局 Codex 策略由用户管理。"
+  else
+    fail "RemoteOps MCP 工具审批或 set_control_mode 确认配置不完整。"
+  fi
+  legacy_env="$(plutil -extract legacy_env raw "$INSPECTION" 2>/dev/null || true)"
+  if [[ "$legacy_env" != 'false' ]]; then
+    fail "macOS 配置不应转发旧 Controller 环境变量。"
+  fi
 else
-  fail "Codex config.toml 未正确配置 remoteops。"
-fi
-if [[ -f "$CONFIG_PATH" ]] && awk '
-  $0 == "[mcp_servers.remoteops]" { in_remoteops=1; next }
-  /^\[/ { in_remoteops=0 }
-  in_remoteops && $0 ~ /^tool_timeout_sec[[:space:]]*=/ {
-    split($0, parts, "="); value=parts[2]+0; found=1
-  }
-  END { exit !(found && value >= 360) }
-' "$CONFIG_PATH"; then
-  pass "RemoteOps MCP 工具超时至少为 360 秒。"
-else
-  fail "RemoteOps MCP tool_timeout_sec 必须至少为 360 秒。"
-fi
-if [[ -f "$CONFIG_PATH" ]] && grep -Fq 'default_tools_approval_mode = "approve"' "$CONFIG_PATH" && grep -Eq '^approval_policy[[:space:]]*=[[:space:]]*\{[[:space:]]*granular[[:space:]]*=[[:space:]]*\{[^}]*mcp_elicitations[[:space:]]*=[[:space:]]*true' "$CONFIG_PATH"; then
-  pass "RemoteOps MCP 交互确认已启用，且不会重复触发 Codex 静态工具审批。"
-else
-  fail "RemoteOps MCP 交互确认配置不完整。"
-fi
-if [[ -f "$CONFIG_PATH" ]] && grep -Fq '[mcp_servers.remoteops.tools.set_control_mode]' "$CONFIG_PATH" && grep -Fq 'approval_mode = "prompt"' "$CONFIG_PATH"; then
-  pass "完全控制仅通过 set_control_mode 的 Codex 工具确认启用。"
-else
-  fail "set_control_mode 未配置独立 Codex 工具确认。"
+  fail "无法解析 Codex remoteops 配置。"
 fi
 if [[ -f "$CONNECTION_CONFIG" ]] && plutil -lint "$CONNECTION_CONFIG" >/dev/null; then
   pass "RemoteOps 连接配置是有效 JSON。"

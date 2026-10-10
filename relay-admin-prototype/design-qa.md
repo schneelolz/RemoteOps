@@ -32,3 +32,20 @@ final result: passed
 生产浏览器验证系统主题变化、手动偏好保持，以及演示数据确认框居中；未发现 CSP 违规。主题初始化移至同源 theme.js，并在资源响应中允许现有样式属性与 data 图标；后端协议、鉴权及关闭接口未改动。未登录时 session 接口401符合预期；未使用真实凭据登录，未关闭真实节点。
 
 备份目录：/opt/remoteops/backups/remoteops-before-relay-ui-20260923-c8f7aa2a。源代码位于 codex/relay-admin-refresh，尚未提交或推送。
+
+## 2026-10-10：MCP 一次性接入界面
+
+### 已验证
+
+- `node --check relay-admin-prototype/app.js` 通过。
+- `node --test scripts/test-relay-admin.mjs`：35 项通过，包括原有 12 项主题与 Agent 关闭测试。
+- 新增测试涵盖明确接入地址与公开证书校验、1 / 24 / 168 小时生成参数、四种设置状态、客户端撤销、名称/标识/时间/代码 HTML 转义、代码与下载 JSON 内容一致、请求提交锁、重复签发保护。
+- 关闭、导航、浏览器 history/hash 切换、pagehide 与退出登录后，内存和已隐藏弹窗 DOM 不再保存设置代码；旧生成、保存、列表及撤销响应不会重开弹窗或覆盖当前页面。离开后返回的旧请求完成时会释放新页面的提交锁，重新读取最新元数据。
+- 演示模式不访问 MCP 接入 API，不签发、复制或下载任何演示凭据。
+- `git diff --check`（前端改动范围）通过。
+
+### 本轮尚未完成的浏览器验收
+
+已将使用合成同源 API 的可移植 Playwright/Chromium 冒烟测试保存为 `scripts/test-mcp-admin-browser.cjs`（用法见 README）。脚本语法及“仅导入不启动浏览器”检查通过，但当前执行环境在 Chromium 启动时拒绝创建本地 socket（`process_singleton_posix.cc: socket() failed: Operation not permitted`），允许的提权重试同样失败。未产生可确认的浏览器截图或实际点击验收结果，不能将 Node 测试结果视为完整的视觉、布局或真实 Relay 集成验收。
+
+后续需在可启动浏览器的隔离环境验证：桌面亮/暗主题、390px 窄屏、滚动及弹窗焦点、实际代码复制与 `.remoteops-setup` 下载、生成及撤销重复点击、请求中断后导航/返回，以及使用临时 Relay 的端到端管理 API 联通。
