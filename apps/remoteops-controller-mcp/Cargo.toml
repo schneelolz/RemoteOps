@@ -52,6 +52,9 @@ keyring-core = "1.0"
 rcgen = "0.14"
 tokio-rustls.workspace = true
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+security-framework = "3.7"
+
 [build-dependencies]
 winresource.workspace = true
 

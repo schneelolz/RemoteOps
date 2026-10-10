@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -27,6 +28,22 @@ SETUP = json.dumps({"version": 1, "grant": DUMMY_GRANT, "fixture_label": "測試
 # to the Rust helper's own tests, not another implementation in installers.
 HELPER_SOURCE = r'''
 use std::{env, fs, io::{self, Read, Write}, path::Path};
+fn close_stdin_for_fault_fixture() {
+    #[cfg(unix)]
+    unsafe {
+        extern "C" { fn close(fd: i32) -> i32; }
+        assert_eq!(close(0), 0);
+    }
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        assert_ne!(CloseHandle(GetStdHandle((-10_i32) as u32)), 0);
+    }
+}
 fn main() {
     let args: Vec<String> = env::args().collect();
     if let Ok(forbidden) = env::var("INSTALLER_TEST_FORBIDDEN_EXECUTABLE") {
@@ -51,6 +68,12 @@ fn main() {
     }
     if args.iter().any(|a| a == "--check-credential" || a == "--remove-credential") { return; }
     assert!(args.iter().any(|a| a == "--setup-stdin"));
+    if let Ok(marker) = env::var("INSTALLER_TEST_BROKEN_STDIN_PID") {
+        fs::write(marker, std::process::id().to_string()).unwrap();
+        close_stdin_for_fault_fixture();
+        // Installer cleanup must terminate this child after the write fails.
+        loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
+    }
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).unwrap();
     let expected = fs::read_to_string(env::var("INSTALLER_TEST_EXPECTED").unwrap()).unwrap();
@@ -98,6 +121,37 @@ try:
 except (OSError, ValueError, KeyError, TypeError):
     sys.exit(1)
 """
+
+
+def fixture_process_alive(pid):
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:  # ERROR_INVALID_PARAMETER: this PID no longer exists.
+                return False
+            if error == 5:  # Access denied is not proof of exit.
+                return True
+            raise OSError(error, "Could not inspect isolated helper process")
+        try:
+            code = wintypes.DWORD()
+            if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+                raise OSError("Could not inspect isolated helper process")
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 class InstallerTests(unittest.TestCase):
@@ -264,6 +318,27 @@ class InstallerTests(unittest.TestCase):
                 with self.subTest(encoding=encoding, stdin=stdin):
                     self.assert_success(self.run_installer(stdin=stdin, console_encoding=encoding))
 
+    def test_windows_broken_stdin_terminates_helper(self):
+        if self.target != "windows":
+            self.skipTest("Windows process-helper cleanup regression")
+        marker = self.root / "fault-helper.pid"
+        self.env["INSTALLER_TEST_BROKEN_STDIN_PID"] = str(marker)
+        # Exceed pipe buffering so a closed reader reliably interrupts Write.
+        self.setup_file.write_text("isolated dummy input " * 65536, encoding="utf-8")
+        try:
+            result = self.run_installer()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(marker.exists(), "Broken-pipe helper did not start")
+            self.assertFalse(fixture_process_alive(int(marker.read_text())),
+                             "Installer left its failed setup helper running")
+            self.assertEqual(self.config.read_bytes(), self.original.encode())
+        finally:
+            # Test failures must not themselves leak the deliberately hung fixture.
+            if marker.exists():
+                pid = int(marker.read_text())
+                if fixture_process_alive(pid):
+                    os.kill(pid, signal.SIGTERM)
+
     def test_hidden_setup_prompt(self):
         self.assert_success(self.run_installer(code=True, input_content=SETUP + "\n"))
 
@@ -331,7 +406,17 @@ class InstallerTests(unittest.TestCase):
         marker = self.root / "unexpected-execution"
         self.env["INSTALLER_TEST_FORBIDDEN_EXECUTABLE"] = str(outside)
         self.env["INSTALLER_TEST_FORBIDDEN_MARKER"] = str(marker)
-        self.config.write_text(self.config.read_text().replace(str(self.codex / "remoteops").replace("\\", "\\\\"), str(self.root).replace("\\", "\\\\")))
+        # Use the real editor, not a textual replacement that assumes TOML's
+        # basic-string escaping (Windows paths may be emitted as literal strings).
+        subprocess.run([str(self.real_helper), "--configure-codex", str(self.config),
+                        "--mcp-command", str(outside),
+                        "--mcp-config", str(self.codex / "remoteops/controller-config.json"),
+                        "--mcp-mode", "agent-controlled"],
+                       capture_output=True, check=True, env=self.env)
+        inspection = subprocess.run([str(self.real_helper), "--inspect-codex", str(self.config)],
+                                    capture_output=True, text=True, encoding="utf-8", check=True, env=self.env)
+        self.assertEqual(json.loads(inspection.stdout)["command"], str(outside),
+                         "Outside-installation fixture did not change the actual command")
         result = self.run_verifier()
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(marker.exists(), "Verifier executed an out-of-installation command")

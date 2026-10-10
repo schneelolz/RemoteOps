@@ -51,8 +51,10 @@ function Read-CodexInspection {
     $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
+    $processStarted = $false
     try {
-        if (-not $process.Start()) { throw '无法启动 Codex 配置检查。' }
+        $processStarted = $process.Start()
+        if (-not $processStarted) { throw '无法启动 Codex 配置检查。' }
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit(30000)) {
@@ -66,7 +68,13 @@ function Read-CodexInspection {
         return $outputText
     }
     finally {
-        $process.Dispose()
+        try {
+            if ($processStarted -and -not $process.HasExited) {
+                $process.Kill()
+                $process.WaitForExit()
+            }
+        }
+        finally { $process.Dispose() }
     }
 }
 

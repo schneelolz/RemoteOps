@@ -112,6 +112,7 @@ function Invoke-SetupHelper {
     $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
+    $processStarted = $false
     try {
         # .NET Framework creates an AutoFlush StreamWriter during Start using
         # Console.InputEncoding, which can emit a BOM before BaseStream is used.
@@ -119,7 +120,8 @@ function Invoke-SetupHelper {
         $previousInputEncoding = [Console]::InputEncoding
         try {
             [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
-            if (-not $process.Start()) { throw '无法启动一次性设置程序。' }
+            $processStarted = $process.Start()
+            if (-not $processStarted) { throw '无法启动一次性设置程序。' }
         }
         finally {
             [Console]::InputEncoding = $previousInputEncoding
@@ -150,7 +152,15 @@ function Invoke-SetupHelper {
         return $outputText.Trim()
     }
     finally {
-        $process.Dispose()
+        # Dispose releases handles but does not stop a child. A broken stdin
+        # pipe or another early failure must not leave enrollment running.
+        try {
+            if ($processStarted -and -not $process.HasExited) {
+                $process.Kill()
+                $process.WaitForExit()
+            }
+        }
+        finally { $process.Dispose() }
     }
 }
 

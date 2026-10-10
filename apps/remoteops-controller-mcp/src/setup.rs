@@ -516,6 +516,9 @@ async fn check_relay(response: &RedeemResponse, path: &Path, secret: &str) -> an
 }
 
 #[cfg(test)]
+mod native_e2e;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -534,6 +537,105 @@ mod tests {
             Ok(())
         }
     }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    struct NativeCredentialCleanup {
+        installation_id: Uuid,
+        armed: bool,
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    impl NativeCredentialCleanup {
+        fn cleanup(&mut self) -> anyhow::Result<()> {
+            OsCredentialStore.remove(self.installation_id)?;
+            anyhow::ensure!(
+                OsCredentialStore.load(self.installation_id)?.is_none(),
+                "temporary native test credential remained after deletion"
+            );
+            self.armed = false;
+            Ok(())
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    impl Drop for NativeCredentialCleanup {
+        fn drop(&mut self) {
+            if self.armed && self.cleanup().is_err() {
+                // The UUID identifies only this test's dummy entry, never an
+                // existing installation. Never print the stored value.
+                eprintln!(
+                    "native test credential cleanup failed for installation {}",
+                    self.installation_id
+                );
+                assert!(
+                    std::thread::panicking(),
+                    "native test credential cleanup failed"
+                );
+            }
+        }
+    }
+
+    /// Opt-in native coverage; never contacts a Relay or enumerates credentials.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    #[ignore = "writes and deletes one isolated dummy entry in the native OS credential store"]
+    fn native_os_credential_store_round_trip() -> anyhow::Result<()> {
+        // Suppress prompts in this process only. A locked/denied Keychain must
+        // fail rather than ask for a password or change its access policy.
+        #[cfg(target_os = "macos")]
+        let previous_interaction =
+            security_framework::os::macos::keychain::SecKeychain::user_interaction_allowed()?;
+        #[cfg(target_os = "macos")]
+        let interaction_guard = if previous_interaction {
+            Some(security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()?)
+        } else {
+            None
+        };
+
+        let installation_id = Uuid::new_v4();
+        let store = OsCredentialStore;
+        // Never overwrite or delete a pre-existing entry, even on UUID collision.
+        anyhow::ensure!(
+            store.load(installation_id)?.is_none(),
+            "random native test credential identifier already exists"
+        );
+        let mut cleanup = NativeCredentialCleanup {
+            installation_id,
+            armed: true,
+        };
+        // Exactly 32 visibly dummy bytes; no Relay ever registers this identity.
+        let dummy = Zeroizing::new(URL_SAFE_NO_PAD.encode(b"RemoteOps OS store test dummy!!!"));
+        let round_trip = (|| -> anyhow::Result<()> {
+            validate_secret(&dummy)?;
+            store.save(installation_id, &dummy)?;
+            let actual = store
+                .load(installation_id)?
+                .context("native credential store did not return the test entry")?;
+            anyhow::ensure!(
+                actual.as_str() == dummy.as_str(),
+                "native credential mismatch"
+            );
+            Ok(())
+        })();
+        // Cleanup is mandatory even if save/read failed; the drop guard retries
+        // after a cleanup error or panic. A cleanup error still fails the test.
+        let cleanup_result = cleanup.cleanup().with_context(|| {
+            format!("failed to remove temporary native credential {installation_id}")
+        });
+        drop(cleanup);
+
+        #[cfg(target_os = "macos")]
+        {
+            drop(interaction_guard);
+            anyhow::ensure!(
+                security_framework::os::macos::keychain::SecKeychain::user_interaction_allowed()?
+                    == previous_interaction,
+                "could not restore process-local Keychain interaction state"
+            );
+        }
+        cleanup_result?;
+        round_trip
+    }
+
     fn setup() -> SetupDocument {
         SetupDocument {
             version: 1,

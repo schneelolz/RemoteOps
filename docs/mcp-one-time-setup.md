@@ -68,4 +68,11 @@ macOS 安装包：
 - `python3 scripts/Test-McpSetupInstallers.py`
 - 全工作区 fmt、check、clippy、test，以及 Windows/macOS CI 的安装器测试。
 
+Windows/macOS CI 另有显式启用的原生测试：真实系统凭据库的临时读写/删除，以及本机隔离 Relay + HTTPS/TLS 的发码、领取、凭据保存、MCP 自检、同安装重试和撤销。测试只创建随机临时身份，不关联生产 Relay；结束时删除凭据并确认不存在。macOS 测试在本进程禁用凭据库交互，锁定或拒绝访问时直接失败，不解锁或修改系统安全策略。
+
+开发时先构建 `remoteops-relay`，将 `REMOTEOPS_TEST_RELAY` 指向本地构建的可执行文件，再显式运行：
+
+- `cargo test -p remoteops-controller-mcp --locked setup::tests::native_os_credential_store_round_trip -- --ignored --exact --test-threads=1`（Windows/macOS）
+- `cargo test -p remoteops-controller-mcp --locked setup::native_e2e::native_os_store_real_relay_onboarding -- --ignored --exact --test-threads=1`（Windows/macOS）
+
 测试使用隔离临时目录、虚构身份、模拟系统凭据或本地临时证书；不使用生产管理秘密。Native CI 与脚本模拟通过不能替代实际签名发布包、企业 Keychain/系统策略和生产反向代理的现场验收。
