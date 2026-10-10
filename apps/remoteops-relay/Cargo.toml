@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-relay"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -24,6 +24,8 @@ clap.workspace = true
 hex.workspace = true
 rand.workspace = true
 rcgen = "0.14"
+remoteops-enrollment = { path = "../../crates/remoteops-enrollment" }
+remoteops-enrollment-store = { path = "../../crates/remoteops-enrollment-store" }
 remoteops-domain = { path = "../../crates/remoteops-domain" }
 remoteops-policy = { path = "../../crates/remoteops-policy" }
 remoteops-protocol = { path = "../../crates/remoteops-protocol" }
@@ -39,6 +41,7 @@ uuid.workspace = true
 winresource.workspace = true
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

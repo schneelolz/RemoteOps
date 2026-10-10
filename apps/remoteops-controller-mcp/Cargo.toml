@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-controller-mcp"
-version = "0.2.0-preview.12"
+version = "0.2.0-preview.13"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -20,6 +20,12 @@ anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 clap.workspace = true
+chrono.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+uuid.workspace = true
+remoteops-enrollment = { path = "../../crates/remoteops-enrollment" }
 hex.workspace = true
 remoteops-application = { path = "../../crates/remoteops-application" }
 remoteops-audit = { path = "../../crates/remoteops-audit" }
@@ -33,7 +39,21 @@ sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+toml_edit = "0.25"
 zeroize.workspace = true
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+keyring = "4.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring-core = "1.0"
+
+[dev-dependencies]
+rcgen = "0.14"
+tokio-rustls.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+security-framework = "3.7"
 
 [build-dependencies]
 winresource.workspace = true

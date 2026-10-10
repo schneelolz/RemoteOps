@@ -2604,7 +2604,7 @@ mod tests {
             "计算机名是 LAB-WIN-B"
         );
         history.remove(first_session);
-        assert!(history.snapshot(first_session).is_empty());
+        assert_eq!(history.snapshot(first_session).len(), 0);
         assert_eq!(history.snapshot(second_session).len(), 1);
     }
 

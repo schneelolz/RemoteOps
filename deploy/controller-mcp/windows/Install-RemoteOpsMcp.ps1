@@ -1,23 +1,44 @@
-﻿[CmdletBinding()]
+﻿[CmdletBinding(PositionalBinding = $false)]
 param(
-    [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
-    [Parameter(Mandatory)]
+    [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$RelayAddress,
-    [Parameter(Mandatory)]
-    [ValidateScript({ $_ -ne [guid]::Empty })]
     [guid]$OwnerId,
     [string]$ServerName,
     [string]$CaCert,
     [string]$TlsFingerprint,
     [ValidateSet('readonly', 'approval', 'agent-controlled', 'full-access')]
     [string]$CommandMode = 'agent-controlled',
-    [switch]$SkipTokenPrompt
+    [switch]$SkipTokenPrompt,
+    [string]$SetupFile,
+    [switch]$SetupStdin,
+    [switch]$SetupCode,
+    [switch]$ConfirmEnrollment
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Never include setup material in diagnostic tracing or native process arguments.
+Set-PSDebug -Off
+$setupMode = -not [string]::IsNullOrWhiteSpace($SetupFile) -or $SetupStdin -or $SetupCode
+$setupSourceCount = [int](-not [string]::IsNullOrWhiteSpace($SetupFile)) + [int]$SetupStdin.IsPresent + [int]$SetupCode.IsPresent
+if ($setupSourceCount -gt 1) {
+    throw 'SetupFile、SetupStdin 和 SetupCode 只能选择一种。'
+}
+if ($setupMode) {
+    foreach ($manualParameter in @('RelayAddress', 'OwnerId', 'ServerName', 'CaCert', 'TlsFingerprint', 'SkipTokenPrompt')) {
+        if ($PSBoundParameters.ContainsKey($manualParameter)) {
+            throw '一次性设置不能与手工 Relay、Owner、证书或 Token 参数混用。'
+        }
+    }
+}
+elseif ($ConfirmEnrollment) {
+    throw 'ConfirmEnrollment 只能用于一次性设置。'
+}
+elseif ([string]::IsNullOrWhiteSpace($RelayAddress) -or $OwnerId -eq [guid]::Empty) {
+    throw '手工安装必须提供 RelayAddress 和非全零 OwnerId；推荐改用 SetupFile 或 SetupCode。'
+}
 
-$mcpVersion = '0.2.0-preview.12'
+$mcpVersion = '0.2.0-preview.13'
 $credentialPromptVersion = '0.2.0-preview.5'
 $tokenVariable = 'REMOTEOPS_CONTROLLER_TOKEN'
 $ownerVariable = 'REMOTEOPS_CONTROLLER_OWNER_ID'
@@ -28,113 +49,158 @@ $defaultCodexHome = Join-Path $env:USERPROFILE '.codex'
 $isDefaultCodexHome = [IO.Path]::GetFullPath($CodexHome).TrimEnd('\') -eq
     [IO.Path]::GetFullPath($defaultCodexHome).TrimEnd('\')
 
-if ([string]::IsNullOrWhiteSpace($ServerName)) {
-    if ($RelayAddress -match '^\[(?<host>[^\]]+)\]:(?<port>\d+)$') {
-        $ServerName = $Matches.host
-    }
-    elseif ($RelayAddress -match '^(?<host>[^:]+):(?<port>\d+)$') {
-        $ServerName = $Matches.host
-    }
-    else {
-        throw 'RelayAddress 必须使用 host:port 格式。'
-    }
-}
-
-if (
-    -not [string]::IsNullOrWhiteSpace($CaCert) -and
-    -not [string]::IsNullOrWhiteSpace($TlsFingerprint)
-) {
-    throw 'CaCert 和 TlsFingerprint 只能选择一种信任方式。'
-}
-$normalizedTlsFingerprint = $null
-if (-not [string]::IsNullOrWhiteSpace($TlsFingerprint)) {
-    $compactFingerprint = $TlsFingerprint.Trim() -replace '^(?i:sha256:)', ''
-    $compactFingerprint = $compactFingerprint -replace '[:\-\s]', ''
-    if ($compactFingerprint -notmatch '^[0-9A-Fa-f]{64}$') {
-        throw 'TlsFingerprint 必须是 64 位 SHA-256 十六进制值。'
-    }
-    $normalizedTlsFingerprint = (
-        0..31 |
-            ForEach-Object {
-                $compactFingerprint.Substring($_ * 2, 2).ToUpperInvariant()
-            }
-    ) -join ':'
-}
-
-function ConvertTo-TomlBasicString {
-    param([Parameter(Mandatory)][string]$Value)
-
-    return '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"'
-}
-
-function Remove-RemoteOpsConfigSections {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Content)
-
-    $result = [System.Collections.Generic.List[string]]::new()
-    $skipSection = $false
-    foreach ($line in [regex]::Split($Content, '\r?\n')) {
-        if ($line -match '^\s*\[(?<name>[^\]]+)\]\s*(?:#.*)?$') {
-            $sectionName = $Matches.name.Trim()
-            $skipSection = $sectionName -eq 'mcp_servers.remoteops' -or
-                $sectionName.StartsWith('mcp_servers.remoteops.', [StringComparison]::Ordinal) -or
-                $sectionName -eq 'mcp_servers."remoteops"' -or
-                $sectionName.StartsWith('mcp_servers."remoteops".', [StringComparison]::Ordinal)
+if (-not $setupMode) {
+    if ([string]::IsNullOrWhiteSpace($ServerName)) {
+        if ($RelayAddress -match '^\[(?<host>[^\]]+)\]:(?<port>\d+)$') {
+            $ServerName = $Matches.host
         }
-        if (-not $skipSection) {
-            $result.Add($line)
+        elseif ($RelayAddress -match '^(?<host>[^:]+):(?<port>\d+)$') {
+            $ServerName = $Matches.host
+        }
+        else {
+            throw 'RelayAddress 必须使用 host:port 格式。'
         }
     }
-    while ($result.Count -gt 0 -and [string]::IsNullOrWhiteSpace($result[$result.Count - 1])) {
-        $result.RemoveAt($result.Count - 1)
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($CaCert) -and
+        -not [string]::IsNullOrWhiteSpace($TlsFingerprint)
+    ) {
+        throw 'CaCert 和 TlsFingerprint 只能选择一种信任方式。'
     }
-    return $result
+    $normalizedTlsFingerprint = $null
+    if (-not [string]::IsNullOrWhiteSpace($TlsFingerprint)) {
+        $compactFingerprint = $TlsFingerprint.Trim() -replace '^(?i:sha256:)', ''
+        $compactFingerprint = $compactFingerprint -replace '[:\-\s]', ''
+        if ($compactFingerprint -notmatch '^[0-9A-Fa-f]{64}$') {
+            throw 'TlsFingerprint 必须是 64 位 SHA-256 十六进制值。'
+        }
+        $normalizedTlsFingerprint = (
+            0..31 |
+                ForEach-Object {
+                    $compactFingerprint.Substring($_ * 2, 2).ToUpperInvariant()
+                }
+        ) -join ':'
+    }
+
 }
 
-function Set-CodexGranularApprovalPolicy {
+# Use a managed worker for the complete transfer: .NET Framework's FlushAsync
+# may synchronously flush its buffer before returning a Task. No PowerShell
+# scriptblock runs on this worker, and setup material is never a process argument.
+if ($setupMode -and -not ('RemoteOps.SetupPipeTransfer' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System.IO;
+using System.Threading.Tasks;
+namespace RemoteOps {
+    public static class SetupPipeTransfer {
+        public static Task SendAsync(Stream stream, byte[] bytes) {
+            return Task.Run(() => {
+                try {
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.Flush();
+                }
+                finally {
+                    try { stream.Close(); }
+                    finally { System.Array.Clear(bytes, 0, bytes.Length); }
+                }
+            });
+        }
+    }
+}
+'@
+}
+
+function Invoke-SetupHelper {
     param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [AllowEmptyString()]
-        [string[]]$Lines
+        [Parameter(Mandatory)][string]$Executable,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$InputContent
     )
 
-    $result = [System.Collections.Generic.List[string]]::new()
-    $skipLegacyGranular = $false
-    $approvalPolicyWritten = $false
-    foreach ($line in $Lines) {
-        if ($line -match '^\s*\[(?<name>[^\]]+)\]\s*(?:#.*)?$') {
-            $skipLegacyGranular = $Matches.name.Trim() -eq 'approval_policy.granular'
-            if ($skipLegacyGranular) {
-                continue
+    # .Arguments works on Windows PowerShell 5.1 as well as PowerShell 7.
+    # Quote only non-secret switches/paths; setup material always uses stdin.
+    $quotedArguments = foreach ($argument in $Arguments) {
+        '"' + ([regex]::Replace(
+            [regex]::Replace($argument, '(\\*)"', '$1$1\"'),
+            '(\\+)$', '$1$1'
+        )) + '"'
+    }
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Executable
+    $startInfo.Arguments = $quotedArguments -join ' '
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $processStarted = $false
+    $inputBytes = $null
+    $inputTransfer = $null
+    try {
+        # .NET Framework creates an AutoFlush StreamWriter during Start using
+        # Console.InputEncoding, which can emit a BOM before BaseStream is used.
+        # Capture a BOM-free encoding for this child only, then restore the host.
+        $previousInputEncoding = [Console]::InputEncoding
+        try {
+            [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+            $processStarted = $process.Start()
+            if (-not $processStarted) { throw '无法启动一次性设置程序。' }
+        }
+        finally {
+            [Console]::InputEncoding = $previousInputEncoding
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        # Write UTF-8 bytes directly for Windows PowerShell 5.1 as well as 7;
+        # do not depend on the console code page or newer encoding properties.
+        $inputBytes = [Text.Encoding]::UTF8.GetBytes($InputContent)
+        # Bound the whole write/flush/close, including synchronous pipe calls.
+        $inputTransfer = [RemoteOps.SetupPipeTransfer]::SendAsync($process.StandardInput.BaseStream, $inputBytes)
+        if (-not $inputTransfer.Wait(10000)) {
+            throw '设置输入传输超时；请保留设置文件并重试。'
+        }
+        $inputTransfer.GetAwaiter().GetResult()
+        # Preview only parses local input. Do not give a stuck preview the full
+        # network-enrollment window, including Framework's silent pipe closure.
+        $helperTimeoutMilliseconds = if ($Arguments -contains '--setup-preview') { 10000 } else { 180000 }
+        if (-not $process.WaitForExit($helperTimeoutMilliseconds)) {
+            $process.Kill()
+            $process.WaitForExit()
+            throw '登记超时；请保留 setup-state.json 并使用同一设置重试。'
+        }
+        $outputText = $stdout.GetAwaiter().GetResult()
+        $errorText = $stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw "一次性设置未完成：$errorText"
+        }
+        return $outputText.Trim()
+    }
+    finally {
+        # Dispose releases handles but does not stop a child. A broken stdin
+        # pipe or another early failure must not leave enrollment running.
+        try {
+            if ($processStarted -and -not $process.HasExited) {
+                $process.Kill()
+                $process.WaitForExit()
             }
         }
-        if ($skipLegacyGranular) {
-            continue
-        }
-        if ($line -match '^\s*approval_policy\s*=') {
-            if (-not $approvalPolicyWritten) {
-                $result.Add(
-                    'approval_policy = { granular = { sandbox_approval = true, rules = true, ' +
-                    'mcp_elicitations = true, request_permissions = false, skill_approval = false } }'
-                )
-                $approvalPolicyWritten = $true
+        finally {
+            # Kill first so any pending pipe write can finish before its buffer
+            # is cleared. Never mutate bytes still owned by an async write.
+            if ($null -ne $inputTransfer -and -not $inputTransfer.IsCompleted) {
+                try { $null = $inputTransfer.Wait(5000) } catch { }
             }
-            continue
+            if ($null -ne $inputBytes -and ($null -eq $inputTransfer -or $inputTransfer.IsCompleted)) {
+                [Array]::Clear($inputBytes, 0, $inputBytes.Length)
+            }
+            $process.Dispose()
         }
-        $result.Add($line)
     }
-    if (-not $approvalPolicyWritten) {
-        $insertAt = 0
-        while ($insertAt -lt $result.Count -and [string]::IsNullOrWhiteSpace($result[$insertAt])) {
-            $insertAt++
-        }
-        $result.Insert(
-            $insertAt,
-            'approval_policy = { granular = { sandbox_approval = true, rules = true, ' +
-            'mcp_elicitations = true, request_permissions = false, skill_approval = false } }'
-        )
-    }
-    return $result
 }
 
 function Write-Utf8NoBom {
@@ -168,38 +234,46 @@ if ($LASTEXITCODE -ne 0 -or $promptVersionOutput -notmatch [regex]::Escape($cred
     throw "SSH 密码安全输入程序版本不正确：$promptVersionOutput"
 }
 
-$userToken = [Environment]::GetEnvironmentVariable($tokenVariable, 'User')
-if ([string]::IsNullOrWhiteSpace($userToken)) {
-    $processToken = [Environment]::GetEnvironmentVariable($tokenVariable, 'Process')
-    if (-not [string]::IsNullOrWhiteSpace($processToken)) {
-        if ($processToken.Length -lt 32) {
-            throw "$tokenVariable 至少需要 32 个字符。"
-        }
-        [Environment]::SetEnvironmentVariable($tokenVariable, $processToken, 'User')
-        $userToken = $processToken
-    }
-}
-if ([string]::IsNullOrWhiteSpace($userToken)) {
-    if ($SkipTokenPrompt) {
-        throw "未找到当前用户环境变量 $tokenVariable。请先安全设置 Token，或不带 -SkipTokenPrompt 重新运行安装脚本。"
-    }
-    $secureToken = Read-Host '请输入 AI Controller Token（输入内容不会显示）' -AsSecureString
-    $tokenPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
-    try {
-        $plainToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer)
-        if ([string]::IsNullOrWhiteSpace($plainToken) -or $plainToken.Length -lt 32) {
-            throw 'AI Controller Token 至少需要 32 个字符。'
-        }
-        [Environment]::SetEnvironmentVariable($tokenVariable, $plainToken, 'User')
-    }
-    finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)
-        Remove-Variable plainToken -ErrorAction SilentlyContinue
-    }
-}
+$configPath = Join-Path $CodexHome 'config.toml'
+# Validate before changing any installation files or credentials.
+& $sourceExecutable --validate-codex $configPath | Out-Host
+if ($LASTEXITCODE -ne 0) { throw 'Codex 配置校验失败；尚未更改安装或凭据。' }
 
-$ownerValue = $OwnerId.ToString('D')
-[Environment]::SetEnvironmentVariable($ownerVariable, $ownerValue, 'User')
+if (-not $setupMode) {
+    $userToken = [Environment]::GetEnvironmentVariable($tokenVariable, 'User')
+    if ([string]::IsNullOrWhiteSpace($userToken)) {
+        $processToken = [Environment]::GetEnvironmentVariable($tokenVariable, 'Process')
+        if (-not [string]::IsNullOrWhiteSpace($processToken)) {
+            if ($processToken.Length -lt 32) {
+                throw "$tokenVariable 至少需要 32 个字符。"
+            }
+            [Environment]::SetEnvironmentVariable($tokenVariable, $processToken, 'User')
+            $userToken = $processToken
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($userToken)) {
+        if ($SkipTokenPrompt) {
+            throw "未找到当前用户环境变量 $tokenVariable。请先安全设置 Token，或不带 -SkipTokenPrompt 重新运行安装脚本。"
+        }
+        $secureToken = Read-Host '请输入 AI Controller Token（输入内容不会显示）' -AsSecureString
+        $tokenPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+        try {
+            $plainToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer)
+            if ([string]::IsNullOrWhiteSpace($plainToken) -or $plainToken.Length -lt 32) {
+                throw 'AI Controller Token 至少需要 32 个字符。'
+            }
+            [Environment]::SetEnvironmentVariable($tokenVariable, $plainToken, 'User')
+        }
+        finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)
+            Remove-Variable plainToken -ErrorAction SilentlyContinue
+        }
+    }
+
+    $ownerValue = $OwnerId.ToString('D')
+    [Environment]::SetEnvironmentVariable($ownerVariable, $ownerValue, 'User')
+
+}
 
 $installDirectory = Join-Path $CodexHome 'remoteops'
 $installedExecutable = Join-Path $installDirectory "remoteops-controller-mcp-$mcpVersion.exe"
@@ -238,19 +312,74 @@ catch {
 }
 
 $installedCaCert = $null
-if (-not [string]::IsNullOrWhiteSpace($CaCert)) {
-    $resolvedCaCert = (Resolve-Path -LiteralPath $CaCert).Path
-    $installedCaCert = Join-Path $installDirectory 'relay-ca.pem'
-    Copy-Item -LiteralPath $resolvedCaCert -Destination $installedCaCert -Force
+if ($setupMode) {
+    $setupInput = $null
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($SetupFile)) {
+            $setupInput = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $SetupFile).Path)
+        }
+        elseif ($SetupStdin) {
+            # Read redirected setup as UTF-8 independently of the Windows OEM
+            # console code page. The source is consumed only once.
+            $setupReader = [IO.StreamReader]::new(
+                [Console]::OpenStandardInput(), [Text.UTF8Encoding]::new($false, $true), $true
+            )
+            try { $setupInput = $setupReader.ReadToEnd() }
+            finally { $setupReader.Dispose() }
+        }
+        else {
+            $secureSetup = Read-Host '请粘贴一次性设置码（输入内容不会显示）' -AsSecureString
+            $setupPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureSetup)
+            try {
+                $setupInput = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($setupPointer)
+            }
+            finally {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($setupPointer)
+                $secureSetup.Dispose()
+            }
+        }
+        # Preview and redemption use the same in-memory snapshot.
+        $preview = Invoke-SetupHelper -Executable $installedExecutable `
+            -Arguments @('--setup-stdin', '--setup-preview') -InputContent $setupInput
+        Write-Host '请核对登记目标（以下不包含设置密钥）：'
+        Write-Host $preview
+        if (-not $ConfirmEnrollment) {
+            if ($SetupStdin) {
+                throw 'SetupStdin 需要 ConfirmEnrollment；请先核对管理员提供的登记目标。'
+            }
+            $confirmation = Read-Host '确认连接此登记地址并保存本机凭据？输入 yes 继续'
+            if ($confirmation -cne 'yes') { throw '已取消，未进行登记。' }
+        }
+        $summary = Invoke-SetupHelper -Executable $installedExecutable -Arguments @(
+            '--setup-stdin', '--setup-enroll',
+            '--setup-state', (Join-Path $installDirectory 'setup-state.json'),
+            '--setup-output', $connectionConfigPath
+        ) -InputContent $setupInput
+        if (-not (Test-Path -LiteralPath $connectionConfigPath -PathType Leaf)) {
+            throw '登记程序未生成连接配置。'
+        }
+        Write-Host $summary
+    }
+    finally {
+        Remove-Variable setupInput -ErrorAction SilentlyContinue
+    }
 }
-$connectionConfig = [ordered]@{
-    relay = $RelayAddress
-    server_name = $ServerName
-    ca_cert = $installedCaCert
-    tls_fingerprint = $normalizedTlsFingerprint
-    reconnect_seconds = 2
-} | ConvertTo-Json
-Write-Utf8NoBom -Path $connectionConfigPath -Content ($connectionConfig + "`r`n")
+else {
+    if (-not [string]::IsNullOrWhiteSpace($CaCert)) {
+        $resolvedCaCert = (Resolve-Path -LiteralPath $CaCert).Path
+        $installedCaCert = Join-Path $installDirectory 'relay-ca.pem'
+        Copy-Item -LiteralPath $resolvedCaCert -Destination $installedCaCert -Force
+    }
+    $connectionConfig = [ordered]@{
+        relay = $RelayAddress
+        server_name = $ServerName
+        ca_cert = $installedCaCert
+        tls_fingerprint = $normalizedTlsFingerprint
+        reconnect_seconds = 2
+    } | ConvertTo-Json
+    Write-Utf8NoBom -Path $connectionConfigPath -Content ($connectionConfig + "`r`n")
+}
+
 foreach ($skillDirectory in @($standardSkillDirectory, $compatSkillDirectory) | Select-Object -Unique) {
     New-Item -ItemType Directory -Force -Path $skillDirectory | Out-Null
     Copy-Item -LiteralPath (Join-Path $sourceSkill 'SKILL.md') -Destination $skillDirectory -Force
@@ -262,55 +391,24 @@ foreach ($skillDirectory in @($standardSkillDirectory, $compatSkillDirectory) | 
     }
 }
 
-$originalContent = if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-    [IO.File]::ReadAllText($configPath)
-}
-else {
-    ''
-}
-$newline = if ($originalContent.Contains("`r`n")) { "`r`n" } else { "`n" }
-$retainedLines = @(Remove-RemoteOpsConfigSections -Content $originalContent)
-$retainedLines = @(Set-CodexGranularApprovalPolicy -Lines $retainedLines)
-$configLines = [System.Collections.Generic.List[string]]::new()
-foreach ($line in $retainedLines) {
-    $configLines.Add($line)
-}
-if ($configLines.Count -gt 0) {
-    $configLines.Add('')
-}
-$configLines.Add('[mcp_servers.remoteops]')
-$configLines.Add('command = ' + (ConvertTo-TomlBasicString -Value $installedExecutable))
-$configLines.Add(
-    'args = ["--config", ' +
-    (ConvertTo-TomlBasicString -Value $connectionConfigPath) +
-    ', "--command-mode", ' +
-    (ConvertTo-TomlBasicString -Value $CommandMode) +
-    ']'
+# The helper parses TOML and preserves unrelated settings, quoted keys and
+# multiline strings. Never edit Codex TOML with line-oriented substitutions.
+$configurationArguments = @(
+    '--configure-codex', $configPath,
+    '--mcp-command', $installedExecutable,
+    '--mcp-config', $connectionConfigPath,
+    '--mcp-mode', $CommandMode
 )
-$configLines.Add(
-    'env_vars = ["REMOTEOPS_CONTROLLER_TOKEN", "REMOTEOPS_CONTROLLER_OWNER_ID"]'
-)
-$configLines.Add('startup_timeout_sec = 15')
-$configLines.Add('tool_timeout_sec = 360')
-$configLines.Add('enabled = true')
-$configLines.Add('required = false')
-$configLines.Add('default_tools_approval_mode = "approve"')
-$configLines.Add('')
-$configLines.Add('[mcp_servers.remoteops.tools.set_control_mode]')
-$configLines.Add('approval_mode = "prompt"')
-$newContent = ($configLines -join $newline) + $newline
+if (-not $setupMode) { $configurationArguments += '--legacy-env' }
+& $installedExecutable @configurationArguments | Out-Host
+if ($LASTEXITCODE -ne 0) { throw 'Codex MCP 配置未完成；请保留设置状态并重试。' }
 
-if ($newContent -ne $originalContent) {
-    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-        $backupPath = "$configPath.remoteops-backup-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')"
-        Copy-Item -LiteralPath $configPath -Destination $backupPath
-        Write-Host "已备份原配置：$backupPath"
-    }
-    Write-Utf8NoBom -Path $configPath -Content $newContent
-}
-
+# This enumeration is already scoped to the installation directory. Compare
+# leaf names: FullName may expand a short (8.3) path or remove dot segments while
+# installedExecutable retains that equivalent spelling, deleting the active exe.
+$installedExecutableName = [IO.Path]::GetFileName($installedExecutable)
 Get-ChildItem -LiteralPath $installDirectory -Filter 'remoteops-controller-mcp-*.exe' -File |
-    Where-Object FullName -NE $installedExecutable |
+    Where-Object Name -NE $installedExecutableName |
     ForEach-Object {
         $oldExecutable = $_.FullName
         try {
@@ -343,6 +441,11 @@ if ($compatSkillDirectory -ne $standardSkillDirectory) {
     Write-Host "RemoteOps skill（兼容目录）：$compatSkillDirectory"
 }
 Write-Host "命令模式：$CommandMode"
-Write-Host '统一 Controller Owner 已保存到当前 Windows 用户环境变量（不会显示其值）。'
+if ($setupMode) {
+    Write-Host '独立 Controller 凭据已保存到 Windows Credential Manager；登记与 Relay 身份自检通过。'
+}
+else {
+    Write-Host '统一 Controller Owner 已保存到当前 Windows 用户环境变量（不会显示其值）。'
+}
 Write-Host '请完全退出并重新打开 Codex，然后输入 /mcp 检查 remoteops。'
 Write-Host '安装脚本未输出、未写入 config.toml，也未打包 Controller Token。'

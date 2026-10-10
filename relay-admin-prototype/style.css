@@ -2192,3 +2192,65 @@ input[type="checkbox"]:disabled {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0s; transition-duration: 0s; scroll-behavior: auto; }
 }
+
+/* MCP onboarding reuses the console's theme, form and status tokens. */
+.mcp-onboarding { display: flex; flex-direction: column; gap: 20px; }
+.mcp-onboarding .page-header { margin-bottom: 0; }
+.mcp-onboarding .page-header > .btn { flex-shrink: 0; }
+.mcp-onboarding .page-title { flex-wrap: wrap; }
+.mcp-onboarding .card, .mcp-onboarding .table-container { min-width: 0; }
+.mcp-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 14px 16px;
+  border: 1px solid var(--status-info-border);
+  border-radius: var(--radius-md);
+  background: var(--status-info-bg);
+  color: var(--text-secondary);
+  line-height: 1.6;
+  font-size: 14px;
+}
+.mcp-notice strong { color: var(--text-primary); }
+.mcp-note { font-size: 14px; line-height: 1.6; color: var(--text-secondary); }
+.mcp-error {
+  padding: 12px 14px;
+  border: 1px solid var(--status-danger-border);
+  border-radius: var(--radius-md);
+  background: var(--status-danger-bg);
+  color: var(--status-danger-text);
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.mcp-error .btn { margin-left: 8px; }
+.mcp-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.mcp-endpoint-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+.mcp-full-width { grid-column: 1 / -1; }
+.mcp-trust-details { margin-top: 20px; border-top: 1px solid var(--border-subtle); padding-top: 16px; }
+.mcp-trust-details summary { cursor: pointer; color: var(--text-primary); font-weight: 500; min-height: 32px; }
+.mcp-pem, .mcp-setup-code { resize: vertical; min-height: 124px; line-height: 1.6; font-size: 14px; overflow-wrap: anywhere; }
+.mcp-form-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-top: 20px; }
+.mcp-form-actions .btn { flex-shrink: 0; }
+.mcp-table-desc { margin-bottom: 0; max-width: 1000px; }
+.mcp-table { min-width: 900px; }
+.mcp-table tbody tr { cursor: default; }
+.mcp-table td:first-child { min-width: 210px; max-width: 300px; overflow-wrap: anywhere; }
+.mcp-table td { white-space: normal; }
+.mcp-table td:last-child { white-space: nowrap; }
+.mcp-table td.font-mono { overflow-wrap: anywhere; max-width: 260px; }
+.mcp-table-note { margin: 0; padding: 14px 20px; font-size: 14px; line-height: 1.6; color: var(--text-secondary); border-top: 1px solid var(--border-subtle); }
+.mcp-modal { max-width: 700px; }
+.mcp-modal > form { display: flex; flex-direction: column; min-height: 0; }
+.mcp-modal .modal-title { margin: 0; }
+.mcp-fields:disabled .input { opacity: 0.75; }
+@media (max-width: 1000px) {
+  .mcp-endpoint-grid { grid-template-columns: minmax(0, 1fr); }
+  .mcp-full-width { grid-column: auto; }
+}
+@media (max-width: 760px) {
+  .mcp-onboarding .page-header { align-items: stretch; flex-direction: column; }
+  .mcp-onboarding .section-title { flex-wrap: wrap; }
+  .mcp-modal .modal-footer .btn { flex: 1 1 auto; }
+  .mcp-form-actions .btn { width: 100%; }
+}

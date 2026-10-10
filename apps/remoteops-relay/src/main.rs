@@ -4,6 +4,7 @@
 //! 由 `relay` 模块统一维护，入口代码不自行决定权限。
 
 mod admin;
+mod enrollment;
 mod relay;
 
 use std::{path::PathBuf, sync::Arc};
