@@ -3,6 +3,9 @@
 //! 本 crate 只负责在已经通过上层策略检查后执行具体能力；它不会根据自然
 //! 语言判断权限，也不会替代 Agent 或 Relay 的 Session/审批校验。
 
+mod file_commit;
+pub use file_commit::FileCommitControl;
+
 use std::{
     env,
     fs::OpenOptions as StdOpenOptions,
@@ -32,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     process::{ChildStdin, Command},
     sync::{Mutex as AsyncMutex, Notify, mpsc},
@@ -46,6 +49,9 @@ const WINDOWS_OEM_CODE_PAGE: u32 = 1;
 
 /// 单次命令允许产生的标准输出和标准错误总字节数。
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+// 请求标识用于输出分帧，必须保持解析窗口有界（Agent 当前使用 UUID）。
+const MAX_SHELL_COMMAND_TAG_BYTES: usize = 128;
 
 /// 单个文件分块允许的最大字节数。
 pub const MAX_FILE_CHUNK_BYTES: usize = 1024 * 1024;
@@ -679,18 +685,16 @@ fn write_all_and_flush(writer: &mut dyn Write, bytes: &[u8]) -> std::io::Result<
     Ok(bytes.len())
 }
 
+/// 子进程状态由独立任务持有，中断不需要等待命令的 I/O 锁。
+type ShellExit = Option<Result<Option<i32>, String>>;
+
 struct InteractiveShellState {
-    /// 由 Job Object 或进程组托管的 Shell 进程树。
-    child: ManagedChild,
-    /// Shell 标准输入。
     stdin: ChildStdin,
-    /// Shell 标准输出。
-    stdout: BufReader<tokio::process::ChildStdout>,
-    /// Shell 标准错误。
-    stderr: BufReader<tokio::process::ChildStderr>,
-    /// 当前 Shell 类型。
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    stdout_pending: Vec<u8>,
+    stderr_pending: Vec<u8>,
     shell: ShellKind,
-    /// 当前 Shell 进程实际使用的输出编码。
     output_encoding: ProcessOutputEncoding,
 }
 
@@ -698,34 +702,83 @@ struct InteractiveShellState {
 #[derive(Clone)]
 pub struct SystemInteractiveShellSession {
     inner: Arc<AsyncMutex<InteractiveShellState>>,
-    /// 中断标志在锁外保存，允许其他任务打断正在持有进程锁的命令。
     interrupted: Arc<AtomicBool>,
-    /// 唤醒当前正在等待 Shell 输出的命令。
     interrupt_notify: Arc<Notify>,
+    closed: Arc<AtomicBool>,
+    shutdown: mpsc::UnboundedSender<()>,
+    exit: tokio::sync::watch::Receiver<ShellExit>,
+}
+
+/// 调用方取消执行 future 时，也不能遗留已部分写入的命令。
+struct InteractiveShellRunGuard {
+    closed: Arc<AtomicBool>,
+    shutdown: mpsc::UnboundedSender<()>,
+    completed: bool,
+}
+
+impl Drop for InteractiveShellRunGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.closed.store(true, Ordering::Release);
+            let _ = self.shutdown.send(());
+        }
+    }
+}
+
+async fn supervise_interactive_shell(
+    mut child: ManagedChild,
+    mut shutdown: mpsc::UnboundedReceiver<()>,
+    closed: Arc<AtomicBool>,
+    exit: tokio::sync::watch::Sender<ShellExit>,
+) {
+    let result = tokio::select! {
+        status = child.wait_for_parent() => status.map(|status| status.code())
+            .map_err(|error| error.to_string()),
+        // 最后一个会话被释放时，通道关闭也会清理整棵进程树。
+        _ = shutdown.recv() => terminate_process_tree(&mut child).await
+            .map(|()| None).map_err(|error| error.to_string()),
+    };
+    drop(child);
+    closed.store(true, Ordering::Release);
+    exit.send_replace(Some(result));
+}
+
+async fn wait_for_interactive_shell_exit(
+    mut exit: tokio::sync::watch::Receiver<ShellExit>,
+) -> Result<Option<i32>, DeviceError> {
+    loop {
+        if let Some(result) = exit.borrow().clone() {
+            return result.map_err(DeviceError::Operation);
+        }
+        exit.changed()
+            .await
+            .map_err(|error| DeviceError::Operation(error.to_string()))?;
+    }
 }
 
 impl SystemInteractiveShellSession {
-    /// 返回持久 Shell 子进程是否已经退出。
+    /// 返回会话是否已关闭或不再能安全接收命令，不会等待正在执行的 I/O。
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// 返回持久 Shell 是否已经退出或关闭，不等待命令的 I/O 锁。
     ///
     /// # Errors
     ///
-    /// 当无法查询子进程状态时返回错误。
+    /// 此兼容查询当前不会返回错误。
+    #[allow(unknown_lints)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn has_exited(&self) -> Result<bool, DeviceError> {
-        self.inner
-            .lock()
-            .await
-            .child
-            .try_wait()
-            .map(|status| status.is_some())
-            .map_err(|error| DeviceError::Operation(error.to_string()))
+        Ok(self.is_closed())
     }
 
-    /// 在持久 Shell 中执行一条命令，并逐行返回实时输出。
+    /// 在持久 Shell 中执行命令，按有界数据块返回两路实时输出。
     ///
     /// # Errors
     ///
     /// 当命令无效、Shell 已退出、输出超限、超时或被中断时返回错误。
-    #[allow(clippy::too_many_lines)]
     pub async fn run(
         &self,
         command: &str,
@@ -733,13 +786,12 @@ impl SystemInteractiveShellSession {
         timeout_seconds: u64,
         output: mpsc::UnboundedSender<CommandOutputChunk>,
     ) -> Result<CommandResult, DeviceError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds.max(1));
         if command.trim().is_empty() {
             return Err(DeviceError::InvalidInput("命令不能为空".to_owned()));
         }
-        if self.interrupted.load(Ordering::Acquire) {
-            return Err(DeviceError::Operation("持久 Shell 已被中断".to_owned()));
-        }
         if command_tag.is_empty()
+            || command_tag.len() > MAX_SHELL_COMMAND_TAG_BYTES
             || !command_tag
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
@@ -748,142 +800,138 @@ impl SystemInteractiveShellSession {
                 "持久 Shell 命令标识无效".to_owned(),
             ));
         }
-
-        let mut state = self.inner.lock().await;
-        if state
-            .child
-            .try_wait()
-            .map_err(|error| DeviceError::Operation(error.to_string()))?
-            .is_some()
-        {
+        let mut state = tokio::select! {
+            () = wait_for_shell_interrupt(self.interrupted.clone(), self.interrupt_notify.clone()) => {
+                return Err(DeviceError::Operation("持久 Shell 已被中断".to_owned()));
+            }
+            () = tokio::time::sleep_until(deadline) => return Err(DeviceError::Timeout),
+            state = self.inner.lock() => state,
+        };
+        if self.is_closed() {
             return Err(DeviceError::Operation("持久 Shell 进程已经退出".to_owned()));
         }
-
         let marker = format!("__REMOTEOPS_DONE_{command_tag}__");
         let payload = interactive_command_payload(state.shell, command, &marker);
         let payload = encode_shell_input(state.shell, &payload)?;
-        state
-            .stdin
-            .write_all(&payload)
-            .await
-            .map_err(|error| DeviceError::Operation(error.to_string()))?;
-        state
-            .stdin
-            .flush()
-            .await
-            .map_err(|error| DeviceError::Operation(error.to_string()))?;
+        let mut guard = InteractiveShellRunGuard {
+            closed: self.closed.clone(),
+            shutdown: self.shutdown.clone(),
+            completed: false,
+        };
+        let result = self
+            .run_io(&mut state, command, &marker, &payload, deadline, &output)
+            .await;
+        if result.is_err() {
+            self.interrupt().await?;
+        }
+        guard.completed = result.is_ok();
+        result
+    }
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds.max(1));
-        let mut stdout_text = String::new();
-        let mut stderr_text = String::new();
-        let mut output_bytes = 0_usize;
-        let mut stdout_buffer = Vec::new();
-        let mut stderr_buffer = Vec::new();
-        let mut stdout_open = true;
-        let mut stderr_open = true;
-
+    #[allow(clippy::too_many_lines)]
+    async fn run_io(
+        &self,
+        state: &mut InteractiveShellState,
+        command: &str,
+        marker: &str,
+        payload: &[u8],
+        deadline: tokio::time::Instant,
+        output: &mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> Result<CommandResult, DeviceError> {
+        let mut stdout = InteractiveShellOutput::new(marker, state.output_encoding, false);
+        let mut stderr = InteractiveShellOutput::new(marker, state.output_encoding, true);
+        let mut output_bytes = 0;
+        stdout.push(
+            &std::mem::take(&mut state.stdout_pending),
+            &mut output_bytes,
+            output,
+        )?;
+        stderr.push(
+            &std::mem::take(&mut state.stderr_pending),
+            &mut output_bytes,
+            output,
+        )?;
+        let mut stdout_buffer = [0_u8; 4096];
+        let mut stderr_buffer = [0_u8; 4096];
+        let mut written = 0;
+        let mut flushed = false;
+        let mut exit_status = None;
+        let exit = self.exit.clone();
         loop {
-            stdout_buffer.clear();
-            stderr_buffer.clear();
-            let output_encoding = state.output_encoding;
-            let InteractiveShellState {
-                child,
-                stdout,
-                stderr,
-                ..
-            } = &mut *state;
+            if self.interrupted.load(Ordering::Acquire) {
+                return Err(DeviceError::Operation("持久 Shell 已被中断".to_owned()));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(DeviceError::Timeout);
+            }
+            if let (Some(stdout_code), Some(stderr_code)) = (stdout.exit_code, stderr.exit_code) {
+                if stdout_code != stderr_code {
+                    return Err(DeviceError::Operation(
+                        "持久 Shell 输出边界不一致".to_owned(),
+                    ));
+                }
+                state.stdout_pending = stdout.pending;
+                state.stderr_pending = stderr.pending;
+                return Ok(CommandResult {
+                    stdout: stdout.collected,
+                    stderr: stderr.collected,
+                    exit_code: Some(stdout_code),
+                });
+            }
+            if let Some(code) = exit_status
+                && stdout.finished()
+                && stderr.finished()
+            {
+                if is_explicit_shell_exit(state.shell, command) {
+                    return Ok(CommandResult {
+                        stdout: stdout.collected,
+                        stderr: stderr.collected,
+                        exit_code: code,
+                    });
+                }
+                return Err(DeviceError::Operation(format!(
+                    "持久 Shell 在命令完成前退出，退出码 {code:?}"
+                )));
+            }
             tokio::select! {
-                count = stdout.read_until(b'\n', &mut stdout_buffer), if stdout_open => {
-                    let count = count.map_err(|error| DeviceError::Operation(error.to_string()))?;
-                    if count == 0 {
-                        stdout_open = false;
-                        continue;
-                    }
-                    let text = decode_shell_output(output_encoding, &stdout_buffer);
-                    let trimmed = text.trim_end_matches(['\r', '\n']);
-                    if let Some(marker_index) = trimmed.find(&marker) {
-                        let prefix = &trimmed[..marker_index];
-                        if !prefix.is_empty() {
-                            output_bytes = output_bytes.saturating_add(prefix.len());
-                            if output_bytes > MAX_COMMAND_OUTPUT_BYTES {
-                                terminate_process_tree(child).await?;
-                                return Err(DeviceError::OutputLimit {
-                                    limit: MAX_COMMAND_OUTPUT_BYTES,
-                                });
-                            }
-                            stdout_text.push_str(prefix);
-                            let _ = output.send(CommandOutputChunk {
-                                stderr: false,
-                                text: prefix.to_owned(),
-                            });
-                        }
-                        let exit_code = &trimmed[marker_index + marker.len()..];
-                        let exit_code = exit_code.trim().parse::<i32>().ok();
-                        return Ok(CommandResult {
-                            stdout: stdout_text,
-                            stderr: stderr_text,
-                            exit_code,
-                        });
-                    }
-                    output_bytes = output_bytes.saturating_add(text.len());
-                    if output_bytes > MAX_COMMAND_OUTPUT_BYTES {
-                        terminate_process_tree(child).await?;
-                        return Err(DeviceError::OutputLimit {
-                            limit: MAX_COMMAND_OUTPUT_BYTES,
-                        });
-                    }
-                    stdout_text.push_str(&text);
-                    let _ = output.send(CommandOutputChunk {
-                        stderr: false,
-                        text,
-                    });
-                }
-                count = stderr.read_until(b'\n', &mut stderr_buffer), if stderr_open => {
-                    let count = count.map_err(|error| DeviceError::Operation(error.to_string()))?;
-                    if count == 0 {
-                        stderr_open = false;
-                        continue;
-                    }
-                    let text = decode_shell_output(output_encoding, &stderr_buffer);
-                    output_bytes = output_bytes.saturating_add(text.len());
-                    if output_bytes > MAX_COMMAND_OUTPUT_BYTES {
-                        terminate_process_tree(child).await?;
-                        return Err(DeviceError::OutputLimit {
-                            limit: MAX_COMMAND_OUTPUT_BYTES,
-                        });
-                    }
-                    stderr_text.push_str(&text);
-                    let _ = output.send(CommandOutputChunk {
-                        stderr: true,
-                        text,
-                    });
-                }
-                status = child.wait_for_parent() => {
-                    let status =
-                        status.map_err(|error| DeviceError::Operation(error.to_string()))?;
-                    let _ = child.start_kill();
-                    if is_explicit_shell_exit(state.shell, command) {
-                        return Ok(CommandResult {
-                            stdout: stdout_text,
-                            stderr: stderr_text,
-                            exit_code: status.code(),
-                        });
-                    }
-                    return Err(DeviceError::Operation(format!(
-                        "持久 Shell 在命令完成前退出，退出码 {:?}",
-                        status.code()
-                    )));
-                }
-                () = tokio::time::sleep_until(deadline) => {
-                    terminate_process_tree(child).await?;
-                    return Err(DeviceError::Timeout);
-                }
-                () = wait_for_shell_interrupt(
-                    self.interrupted.clone(),
-                    self.interrupt_notify.clone(),
-                ) => {
-                    terminate_process_tree(child).await?;
+                () = wait_for_shell_interrupt(self.interrupted.clone(), self.interrupt_notify.clone()) => {
                     return Err(DeviceError::Operation("持久 Shell 已被中断".to_owned()));
+                }
+                () = tokio::time::sleep_until(deadline) => return Err(DeviceError::Timeout),
+                status = wait_for_interactive_shell_exit(exit.clone()), if exit_status.is_none() => {
+                    exit_status = Some(status?);
+                }
+                result = async {
+                    if written < payload.len() {
+                        state.stdin.write(&payload[written..]).await
+                    } else {
+                        state.stdin.flush().await.map(|()| 0)
+                    }
+                }, if !flushed => {
+                    let count = result.map_err(|error| DeviceError::Operation(error.to_string()))?;
+                    if written == payload.len() {
+                        flushed = true;
+                    } else if count == 0 {
+                        return Err(DeviceError::Operation("无法写入持久 Shell 标准输入".to_owned()));
+                    } else {
+                        written += count;
+                    }
+                }
+                count = state.stdout.read(&mut stdout_buffer), if !stdout.finished() => {
+                    let count = count.map_err(|error| DeviceError::Operation(error.to_string()))?;
+                    if count == 0 {
+                        stdout.finish(&mut output_bytes, output)?;
+                    } else {
+                        stdout.push(&stdout_buffer[..count], &mut output_bytes, output)?;
+                    }
+                }
+                count = state.stderr.read(&mut stderr_buffer), if !stderr.finished() => {
+                    let count = count.map_err(|error| DeviceError::Operation(error.to_string()))?;
+                    if count == 0 {
+                        stderr.finish(&mut output_bytes, output)?;
+                    } else {
+                        stderr.push(&stderr_buffer[..count], &mut output_bytes, output)?;
+                    }
                 }
             }
         }
@@ -893,21 +941,139 @@ impl SystemInteractiveShellSession {
     ///
     /// # Errors
     ///
-    /// 当无法查询或终止 Shell 子进程时返回错误。
+    /// 当无法终止 Shell 子进程时返回错误。
     pub async fn close(&self) -> Result<(), DeviceError> {
         self.interrupt().await
     }
 
-    /// 中断当前持久 Shell 及其正在执行的命令。
+    /// 不等待命令的 I/O 锁，中断并回收持久 Shell 及其子进程。
     ///
     /// # Errors
     ///
-    /// 当无法查询或终止 Shell 子进程时返回错误。
+    /// 当无法终止 Shell 子进程时返回错误。
     pub async fn interrupt(&self) -> Result<(), DeviceError> {
+        self.closed.store(true, Ordering::Release);
         self.interrupted.store(true, Ordering::Release);
         self.interrupt_notify.notify_waiters();
-        let mut state = self.inner.lock().await;
-        terminate_process_tree(&mut state.child).await
+        let _ = self.shutdown.send(());
+        wait_for_interactive_shell_exit(self.exit.clone()).await?;
+        Ok(())
+    }
+}
+
+/// 分帧只保留 marker 前缀和最多 12 字节退出码，不依赖换行读取普通输出。
+struct InteractiveShellOutput {
+    marker: Vec<u8>,
+    pending: Vec<u8>,
+    decoder: ProcessOutputDecoder,
+    collected: String,
+    stderr: bool,
+    eof: bool,
+    exit_code: Option<i32>,
+}
+
+impl InteractiveShellOutput {
+    fn new(marker: &str, encoding: ProcessOutputEncoding, stderr: bool) -> Self {
+        Self {
+            marker: marker.as_bytes().to_vec(),
+            pending: Vec::new(),
+            decoder: ProcessOutputDecoder::new(encoding),
+            collected: String::new(),
+            stderr,
+            eof: false,
+            exit_code: None,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.eof || self.exit_code.is_some()
+    }
+
+    fn emit(
+        &mut self,
+        count: usize,
+        output_bytes: &mut usize,
+        output: &mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> Result<(), DeviceError> {
+        *output_bytes = output_bytes.saturating_add(count);
+        if *output_bytes > MAX_COMMAND_OUTPUT_BYTES {
+            return Err(DeviceError::OutputLimit {
+                limit: MAX_COMMAND_OUTPUT_BYTES,
+            });
+        }
+        let bytes = self.pending.drain(..count).collect::<Vec<_>>();
+        let text = self.decoder.push(&bytes, false);
+        self.emit_text(text, output);
+        Ok(())
+    }
+
+    fn emit_text(&mut self, text: String, output: &mpsc::UnboundedSender<CommandOutputChunk>) {
+        if !text.is_empty() {
+            self.collected.push_str(&text);
+            let _ = output.send(CommandOutputChunk {
+                stderr: self.stderr,
+                text,
+            });
+        }
+    }
+
+    fn flush_decoder(&mut self, output: &mpsc::UnboundedSender<CommandOutputChunk>) {
+        let text = self.decoder.push(&[], true);
+        self.emit_text(text, output);
+    }
+
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        output_bytes: &mut usize,
+        output: &mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> Result<(), DeviceError> {
+        self.pending.extend_from_slice(bytes);
+        while !self.pending.is_empty() && self.exit_code.is_none() {
+            let marker_index = self
+                .pending
+                .windows(self.marker.len())
+                .position(|window| window == self.marker);
+            let Some(marker_index) = marker_index else {
+                let retained = (1..self.marker.len().min(self.pending.len() + 1))
+                    .rev()
+                    .find(|&count| self.pending.ends_with(&self.marker[..count]))
+                    .unwrap_or(0);
+                self.emit(self.pending.len() - retained, output_bytes, output)?;
+                break;
+            };
+            self.emit(marker_index, output_bytes, output)?;
+            let suffix = &self.pending[self.marker.len()..];
+            if let Some(end) = suffix.iter().position(|&byte| byte == b'\n') {
+                let code = suffix[..end].strip_suffix(b"\r").unwrap_or(&suffix[..end]);
+                if code.len() <= 11
+                    && let Some(code) = std::str::from_utf8(code)
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok())
+                {
+                    self.exit_code = Some(code);
+                    self.pending.drain(..=self.marker.len() + end);
+                    self.flush_decoder(output);
+                    break;
+                }
+            } else if suffix.len() <= 12 {
+                break;
+            }
+            // marker 相似文本仍是用户输出；不允许畸形候选无限累积。
+            self.emit(1, output_bytes, output)?;
+        }
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        output_bytes: &mut usize,
+        output: &mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> Result<(), DeviceError> {
+        self.emit(self.pending.len(), output_bytes, output)?;
+        self.flush_decoder(output);
+        self.eof = true;
+        Ok(())
     }
 }
 
@@ -992,26 +1158,56 @@ impl SystemFileUploadSession {
     ///
     /// 当文件不完整、哈希不一致或替换失败时返回错误。
     pub async fn complete(&self) -> Result<String, DeviceError> {
+        self.complete_with_control(&FileCommitControl::default())
+            .await
+    }
+
+    /// 校验后提交文件，与取消请求竞争同一个不可逆提交点。
+    ///
+    /// # Errors
+    /// 当文件不完整、哈希不一致、已取消或替换失败时返回错误。
+    pub async fn complete_with_control(
+        &self,
+        control: &FileCommitControl,
+    ) -> Result<String, DeviceError> {
         let destination = Arc::clone(&self.destination);
         let temporary = Arc::clone(&self.temporary);
         let expected_size = self.expected_size;
         let expected_sha256 = Arc::clone(&self.expected_sha256);
         let overwrite = self.overwrite;
-        let written = self.written();
+        let written = Arc::clone(&self.written);
+        let _cancel = control.cancel_on_drop();
+        let worker = control.worker()?;
+        let control = control.clone();
         tokio::task::spawn_blocking(move || {
-            if written != expected_size {
-                return Err(DeviceError::InvalidInput(format!(
-                    "上传文件尚未完成：{written} / {expected_size} 字节"
-                )));
+            let _worker = worker;
+            // A chunk or explicit abort cannot race the hash and publication.
+            let written = written
+                .lock()
+                .map_err(|_| DeviceError::Operation("文件上传计数锁已损坏".to_owned()))?;
+            let result = (|| {
+                control.checkpoint()?;
+                if *written != expected_size {
+                    return Err(DeviceError::InvalidInput(format!(
+                        "上传文件尚未完成：{written} / {expected_size} 字节"
+                    )));
+                }
+                let actual_hash = sha256_file_with_control(&temporary, Some(&control))?;
+                if !actual_hash.eq_ignore_ascii_case(&expected_sha256) {
+                    return Err(DeviceError::InvalidInput(
+                        "上传文件 SHA-256 校验失败".to_owned(),
+                    ));
+                }
+                control.begin_commit()?;
+                commit_temporary_file(&temporary, &destination, overwrite)?;
+                Ok(actual_hash)
+            })();
+            // Cancellation is terminal for this temporary upload. Other failures
+            // retain it so the caller can inspect or explicitly abort the upload.
+            if result.is_err() && control.is_cancelled() {
+                let _ = std::fs::remove_file(&*temporary);
             }
-            let actual_hash = sha256_file_no_follow(&temporary)?;
-            if !actual_hash.eq_ignore_ascii_case(&expected_sha256) {
-                return Err(DeviceError::InvalidInput(
-                    "上传文件 SHA-256 校验失败".to_owned(),
-                ));
-            }
-            commit_temporary_file(&temporary, &destination, overwrite)?;
-            Ok(actual_hash)
+            result
         })
         .await
         .map_err(|error| DeviceError::Operation(error.to_string()))?
@@ -1024,10 +1220,16 @@ impl SystemFileUploadSession {
     /// 当临时文件存在但无法删除时返回错误。
     pub async fn abort(&self) -> Result<(), DeviceError> {
         let temporary = Arc::clone(&self.temporary);
-        tokio::task::spawn_blocking(move || match std::fs::remove_file(&*temporary) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(DeviceError::Operation(error.to_string())),
+        let written = Arc::clone(&self.written);
+        tokio::task::spawn_blocking(move || {
+            let _written = written
+                .lock()
+                .map_err(|_| DeviceError::Operation("文件上传计数锁已损坏".to_owned()))?;
+            match std::fs::remove_file(&*temporary) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(DeviceError::Operation(error.to_string())),
+            }
         })
         .await
         .map_err(|error| DeviceError::Operation(error.to_string()))?
@@ -1120,6 +1322,30 @@ impl SystemDevice {
             overwrite,
             written: Arc::new(Mutex::new(0)),
         })
+    }
+
+    /// 写入文件，并在发布前允许协作取消。
+    ///
+    /// # Errors
+    /// 当路径无效、取消获胜、目标已存在或写入失败时返回错误。
+    pub async fn write_file_with_control(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        overwrite: bool,
+        control: &FileCommitControl,
+    ) -> Result<(), DeviceError> {
+        let resolved = resolve_transfer_destination(self.transfer_root(), path)?;
+        let bytes = bytes.to_vec();
+        let _cancel = control.cancel_on_drop();
+        let worker = control.worker()?;
+        let control = control.clone();
+        tokio::task::spawn_blocking(move || {
+            let _worker = worker;
+            write_file_no_follow(&resolved, &bytes, overwrite, &control)
+        })
+        .await
+        .map_err(|error| DeviceError::Operation(error.to_string()))?
     }
 
     /// 从交换目录普通文件的指定偏移读取一个有界分块。
@@ -1315,17 +1541,30 @@ impl SystemDevice {
             .stderr()
             .take()
             .ok_or_else(|| DeviceError::Operation("无法取得 Shell 标准错误".to_owned()))?;
+        let closed = Arc::new(AtomicBool::new(false));
+        let (shutdown, shutdown_receiver) = mpsc::unbounded_channel();
+        let (exit_sender, exit) = tokio::sync::watch::channel(None);
+        tokio::spawn(supervise_interactive_shell(
+            child,
+            shutdown_receiver,
+            closed.clone(),
+            exit_sender,
+        ));
         Ok(SystemInteractiveShellSession {
             inner: Arc::new(AsyncMutex::new(InteractiveShellState {
-                child,
                 stdin,
-                stdout: BufReader::new(stdout),
-                stderr: BufReader::new(stderr),
+                stdout,
+                stderr,
+                stdout_pending: Vec::new(),
+                stderr_pending: Vec::new(),
                 shell,
                 output_encoding,
             })),
             interrupted: Arc::new(AtomicBool::new(false)),
             interrupt_notify: Arc::new(Notify::new()),
+            closed,
+            shutdown,
+            exit,
         })
     }
 
@@ -1617,10 +1856,13 @@ impl SystemDevice {
 }
 
 async fn wait_for_shell_interrupt(interrupted: Arc<AtomicBool>, notify: Arc<Notify>) {
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
     if interrupted.load(Ordering::Acquire) {
         return;
     }
-    notify.notified().await;
+    notified.await;
 }
 
 #[async_trait]
@@ -1779,11 +2021,8 @@ impl FileTransferProvider for SystemDevice {
         bytes: &[u8],
         overwrite: bool,
     ) -> Result<(), DeviceError> {
-        let resolved = resolve_transfer_destination(self.transfer_root(), path)?;
-        let bytes = bytes.to_vec();
-        tokio::task::spawn_blocking(move || write_file_no_follow(&resolved, &bytes, overwrite))
+        self.write_file_with_control(path, bytes, overwrite, &FileCommitControl::default())
             .await
-            .map_err(|error| DeviceError::Operation(error.to_string()))?
     }
 
     async fn file_metadata(&self, path: &str) -> Result<FileMetadata, DeviceError> {
@@ -2583,24 +2822,33 @@ fn open_existing_no_follow(path: &Path, write: bool) -> Result<std::fs::File, De
     Ok(file)
 }
 
-fn write_file_no_follow(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), DeviceError> {
-    if path.exists() && !overwrite {
-        return Err(DeviceError::Operation("目标文件已存在".to_owned()));
-    }
+fn write_file_no_follow(
+    path: &Path,
+    bytes: &[u8],
+    overwrite: bool,
+    control: &FileCommitControl,
+) -> Result<(), DeviceError> {
+    control.checkpoint()?;
     let temporary = create_temporary_file(path)?;
-    let mut file = open_existing_no_follow(&temporary, true)?;
-    file.write_all(bytes)
-        .map_err(|error| DeviceError::Operation(error.to_string()))?;
-    file.flush()
-        .map_err(|error| DeviceError::Operation(error.to_string()))?;
-    file.sync_all()
-        .map_err(|error| DeviceError::Operation(error.to_string()))?;
-    drop(file);
-    if let Err(error) = commit_temporary_file(&temporary, path, overwrite) {
+    let result = (|| {
+        let mut file = open_existing_no_follow(&temporary, true)?;
+        for chunk in bytes.chunks(MAX_FILE_CHUNK_BYTES) {
+            control.checkpoint()?;
+            file.write_all(chunk)
+                .map_err(|error| DeviceError::Operation(error.to_string()))?;
+        }
+        file.flush()
+            .map_err(|error| DeviceError::Operation(error.to_string()))?;
+        file.sync_all()
+            .map_err(|error| DeviceError::Operation(error.to_string()))?;
+        drop(file);
+        control.begin_commit()?;
+        commit_temporary_file(&temporary, path, overwrite)
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
-        return Err(error);
     }
-    Ok(())
+    result
 }
 
 fn create_temporary_file(destination: &Path) -> Result<PathBuf, DeviceError> {
@@ -2662,12 +2910,24 @@ fn commit_temporary_file(
     destination: &Path,
     overwrite: bool,
 ) -> Result<(), DeviceError> {
+    if !overwrite {
+        // Both paths share a filesystem. Creating the destination hard link is an
+        // atomic no-replace publication, unlike an exists() check followed by rename.
+        // Unsupported filesystems fail closed rather than falling back to overwrite.
+        std::fs::hard_link(temporary, destination).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                DeviceError::Operation("目标文件已存在".to_owned())
+            } else {
+                DeviceError::Operation(error.to_string())
+            }
+        })?;
+        return std::fs::remove_file(temporary).map_err(|error| {
+            DeviceError::Operation(format!("新文件已提交，但清理临时文件失败：{error}"))
+        });
+    }
     if !destination.exists() {
         return std::fs::rename(temporary, destination)
             .map_err(|error| DeviceError::Operation(error.to_string()));
-    }
-    if !overwrite {
-        return Err(DeviceError::Operation("目标文件已存在".to_owned()));
     }
     let destination_file = open_existing_no_follow(destination, false)?;
     if !destination_file
@@ -2696,6 +2956,13 @@ fn commit_temporary_file(
 }
 
 fn sha256_file_no_follow(path: &Path) -> Result<String, DeviceError> {
+    sha256_file_with_control(path, None)
+}
+
+fn sha256_file_with_control(
+    path: &Path,
+    control: Option<&FileCommitControl>,
+) -> Result<String, DeviceError> {
     let mut file = open_existing_no_follow(path, false)?;
     let metadata = file
         .metadata()
@@ -2708,6 +2975,9 @@ fn sha256_file_no_follow(path: &Path) -> Result<String, DeviceError> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; MAX_FILE_CHUNK_BYTES];
     loop {
+        if let Some(control) = control {
+            control.checkpoint()?;
+        }
         let read = file
             .read(&mut buffer)
             .map_err(|error| DeviceError::Operation(error.to_string()))?;
@@ -2895,11 +3165,6 @@ fn decode_windows_cmd_line(bytes: &[u8]) -> String {
     decode_windows_code_page_incremental(WINDOWS_OEM_CODE_PAGE, &mut bytes, true)
 }
 
-fn decode_shell_output(output_encoding: ProcessOutputEncoding, bytes: &[u8]) -> String {
-    let mut decoder = ProcessOutputDecoder::new(output_encoding);
-    decoder.push(bytes, true)
-}
-
 #[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
 fn encode_shell_input(shell: ShellKind, text: &str) -> Result<Vec<u8>, DeviceError> {
     #[cfg(windows)]
@@ -2968,18 +3233,35 @@ where
 }
 
 fn interactive_command_payload(shell: ShellKind, command: &str, marker: &str) -> String {
+    if is_explicit_shell_exit(shell, command) {
+        return format!("{command}{}", if cfg!(windows) { "\r\n" } else { "\n" });
+    }
+    let shell = if cfg!(windows) && shell == ShellKind::System {
+        ShellKind::Cmd
+    } else {
+        shell
+    };
     match shell {
         ShellKind::Cmd => {
-            format!("{command}\r\necho {marker}%errorlevel%\r\n")
+            format!(
+                "{command}\r\nset \"__remoteops_exit_code=%errorlevel%\"\r\necho {marker}%__remoteops_exit_code%\r\n1>&2 echo {marker}%__remoteops_exit_code%\r\n"
+            )
         }
-        ShellKind::WindowsPowerShell => format!(
-            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; . {{ {command} }}; if ($?) {{ $remoteOpsExitCode = 0 }} else {{ $remoteOpsExitCode = 1 }}; Write-Output \"{marker}$remoteOpsExitCode\"\r\n"
-        ),
-        ShellKind::PowerShell => format!(
-            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $PSStyle.OutputRendering = 'PlainText'; . {{ {command} }}; if ($?) {{ $remoteOpsExitCode = 0 }} else {{ $remoteOpsExitCode = 1 }}; Write-Output \"{marker}$remoteOpsExitCode\"\r\n"
-        ),
+        ShellKind::WindowsPowerShell | ShellKind::PowerShell => {
+            let style = if shell == ShellKind::PowerShell {
+                "$PSStyle.OutputRendering = 'PlainText'; "
+            } else {
+                ""
+            };
+            // PowerShell 5.1 会在点调用返回时重置 $?；在同一作用域的 finally
+            // 中采集命令体退出前的 $?/LASTEXITCODE 状态，也覆盖提前 return。
+            // $? 为真时成功；否则保留本次请求最近的 native 退出码或使用 1。
+            format!(
+                "[Console]::OutputEncoding = [Text.Encoding]::UTF8; {style}$remoteOpsExitCode = 1; $LASTEXITCODE = 0; try {{ . {{ try {{ {command}\n}} finally {{ if ($?) {{ $remoteOpsExitCode = 0 }} elseif ($LASTEXITCODE -ne 0) {{ $remoteOpsExitCode = $LASTEXITCODE }} }} }} }} catch {{ $remoteOpsExitCode = 1; [Console]::Error.WriteLine($_.ToString()) }} finally {{ Write-Output \"{marker}$remoteOpsExitCode\"; [Console]::Error.WriteLine(\"{marker}$remoteOpsExitCode\") }}\r\n\r\n"
+            )
+        }
         ShellKind::System => format!(
-            "{command}\n__remoteops_exit_code=$?\nprintf '{marker}%s\\n' \"$__remoteops_exit_code\"\n"
+            "{command}\n__remoteops_exit_code=$?\nprintf '{marker}%s\\n' \"$__remoteops_exit_code\"\nprintf '{marker}%s\\n' \"$__remoteops_exit_code\" >&2\n"
         ),
     }
 }
@@ -3012,6 +3294,115 @@ fn is_explicit_shell_exit(shell: ShellKind, command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn competing_no_replace_publications_preserve_the_winner() {
+        let directory = TestDirectory::new("atomic-no-replace-race");
+        let destination = directory.0.join("winner.bin");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|index| {
+                let temporary = directory.0.join(format!("candidate-{index}.part"));
+                std::fs::write(&temporary, [index]).unwrap();
+                let destination = destination.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (
+                        index,
+                        commit_temporary_file(&temporary, &destination, false),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        let winner = results.iter().find(|(_, result)| result.is_ok()).unwrap().0;
+        assert_eq!(std::fs::read(destination).unwrap(), [winner]);
+    }
+
+    #[tokio::test]
+    async fn failed_chunked_publication_preserves_staged_bytes_for_retry() {
+        let directory = TestDirectory::new("failed-chunked-publication");
+        let device = SystemDevice::with_transfer_root(&directory.0).unwrap();
+        let contents = b"safe fixture";
+        let hash = format!("{:x}", Sha256::digest(contents));
+        let upload = device
+            .begin_file_upload("result.bin", contents.len() as u64, &hash, false)
+            .unwrap();
+        upload.write_chunk(0, contents).await.unwrap();
+        let destination = directory.0.join("result.bin");
+        std::fs::write(&destination, b"other writer").unwrap();
+        assert!(upload.complete().await.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"other writer");
+        assert_eq!(std::fs::read(&*upload.temporary).unwrap(), contents);
+        std::fs::remove_file(&destination).unwrap();
+        assert_eq!(upload.complete().await.unwrap(), hash);
+        assert_eq!(std::fs::read(&destination).unwrap(), contents);
+        assert!(!upload.temporary.exists());
+    }
+
+    #[tokio::test]
+    async fn cancelled_write_cannot_publish_or_leave_a_temporary() {
+        let directory = TestDirectory::new("cancelled-single-write");
+        let device = SystemDevice::with_transfer_root(&directory.0).unwrap();
+        let control = FileCommitControl::default();
+        assert!(control.try_cancel());
+        assert!(
+            device
+                .write_file_with_control("result.bin", b"safe fixture", false, &control)
+                .await
+                .is_err()
+        );
+        assert!(!directory.0.join("result.bin").exists());
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_chunked_commit_cleans_up_before_publication() {
+        let directory = TestDirectory::new("cancelled-chunked-commit");
+        let device = SystemDevice::with_transfer_root(&directory.0).unwrap();
+        let contents = b"safe fixture";
+        let hash = format!("{:x}", Sha256::digest(contents));
+        let upload = device
+            .begin_file_upload("result.bin", contents.len() as u64, &hash, false)
+            .unwrap();
+        upload.write_chunk(0, contents).await.unwrap();
+        let control = FileCommitControl::default();
+        let written = upload.written.clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_task = tokio::task::spawn_blocking(move || {
+            let _lock = written.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.await.unwrap();
+        let task_upload = upload.clone();
+        let task_control = control.clone();
+        let task =
+            tokio::spawn(async move { task_upload.complete_with_control(&task_control).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !control.worker_active() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(control.try_cancel());
+        release_tx.send(()).unwrap();
+        lock_task.await.unwrap();
+        assert!(task.await.unwrap().is_err());
+        control.wait_idle().await;
+        assert!(!directory.0.join("result.bin").exists());
+        assert!(!upload.temporary.exists());
+    }
+
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -3386,7 +3777,8 @@ mod tests {
                 .await
         });
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // CI 上首次启动 PowerShell 可能较慢；等待测试就绪与取消后的退出时限分开。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let process_id = loop {
             if let Ok(text) = std::fs::read_to_string(&process_id_path)
                 && let Ok(process_id) = text.trim().parse::<u32>()
@@ -3450,7 +3842,8 @@ mod tests {
                 .await
         });
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // 与取消测试使用相同的启动等待上限，不放宽后续进程树回收断言。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let process_id = loop {
             if let Ok(text) = std::fs::read_to_string(&process_id_path)
                 && let Ok(process_id) = text.trim().parse::<u32>()
@@ -3729,6 +4122,550 @@ mod tests {
         assert_eq!(result.sent_bytes, 3);
         assert_eq!(result.received, b"cba");
         server.await.expect("测试服务端应结束");
+    }
+
+    #[test]
+    fn persistent_shell_frames_preserve_every_chunk_boundary() {
+        let marker = "__REMOTEOPS_DONE_frame-test__";
+        let prefix = "前缀\nwithout-newline";
+        let wire = format!("{prefix}{marker}-2147483648\r\nnext-command");
+        for split in 0..=wire.len() {
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let mut stream = InteractiveShellOutput::new(marker, ProcessOutputEncoding::Utf8, true);
+            let mut bytes = 0;
+            stream
+                .push(&wire.as_bytes()[..split], &mut bytes, &sender)
+                .unwrap();
+            stream
+                .push(&wire.as_bytes()[split..], &mut bytes, &sender)
+                .unwrap();
+            assert_eq!(stream.collected, prefix, "split {split}");
+            assert_eq!(stream.exit_code, Some(i32::MIN));
+            assert_eq!(stream.pending, b"next-command");
+            assert_eq!(bytes, prefix.len());
+            let mut streamed = String::new();
+            while let Ok(chunk) = receiver.try_recv() {
+                assert!(chunk.stderr);
+                streamed.push_str(&chunk.text);
+            }
+            assert_eq!(streamed, prefix);
+        }
+    }
+
+    #[test]
+    fn persistent_shell_parser_bounds_unterminated_marker_candidates() {
+        let marker = "__REMOTEOPS_DONE_bounded__";
+        let mut stream = InteractiveShellOutput::new(marker, ProcessOutputEncoding::Utf8, false);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let malformed = format!("{marker}{}", "7".repeat(8192));
+        let mut bytes = 0;
+        for byte in malformed.bytes() {
+            stream.push(&[byte], &mut bytes, &sender).unwrap();
+            assert!(stream.pending.len() <= marker.len() + 12);
+        }
+        stream.finish(&mut bytes, &sender).unwrap();
+        assert_eq!(stream.collected, malformed);
+        assert_eq!(stream.exit_code, None);
+        assert_eq!(bytes, malformed.len());
+    }
+
+    #[test]
+    fn persistent_shell_streams_share_a_raw_byte_limit() {
+        let marker = "__REMOTEOPS_DONE_limit__";
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let mut stdout = InteractiveShellOutput::new(marker, ProcessOutputEncoding::Utf8, false);
+        let mut stderr = InteractiveShellOutput::new(marker, ProcessOutputEncoding::Utf8, true);
+        let mut bytes = 0;
+        // 非 UTF-8 字节损失解码后变长，预算仍依据原始字节。
+        let chunk = [0xff; 4096];
+        for index in 0..MAX_COMMAND_OUTPUT_BYTES / chunk.len() {
+            let stream = if index % 2 == 0 {
+                &mut stdout
+            } else {
+                &mut stderr
+            };
+            stream.push(&chunk, &mut bytes, &sender).unwrap();
+            assert!(stream.pending.len() <= marker.len() + 12);
+        }
+        assert_eq!(bytes, MAX_COMMAND_OUTPUT_BYTES);
+        assert!(matches!(
+            stderr.push(b"x", &mut bytes, &sender),
+            Err(DeviceError::OutputLimit { .. })
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn persistent_shell_limit_counts_filtered_terminal_bytes() {
+        let marker = "__REMOTEOPS_DONE_escape-limit__";
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let mut stream =
+            InteractiveShellOutput::new(marker, ProcessOutputEncoding::PlainUtf8, false);
+        let mut bytes = 0;
+        let chunk = b"\x1b[0m".repeat(1024);
+        for _ in 0..MAX_COMMAND_OUTPUT_BYTES / chunk.len() {
+            stream.push(&chunk, &mut bytes, &sender).unwrap();
+        }
+        assert_eq!(stream.collected, "");
+        assert!(matches!(
+            stream.push(&chunk, &mut bytes, &sender),
+            Err(DeviceError::OutputLimit { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_shell_interrupt_does_not_wait_for_io_lock() {
+        let shell = if cfg!(windows) {
+            ShellKind::Cmd
+        } else {
+            ShellKind::System
+        };
+        let session = SystemDevice::new()
+            .open_interactive_shell(shell)
+            .await
+            .unwrap();
+        let _io = session.inner.lock().await;
+        timeout(Duration::from_secs(5), session.interrupt())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.is_closed());
+        assert!(session.has_exited().await.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_shell_stdin_backpressure_obeys_total_timeout() {
+        let session = SystemDevice::new()
+            .open_interactive_shell(ShellKind::System)
+            .await
+            .unwrap();
+        let command = format!("sleep 30\n#{}", "x".repeat(512 * 1024));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let started = Instant::now();
+        let result = timeout(
+            Duration::from_secs(5),
+            session.run(&command, "write-timeout", 1, sender),
+        )
+        .await
+        .expect("背压写入必须遵守总超时");
+        assert!(matches!(result, Err(DeviceError::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(session.is_closed());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_shell_stdin_backpressure_can_be_interrupted() {
+        let session = SystemDevice::new()
+            .open_interactive_shell(ShellKind::System)
+            .await
+            .unwrap();
+        let command = format!("printf ready\nsleep 30\n#{}", "x".repeat(512 * 1024));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let worker = session.clone();
+        let task =
+            tokio::spawn(async move { worker.run(&command, "write-cancel", 60, sender).await });
+        let first = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.text, "ready");
+        timeout(Duration::from_secs(5), session.interrupt())
+            .await
+            .unwrap()
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert!(session.is_closed());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_shell_drains_output_while_writing_large_input() {
+        let session = SystemDevice::new()
+            .open_interactive_shell(ShellKind::System)
+            .await
+            .unwrap();
+        let command = format!("head -c 131072 /dev/zero\n#{}", "x".repeat(512 * 1024));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let result = session
+            .run(&command, "write-read", 5, sender)
+            .await
+            .unwrap();
+        assert_eq!(result.stdout.as_bytes(), vec![0; 131_072]);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!session.is_closed());
+        session.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_shell_preserves_interleaved_unterminated_output() {
+        let session = SystemDevice::new()
+            .open_interactive_shell(ShellKind::System)
+            .await
+            .unwrap();
+        let cases = [
+            (
+                "printf 'out-'; printf 'err-line\\n' >&2; sleep 0.05; printf 'end\\n'; printf 'err-tail' >&2",
+                "out-end\n",
+                "err-line\nerr-tail",
+            ),
+            (
+                "printf 'err-' >&2; printf 'out-line\\n'; sleep 0.05; printf 'end\\n' >&2; printf 'out-tail'",
+                "out-line\nout-tail",
+                "err-end\n",
+            ),
+            ("printf 'only-error' >&2", "", "only-error"),
+            (":", "", ""),
+        ];
+        for (index, (command, expected_stdout, expected_stderr)) in cases.into_iter().enumerate() {
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let result = session
+                .run(command, &format!("interleaved-{index}"), 5, sender)
+                .await
+                .unwrap();
+            assert_eq!(result.stdout, expected_stdout);
+            assert_eq!(result.stderr, expected_stderr);
+            assert_eq!(result.exit_code, Some(0));
+            let mut streamed_stdout = String::new();
+            let mut streamed_stderr = String::new();
+            while let Ok(chunk) = receiver.try_recv() {
+                if chunk.stderr {
+                    streamed_stderr.push_str(&chunk.text);
+                } else {
+                    streamed_stdout.push_str(&chunk.text);
+                }
+            }
+            assert_eq!(streamed_stdout, expected_stdout);
+            assert_eq!(streamed_stderr, expected_stderr);
+        }
+        session.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_shell_limits_no_newline_output_on_either_stream() {
+        for redirect in ["", " >&2"] {
+            let session = SystemDevice::new()
+                .open_interactive_shell(ShellKind::System)
+                .await
+                .unwrap();
+            let command = format!(
+                "head -c {} /dev/zero{redirect}",
+                MAX_COMMAND_OUTPUT_BYTES + 8192
+            );
+            let (sender, receiver) = mpsc::unbounded_channel();
+            drop(receiver);
+            let result = session.run(&command, "no-newline-limit", 5, sender).await;
+            assert!(matches!(result, Err(DeviceError::OutputLimit { .. })));
+            assert!(session.is_closed());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_shell_aborted_run_closes_session() {
+        let session = SystemDevice::new()
+            .open_interactive_shell(ShellKind::System)
+            .await
+            .unwrap();
+        let worker = session.clone();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            worker
+                .run("printf ready; sleep 30", "abort-run", 60, sender)
+                .await
+        });
+        timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(session.is_closed());
+        timeout(
+            Duration::from_secs(5),
+            wait_for_interactive_shell_exit(session.exit.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_shell_queue_wait_is_included_in_timeout() {
+        let session = SystemDevice::new()
+            .open_interactive_shell(ShellKind::System)
+            .await
+            .unwrap();
+        let _io = session.inner.lock().await;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let result = timeout(
+            Duration::from_secs(3),
+            session.run(":", "queue-timeout", 1, sender),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(DeviceError::Timeout)));
+        assert!(!session.is_closed());
+        session.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_shell_unexpected_exit_drains_both_streams() {
+        let session = SystemDevice::new()
+            .open_interactive_shell(ShellKind::System)
+            .await
+            .unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let result = session
+            .run(
+                "printf out-tail; printf err-tail >&2; exit 9",
+                "unexpected-exit",
+                5,
+                sender,
+            )
+            .await;
+        assert!(matches!(result, Err(DeviceError::Operation(_))));
+        assert!(session.is_closed());
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            if chunk.stderr {
+                stderr.push_str(&chunk.text);
+            } else {
+                stdout.push_str(&chunk.text);
+            }
+        }
+        assert_eq!(stdout, "out-tail");
+        assert_eq!(stderr, "err-tail");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn persistent_shell_interrupt_reaps_descendant_processes() {
+        let session = SystemDevice::new()
+            .open_interactive_shell(ShellKind::System)
+            .await
+            .unwrap();
+        let worker = session.clone();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            worker
+                .run(
+                    "sleep 30 & printf '%s\\n' \"$!\"; wait",
+                    "descendant",
+                    60,
+                    sender,
+                )
+                .await
+        });
+        let process_id = timeout(Duration::from_secs(5), async {
+            let mut line = String::new();
+            loop {
+                line.push_str(&receiver.recv().await.unwrap().text);
+                if line.ends_with('\n') {
+                    break line.trim().parse::<u32>().unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        session.interrupt().await.unwrap();
+        assert!(task.await.unwrap().is_err());
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let status = std::fs::read_to_string(format!("/proc/{process_id}/stat"));
+                if status.is_err() || status.unwrap().split_whitespace().nth(2) == Some("Z") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("中断必须清理 Shell 的后代进程");
+    }
+
+    #[tokio::test]
+    async fn persistent_powershell_stdin_submits_multiline_payload_when_available() {
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+        let executable = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
+        if !command_exists(executable) {
+            return;
+        }
+        let mut child = Command::new(executable)
+            .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
+            .env("TERM", "dumb")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        for (index, command) in [
+            "Write-Output 'FIRST'",
+            "Write-Output 'SECOND'",
+            "throw 'FIXTURE_ERROR'",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let marker = format!("__REMOTEOPS_DONE_submission{index}__");
+            let payload = interactive_command_payload(ShellKind::PowerShell, command, &marker);
+            stdin.write_all(payload.as_bytes()).await.unwrap();
+            stdin.flush().await.unwrap();
+            let expected_code = i32::from(index == 2);
+            let expected_marker = format!("{marker}{expected_code}");
+            let (out, err) = timeout(Duration::from_secs(20), async {
+                let mut out = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(stdout.read_line(&mut line).await.unwrap(), 0);
+                    if line.trim() == expected_marker {
+                        break;
+                    }
+                    out.push_str(&line);
+                }
+                let mut err = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(stderr.read_line(&mut line).await.unwrap(), 0);
+                    if line.trim() == expected_marker {
+                        break;
+                    }
+                    err.push_str(&line);
+                }
+                (out, err)
+            })
+            .await
+            .expect("multiline stdin must submit without waiting for EOF or the next command");
+            match index {
+                0 => assert!(out.contains("FIRST")),
+                1 => assert!(out.contains("SECOND")),
+                _ => assert!(err.contains("FIXTURE_ERROR")),
+            }
+        }
+        stdin.write_all(b"exit\n").await.unwrap();
+        drop(stdin);
+        timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn persistent_powershell_errors_complete_and_preserve_session() {
+        let mut shells = Vec::new();
+        #[cfg(windows)]
+        shells.push(ShellKind::WindowsPowerShell);
+        if command_exists(if cfg!(windows) { "pwsh.exe" } else { "pwsh" }) {
+            shells.push(ShellKind::PowerShell);
+        }
+        let native_failure = if cfg!(windows) {
+            "cmd.exe /D /C exit 7"
+        } else {
+            "/bin/sh -c 'exit 7'"
+        };
+        let native_then_success = format!("{native_failure}; Write-Output 'RECOVERED'");
+        let native_then_return = format!("{native_failure}; return");
+        let native_then_cmdlet_failure =
+            format!("{native_failure}; Write-Error 'NONTERMINATING' -ErrorAction Continue");
+        for shell in shells {
+            let session = SystemDevice::new()
+                .open_interactive_shell(shell)
+                .await
+                .unwrap();
+            for (tag, text) in [
+                ("first-submission", "FIRST"),
+                ("second-submission", "SECOND"),
+            ] {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                drop(receiver);
+                let result = session
+                    .run(&format!("Write-Output '{text}'"), tag, 20, sender)
+                    .await
+                    .expect("simple consecutive PowerShell commands must submit independently");
+                assert_eq!(result.exit_code, Some(0));
+                assert!(result.stdout.contains(text));
+            }
+            for (index, (command, expected_code, expected_stdout, expected_stderr)) in [
+                (
+                    "throw 'REMOTEOPS_THROW_REGRESSION'",
+                    1,
+                    "",
+                    "REMOTEOPS_THROW_REGRESSION",
+                ),
+                (
+                    "Write-Error 'REMOTEOPS_STOP_REGRESSION' -ErrorAction Stop",
+                    1,
+                    "",
+                    "REMOTEOPS_STOP_REGRESSION",
+                ),
+                (native_failure, 7, "", ""),
+                (
+                    "[Console]::Error.Write('REMOTEOPS_STDERR'); Write-Output 'REMOTEOPS_OK'",
+                    0,
+                    "REMOTEOPS_OK",
+                    "REMOTEOPS_STDERR",
+                ),
+                (native_then_success.as_str(), 0, "RECOVERED", ""),
+                ("return 'EARLY_RETURN'", 0, "EARLY_RETURN", ""),
+                (native_then_return.as_str(), 7, "", ""),
+                (
+                    "Write-Error 'NONTERMINATING' -ErrorAction Continue",
+                    1,
+                    "",
+                    "NONTERMINATING",
+                ),
+                (native_then_cmdlet_failure.as_str(), 7, "", "NONTERMINATING"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                drop(receiver);
+                let result = session
+                    .run(command, &format!("powershell-error-{index}"), 20, sender)
+                    .await
+                    .expect("终止性错误也应返回完成边界");
+                assert_eq!(
+                    result.exit_code,
+                    Some(expected_code),
+                    "{shell:?}: {result:?}"
+                );
+                assert!(result.stdout.contains(expected_stdout));
+                assert!(result.stderr.contains(expected_stderr));
+                if index == 3 {
+                    assert_eq!(result.stderr, "REMOTEOPS_STDERR");
+                }
+                assert!(!session.is_closed());
+            }
+            let (sender, receiver) = mpsc::unbounded_channel();
+            drop(receiver);
+            let result = session
+                .run("exit 3", "powershell-explicit-exit", 20, sender)
+                .await
+                .unwrap();
+            assert_eq!(result.exit_code, Some(3));
+            assert!(session.is_closed());
+        }
     }
 
     #[tokio::test]
@@ -4100,7 +5037,7 @@ mod unix_inventory_tests {
         let result = device.list_processes().await.unwrap();
         let data: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         let items = data["items"].as_array().unwrap();
-        assert!(!items.is_empty());
+        assert_ne!(items.as_slice(), &[] as &[serde_json::Value]);
         assert!(items.iter().all(|item| item["Id"].as_u64().is_some()));
         assert_eq!(data["returned"], items.len());
         assert!(device.run(ShellKind::Cmd, "echo wrong", 5).await.is_err());

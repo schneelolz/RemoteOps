@@ -131,11 +131,16 @@ impl Default for DefaultPolicy {
     fn default() -> Self {
         Self {
             high_risk_patterns: compile_patterns(&[
-                r"(?i)\b(shutdown|restart-computer|stop-computer|reboot)\b",
-                r"(?i)\b(sc(\.exe)?\s+(delete|stop|config)|set-service|stop-service)\b",
-                r"(?i)\b(reg(\.exe)?\s+(add|delete)|set-executionpolicy)\b",
-                r"(?i)\b(format|diskpart|bcdedit|cipher\s+/w)\b",
-                r"(?i)\b(invoke-expression|iex|start-process)\b",
+                r"(?i)^(shutdown|restart-computer|stop-computer|reboot)(\.(exe|com|cmd|bat))?( |$)",
+                r"(?i)^(sc(\.(exe|com|cmd|bat))?( \\\\[^ ]+)? (delete|stop|config)|set-service|stop-service)( |$)",
+                r"(?i)^(reg(\.(exe|com|cmd|bat))? (add|delete)|set-executionpolicy)( |$)",
+                r"(?i)^(format|diskpart|bcdedit)(\.(exe|com|cmd|bat))?( |$)",
+                r"(?i)^cipher(\.(exe|com|cmd|bat))?( [^ ]+)* /w(:[^ ]*)?( |$)",
+                r"(?i)^(invoke-expression|iex|start-process)( |$)",
+                // Interpreter/wrapper arguments can themselves be commands. Do
+                // not reinterpret their strings as harmless ordinary arguments.
+                r"(?i)^(cmd|powershell|pwsh|sh|bash|dash|zsh|sudo|env)(\.(exe|com|cmd|bat))?( |$)",
+                r"(?i)^(if|for|while|until|case|foreach|switch|call|start|exec|eval|command|nohup|time|nice|xargs|!|\.)( |$)",
             ]),
         }
     }
@@ -343,18 +348,101 @@ impl DefaultPolicy {
     }
 
     fn classify_command(&self, shell: Option<ShellKind>, command: &str) -> RiskLevel {
-        if self
-            .high_risk_patterns
-            .iter()
-            .any(|pattern| pattern.is_match(command))
-        {
+        if is_structured_readonly_command(shell, command) {
+            return RiskLevel::ReadOnly;
+        }
+        let Some(invocations) = risk_invocations(shell, command) else {
+            // Unknown quoting/expansion is not evidence of a low-risk command.
+            return RiskLevel::High;
+        };
+        if invocations.iter().any(|invocation| {
+            self.high_risk_patterns
+                .iter()
+                .any(|pattern| pattern.is_match(invocation))
+        }) {
             return RiskLevel::High;
         }
-        if is_structured_readonly_command(shell, command) {
-            RiskLevel::ReadOnly
-        } else {
-            RiskLevel::Mutating
+        RiskLevel::Mutating
+    }
+}
+
+// This is a conservative risk scanner, not an execution parser and never a
+// readonly allowlist. Inspect command positions, not filenames or quoted data.
+// Compound syntax remains outside the readonly grammar even when no known
+// high-risk invocation occurs. Ambiguous syntax falls back to High.
+fn risk_invocations(shell: Option<ShellKind>, command: &str) -> Option<Vec<String>> {
+    if command.len() > 4_096 {
+        return None;
+    }
+    let mut invocations = Vec::new();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut chars = command.chars().peekable();
+    while let Some(character) = chars.next() {
+        if is_powershell_smart_quote(character) {
+            return None;
         }
+        match quote {
+            Some(delimiter) if character == delimiter => {
+                if chars.peek() == Some(&delimiter) {
+                    return None;
+                }
+                quote = None;
+            }
+            Some('"') if matches!(character, '$' | '`' | '%' | '!' | '\\') => return None,
+            None if character == '"' || (character == '\'' && shell != Some(ShellKind::Cmd)) => {
+                quote = Some(character);
+            }
+            None if matches!(
+                character,
+                '`' | '^' | '$' | '>' | '<' | '=' | '@' | '#' | '[' | ']'
+            ) =>
+            {
+                return None;
+            }
+            None if (shell == Some(ShellKind::System) && character == '\\')
+                || (shell == Some(ShellKind::Cmd) && matches!(character, '%' | '!')) =>
+            {
+                return None;
+            }
+            None if matches!(
+                character,
+                ';' | '|' | '&' | '\r' | '\n' | '(' | ')' | '{' | '}'
+            ) =>
+            {
+                finish_risk_word(&mut words, &mut word);
+                finish_risk_invocation(&mut invocations, &mut words);
+            }
+            None if character.is_whitespace() => finish_risk_word(&mut words, &mut word),
+            Some(_) | None => word.push(character),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    finish_risk_word(&mut words, &mut word);
+    finish_risk_invocation(&mut invocations, &mut words);
+    Some(invocations)
+}
+
+fn finish_risk_word(words: &mut Vec<String>, word: &mut String) {
+    if !word.is_empty() {
+        words.push(std::mem::take(word));
+    }
+}
+
+fn finish_risk_invocation(invocations: &mut Vec<String>, words: &mut Vec<String>) {
+    if let Some(program) = words.first_mut() {
+        // Basenames may raise risk, but never establish readonly trust.
+        *program = program
+            .rsplit(['\\', '/', ':'])
+            .next()
+            .unwrap_or(program)
+            .trim_end_matches(['.', ' '])
+            .to_owned();
+        invocations.push(words.join(" "));
+        words.clear();
     }
 }
 
@@ -372,31 +460,79 @@ fn is_structured_readonly_command(shell: Option<ShellKind>, command: &str) -> bo
     let Some(program) = command.split_whitespace().next() else {
         return false;
     };
-    let program = program
-        .trim_matches('"')
-        .rsplit(['\\', '/'])
-        .next()
-        .unwrap_or(program)
-        .to_ascii_lowercase();
     match shell {
-        Some(ShellKind::Cmd) => is_cmd_readonly(&program, command),
+        Some(ShellKind::Cmd) => readonly_program_name(shell, program)
+            .is_some_and(|program| is_cmd_readonly(&program, command)),
         Some(ShellKind::WindowsPowerShell | ShellKind::PowerShell) => {
             is_literal_read(command)
                 || is_environment_read(command)
-                || is_powershell_readonly(&program, command)
+                || readonly_program_name(shell, program)
+                    .is_some_and(|program| is_powershell_readonly(&program, command))
         }
-        Some(ShellKind::System) => is_posix_readonly(&program, command),
+        Some(ShellKind::System) => readonly_program_name(shell, program)
+            .is_some_and(|program| is_posix_readonly(&program, command)),
         None => false,
     }
 }
 
+// Do not infer executable identity from a caller-controlled basename. The sole
+// path exception preserves the existing IIS query at its fixed system location;
+// this does not trust arbitrary Windows directories, drive letters or modules.
+// Bare names still require a trusted target PATH/current directory and command
+// resolution environment. That cannot be verified by this string-only policy.
+fn readonly_program_name(shell: Option<ShellKind>, program: &str) -> Option<String> {
+    let program = program
+        .strip_prefix('"')
+        .and_then(|quoted| quoted.strip_suffix('"'))
+        .unwrap_or(program);
+    if shell == Some(ShellKind::Cmd)
+        && program.eq_ignore_ascii_case(r"C:\Windows\System32\inetsrv\appcmd.exe")
+    {
+        return Some("appcmd.exe".to_owned());
+    }
+    if program.is_empty()
+        || !program
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    {
+        return None;
+    }
+    // POSIX executable names are case-sensitive. Windows command lookup is not.
+    Some(if shell == Some(ShellKind::System) {
+        program.to_owned()
+    } else {
+        program.to_ascii_lowercase()
+    })
+}
+
 fn is_literal_read(command: &str) -> bool {
-    command.len() >= 2
-        && ((command.starts_with('\'') && command.ends_with('\''))
-            || (command.starts_with('"')
-                && command.ends_with('"')
-                && !command.contains('$')
-                && !command.contains('%')))
+    let mut chars = command.chars().peekable();
+    let Some(quote @ ('\'' | '"')) = chars.next() else {
+        return false;
+    };
+    while let Some(character) = chars.next() {
+        // PowerShell treats smart quotes as delimiters too. They are deliberately
+        // unsupported rather than interpreted differently from the target shell.
+        if is_powershell_smart_quote(character)
+            || character == '`'
+            || (quote == '"' && matches!(character, '$' | '%'))
+        {
+            return false;
+        }
+        if character == quote {
+            if chars.peek() == Some(&quote) {
+                let _ = chars.next();
+            } else {
+                // The first unescaped closing quote must end the entire input.
+                return chars.next().is_none();
+            }
+        }
+    }
+    false
+}
+
+fn is_powershell_smart_quote(character: char) -> bool {
+    matches!(character, '\u{2018}'..='\u{201f}')
 }
 
 fn is_environment_read(command: &str) -> bool {
@@ -411,8 +547,9 @@ fn is_environment_read(command: &str) -> bool {
 
 fn is_cmd_readonly(program: &str, command: &str) -> bool {
     match program {
-        "echo" | "ver" | "hostname" | "whoami" | "tasklist" | "systeminfo" | "netstat" | "arp"
+        "echo" | "ver" | "hostname" | "whoami" | "tasklist" | "systeminfo" | "netstat"
         | "nslookup" | "ping" | "tracert" | "pathping" => true,
+        "arp" | "arp.exe" => is_cmd_arp_readonly(command),
         "ipconfig" => command.split_whitespace().skip(1).all(|argument| {
             matches!(
                 argument.to_ascii_lowercase().as_str(),
@@ -431,6 +568,38 @@ fn is_cmd_readonly(program: &str, command: &str) -> bool {
         }),
         "appcmd" | "appcmd.exe" => is_appcmd_readonly(command),
         _ => false,
+    }
+}
+
+fn is_cmd_arp_readonly(command: &str) -> bool {
+    let mut arguments = command.split_whitespace().skip(1).peekable();
+    match arguments.next() {
+        None => true,
+        Some("/?") => arguments.next().is_none(),
+        Some("-a" | "-g") => {
+            if arguments
+                .peek()
+                .is_some_and(|argument| argument.parse::<std::net::Ipv4Addr>().is_ok())
+            {
+                let _ = arguments.next();
+            }
+            while let Some(argument) = arguments.next() {
+                match argument {
+                    "-v" => {}
+                    "-N" => {
+                        if arguments
+                            .next()
+                            .is_none_or(|address| address.parse::<std::net::Ipv4Addr>().is_err())
+                        {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            true
+        }
+        Some(_) => false,
     }
 }
 
@@ -482,6 +651,9 @@ fn is_powershell_readonly(program: &str, command: &str) -> bool {
 }
 
 fn is_simple_powershell_invocation(command: &str) -> bool {
+    if command.chars().any(is_powershell_smart_quote) {
+        return false;
+    }
     let mut quote = None;
     let mut chars = command.chars().peekable();
     while let Some(character) = chars.next() {
@@ -536,7 +708,8 @@ fn is_posix_readonly(program: &str, command: &str) -> bool {
     match program {
         "hostname" | "date" => command.split_whitespace().count() == 1,
         "printf" | "echo" | "uname" | "whoami" | "id" | "uptime" | "pwd" | "ls" | "head"
-        | "tail" | "grep" | "ps" | "ss" | "netstat" | "df" => true,
+        | "tail" | "grep" | "ps" | "netstat" | "df" => true,
+        "ss" => is_posix_ss_readonly(command),
         "cat" => command
             .split_whitespace()
             .skip(1)
@@ -547,22 +720,96 @@ fn is_posix_readonly(program: &str, command: &str) -> bool {
 }
 
 fn is_posix_ip_readonly(command: &str) -> bool {
-    let arguments = command
-        .split_whitespace()
-        .skip(1)
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    let Some(object_index) = arguments
-        .iter()
-        .position(|argument| matches!(argument.as_str(), "address" | "addr" | "route" | "link"))
-    else {
+    let mut arguments = command.split_whitespace().skip(1).peekable();
+    // Exact spellings only: ip accepts option abbreviations, and -b means batch,
+    // not brief. Never search past unknown global options for a safe-looking object.
+    while arguments
+        .peek()
+        .is_some_and(|argument| argument.starts_with('-'))
+    {
+        match arguments.next() {
+            Some(
+                "-4" | "-6" | "-0" | "-br" | "-brief" | "-j" | "-json" | "-p" | "-pretty" | "-o"
+                | "-oneline" | "-s" | "-stats" | "-statistics" | "-d" | "-details" | "-r"
+                | "-resolve",
+            ) => {}
+            Some("-f" | "-family") => {
+                if !matches!(arguments.next(), Some("inet" | "inet6" | "link")) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    if !matches!(
+        arguments.next(),
+        Some("address" | "addr" | "a" | "route" | "r" | "link" | "l")
+    ) {
         return false;
-    };
-    !arguments[object_index + 1..].iter().any(|argument| {
-        matches!(
-            argument.as_str(),
-            "add" | "append" | "change" | "delete" | "del" | "flush" | "replace" | "set"
-        )
+    }
+    match arguments.next() {
+        None => true,
+        // Once the dispatch action is explicitly a read, remaining arguments are
+        // query filters. Keep them literal and reject options/expansion syntax.
+        Some("show" | "list" | "lst") => arguments.all(is_native_query_atom),
+        _ => false,
+    }
+}
+
+fn is_native_query_atom(argument: &str) -> bool {
+    !argument.is_empty()
+        && !argument.starts_with('-')
+        && argument.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/' | b',')
+        })
+}
+
+fn is_posix_ss_readonly(command: &str) -> bool {
+    // Only no-argument diagnostic flags are accepted. In particular, never
+    // lowercase short options: -K closes sockets and -D writes a dump file.
+    command.split_whitespace().skip(1).all(|argument| {
+        if argument.starts_with("--") {
+            matches!(
+                argument,
+                "--help"
+                    | "--version"
+                    | "--no-header"
+                    | "--no-queues"
+                    | "--oneline"
+                    | "--numeric"
+                    | "--resolve"
+                    | "--all"
+                    | "--listening"
+                    | "--options"
+                    | "--extended"
+                    | "--memory"
+                    | "--processes"
+                    | "--info"
+                    | "--summary"
+                    | "--ipv4"
+                    | "--ipv6"
+                    | "--packet"
+                    | "--tcp"
+                    | "--udp"
+                    | "--raw"
+                    | "--unix"
+                    | "--sctp"
+                    | "--tipc"
+                    | "--vsock"
+                    | "--xdp"
+                    | "--mptcp"
+                    | "--tos"
+                    | "--cgroup"
+                    | "--inet-sockopt"
+            )
+        } else {
+            argument.strip_prefix('-').is_some_and(|flags| {
+                !flags.is_empty()
+                    && flags
+                        .bytes()
+                        .all(|flag| b"hVHQOnraloempsituwxS046M".contains(&flag))
+            })
+        }
     })
 }
 
@@ -710,6 +957,381 @@ mod tests {
     use remoteops_domain::{SerialLineEnding, SerialSettings, SerialTerminalProfile, ShellKind};
 
     use super::*;
+
+    const PERMISSION_MODES: [PermissionMode; 4] = [
+        PermissionMode::ReadOnly,
+        PermissionMode::ApprovalRequired,
+        PermissionMode::ControllerApproved,
+        PermissionMode::FullAccess,
+    ];
+
+    // Every regression below is string-only. No shell, device or native network
+    // utility is invoked, including for examples that describe modifying flags.
+    fn assert_readonly_query(shell: ShellKind, command: &str, accepted: bool) {
+        let policy = DefaultPolicy::default();
+        let operation = RemoteOperation::RunCommand {
+            shell,
+            command: command.to_owned(),
+            readonly: true,
+        };
+        assert_eq!(
+            policy.classify(&operation) == RiskLevel::ReadOnly,
+            accepted,
+            "classification: {shell:?}: {command}"
+        );
+        for mode in PERMISSION_MODES {
+            for source in [EventSource::Ai, EventSource::Human] {
+                let decision = policy.evaluate_with_mode(mode, source, &operation);
+                if accepted {
+                    assert_eq!(decision, PolicyDecision::Allow, "{mode:?}: {command}");
+                } else {
+                    assert!(
+                        matches!(decision, PolicyDecision::Deny { .. }),
+                        "{mode:?}: {command}: {decision:?}"
+                    );
+                }
+            }
+        }
+        if !accepted {
+            let operation = RemoteOperation::RunCommand {
+                shell,
+                command: command.to_owned(),
+                readonly: false,
+            };
+            assert!(matches!(
+                policy.evaluate_with_mode(PermissionMode::ReadOnly, EventSource::Ai, &operation),
+                PolicyDecision::Deny { .. }
+            ));
+            assert!(matches!(
+                policy.evaluate_with_mode(
+                    PermissionMode::ApprovalRequired,
+                    EventSource::Ai,
+                    &operation
+                ),
+                PolicyDecision::RequireApproval { .. }
+            ));
+            for mode in [
+                PermissionMode::ControllerApproved,
+                PermissionMode::FullAccess,
+            ] {
+                assert_eq!(
+                    policy.evaluate_with_mode(mode, EventSource::Ai, &operation),
+                    PolicyDecision::Allow
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn powershell_literals_must_be_one_complete_nonexpanding_string() {
+        for shell in [ShellKind::WindowsPowerShell, ShellKind::PowerShell] {
+            for command in [
+                "''",
+                "\"\"",
+                "'SAFE_REVIEW'",
+                "'prefix''suffix'",
+                "\"prefix\"\"suffix\"",
+                "'format shutdown reboot'",
+                "'a (parenthesized) literal'",
+                "'C:\\review\\shutdown.log'",
+                "'literal $name'",
+            ] {
+                assert_readonly_query(shell, command, true);
+            }
+            for command in [
+                "'prefix' + (Write-Output SAFE_REVIEW) + 'suffix'",
+                "\"prefix\" + (Write-Output SAFE_REVIEW) + \"suffix\"",
+                "'prefix' + 'suffix'",
+                "'' (Write-Output SAFE_REVIEW) ''",
+                "'prefix' 'suffix'",
+                "'prefix' SAFE_REVIEW 'suffix'",
+                "'unterminated",
+                "\"unterminated",
+                "'prefix''",
+                "\"$env:COMPUTERNAME\"",
+                "\"$(Write-Output SAFE_REVIEW)\"",
+                "\"prefix`\"suffix\"",
+                "'prefix’ + (Write-Output SAFE_REVIEW) + ‘suffix'",
+                "Write-Output 'prefix’ (Write-Output SAFE_REVIEW) ‘suffix'",
+            ] {
+                assert_readonly_query(shell, command, false);
+            }
+            for smart_quote in '\u{2018}'..='\u{201f}' {
+                for quote in ['\'', '"'] {
+                    let literal = format!(
+                        "{quote}prefix{smart_quote} + (Write-Output SAFE_REVIEW) + {smart_quote}suffix{quote}"
+                    );
+                    assert_readonly_query(shell, &literal, false);
+                    assert_readonly_query(shell, &format!("Write-Output {literal}"), false);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn arp_queries_use_only_explicit_display_options() {
+        for command in [
+            "arp",
+            "arp /?",
+            "arp -a",
+            "ARP -g 192.0.2.1",
+            "arp.exe -a -N 192.0.2.2 -v",
+            "arp -a 192.0.2.1 -v -N 192.0.2.2",
+        ] {
+            assert_readonly_query(ShellKind::Cmd, command, true);
+        }
+        for command in [
+            "arp -d 192.0.2.1",
+            "arp -s 192.0.2.1 00-00-5e-00-53-01",
+            "arp -a -d 192.0.2.1",
+            "arp -ad",
+            "arp -a -N -d",
+            "arp -a -N",
+            "arp -a --unknown",
+            "arp -a %REVIEW_OPTIONS%",
+            "arp -a 192.0.2.1 -N 999.0.0.1",
+            "arp /? -d 192.0.2.1",
+        ] {
+            assert_readonly_query(ShellKind::Cmd, command, false);
+        }
+    }
+
+    #[test]
+    fn ss_queries_allow_only_diagnostic_flags() {
+        for command in [
+            "ss",
+            "ss -lntup",
+            "ss -s",
+            "ss -H -4 -m -i",
+            "ss --tcp --numeric --listening --processes",
+            "ss --summary",
+        ] {
+            assert_readonly_query(ShellKind::System, command, true);
+        }
+        for command in [
+            "ss -K",
+            "ss --kill",
+            "ss --kil",
+            "ss --ki",
+            "ss --k",
+            "ss -ntK",
+            "ss -Knt",
+            "ss -n -K",
+            "ss -D /tmp/SAFE_REVIEW_MISSING",
+            "ss -nD/tmp/SAFE_REVIEW_MISSING",
+            "ss --diag=/tmp/SAFE_REVIEW_MISSING",
+            "ss --filter=/tmp/SAFE_REVIEW_MISSING",
+            "ss --unknown",
+            "ss -f inet",
+            "ss $REVIEW_OPTIONS",
+            "ss '-K'",
+            "ss -- -K",
+        ] {
+            assert_readonly_query(ShellKind::System, command, false);
+        }
+    }
+
+    #[test]
+    fn ip_queries_require_ordered_options_and_read_dispatch() {
+        for command in [
+            "ip addr",
+            "ip address show",
+            "ip a",
+            "ip r",
+            "ip l",
+            "ip -br addr",
+            "ip -j -4 address show dev eth0",
+            "ip -f inet6 route show table all",
+            "ip -s link show dev eth0",
+            "ip route list",
+            "ip addr lst scope global",
+            "ip addr show to 192.0.2.0/24",
+        ] {
+            assert_readonly_query(ShellKind::System, command, true);
+        }
+        for command in [
+            "ip addr add 192.0.2.1/24 dev eth0",
+            "ip addr a 192.0.2.1/24 dev eth0",
+            "ip addr del 192.0.2.1/24 dev eth0",
+            "ip addr d 192.0.2.1/24 dev eth0",
+            "ip route replace default via 192.0.2.1",
+            "ip route r default via 192.0.2.1",
+            "ip link set dev eth0 down",
+            "ip link s dev eth0 down",
+            "ip -batch /tmp/SAFE_REVIEW_MISSING addr show",
+            "ip -b /tmp/SAFE_REVIEW_MISSING link",
+            "ip -ba /tmp/SAFE_REVIEW_MISSING route",
+            "ip --batch /tmp/SAFE_REVIEW_MISSING address show",
+            "ip -br -b /tmp/SAFE_REVIEW_MISSING addr",
+            "ip -j --unknown addr show",
+            "ip -f -batch /tmp/SAFE_REVIEW_MISSING addr show",
+            "ip -f inet",
+            "ip -j",
+            "ip addr show -batch /tmp/SAFE_REVIEW_MISSING",
+            "ip addr show $REVIEW_FILTER",
+            "ip addr 'show'",
+            "ip -BR addr",
+            "ip addr s",
+            "ip address unknown",
+        ] {
+            assert_readonly_query(ShellKind::System, command, false);
+        }
+    }
+
+    #[test]
+    fn readonly_programs_do_not_trust_arbitrary_paths_or_module_names() {
+        for (shell, command) in [
+            (ShellKind::System, "ls /tmp/SAFE_REVIEW_MISSING"),
+            (ShellKind::Cmd, "whoami"),
+            (ShellKind::PowerShell, "Get-Process"),
+            (ShellKind::Cmd, "appcmd.exe list site"),
+            (
+                ShellKind::Cmd,
+                r"C:\Windows\System32\inetsrv\appcmd.exe list site",
+            ),
+            (
+                ShellKind::Cmd,
+                r#""C:\Windows\System32\inetsrv\appcmd.exe" list site"#,
+            ),
+        ] {
+            assert_readonly_query(shell, command, true);
+        }
+        for (shell, command) in [
+            (ShellKind::System, "/tmp/SAFE_REVIEW_MISSING/ls"),
+            (ShellKind::System, "./ls"),
+            (ShellKind::System, "../ls"),
+            (ShellKind::System, "/usr/bin/ls"),
+            (ShellKind::System, "LS"),
+            (ShellKind::Cmd, r"C:\SAFE_REVIEW_MISSING\whoami"),
+            (ShellKind::Cmd, r".\whoami"),
+            (ShellKind::Cmd, r"C:whoami"),
+            (ShellKind::Cmd, "C:/SAFE_REVIEW_MISSING/whoami"),
+            (ShellKind::Cmd, r"\\SAFE_REVIEW_MISSING\tools\whoami"),
+            (
+                ShellKind::Cmd,
+                r"C:\SAFE_REVIEW_MISSING\appcmd.exe list site",
+            ),
+            (
+                ShellKind::Cmd,
+                r"D:\Windows\System32\inetsrv\appcmd.exe list site",
+            ),
+            (
+                ShellKind::Cmd,
+                r"C:\Windows\System32\inetsrv\..\appcmd.exe list site",
+            ),
+            (ShellKind::PowerShell, r"ReviewModule\Get-Process"),
+            (ShellKind::PowerShell, r"C:\SAFE_REVIEW_MISSING\Get-Process"),
+        ] {
+            assert_readonly_query(shell, command, false);
+        }
+    }
+
+    #[test]
+    fn high_risk_words_in_query_data_are_not_command_invocations() {
+        for (shell, command) in [
+            (
+                ShellKind::PowerShell,
+                "Get-Content C:\\review\\shutdown.log",
+            ),
+            (
+                ShellKind::PowerShell,
+                "Write-Output 'format diskpart reboot'",
+            ),
+            (ShellKind::PowerShell, "Get-Command Format-Table"),
+            (ShellKind::PowerShell, "Get-Service -Name shutdown"),
+            (ShellKind::Cmd, "echo restart-computer format"),
+            (ShellKind::System, "cat /tmp/shutdown.log"),
+            (ShellKind::System, "grep format /tmp/SAFE_REVIEW_MISSING"),
+        ] {
+            assert_readonly_query(shell, command, true);
+        }
+        let policy = DefaultPolicy::default();
+        for command in [
+            "Format-Table -AutoSize",
+            "Format-List Name",
+            "Get-Process | Format-Table",
+            "Get-Process; Get-Service",
+        ] {
+            let operation = RemoteOperation::RunCommand {
+                shell: ShellKind::PowerShell,
+                command: command.to_owned(),
+                readonly: true,
+            };
+            assert_eq!(
+                policy.classify(&operation),
+                RiskLevel::Mutating,
+                "{command}"
+            );
+            assert_readonly_query(ShellKind::PowerShell, command, false);
+        }
+    }
+
+    #[test]
+    fn genuine_high_risk_invocations_still_require_human_approval() {
+        let policy = DefaultPolicy::default();
+        for (shell, command) in [
+            (ShellKind::Cmd, "format X:"),
+            (ShellKind::Cmd, "FORMAT.EXE X:"),
+            (ShellKind::Cmd, "format.com X:"),
+            (ShellKind::Cmd, "format. X:"),
+            (ShellKind::Cmd, "C:format.exe X:"),
+            (ShellKind::Cmd, r"C:\Windows\System32\format.exe X:"),
+            (ShellKind::Cmd, "diskpart"),
+            (ShellKind::Cmd, "bcdedit /enum"),
+            (ShellKind::Cmd, "cipher.exe /w:X:\\SAFE_REVIEW_MISSING"),
+            (ShellKind::Cmd, "sc.exe stop SAFE_REVIEW_MISSING"),
+            (
+                ShellKind::Cmd,
+                r"sc.exe \\review.example stop SAFE_REVIEW_MISSING",
+            ),
+            (ShellKind::Cmd, "reg.exe delete HKCU\\SAFE_REVIEW_MISSING"),
+            (ShellKind::Cmd, "echo SAFE_REVIEW & shutdown /?"),
+            (ShellKind::Cmd, "if exist SAFE_REVIEW_MISSING shutdown /?"),
+            (ShellKind::PowerShell, "Restart-Computer -WhatIf"),
+            (ShellKind::PowerShell, "Get-Process | Stop-Service -WhatIf"),
+            (ShellKind::PowerShell, "& 'Restart-Computer' -WhatIf"),
+            (
+                ShellKind::PowerShell,
+                "Write-Output (Restart-Computer -WhatIf)",
+            ),
+            (
+                ShellKind::PowerShell,
+                "Set-ExecutionPolicy Restricted -WhatIf",
+            ),
+            (
+                ShellKind::PowerShell,
+                "Invoke-Expression 'Write-Output SAFE_REVIEW'",
+            ),
+            (ShellKind::System, "echo SAFE_REVIEW; reboot --help"),
+            (ShellKind::System, "/sbin/reboot --help"),
+            (ShellKind::System, "sh -c 'echo SAFE_REVIEW'"),
+            (ShellKind::System, "REVIEW=value reboot --help"),
+        ] {
+            let operation = RemoteOperation::RunCommand {
+                shell,
+                command: command.to_owned(),
+                readonly: false,
+            };
+            assert_eq!(policy.classify(&operation), RiskLevel::High, "{command}");
+            for source in [EventSource::Ai, EventSource::Human] {
+                assert!(
+                    matches!(
+                        policy.evaluate_with_mode(
+                            PermissionMode::ApprovalRequired,
+                            source,
+                            &operation
+                        ),
+                        PolicyDecision::RequireApproval {
+                            risk: RiskLevel::High,
+                            ..
+                        }
+                    ),
+                    "{command}"
+                );
+            }
+            assert_readonly_query(shell, command, false);
+        }
+    }
 
     #[test]
     fn ai_readonly_command_is_allowed() {
