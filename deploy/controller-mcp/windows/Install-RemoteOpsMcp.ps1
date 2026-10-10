@@ -85,6 +85,32 @@ if (-not $setupMode) {
 
 }
 
+# Use a managed worker for the complete transfer: .NET Framework's FlushAsync
+# may synchronously flush its buffer before returning a Task. No PowerShell
+# scriptblock runs on this worker, and setup material is never a process argument.
+if ($setupMode -and -not ('RemoteOps.SetupPipeTransfer' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System.IO;
+using System.Threading.Tasks;
+namespace RemoteOps {
+    public static class SetupPipeTransfer {
+        public static Task SendAsync(Stream stream, byte[] bytes) {
+            return Task.Run(() => {
+                try {
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.Flush();
+                }
+                finally {
+                    try { stream.Close(); }
+                    finally { System.Array.Clear(bytes, 0, bytes.Length); }
+                }
+            });
+        }
+    }
+}
+'@
+}
+
 function Invoke-SetupHelper {
     param(
         [Parameter(Mandatory)][string]$Executable,
@@ -113,6 +139,8 @@ function Invoke-SetupHelper {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     $processStarted = $false
+    $inputBytes = $null
+    $inputTransfer = $null
     try {
         # .NET Framework creates an AutoFlush StreamWriter during Start using
         # Console.InputEncoding, which can emit a BOM before BaseStream is used.
@@ -131,15 +159,16 @@ function Invoke-SetupHelper {
         # Write UTF-8 bytes directly for Windows PowerShell 5.1 as well as 7;
         # do not depend on the console code page or newer encoding properties.
         $inputBytes = [Text.Encoding]::UTF8.GetBytes($InputContent)
-        try {
-            $process.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)
-            $process.StandardInput.BaseStream.Flush()
-            $process.StandardInput.BaseStream.Close()
+        # Bound the whole write/flush/close, including synchronous pipe calls.
+        $inputTransfer = [RemoteOps.SetupPipeTransfer]::SendAsync($process.StandardInput.BaseStream, $inputBytes)
+        if (-not $inputTransfer.Wait(10000)) {
+            throw '设置输入传输超时；请保留设置文件并重试。'
         }
-        finally {
-            [Array]::Clear($inputBytes, 0, $inputBytes.Length)
-        }
-        if (-not $process.WaitForExit(180000)) {
+        $inputTransfer.GetAwaiter().GetResult()
+        # Preview only parses local input. Do not give a stuck preview the full
+        # network-enrollment window, including Framework's silent pipe closure.
+        $helperTimeoutMilliseconds = if ($Arguments -contains '--setup-preview') { 10000 } else { 180000 }
+        if (-not $process.WaitForExit($helperTimeoutMilliseconds)) {
             $process.Kill()
             $process.WaitForExit()
             throw '登记超时；请保留 setup-state.json 并使用同一设置重试。'
@@ -160,7 +189,17 @@ function Invoke-SetupHelper {
                 $process.WaitForExit()
             }
         }
-        finally { $process.Dispose() }
+        finally {
+            # Kill first so any pending pipe write can finish before its buffer
+            # is cleared. Never mutate bytes still owned by an async write.
+            if ($null -ne $inputTransfer -and -not $inputTransfer.IsCompleted) {
+                try { $null = $inputTransfer.Wait(5000) } catch { }
+            }
+            if ($null -ne $inputBytes -and ($null -eq $inputTransfer -or $inputTransfer.IsCompleted)) {
+                [Array]::Clear($inputBytes, 0, $inputBytes.Length)
+            }
+            $process.Dispose()
+        }
     }
 }
 
@@ -364,8 +403,12 @@ if (-not $setupMode) { $configurationArguments += '--legacy-env' }
 & $installedExecutable @configurationArguments | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'Codex MCP 配置未完成；请保留设置状态并重试。' }
 
+# This enumeration is already scoped to the installation directory. Compare
+# leaf names: FullName may expand a short (8.3) path or remove dot segments while
+# installedExecutable retains that equivalent spelling, deleting the active exe.
+$installedExecutableName = [IO.Path]::GetFileName($installedExecutable)
 Get-ChildItem -LiteralPath $installDirectory -Filter 'remoteops-controller-mcp-*.exe' -File |
-    Where-Object FullName -NE $installedExecutable |
+    Where-Object Name -NE $installedExecutableName |
     ForEach-Object {
         $oldExecutable = $_.FullName
         try {

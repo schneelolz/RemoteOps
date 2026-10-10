@@ -18,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,8 +41,16 @@ fn close_stdin_for_fault_fixture() {
         extern "system" {
             fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;
             fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+            fn GetFileType(handle: *mut std::ffi::c_void) -> u32;
         }
-        assert_ne!(CloseHandle(GetStdHandle((-10_i32) as u32)), 0);
+        extern "C" { fn _get_osfhandle(fd: i32) -> isize; }
+        let handle = GetStdHandle((-10_i32) as u32);
+        let crt_same = _get_osfhandle(0) == handle as isize;
+        let pipe = GetFileType(handle) == 3;
+        let closed = CloseHandle(handle) != 0;
+        fs::write(env::var("INSTALLER_TEST_STDIN_DIAGNOSTIC").unwrap(),
+            format!("{{\"crt_same\":{crt_same},\"pipe\":{pipe},\"closed\":{closed}}}")).unwrap();
+        assert!(closed);
     }
 }
 fn main() {
@@ -70,8 +79,11 @@ fn main() {
     assert!(args.iter().any(|a| a == "--setup-stdin"));
     if let Ok(marker) = env::var("INSTALLER_TEST_BROKEN_STDIN_PID") {
         fs::write(marker, std::process::id().to_string()).unwrap();
-        close_stdin_for_fault_fixture();
-        // Installer cleanup must terminate this child after the write fails.
+        if env::var_os("INSTALLER_TEST_KEEP_STDIN_OPEN").is_none() {
+            close_stdin_for_fault_fixture();
+        }
+        // Installer cleanup must terminate this child after transfer failure
+        // or a bounded preview timeout (Framework can swallow ERROR_NO_DATA).
         // Stay alive past the harness timeout, but bound inherited-pipe lifetime
         // if a failing outer shell is killed before it can clean up its child.
         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -321,26 +333,58 @@ class InstallerTests(unittest.TestCase):
                 with self.subTest(encoding=encoding, stdin=stdin):
                     self.assert_success(self.run_installer(stdin=stdin, console_encoding=encoding))
 
-    def test_windows_broken_stdin_terminates_helper(self):
+    def assert_stalled_helper_cleanup(self, *, close_reader):
         if self.target != "windows":
             self.skipTest("Windows process-helper cleanup regression")
         marker = self.root / "fault-helper.pid"
+        diagnostic = self.root / "fault-helper-stdin.json"
+        phase = self.root / "fault-helper-phase"
         self.env["INSTALLER_TEST_BROKEN_STDIN_PID"] = str(marker)
-        # Exceed pipe buffering so a closed reader reliably interrupts Write.
+        self.env["INSTALLER_TEST_STDIN_DIAGNOSTIC"] = str(diagnostic)
+        if not close_reader:
+            self.env["INSTALLER_TEST_KEEP_STDIN_OPEN"] = "1"
+        # Observe the phase in this isolated script copy without adding a
+        # production environment hook or logging setup material.
+        self.env["INSTALLER_TEST_TRANSFER_PHASE"] = str(phase)
+        installer = self.package / "Install-RemoteOpsMcp.ps1"
+        script = installer.read_text(encoding="utf-8-sig")
+        boundary = "        if (-not $process.WaitForExit($helperTimeoutMilliseconds)) {"
+        self.assertEqual(script.count(boundary), 1)
+        script = script.replace(boundary,
+                                '        [IO.File]::WriteAllText($env:INSTALLER_TEST_TRANSFER_PHASE, "input transferred")\n' + boundary)
+        installer.write_text(script, encoding="utf-8-sig")
+        # Exceed buffering so a reader which never consumes input blocks Write.
         self.setup_file.write_text("isolated dummy input " * 65536, encoding="utf-8")
+        started = time.monotonic()
         try:
             result = self.run_installer()
             self.assertNotEqual(result.returncode, 0)
-            self.assertTrue(marker.exists(), "Broken-pipe helper did not start")
+            self.assertLess(time.monotonic() - started, 25)
+            self.assertTrue(marker.exists(), "Fault helper did not start")
             self.assertFalse(fixture_process_alive(int(marker.read_text())),
                              "Installer left its failed setup helper running")
             self.assertEqual(self.config.read_bytes(), self.original.encode())
+            if close_reader and os.name == "nt":
+                details = json.loads(diagnostic.read_text())
+                self.assertTrue(details["closed"])
+                self.assertTrue(details["pipe"])
+                self.assertTrue(details["crt_same"], "CRT has a different stdin handle; fixture needs explicit closure")
+                print("closed-reader diagnostic: " + json.dumps(details) +
+                      "; reached_process_wait=" + str(phase.exists()), flush=True)
+            if not close_reader:
+                self.assertFalse(phase.exists(), "Nonreading fixture unexpectedly accepted all input")
         finally:
             # Test failures must not themselves leak the deliberately hung fixture.
             if marker.exists():
                 pid = int(marker.read_text())
                 if fixture_process_alive(pid):
                     os.kill(pid, signal.SIGTERM)
+
+    def test_windows_broken_stdin_terminates_helper(self):
+        self.assert_stalled_helper_cleanup(close_reader=True)
+
+    def test_windows_nonreading_stdin_terminates_helper(self):
+        self.assert_stalled_helper_cleanup(close_reader=False)
 
     def test_hidden_setup_prompt(self):
         self.assert_success(self.run_installer(code=True, input_content=SETUP + "\n"))
@@ -370,6 +414,43 @@ class InstallerTests(unittest.TestCase):
     def test_installed_verifier_uses_native_credential_helper(self):
         self.assert_success(self.run_installer())
         self.assert_verifier_success()
+
+    def test_windows_installation_alias_preserves_active_executable(self):
+        if self.target != "windows":
+            self.skipTest("Windows equivalent-path cleanup regression")
+        alias_component = self.home / "alias component"
+        alias_component.mkdir()
+        aliases = [("dot segments", str(alias_component / ".." / self.codex.name))]
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+            kernel.GetShortPathNameW.restype = wintypes.DWORD
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = kernel.GetShortPathNameW(str(self.codex.resolve()), buffer, len(buffer))
+            if not length:
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.assertLess(length, len(buffer), "Short-path fixture was truncated")
+            # Volumes may disable 8.3 aliases; dot segments still test the same
+            # lexical-vs-filesystem bug without changing any volume settings.
+            if buffer.value.lower() != str(self.codex.resolve()).lower():
+                aliases.append(("8.3 path", buffer.value))
+        for kind, alias in aliases:
+            with self.subTest(alias=kind):
+                self.env["CODEX_HOME"] = alias
+                install_directory = self.codex / "remoteops"
+                install_directory.mkdir(exist_ok=True)
+                obsolete = install_directory / "remoteops-controller-mcp-0.0.0.exe"
+                obsolete.write_bytes(b"obsolete isolated dummy executable")
+                self.assert_success(self.run_installer())
+                inspection = subprocess.run(
+                    [str(self.real_helper), "--inspect-codex", str(self.config)],
+                    capture_output=True, text=True, encoding="utf-8", check=True, env=self.env)
+                active = Path(json.loads(inspection.stdout)["command"])
+                self.assertTrue(active.is_file(), "Cleanup deleted the configured active executable")
+                self.assertFalse(obsolete.exists(), "Cleanup did not remove the obsolete executable")
+                self.assert_verifier_success()
 
     def test_windows_verifier_reads_utf8_independently_of_console_encoding(self):
         if self.target != "windows":
