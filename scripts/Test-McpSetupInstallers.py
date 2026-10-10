@@ -72,7 +72,10 @@ fn main() {
         fs::write(marker, std::process::id().to_string()).unwrap();
         close_stdin_for_fault_fixture();
         // Installer cleanup must terminate this child after the write fails.
-        loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
+        // Stay alive past the harness timeout, but bound inherited-pipe lifetime
+        // if a failing outer shell is killed before it can clean up its child.
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        std::process::exit(89);
     }
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).unwrap();

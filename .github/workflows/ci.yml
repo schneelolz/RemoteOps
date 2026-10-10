@@ -94,8 +94,10 @@ jobs:
           REMOTEOPS_TEST_RELAY: ${{ github.workspace }}/target/debug/remoteops-relay.exe
         run: cargo test -p remoteops-controller-mcp --locked setup::native_e2e::native_os_store_real_relay_onboarding -- --ignored --exact --test-threads=1
       - name: Test setup installer on Windows PowerShell 5.1
+        timeout-minutes: 10
         run: python scripts/Test-McpSetupInstallers.py --platform windows --powershell powershell.exe
       - name: Test setup installer on PowerShell 7
+        timeout-minutes: 10
         run: python scripts/Test-McpSetupInstallers.py --platform windows --powershell pwsh
       - name: Test control permission lifecycle
         shell: pwsh
