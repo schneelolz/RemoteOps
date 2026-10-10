@@ -30,6 +30,7 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 - [项目结构规范](项目结构规范.md)
 - [文档维护规范](文档维护规范.md)
 - [项目维护审计](项目维护审计.md)
+- [只读边界与执行生命周期加固](safety-lifecycle-hardening.md)
 
 ## 功能和维护
 

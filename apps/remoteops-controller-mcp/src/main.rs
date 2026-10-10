@@ -4182,6 +4182,21 @@ fn error_action_output(session_id: SessionId, error: ApplicationError) -> Action
             sha256: None,
             details: None,
         },
+        ApplicationError::OperationTimedOut { request_id } => ActionOutput {
+            status: "unknown".to_owned(),
+            session_id: session_id.to_string(),
+            request_id: Some(request_id.to_string()),
+            exit_code: None,
+            summary: ApplicationError::OperationTimedOut { request_id }.to_string(),
+            approval_id: None,
+            sha256: None,
+            details: Some(serde_json::json!({
+                "code": "remote_operation_timeout",
+                "execution_state": "unknown",
+                "cancellation_confirmed": false,
+                "safe_to_retry": false,
+            })),
+        },
         other => ActionOutput {
             status: "failed".to_owned(),
             session_id: session_id.to_string(),
@@ -4202,6 +4217,24 @@ fn application_error(error: ApplicationError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timed_out_operation_preserves_identity_and_unknown_execution_state() {
+        let session_id = remoteops_domain::SessionId::new();
+        let request_id = remoteops_domain::RequestId::new();
+        let output = super::error_action_output(
+            session_id,
+            remoteops_application::ApplicationError::OperationTimedOut { request_id },
+        );
+        assert_eq!(output.status, "unknown");
+        assert_eq!(
+            output.request_id.as_deref(),
+            Some(request_id.to_string().as_str())
+        );
+        let details = output.details.unwrap();
+        assert_eq!(details["cancellation_confirmed"], false);
+        assert_eq!(details["safe_to_retry"], false);
+    }
+
     #[test]
     fn visual_uia_requires_explicit_success() {
         for observation in [
