@@ -3253,8 +3253,11 @@ fn interactive_command_payload(shell: ShellKind, command: &str, marker: &str) ->
             } else {
                 ""
             };
+            // PowerShell 5.1 会在点调用返回时重置 $?；在同一作用域的 finally
+            // 中采集命令体退出前的 $?/LASTEXITCODE 状态，也覆盖提前 return。
+            // $? 为真时成功；否则保留本次请求最近的 native 退出码或使用 1。
             format!(
-                "[Console]::OutputEncoding = [Text.Encoding]::UTF8; {style}$remoteOpsExitCode = 1; $LASTEXITCODE = 0; try {{ . {{ {command}\n}}; if ($?) {{ $remoteOpsExitCode = 0 }} elseif ($LASTEXITCODE -ne 0) {{ $remoteOpsExitCode = $LASTEXITCODE }} }} catch {{ $remoteOpsExitCode = 1; [Console]::Error.WriteLine($_.ToString()) }} finally {{ Write-Output \"{marker}$remoteOpsExitCode\"; [Console]::Error.WriteLine(\"{marker}$remoteOpsExitCode\") }}\r\n\r\n"
+                "[Console]::OutputEncoding = [Text.Encoding]::UTF8; {style}$remoteOpsExitCode = 1; $LASTEXITCODE = 0; try {{ . {{ try {{ {command}\n}} finally {{ if ($?) {{ $remoteOpsExitCode = 0 }} elseif ($LASTEXITCODE -ne 0) {{ $remoteOpsExitCode = $LASTEXITCODE }} }} }} }} catch {{ $remoteOpsExitCode = 1; [Console]::Error.WriteLine($_.ToString()) }} finally {{ Write-Output \"{marker}$remoteOpsExitCode\"; [Console]::Error.WriteLine(\"{marker}$remoteOpsExitCode\") }}\r\n\r\n"
             )
         }
         ShellKind::System => format!(
@@ -4566,13 +4569,24 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(windows)]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn persistent_powershell_errors_complete_and_preserve_session() {
-        let mut shells = vec![ShellKind::WindowsPowerShell];
-        if command_exists("pwsh.exe") {
+        let mut shells = Vec::new();
+        #[cfg(windows)]
+        shells.push(ShellKind::WindowsPowerShell);
+        if command_exists(if cfg!(windows) { "pwsh.exe" } else { "pwsh" }) {
             shells.push(ShellKind::PowerShell);
         }
+        let native_failure = if cfg!(windows) {
+            "cmd.exe /D /C exit 7"
+        } else {
+            "/bin/sh -c 'exit 7'"
+        };
+        let native_then_success = format!("{native_failure}; Write-Output 'RECOVERED'");
+        let native_then_return = format!("{native_failure}; return");
+        let native_then_cmdlet_failure =
+            format!("{native_failure}; Write-Error 'NONTERMINATING' -ErrorAction Continue");
         for shell in shells {
             let session = SystemDevice::new()
                 .open_interactive_shell(shell)
@@ -4591,17 +4605,36 @@ mod tests {
                 assert_eq!(result.exit_code, Some(0));
                 assert!(result.stdout.contains(text));
             }
-            for (index, (command, expected_code)) in [
-                ("throw 'REMOTEOPS_THROW_REGRESSION'", 1),
+            for (index, (command, expected_code, expected_stdout, expected_stderr)) in [
+                (
+                    "throw 'REMOTEOPS_THROW_REGRESSION'",
+                    1,
+                    "",
+                    "REMOTEOPS_THROW_REGRESSION",
+                ),
                 (
                     "Write-Error 'REMOTEOPS_STOP_REGRESSION' -ErrorAction Stop",
                     1,
+                    "",
+                    "REMOTEOPS_STOP_REGRESSION",
                 ),
-                ("cmd.exe /D /C exit 7", 7),
+                (native_failure, 7, "", ""),
                 (
                     "[Console]::Error.Write('REMOTEOPS_STDERR'); Write-Output 'REMOTEOPS_OK'",
                     0,
+                    "REMOTEOPS_OK",
+                    "REMOTEOPS_STDERR",
                 ),
+                (native_then_success.as_str(), 0, "RECOVERED", ""),
+                ("return 'EARLY_RETURN'", 0, "EARLY_RETURN", ""),
+                (native_then_return.as_str(), 7, "", ""),
+                (
+                    "Write-Error 'NONTERMINATING' -ErrorAction Continue",
+                    1,
+                    "",
+                    "NONTERMINATING",
+                ),
+                (native_then_cmdlet_failure.as_str(), 7, "", "NONTERMINATING"),
             ]
             .into_iter()
             .enumerate()
@@ -4617,11 +4650,9 @@ mod tests {
                     Some(expected_code),
                     "{shell:?}: {result:?}"
                 );
-                if index < 2 {
-                    assert!(result.stderr.contains("REGRESSION"));
-                }
+                assert!(result.stdout.contains(expected_stdout));
+                assert!(result.stderr.contains(expected_stderr));
                 if index == 3 {
-                    assert!(result.stdout.contains("REMOTEOPS_OK"));
                     assert_eq!(result.stderr, "REMOTEOPS_STDERR");
                 }
                 assert!(!session.is_closed());
