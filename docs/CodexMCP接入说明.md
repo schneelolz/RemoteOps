@@ -170,6 +170,9 @@ $env:REMOTEOPS_CONTROLLER_OWNER_ID = '<与 AI MCP 相同的 Owner UUID>'
 每个远程工具必须使用它返回的不可变 session_id。
 调用 get_target_info，确认目标主机和 power_shell 能力。
 只读诊断使用一次性 Shell 的 run_readonly_command。
+run_readonly_command 仅接受白名单中的单条查询，最长 4096 字节；命令文本不得包含换行、分号、管道、重定向、命令连接符或反引号。PowerShell 参数只接受字面量，不支持变量展开、子表达式、脚本块或会写入变量的参数。
+环境变量先单独查询（如 $env:LOCALAPPDATA），再将返回的实际路径作为字面量传给下一条查询；多个目录分别调用，筛选和格式化在控制端完成。
+只读查询被拒绝时按限制改写或拆分，不要仅因此自动改走审批命令或切换完全控制；完全控制也不会放宽只读白名单。
 需要保持目录、变量或模块状态时，以 power_shell 打开持久 Shell；持久 Shell 的所有命令都通过 run_command，并接受逐项确认或完全控制约束。
 配对后通过 get_control_mode 读取 Relay 确认的有效状态；未授权时保持逐项确认。现场已授权完全控制时无需再次调用 set_control_mode。
 逐项确认下调用修改工具时，MCP 会向当前用户确认本次操作；拒绝、关闭或超时后停止。
