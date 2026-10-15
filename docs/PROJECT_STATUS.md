@@ -5,7 +5,7 @@
 ## 当前基线
 
 - 项目：RemoteOps
-- 当前源码版本：Agent `0.2.0-preview.26`，GUI `0.2.0-preview.27`，Relay `0.2.0-preview.6`，MCP `0.2.0-preview.12`
+- 当前源码版本：Agent `0.2.0-preview.26`，GUI `0.2.0-preview.28`，Relay `0.2.0-preview.6`，MCP `0.2.0-preview.12`
 - 首个计划公开版本：`0.2.0-preview.7`
 - 当前协议版本：`v16`
 - 发布阶段：GitHub Technical Preview 准备中，尚未创建首个 GitHub Release
