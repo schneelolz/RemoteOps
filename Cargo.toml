@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/remoteops-domain",
+    "crates/remoteops-enrollment",
+    "crates/remoteops-enrollment-store",
     "crates/remoteops-protocol",
     "crates/remoteops-session",
     "crates/remoteops-serial",
@@ -50,6 +52,8 @@ hpke = { version = "0.14", default-features = false, features = ["alloc", "chach
 process-wrap = { version = "9.1", features = ["tokio1"] }
 rand = "0.8"
 regex = "1.11"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"

@@ -33,6 +33,7 @@ pub(crate) struct AdminState {
     pub sessions: Arc<Mutex<HashMap<String, Instant>>>,
     pub secure_cookie: bool,
     login_attempts: Arc<Mutex<HashMap<(String, String), LoginAttempt>>>,
+    pub(crate) enrollment_limits: Arc<Mutex<crate::enrollment::EnrollmentLimits>>,
 }
 
 #[derive(Clone, Debug)]
@@ -175,8 +176,8 @@ struct SessionResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: String,
+pub(crate) struct ErrorResponse {
+    pub(crate) error: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +207,7 @@ pub(crate) async fn serve(
         sessions: Arc::new(Mutex::new(HashMap::new())),
         secure_cookie,
         login_attempts: Arc::new(Mutex::new(HashMap::new())),
+        enrollment_limits: Arc::new(Mutex::new(crate::enrollment::EnrollmentLimits::default())),
     };
     let app = Router::new()
         .route("/api/admin/login", post(login))
@@ -240,6 +242,7 @@ pub(crate) async fn serve(
         .route("/theme.js", get(theme_js))
         .route("/style.css", get(style_css))
         .layer(DefaultBodyLimit::max(8 * 1024))
+        .merge(crate::enrollment::router())
         .with_state(state)
         .fallback(index);
     axum::serve(
@@ -536,7 +539,7 @@ async fn audit(
     Ok(Json(events))
 }
 
-async fn authorize(
+pub(crate) async fn authorize(
     state: &AdminState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -555,7 +558,7 @@ async fn authorize(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    if constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
+    if !state.token.is_empty() && constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
         Ok(())
     } else {
         state
@@ -751,7 +754,246 @@ mod tests {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             secure_cookie: false,
             login_attempts: Arc::new(Mutex::new(HashMap::new())),
+            enrollment_limits: Arc::new(Mutex::new(crate::enrollment::EnrollmentLimits::default())),
         }
+    }
+
+    #[tokio::test]
+    async fn empty_admin_token_explicitly_disables_bearer_authentication() {
+        let state = test_state();
+        for supplied in [None, Some("Bearer "), Some("Bearer"), Some("Bearer wrong")] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = supplied {
+                headers.insert(axum::http::header::AUTHORIZATION, value.parse().unwrap());
+            }
+            assert_eq!(
+                authorize(&state, &headers).await.unwrap_err().0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            "remoteops_admin_session=valid-session".parse().unwrap(),
+        );
+        state.sessions.lock().await.insert(
+            "valid-session".to_owned(),
+            Instant::now() + StdDuration::from_secs(60),
+        );
+        assert!(
+            authorize(&state, &headers).await.is_ok(),
+            "session authentication remains available"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_admin_token_requires_exact_bearer_value() {
+        let mut state = test_state();
+        state.token = Arc::new("dummy-admin-token".to_owned());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer dummy-admin-token".parse().unwrap(),
+        );
+        assert!(authorize(&state, &headers).await.is_ok());
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer dummy-admin-token-other".parse().unwrap(),
+        );
+        assert!(authorize(&state, &headers).await.is_err());
+    }
+
+    struct EnrollmentFixture {
+        state: AdminState,
+        root: std::path::PathBuf,
+    }
+
+    impl EnrollmentFixture {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("remoteops-enrollment-http-{}", Uuid::new_v4()));
+            let mut state = test_state();
+            state.token = Arc::new("dummy-admin-token".to_owned());
+            state.relay = Arc::new(
+                Relay::new_with_state_path(
+                    Duration::minutes(10),
+                    5,
+                    ControllerOwnerId::new(),
+                    "human-token-for-tests-123456".to_owned(),
+                    "ai-token-for-tests-123456".to_owned(),
+                    root.join("relay-state.json"),
+                )
+                .unwrap(),
+            );
+            Self { state, root }
+        }
+
+        async fn request(&self, method: &str, path: &str, body: &str, admin: bool) -> Response {
+            use tower::ServiceExt as _;
+            let app = crate::enrollment::router()
+                .with_state(self.state.clone())
+                .layer(axum::Extension(ConnectInfo(
+                    "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+                )));
+            let mut request = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header(axum::http::header::CONTENT_TYPE, "application/json");
+            if admin {
+                request = request.header(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer dummy-admin-token",
+                );
+            }
+            app.oneshot(
+                request
+                    .body(axum::body::Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    }
+
+    impl Drop for EnrollmentFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    async fn json_response(response: Response) -> serde_json::Value {
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn enrollment_http_routes_require_admin_and_do_not_cache_secrets() {
+        let fixture = EnrollmentFixture::new();
+        for (method, route) in [
+            ("GET", "/api/admin/mcp/settings"),
+            ("PUT", "/api/admin/mcp/settings"),
+            ("GET", "/api/admin/mcp/setups"),
+            ("POST", "/api/admin/mcp/setups"),
+            ("GET", "/api/admin/mcp/clients"),
+            (
+                "POST",
+                "/api/admin/mcp/setups/00000000-0000-0000-0000-000000000001/revoke",
+            ),
+            (
+                "POST",
+                "/api/admin/mcp/clients/00000000-0000-0000-0000-000000000001/revoke",
+            ),
+        ] {
+            let response = fixture.request(method, route, "{}", false).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{route}");
+            assert!(json_response(response).await["error"].is_string());
+        }
+        let response = fixture
+            .request("GET", "/api/admin/mcp/settings", "", true)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(json_response(response).await.is_null());
+        let response = fixture
+            .request("POST", "/api/admin/mcp/setups", "{}", true)
+            .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn enrollment_http_success_strict_fields_and_redacted_lists() {
+        let fixture = EnrollmentFixture::new();
+        let settings = serde_json::json!({
+            "enrollment_url": "https://relay.example.test/api/mcp/enroll", "relay": "relay.example.test:7443",
+            "server_name": "relay.example.test", "relay_ca_pem": null, "enrollment_ca_pem": null,
+        });
+        let response = fixture
+            .request(
+                "PUT",
+                "/api/admin/mcp/settings",
+                &settings.to_string(),
+                true,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_response(response).await, settings);
+        let response = fixture
+            .request(
+                "POST",
+                "/api/admin/mcp/setups",
+                r#"{"client_name":"test laptop","expires_in_hours":24}"#,
+                true,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let grant = json_response(response).await;
+        assert!(
+            grant["setup_code"]
+                .as_str()
+                .unwrap()
+                .starts_with("remoteops-setup-v1.")
+        );
+        let secret = grant["setup"]["grant_secret"].as_str().unwrap();
+        let request = serde_json::json!({
+            "grant_id": grant["setup"]["grant_id"], "grant_secret": secret,
+            "installation_id": Uuid::new_v4(), "installation_secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE",
+        });
+        let mut escalated = request.clone();
+        escalated["owner_id"] = serde_json::json!(Uuid::new_v4());
+        let response = fixture
+            .request("POST", "/api/mcp/enroll", &escalated.to_string(), false)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = fixture
+            .request("POST", "/api/mcp/enroll", &request.to_string(), false)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let redeemed = json_response(response).await;
+        assert_eq!(redeemed["installation_id"], request["installation_id"]);
+        assert_eq!(
+            redeemed["owner_id"],
+            serde_json::json!(fixture.state.relay.admin_snapshot().await.overview.owner_id)
+        );
+        assert!(redeemed.get("installation_secret").is_none());
+        for route in ["/api/admin/mcp/setups", "/api/admin/mcp/clients"] {
+            let response = fixture.request("GET", route, "", true).await;
+            let body = json_response(response).await.to_string();
+            assert!(!body.contains(secret));
+            assert!(!body.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"));
+            assert!(!body.contains("secret_hash"));
+        }
+    }
+
+    #[tokio::test]
+    async fn enrollment_http_rejects_oversized_requests_and_rate_limits_by_ip() {
+        let fixture = EnrollmentFixture::new();
+        let response = fixture
+            .request(
+                "POST",
+                "/api/mcp/enroll",
+                &"x".repeat(remoteops_enrollment::MAX_SETUP_BYTES + 1),
+                false,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(json_response(response).await["error"].is_string());
+        for _ in 0..29 {
+            let response = fixture
+                .request("POST", "/api/mcp/enroll", "{}", false)
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = fixture
+            .request("POST", "/api/mcp/enroll", "{}", false)
+            .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

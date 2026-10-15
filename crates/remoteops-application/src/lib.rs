@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -36,10 +36,13 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
     sync::{Mutex, broadcast, mpsc, oneshot, watch},
-    time::{Duration as TokioDuration, interval, sleep, timeout},
+    time::{Duration as TokioDuration, Instant, interval, sleep, timeout, timeout_at},
 };
 use tokio_rustls::{client::TlsStream, rustls::ClientConfig};
 use tracing::warn;
+
+const CONTROLLER_CONNECT_TIMEOUT: TokioDuration = TokioDuration::from_secs(20);
+const CONTROLLER_HEARTBEAT_TIMEOUT: TokioDuration = TokioDuration::from_secs(45);
 
 /// 应用服务错误。
 #[derive(Debug, Error)]
@@ -75,6 +78,14 @@ pub enum ApplicationError {
     /// 等待远程响应超时。
     #[error("等待远程响应超时")]
     Timeout,
+    /// 业务响应超时；远端可能仍在执行，不能据此安全重试。
+    #[error(
+        "等待远程请求 {request_id} 响应超时；执行状态未知，远端操作未确认取消，请先核查状态，不要自动重试"
+    )]
+    OperationTimedOut {
+        /// 用于查询审计或显式取消的原始请求标识。
+        request_id: RequestId,
+    },
     /// 审计日志写入或导出失败。
     #[error("审计日志失败：{0}")]
     Audit(String),
@@ -222,16 +233,46 @@ pub struct PendingOperation {
     pub request_id: RequestId,
     /// Agent 最终响应通道。
     receiver: oneshot::Receiver<Result<RemoteResponse, ApplicationError>>,
+    registration: PendingRegistration,
 }
 
 impl PendingOperation {
-    /// 等待远程操作完成。
+    /// 等待远程操作完成。超时或放弃等待只清理本地注册，不代表远端已取消。
     pub async fn wait(self) -> Result<OperationResult, ApplicationError> {
-        let response = timeout(TokioDuration::from_mins(3), self.receiver)
+        let Self {
+            request_id,
+            receiver,
+            registration,
+        } = self;
+        let response = timeout(TokioDuration::from_mins(3), receiver)
             .await
-            .map_err(|_| ApplicationError::Timeout)?
+            .map_err(|_| ApplicationError::OperationTimedOut { request_id })?
             .map_err(|_| ApplicationError::Transport("远程响应通道已关闭".to_owned()))??;
+        drop(registration);
         Ok(OperationResult { response })
+    }
+}
+
+/// 注册表只进行短时内存操作；同步锁使 future 被丢弃时也能立即回收。
+#[derive(Default)]
+struct PendingRegistry(StdMutex<BTreeMap<RequestId, PendingRemoteResponse>>);
+
+impl PendingRegistry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<RequestId, PendingRemoteResponse>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+struct PendingRegistration {
+    request_id: RequestId,
+    pending: Arc<PendingRegistry>,
+}
+
+impl Drop for PendingRegistration {
+    fn drop(&mut self) {
+        self.pending.lock().remove(&self.request_id);
     }
 }
 
@@ -244,7 +285,7 @@ struct ClientInner {
     transport_generation: AtomicU64,
     connected: watch::Sender<bool>,
     core: Mutex<ControllerCore>,
-    pending: Mutex<BTreeMap<RequestId, PendingRemoteResponse>>,
+    pending: Arc<PendingRegistry>,
     pair_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<PairResult>>>,
     release_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ReleaseSessionResult>>>,
     approval_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ApprovalResult>>>,
@@ -297,7 +338,12 @@ impl RelayClient {
         let tls_config = if let Some(certificate_path) = config.ca_certificate.as_deref() {
             load_client_config(certificate_path)
         } else if let Some(fingerprint) = config.tls_fingerprint.as_deref() {
-            load_pinned_client_config(&config.relay_address, &config.server_name, fingerprint).await
+            timeout(
+                CONTROLLER_CONNECT_TIMEOUT,
+                load_pinned_client_config(&config.relay_address, &config.server_name, fingerprint),
+            )
+            .await
+            .map_err(|_| ApplicationError::Transport("获取 Relay TLS 证书超时".to_owned()))?
         } else {
             load_native_client_config()
         }
@@ -318,7 +364,7 @@ impl RelayClient {
             transport_generation: AtomicU64::new(0),
             connected,
             core: Mutex::new(ControllerCore::default()),
-            pending: Mutex::new(BTreeMap::new()),
+            pending: Arc::new(PendingRegistry::default()),
             pair_pending: Mutex::new(BTreeMap::new()),
             release_pending: Mutex::new(BTreeMap::new()),
             approval_pending: Mutex::new(BTreeMap::new()),
@@ -334,9 +380,8 @@ impl RelayClient {
 
         let (initial_sender, initial_receiver) = oneshot::channel();
         tokio::spawn(connection_supervisor(inner.clone(), initial_sender));
-        timeout(TokioDuration::from_secs(20), initial_receiver)
+        initial_receiver
             .await
-            .map_err(|_| ApplicationError::Timeout)?
             .map_err(|_| ApplicationError::Transport("Controller 连接任务意外退出".to_owned()))??;
 
         Ok(Self { inner })
@@ -974,20 +1019,23 @@ impl RelayClient {
             occurred_at: Utc::now(),
         })?;
         let (sender, receiver) = oneshot::channel();
-        self.inner.pending.lock().await.insert(
+        self.inner.pending.lock().insert(
             request_id,
             PendingRemoteResponse {
                 session_id: request.session_id,
                 sender,
             },
         );
-        if let Err(error) = self.send_wire(WireMessage::RemoteRequest(request)).await {
-            self.inner.pending.lock().await.remove(&request_id);
-            return Err(error);
-        }
+        // 在下一个 await 前取得清理责任，覆盖发送 future 被取消的窗口。
+        let registration = PendingRegistration {
+            request_id,
+            pending: self.inner.pending.clone(),
+        };
+        self.send_wire(WireMessage::RemoteRequest(request)).await?;
         Ok(PendingOperation {
             request_id,
             receiver,
+            registration,
         })
     }
 
@@ -1078,15 +1126,45 @@ async fn connection_supervisor(
 async fn open_controller_connection(
     inner: &ClientInner,
 ) -> Result<TlsStream<TcpStream>, ApplicationError> {
-    let mut stream = connect_tls(
-        &inner.config.relay_address,
-        &inner.config.server_name,
-        inner.tls_config.clone(),
-    )
+    complete_controller_connection(inner, async {
+        connect_tls(
+            &inner.config.relay_address,
+            &inner.config.server_name,
+            inner.tls_config.clone(),
+        )
+        .await
+        .map_err(|error| ApplicationError::Transport(error.to_string()))
+    })
     .await
-    .map_err(|error| ApplicationError::Transport(error.to_string()))?;
+}
+
+async fn complete_controller_connection<S>(
+    inner: &ClientInner,
+    connection: impl std::future::Future<Output = Result<S, ApplicationError>>,
+) -> Result<S, ApplicationError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    timeout(CONTROLLER_CONNECT_TIMEOUT, async {
+        let mut stream = connection.await?;
+        exchange_controller_hello(inner, &mut stream).await?;
+        Ok(stream)
+    })
+    .await
+    .map_err(|_| {
+        ApplicationError::Transport("连接 Relay 超时（TCP/TLS/ControllerWelcome）".to_owned())
+    })?
+}
+
+async fn exchange_controller_hello<S>(
+    inner: &ClientInner,
+    stream: &mut S,
+) -> Result<(), ApplicationError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     write_frame(
-        &mut stream,
+        stream,
         &WireMessage::Hello(ClientHello::Controller(ControllerHello {
             protocol_version: PROTOCOL_VERSION,
             controller_instance_id: inner.controller_instance_id,
@@ -1099,14 +1177,14 @@ async fn open_controller_connection(
     )
     .await
     .map_err(|error| ApplicationError::Transport(error.to_string()))?;
-    match read_frame::<WireMessage, _>(&mut stream)
+    match read_frame::<WireMessage, _>(stream)
         .await
         .map_err(|error| ApplicationError::Transport(error.to_string()))?
     {
         WireMessage::ControllerWelcome { protocol_version }
             if protocol_version == PROTOCOL_VERSION =>
         {
-            Ok(stream)
+            Ok(())
         }
         WireMessage::Error { code, message, .. } => Err(ApplicationError::Remote { code, message }),
         other => Err(ApplicationError::Transport(format!(
@@ -1281,10 +1359,12 @@ where
     tokio::select! {
         result = &mut reader_task => {
             writer_task.abort();
+            let _ = writer_task.await;
             flatten_transport_task("读取", result)
         }
         result = &mut writer_task => {
             reader_task.abort();
+            let _ = reader_task.await;
             flatten_transport_task("写入", result)
         }
     }
@@ -1297,10 +1377,18 @@ async fn read_transport_messages<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let mut deadline = Instant::now() + CONTROLLER_HEARTBEAT_TIMEOUT;
     loop {
-        let message = read_frame::<WireMessage, _>(&mut reader)
+        // 超时后整个 transport 退出，绝不在取消半帧读取后复用字节流。
+        let message = timeout_at(deadline, read_frame::<WireMessage, _>(&mut reader))
             .await
+            .map_err(|_| {
+                ApplicationError::Transport("Relay 心跳确认超时；连接状态未知".to_owned())
+            })?
             .map_err(|error| ApplicationError::Transport(error.to_string()))?;
+        if matches!(message, WireMessage::HeartbeatAck { .. }) {
+            deadline = Instant::now() + CONTROLLER_HEARTBEAT_TIMEOUT;
+        }
         handle_wire_message(&inner, message).await;
     }
 }
@@ -1350,7 +1438,7 @@ async fn set_transport_disconnected(inner: &ClientInner, cause: Option<Applicati
 async fn fail_pending_requests(inner: &ClientInner, message: &str) {
     inner.control_states.lock().await.clear();
     inner.control_pending.lock().await.clear();
-    let pending = std::mem::take(&mut *inner.pending.lock().await);
+    let pending = std::mem::take(&mut *inner.pending.lock());
     for (_, pending) in pending {
         let _ = pending
             .sender
@@ -1441,7 +1529,7 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
         }
         WireMessage::RemoteResponse(response) => {
             let pending = {
-                let mut pending = inner.pending.lock().await;
+                let mut pending = inner.pending.lock();
                 take_matching_pending(&mut pending, response.request_id, response.session_id)
             };
             let sender = match pending {
@@ -1533,7 +1621,7 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
             forget_session_pairing(inner, session_id).await;
             let _ = inner.core.lock().await.remove_connection(session_id);
             let pending = {
-                let mut pending = inner.pending.lock().await;
+                let mut pending = inner.pending.lock();
                 let request_ids = pending
                     .iter()
                     .filter_map(|(request_id, entry)| {
@@ -1558,7 +1646,7 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
             request_id,
         } => {
             if let Some(request_id) = request_id
-                && let Some(pending) = inner.pending.lock().await.remove(&request_id)
+                && let Some(pending) = inner.pending.lock().remove(&request_id)
             {
                 let _ = pending
                     .sender
@@ -1817,7 +1905,7 @@ mod tests {
             transport_generation: AtomicU64::new(0),
             connected,
             core: Mutex::new(ControllerCore::default()),
-            pending: Mutex::new(BTreeMap::new()),
+            pending: Arc::new(PendingRegistry::default()),
             pair_pending: Mutex::new(BTreeMap::new()),
             release_pending: Mutex::new(BTreeMap::new()),
             approval_pending: Mutex::new(BTreeMap::new()),
@@ -2101,7 +2189,7 @@ mod tests {
             .insert(RequestId::new(), pairing_code);
         let request_id = RequestId::new();
         let (response_sender, response_receiver) = oneshot::channel();
-        inner.pending.lock().await.insert(
+        inner.pending.lock().insert(
             request_id,
             PendingRemoteResponse {
                 session_id,
@@ -2212,6 +2300,260 @@ mod tests {
         assert_eq!(pair_result.request_id, request_id);
 
         transport_task.abort();
+    }
+
+    async fn queue_test_operation(
+        inner: &Arc<ClientInner>,
+    ) -> (
+        PendingOperation,
+        mpsc::UnboundedReceiver<WireMessage>,
+        SessionId,
+    ) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        *inner.transport.lock().await = Some(ActiveTransport {
+            generation: 1,
+            sender,
+        });
+        let session_id = SessionId::new();
+        let operation = RelayClient {
+            inner: inner.clone(),
+        }
+        .queue_request(
+            RemoteRequest {
+                request_id: RequestId::new(),
+                session_id,
+                source: EventSource::Ai,
+                operation: RemoteOperation::RunCommand {
+                    shell: ShellKind::WindowsPowerShell,
+                    command: "Get-Process".to_owned(),
+                    readonly: true,
+                },
+                approval_id: None,
+                payload_base64: None,
+                control_proof: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("应排入本地模拟传输");
+        (operation, receiver, session_id)
+    }
+
+    fn successful_response(request_id: RequestId, session_id: SessionId) -> RemoteResponse {
+        RemoteResponse {
+            request_id,
+            session_id,
+            exit_code: Some(0),
+            summary: "done".to_owned(),
+            error_code: None,
+            payload_base64: None,
+            sha256: None,
+            details: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_operation_removes_registration_without_claiming_remote_cancellation() {
+        let inner = transport_test_inner();
+        let (operation, mut outgoing, _) = queue_test_operation(&inner).await;
+        assert_eq!(inner.pending.lock().len(), 1);
+        drop(operation);
+        assert!(inner.pending.lock().is_empty());
+        assert!(matches!(
+            outgoing.try_recv(),
+            Ok(WireMessage::RemoteRequest(_))
+        ));
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn aborting_operation_wait_removes_registration() {
+        let inner = transport_test_inner();
+        let (operation, _outgoing, _) = queue_test_operation(&inner).await;
+        let task = tokio::spawn(operation.wait());
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.expect_err("等待应被取消").is_cancelled());
+        assert!(inner.pending.lock().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operation_timeout_preserves_request_id_and_discards_late_response() {
+        let inner = transport_test_inner();
+        let (operation, mut outgoing, session_id) = queue_test_operation(&inner).await;
+        let request_id = operation.request_id;
+        let error = operation.wait().await.expect_err("无终态的请求应超时");
+        assert!(
+            matches!(error, ApplicationError::OperationTimedOut { request_id: id } if id == request_id)
+        );
+        assert!(error.to_string().contains(&request_id.to_string()));
+        assert!(error.to_string().contains("执行状态未知"));
+        assert!(inner.pending.lock().is_empty());
+        handle_wire_message(
+            &inner,
+            WireMessage::RemoteResponse(successful_response(request_id, session_id)),
+        )
+        .await;
+        assert!(inner.pending.lock().is_empty());
+        assert!(matches!(
+            outgoing.try_recv(),
+            Ok(WireMessage::RemoteRequest(_))
+        ));
+        assert!(outgoing.try_recv().is_err(), "超时不得自动取消或重放请求");
+    }
+
+    #[tokio::test]
+    async fn completed_operation_has_one_response_and_no_registration() {
+        let inner = transport_test_inner();
+        let (operation, _outgoing, session_id) = queue_test_operation(&inner).await;
+        let response = successful_response(operation.request_id, session_id);
+        handle_wire_message(&inner, WireMessage::RemoteResponse(response.clone())).await;
+        handle_wire_message(&inner, WireMessage::RemoteResponse(response.clone())).await;
+        assert_eq!(
+            operation.wait().await.expect("应成功完成").response,
+            response
+        );
+        assert!(inner.pending.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandoning_queue_while_waiting_for_transport_removes_registration() {
+        let inner = transport_test_inner();
+        let transport_lock = inner.transport.lock().await;
+        let client = RelayClient {
+            inner: inner.clone(),
+        };
+        let task = tokio::spawn(async move {
+            client
+                .queue_request(
+                    RemoteRequest {
+                        request_id: RequestId::new(),
+                        session_id: SessionId::new(),
+                        source: EventSource::Ai,
+                        operation: RemoteOperation::RunCommand {
+                            shell: ShellKind::WindowsPowerShell,
+                            command: "Get-Process".to_owned(),
+                            readonly: true,
+                        },
+                        approval_id: None,
+                        payload_base64: None,
+                        control_proof: None,
+                    },
+                    None,
+                    None,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(inner.pending.lock().len(), 1);
+        task.abort();
+        assert!(task.await.is_err());
+        assert!(inner.pending.lock().is_empty());
+        drop(transport_lock);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn controller_connection_budget_covers_connect_and_welcome_together() {
+        let inner = transport_test_inner();
+        let (stream, _peer) = duplex(4096);
+        let started = Instant::now();
+        let result = complete_controller_connection(&inner, async {
+            sleep(CONTROLLER_CONNECT_TIMEOUT / 2).await;
+            Ok(stream)
+        })
+        .await;
+        assert!(
+            matches!(result, Err(ApplicationError::Transport(message)) if message.contains("ControllerWelcome"))
+        );
+        assert_eq!(Instant::now() - started, CONTROLLER_CONNECT_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn controller_connection_budget_bounds_stalled_tls_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应监听回环端口");
+        let mut inner = transport_test_inner();
+        Arc::get_mut(&mut inner)
+            .expect("测试状态应独占")
+            .config
+            .relay_address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move { open_controller_connection(&inner).await });
+        let (_stalled_peer, _) = listener.accept().await.expect("应接受本地连接");
+        tokio::time::advance(CONTROLLER_CONNECT_TIMEOUT).await;
+        assert!(
+            matches!(task.await.unwrap(), Err(ApplicationError::Transport(message)) if message.contains("超时"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_timeout_closes_partial_frame_and_fails_pending_waits() {
+        use tokio::io::AsyncReadExt;
+        let inner = transport_test_inner();
+        let (operation, _original_outgoing, _) = queue_test_operation(&inner).await;
+        set_connected(&inner.connected, true);
+        let (stream, mut peer) = duplex(4096);
+        peer.write_all(&[0, 0]).await.unwrap();
+        let (reader, writer) = tokio::io::split(stream);
+        let (_sender, receiver) = mpsc::unbounded_channel();
+        let cause = run_transport_io(inner.clone(), reader, writer, receiver)
+            .await
+            .err();
+        assert!(
+            cause
+                .as_ref()
+                .is_some_and(|error| error.to_string().contains("心跳确认超时"))
+        );
+        set_transport_disconnected(&inner, cause).await;
+        assert!(!*inner.connected.borrow());
+        assert!(inner.transport.lock().await.is_none());
+        assert!(inner.pending.lock().is_empty());
+        assert!(matches!(
+            operation.wait().await,
+            Err(ApplicationError::Transport(_))
+        ));
+        let mut byte = [0];
+        assert_eq!(
+            peer.read(&mut byte).await.unwrap(),
+            0,
+            "半帧超时后必须关闭整个 transport"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_heartbeat_ack_refreshes_controller_watchdog() {
+        let inner = transport_test_inner();
+        let (stream, mut peer) = duplex(4096);
+        let task = tokio::spawn(read_transport_messages(inner, stream));
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONTROLLER_HEARTBEAT_TIMEOUT / 2).await;
+        write_frame(
+            &mut peer,
+            &WireMessage::HeartbeatAck {
+                received_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONTROLLER_HEARTBEAT_TIMEOUT / 2).await;
+        assert!(!task.is_finished(), "ACK 应刷新单调时钟期限");
+        write_frame(
+            &mut peer,
+            &WireMessage::Error {
+                code: "test".to_owned(),
+                message: "test".to_owned(),
+                request_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONTROLLER_HEARTBEAT_TIMEOUT / 2).await;
+        assert!(
+            matches!(task.await.unwrap(), Err(ApplicationError::Transport(message)) if message.contains("心跳确认超时"))
+        );
     }
 
     #[tokio::test]

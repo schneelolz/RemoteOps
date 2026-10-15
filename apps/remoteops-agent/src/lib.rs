@@ -27,9 +27,10 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use remoteops_audit::sha256_bytes;
 use remoteops_device::{
-    CommandOutputChunk, FileTransferProvider, MAX_FILE_CHUNK_BYTES, PortProbeProvider,
-    SerialProvider, ShellProvider, SshProvider, SystemDevice, SystemDuplexSerialSession,
-    SystemFileUploadSession, SystemInteractiveShellSession, SystemProvider, TcpExchangeProvider,
+    CommandOutputChunk, FileCommitControl, FileTransferProvider, MAX_FILE_CHUNK_BYTES,
+    PortProbeProvider, SerialProvider, ShellProvider, SshProvider, SystemDevice,
+    SystemDuplexSerialSession, SystemFileUploadSession, SystemInteractiveShellSession,
+    SystemProvider, TcpExchangeProvider,
 };
 use remoteops_domain::{
     AgentInstanceId, ApprovalState, Capability, CapabilitySet, ControllerInstanceId,
@@ -658,11 +659,30 @@ struct SerialRuntime {
     session_id: SessionId,
     port_name: String,
     writable: bool,
-    port: SystemDuplexSerialSession,
+    port: Arc<dyn AgentSerialPort>,
     transcript: Arc<Mutex<SerialTranscript>>,
     activity: Arc<Notify>,
     operation_lock: Arc<Mutex<()>>,
     cancelled: Arc<AtomicBool>,
+    reader_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+/// Agent 只依赖读写接口，生命周期测试无需真实串口设备。
+#[async_trait::async_trait]
+trait AgentSerialPort: Send + Sync {
+    async fn read(&self, max_bytes: usize) -> Result<Vec<u8>, remoteops_device::DeviceError>;
+    async fn write(&self, bytes: Vec<u8>) -> Result<usize, remoteops_device::DeviceError>;
+}
+
+#[async_trait::async_trait]
+impl AgentSerialPort for SystemDuplexSerialSession {
+    async fn read(&self, max_bytes: usize) -> Result<Vec<u8>, remoteops_device::DeviceError> {
+        self.read(max_bytes).await
+    }
+
+    async fn write(&self, bytes: Vec<u8>) -> Result<usize, remoteops_device::DeviceError> {
+        self.write(bytes).await
+    }
 }
 
 struct AgentSerialQueryTransport {
@@ -672,6 +692,9 @@ struct AgentSerialQueryTransport {
 #[async_trait::async_trait]
 impl SerialQueryTransport for AgentSerialQueryTransport {
     async fn write_all(&self, bytes: &[u8]) -> Result<(), SerialQueryError> {
+        if self.runtime.cancelled.load(Ordering::Acquire) {
+            return Err(SerialQueryError::Transport("串口会话已关闭".to_owned()));
+        }
         let written = self
             .runtime
             .port
@@ -704,6 +727,9 @@ impl SerialQueryTransport for AgentSerialQueryTransport {
     ) -> Result<Vec<SerialObservedChunk>, SerialQueryError> {
         loop {
             let notified = self.runtime.activity.notified();
+            if self.runtime.cancelled.load(Ordering::Acquire) {
+                return Err(SerialQueryError::Transport("串口会话已关闭".to_owned()));
+            }
             let chunks = self
                 .runtime
                 .transcript
@@ -735,6 +761,28 @@ struct ShellRuntime {
     shell: ShellKind,
     /// 持久 Shell 子进程。
     session: SystemInteractiveShellSession,
+    /// 每次登记的身份，防止旧任务移除后来登记的句柄。
+    identity: Arc<()>,
+}
+
+#[derive(Debug)]
+struct ShellOperationError {
+    shell_id: ShellId,
+    shell: ShellKind,
+    shell_closed: bool,
+    source: remoteops_device::DeviceError,
+}
+
+impl std::fmt::Display for ShellOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ShellOperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -747,6 +795,8 @@ struct FileUploadRuntime {
 
 #[derive(Clone)]
 struct RequestRuntimeState {
+    /// 本次文件操作的取消与不可逆提交点。
+    file_commit: FileCommitControl,
     /// 持久 Shell 会话。
     shell_sessions: Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
     /// 串口会话。
@@ -760,6 +810,10 @@ struct RequestRuntimeState {
 }
 
 struct PendingTask {
+    /// 完成上传被取消时回收对应的暂存会话。
+    file_transfer_id: Option<FileTransferId>,
+    /// 文件请求必须与 blocking 提交协作取消，不能只 abort 外层 future。
+    file_commit: Option<FileCommitControl>,
     /// 请求所属的逻辑会话，用于限制单会话并发。
     session_id: SessionId,
     /// Tokio 请求任务；取消时必须等待其底层资源完成清理。
@@ -1578,9 +1632,21 @@ where
                     request_id: target_request_id,
                 } = &request.operation
                 {
+                    let cancelled_upload = tasks
+                        .lock()
+                        .await
+                        .get(target_request_id)
+                        .and_then(|task| task.file_transfer_id);
                     let outcome =
                         cancel_pending_task(&tasks, &recent_task_terminals, *target_request_id)
                             .await;
+                    if outcome == CancelTaskOutcome::Cancelled
+                        && let Some(transfer_id) = cancelled_upload
+                        && let Some(runtime) = file_uploads.lock().await.remove(&transfer_id)
+                    {
+                        let _ = runtime.upload.abort().await;
+                    }
+                    prune_closed_shells(&shell_sessions).await;
                     if outcome == CancelTaskOutcome::Cancelled {
                         send_event(
                             &sender,
@@ -1677,7 +1743,17 @@ where
                 let tasks_clone = tasks.clone();
                 let recent_task_terminals_clone = recent_task_terminals.clone();
                 let credential_encryption = credential_encryption.clone();
+                let file_transfer_id = match &request.operation {
+                    RemoteOperation::CompleteUploadFile { transfer_id } => Some(*transfer_id),
+                    _ => None,
+                };
+                let file_commit = matches!(
+                    request.operation,
+                    RemoteOperation::UploadFile { .. } | RemoteOperation::CompleteUploadFile { .. }
+                )
+                .then(FileCommitControl::default);
                 let runtime_state = RequestRuntimeState {
+                    file_commit: file_commit.clone().unwrap_or_default(),
                     shell_sessions: shell_sessions.clone(),
                     serial_sessions: serial_sessions.clone(),
                     file_uploads: file_uploads.clone(),
@@ -1738,6 +1814,8 @@ where
                 tasks.lock().await.insert(
                     request_id,
                     PendingTask {
+                        file_transfer_id,
+                        file_commit,
                         session_id: request_session_id,
                         task,
                         terminal,
@@ -1773,6 +1851,9 @@ where
         writer_task.abort();
     }
     abort_pending_tasks(&tasks, Some(&log_observer), "连接已断开，操作已中断").await;
+    // 逻辑身份可以恢复，持久 Shell 和串口的事件通道只属于本次连接。
+    // 先等待在途请求停止，再释放设备，避免重连后保留旧 sender 或重放写操作。
+    close_agent_resources(&shell_sessions, &serial_sessions).await;
     close_file_uploads(&file_uploads).await;
     local_permission_policy.set_active_owner(None);
     emit_agent_event(
@@ -2151,6 +2232,13 @@ async fn execute_request(
         }
         Err(error) => {
             let message = error.to_string();
+            let details = error.downcast_ref::<ShellOperationError>().map(|error| {
+                serde_json::json!({
+                    "shell_id": error.shell_id.to_string(),
+                    "shell": format!("{:?}", error.shell),
+                    "shell_closed": error.shell_closed,
+                })
+            });
             send_event(
                 sender,
                 sequence,
@@ -2168,7 +2256,7 @@ async fn execute_request(
                 error_code: Some("agent_operation_failed".to_owned()),
                 payload_base64: None,
                 sha256: None,
-                details: None,
+                details,
             }));
         }
     }
@@ -2204,6 +2292,7 @@ async fn execute_operation(
             let session = device.open_interactive_shell(*shell).await?;
             let shell_id = ShellId::new();
             let mut sessions = shell_sessions.lock().await;
+            sessions.retain(|_, runtime| !runtime.session.is_closed());
             let session_count = sessions
                 .values()
                 .filter(|runtime| runtime.session_id == request.session_id)
@@ -2219,6 +2308,7 @@ async fn execute_operation(
                     session_id: request.session_id,
                     shell: *shell,
                     session,
+                    identity: Arc::new(()),
                 },
             );
             drop(sessions);
@@ -2258,11 +2348,16 @@ async fn execute_operation(
                 .run(command, &request.request_id.to_string(), 120, output_sender)
                 .await;
             let _ = output_task.await;
-            let result = result?;
-            let shell_closed = runtime.session.has_exited().await?;
+            let shell_closed = runtime.session.is_closed();
             if shell_closed {
-                shell_sessions.lock().await.remove(shell_id);
+                remove_shell_runtime(shell_sessions, *shell_id, &runtime).await;
             }
+            let result = result.map_err(|source| ShellOperationError {
+                shell_id: *shell_id,
+                shell: runtime.shell,
+                shell_closed,
+                source,
+            })?;
             response.exit_code = result.exit_code;
             response.summary = command_summary(&result.stdout, &result.stderr);
             response.details = Some(serde_json::json!({
@@ -2281,8 +2376,11 @@ async fn execute_operation(
             if runtime.session_id != request.session_id {
                 bail!("持久 Shell 不属于指定 session_id");
             }
-            runtime.session.close().await?;
-            shell_sessions.lock().await.remove(shell_id);
+            let result = runtime.session.close().await;
+            if runtime.session.is_closed() {
+                remove_shell_runtime(shell_sessions, *shell_id, &runtime).await;
+            }
+            result?;
             response.summary = format!("持久 Shell {shell_id} 已关闭");
         }
         RemoteOperation::RunCommand { shell, command, .. } => {
@@ -2332,7 +2430,14 @@ async fn execute_operation(
             if &actual_hash != sha256 {
                 bail!("上传文件 SHA-256 校验失败");
             }
-            device.write_file(remote_path, &bytes, *overwrite).await?;
+            device
+                .write_file_with_control(
+                    remote_path,
+                    &bytes,
+                    *overwrite,
+                    &runtime_state.file_commit,
+                )
+                .await?;
             response.summary = format!("已写入 {} 字节", bytes.len());
             response.sha256 = Some(actual_hash);
         }
@@ -2437,7 +2542,10 @@ async fn execute_operation(
             if runtime.session_id != request.session_id {
                 bail!("文件上传会话不属于指定 session_id");
             }
-            let actual_hash = runtime.upload.complete().await?;
+            let actual_hash = runtime
+                .upload
+                .complete_with_control(&runtime_state.file_commit)
+                .await?;
             file_uploads.lock().await.remove(transfer_id);
             response.summary = format!("已完成 {} 字节文件上传", runtime.upload.written());
             response.sha256 = Some(actual_hash);
@@ -2661,7 +2769,8 @@ async fn execute_operation(
             settings,
             writable,
         } => {
-            let port = device.open_duplex_serial(port_name, *settings).await?;
+            let port: Arc<dyn AgentSerialPort> =
+                Arc::new(device.open_duplex_serial(port_name, *settings).await?);
             let serial_session_id = SerialSessionId::new();
             let cancelled = Arc::new(AtomicBool::new(false));
             let transcript = Arc::new(Mutex::new(SerialTranscript::default()));
@@ -2681,6 +2790,19 @@ async fn execute_operation(
             if ensure_serial_capacity(sessions.len(), session_count).is_err() {
                 bail!("串口会话达到安全上限");
             }
+            let reader_task = spawn_serial_reader(
+                serial_session_id,
+                request.session_id,
+                request.request_id,
+                request.source,
+                port.clone(),
+                transcript.clone(),
+                activity.clone(),
+                cancelled.clone(),
+                serial_sessions.clone(),
+                sender.clone(),
+                sequence.clone(),
+            );
             sessions.insert(
                 serial_session_id,
                 SerialRuntime {
@@ -2692,22 +2814,10 @@ async fn execute_operation(
                     activity: activity.clone(),
                     operation_lock,
                     cancelled: cancelled.clone(),
+                    reader_task: Arc::new(Mutex::new(Some(reader_task))),
                 },
             );
             drop(sessions);
-            spawn_serial_reader(
-                serial_session_id,
-                request.session_id,
-                request.request_id,
-                request.source,
-                port,
-                transcript,
-                activity,
-                cancelled,
-                serial_sessions.clone(),
-                sender.clone(),
-                sequence.clone(),
-            );
             response.summary = format!("串口 {port_name} 已打开");
             response.details = Some(serde_json::json!({
                 "serial_session_id": serial_session_id.to_string(),
@@ -2748,6 +2858,9 @@ async fn execute_operation(
                 bail!("串口写入 SHA-256 与声明不一致");
             }
             let _operation_guard = runtime.operation_lock.lock().await;
+            if runtime.cancelled.load(Ordering::Acquire) {
+                bail!("串口会话已关闭");
+            }
             let written = runtime.port.write(bytes.clone()).await?;
             runtime
                 .transcript
@@ -2826,33 +2939,12 @@ async fn execute_operation(
                 bail!("串口会话不属于指定 session_id");
             }
             let _operation_guard = runtime.operation_lock.lock().await;
-            runtime.cancelled.store(true, Ordering::Relaxed);
-            serial_sessions.lock().await.remove(&serial_session_id);
+            remove_serial_runtime(serial_sessions, serial_session_id, &runtime.cancelled).await;
+            close_serial_runtime(&runtime).await;
             response.summary.push_str("串口会话已关闭");
         }
         RemoteOperation::CloseConnection => {
-            let shells_to_close: Vec<_> = shell_sessions
-                .lock()
-                .await
-                .iter()
-                .filter(|(_, runtime)| runtime.session_id == request.session_id)
-                .map(|(shell_id, runtime)| (*shell_id, runtime.session.clone()))
-                .collect();
-            for (shell_id, session) in shells_to_close {
-                let _ = session.close().await;
-                shell_sessions.lock().await.remove(&shell_id);
-            }
-            let serial_to_close: Vec<_> = serial_sessions
-                .lock()
-                .await
-                .iter()
-                .filter(|(_, runtime)| runtime.session_id == request.session_id)
-                .map(|(serial_id, runtime)| (*serial_id, runtime.cancelled.clone()))
-                .collect();
-            for (serial_id, cancelled) in serial_to_close {
-                cancelled.store(true, Ordering::Relaxed);
-                serial_sessions.lock().await.remove(&serial_id);
-            }
+            close_session_resources(shell_sessions, serial_sessions, request.session_id).await;
             response.summary.push_str("会话关闭请求已确认");
         }
         RemoteOperation::HumanTakeover => {
@@ -3045,11 +3137,23 @@ async fn abort_pending_tasks(
     };
     for (request_id, pending) in pending {
         let PendingTask {
+            file_transfer_id: _,
+            file_commit,
             session_id,
             task,
             terminal,
             interactive_shell,
         } = pending;
+        if let Some(control) = &file_commit
+            && !control.try_cancel()
+        {
+            // Publication already won. Wait for its real terminal state.
+            let _ = task.await;
+            if let Some(control) = &file_commit {
+                control.wait_idle().await;
+            }
+            continue;
+        }
         match terminal.try_commit(TaskTerminal::Aborted) {
             Ok(()) => {
                 if let Some(observer) = log_observer
@@ -3062,13 +3166,22 @@ async fn abort_pending_tasks(
                 }
                 task.abort();
                 let _ = task.await;
+                if let Some(control) = &file_commit {
+                    control.wait_idle().await;
+                }
             }
             Err(TaskTerminal::Completed | TaskTerminal::Failed) => {
                 let _ = task.await;
+                if let Some(control) = &file_commit {
+                    control.wait_idle().await;
+                }
             }
             Err(TaskTerminal::Running | TaskTerminal::Cancelled | TaskTerminal::Aborted) => {
                 task.abort();
                 let _ = task.await;
+                if let Some(control) = &file_commit {
+                    control.wait_idle().await;
+                }
             }
         }
     }
@@ -3092,11 +3205,22 @@ async fn abort_pending_tasks_for_session(
     };
     for (pending, request_id) in pending {
         let PendingTask {
+            file_transfer_id: _,
+            file_commit,
             session_id,
             task,
             terminal,
             interactive_shell,
         } = pending;
+        if let Some(control) = &file_commit
+            && !control.try_cancel()
+        {
+            let _ = task.await;
+            if let Some(control) = &file_commit {
+                control.wait_idle().await;
+            }
+            continue;
+        }
         if terminal.try_commit(TaskTerminal::Aborted).is_ok() {
             if let Some(observer) = log_observer
                 && let Ok(mut observer) = observer.lock()
@@ -3109,6 +3233,9 @@ async fn abort_pending_tasks_for_session(
         }
         task.abort();
         let _ = task.await;
+        if let Some(control) = &file_commit {
+            control.wait_idle().await;
+        }
     }
 }
 
@@ -3128,11 +3255,26 @@ async fn cancel_pending_task(
         };
     };
     let PendingTask {
+        file_transfer_id: _,
+        file_commit,
         session_id: _,
         task,
         terminal,
         interactive_shell,
     } = pending;
+    if let Some(control) = &file_commit
+        && !control.try_cancel()
+    {
+        let _ = task.await;
+        if let Some(control) = &file_commit {
+            control.wait_idle().await;
+        }
+        let final_terminal = terminal.load();
+        if final_terminal.is_reported() {
+            remember_task_terminal(recent_task_terminals, request_id, final_terminal).await;
+        }
+        return CancelTaskOutcome::Completed;
+    }
     match terminal.try_commit(TaskTerminal::Cancelled) {
         Ok(()) => {
             if let Some(shell) = interactive_shell {
@@ -3140,6 +3282,9 @@ async fn cancel_pending_task(
             }
             task.abort();
             let _ = task.await;
+            if let Some(control) = &file_commit {
+                control.wait_idle().await;
+            }
             remember_task_terminal(recent_task_terminals, request_id, TaskTerminal::Cancelled)
                 .await;
             CancelTaskOutcome::Cancelled
@@ -3147,12 +3292,18 @@ async fn cancel_pending_task(
         Err(TaskTerminal::Completed | TaskTerminal::Failed) => {
             let final_terminal = terminal.load();
             let _ = task.await;
+            if let Some(control) = &file_commit {
+                control.wait_idle().await;
+            }
             remember_task_terminal(recent_task_terminals, request_id, final_terminal).await;
             CancelTaskOutcome::Completed
         }
         Err(TaskTerminal::Cancelled) => {
             task.abort();
             let _ = task.await;
+            if let Some(control) = &file_commit {
+                control.wait_idle().await;
+            }
             remember_task_terminal(recent_task_terminals, request_id, TaskTerminal::Cancelled)
                 .await;
             CancelTaskOutcome::AlreadyCancelled
@@ -3160,6 +3311,9 @@ async fn cancel_pending_task(
         Err(TaskTerminal::Running | TaskTerminal::Aborted) => {
             task.abort();
             let _ = task.await;
+            if let Some(control) = &file_commit {
+                control.wait_idle().await;
+            }
             CancelTaskOutcome::NotFound
         }
     }
@@ -3193,6 +3347,27 @@ fn ensure_shell_capacity(total: usize, session: usize) -> anyhow::Result<()> {
         bail!("持久 Shell 会话达到安全上限");
     }
     Ok(())
+}
+
+async fn prune_closed_shells(shell_sessions: &Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>) {
+    shell_sessions
+        .lock()
+        .await
+        .retain(|_, runtime| !runtime.session.is_closed());
+}
+
+async fn remove_shell_runtime(
+    shell_sessions: &Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
+    shell_id: ShellId,
+    expected: &ShellRuntime,
+) {
+    let mut sessions = shell_sessions.lock().await;
+    if sessions
+        .get(&shell_id)
+        .is_some_and(|runtime| Arc::ptr_eq(&runtime.identity, &expected.identity))
+    {
+        sessions.remove(&shell_id);
+    }
 }
 
 fn ensure_serial_capacity(total: usize, session: usize) -> anyhow::Result<()> {
@@ -3244,17 +3419,23 @@ fn spawn_serial_reader(
     session_id: SessionId,
     request_id: RequestId,
     source: remoteops_domain::EventSource,
-    port: SystemDuplexSerialSession,
+    port: Arc<dyn AgentSerialPort>,
     transcript: Arc<Mutex<SerialTranscript>>,
     activity: Arc<Notify>,
     cancelled: Arc<AtomicBool>,
     serial_sessions: Arc<Mutex<BTreeMap<SerialSessionId, SerialRuntime>>>,
     sender: mpsc::UnboundedSender<WireMessage>,
     sequence: Arc<AtomicU64>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while !cancelled.load(Ordering::Relaxed) {
-            match port.read(4096).await {
+        while !cancelled.load(Ordering::Acquire) && !sender.is_closed() {
+            // 串口读取在阻塞线程执行，必须等已开始的有界读取返回后再释放句柄。
+            // 直接 abort 此任务会留下仍持有设备的 blocking worker。
+            let result = port.read(4096).await;
+            if cancelled.load(Ordering::Acquire) || sender.is_closed() {
+                break;
+            }
+            match result {
                 Ok(bytes) if bytes.is_empty() => {
                     // 某些 Windows 串口驱动会立即返回空数据，避免空读忙等。
                     sleep(Duration::from_millis(20)).await;
@@ -3285,7 +3466,6 @@ fn spawn_serial_reader(
                     }
                 }
                 Err(error) => {
-                    serial_sessions.lock().await.remove(&serial_session_id);
                     let _ = sender.send(WireMessage::RemoteEvent(RemoteEvent {
                         sequence: sequence.fetch_add(1, Ordering::Relaxed),
                         session_id,
@@ -3302,7 +3482,33 @@ fn spawn_serial_reader(
                 }
             }
         }
-    });
+        cancelled.store(true, Ordering::Release);
+        activity.notify_waiters();
+        remove_serial_runtime(&serial_sessions, serial_session_id, &cancelled).await;
+    })
+}
+
+async fn remove_serial_runtime(
+    serial_sessions: &Arc<Mutex<BTreeMap<SerialSessionId, SerialRuntime>>>,
+    serial_session_id: SerialSessionId,
+    expected: &Arc<AtomicBool>,
+) {
+    let mut sessions = serial_sessions.lock().await;
+    if sessions
+        .get(&serial_session_id)
+        .is_some_and(|runtime| Arc::ptr_eq(&runtime.cancelled, expected))
+    {
+        sessions.remove(&serial_session_id);
+    }
+}
+
+async fn close_serial_runtime(runtime: &SerialRuntime) {
+    runtime.cancelled.store(true, Ordering::Release);
+    runtime.activity.notify_waiters();
+    let reader = runtime.reader_task.lock().await.take();
+    if let Some(reader) = reader {
+        let _ = reader.await;
+    }
 }
 
 fn validate_shell_binding(
@@ -3717,18 +3923,21 @@ async fn close_agent_resources(
             .map(|runtime| runtime.session)
             .collect::<Vec<_>>()
     };
-    for shell in shells {
-        let _ = shell.close().await;
-    }
     let serials = {
         let mut sessions = serial_sessions.lock().await;
         std::mem::take(&mut *sessions)
             .into_values()
-            .map(|runtime| runtime.cancelled)
             .collect::<Vec<_>>()
     };
-    for cancelled in serials {
-        cancelled.store(true, Ordering::Relaxed);
+    for runtime in &serials {
+        runtime.cancelled.store(true, Ordering::Release);
+        runtime.activity.notify_waiters();
+    }
+    for shell in shells {
+        let _ = shell.close().await;
+    }
+    for runtime in serials {
+        close_serial_runtime(&runtime).await;
     }
 }
 
@@ -3790,9 +3999,6 @@ async fn close_session_resources(
             .map(|runtime| runtime.session)
             .collect::<Vec<_>>()
     };
-    for shell in shells {
-        let _ = shell.close().await;
-    }
     let serials = {
         let mut sessions = serial_sessions.lock().await;
         let ids = sessions
@@ -3801,11 +4007,17 @@ async fn close_session_resources(
             .collect::<Vec<_>>();
         ids.into_iter()
             .filter_map(|id| sessions.remove(&id))
-            .map(|runtime| runtime.cancelled)
             .collect::<Vec<_>>()
     };
-    for cancelled in serials {
-        cancelled.store(true, Ordering::Relaxed);
+    for runtime in &serials {
+        runtime.cancelled.store(true, Ordering::Release);
+        runtime.activity.notify_waiters();
+    }
+    for shell in shells {
+        let _ = shell.close().await;
+    }
+    for runtime in serials {
+        close_serial_runtime(&runtime).await;
     }
 }
 
@@ -3935,6 +4147,7 @@ mod tests {
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let runtime_state = RequestRuntimeState {
+            file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::clone(file_uploads),
@@ -4164,6 +4377,10 @@ mod tests {
         let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
         let (log_sender, log_receiver) = std_mpsc::channel();
         let connection_state_file = state_file.clone();
+        let shell_sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let serial_sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let connection_shells = shell_sessions.clone();
+        let connection_serials = serial_sessions.clone();
         let connection_task = tokio::spawn(async move {
             run_connection(
                 agent_stream,
@@ -4179,8 +4396,8 @@ mod tests {
                 default_visual_provider(),
                 Arc::new(SystemDevice::new()),
                 Arc::new(AtomicU64::new(1)),
-                Arc::new(Mutex::new(BTreeMap::new())),
-                Arc::new(Mutex::new(BTreeMap::new())),
+                connection_shells,
+                connection_serials,
                 Arc::new(LocalPermissionPolicy::default()),
                 Arc::new(CredentialEncryptionKeyPair::generate()),
                 watch::channel(PermissionMode::ApprovalRequired).1,
@@ -4343,12 +4560,43 @@ mod tests {
                     && log.level == AgentLogLevel::Success)
         );
 
+        let idle_shell = SystemDevice::new()
+            .open_interactive_shell(shell)
+            .await
+            .unwrap();
+        shell_sessions.lock().await.insert(
+            ShellId::new(),
+            ShellRuntime {
+                session_id,
+                shell,
+                session: idle_shell.clone(),
+                identity: Arc::new(()),
+            },
+        );
+        let (serial_sender, _serial_receiver) = mpsc::unbounded_channel();
+        let serial = register_mock_serial(
+            &serial_sessions,
+            SerialSessionId::new(),
+            session_id,
+            serial_sender,
+        )
+        .await;
+        serial.started.notified().await;
         drop(relay_stream);
+        wait_for_flag(&serial.cancelled).await;
+        serial
+            .input
+            .send(Ok(b"bytes after disconnect".to_vec()))
+            .unwrap();
         let connection_result = timeout(Duration::from_secs(2), connection_task)
             .await
             .expect("Relay 关闭后 Agent 连接任务应结束")
             .expect("Agent 连接任务不应 panic");
         assert!(connection_result.is_err());
+        assert!(idle_shell.is_closed());
+        assert!(shell_sessions.lock().await.is_empty());
+        assert!(serial_sessions.lock().await.is_empty());
+        assert!(serial.dropped.load(Ordering::Acquire));
         let _ = std::fs::remove_file(state_file);
     }
 
@@ -4375,6 +4623,7 @@ mod tests {
         };
 
         let runtime_state = RequestRuntimeState {
+            file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4550,6 +4799,8 @@ mod tests {
         tasks.lock().await.insert(
             request_id,
             PendingTask {
+                file_transfer_id: None,
+                file_commit: None,
                 session_id: SessionId::new(),
                 task: tokio::spawn(async {}),
                 terminal: terminal.clone(),
@@ -4570,6 +4821,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_publication_winner_is_reported_as_completed_on_cancel() {
+        let root = test_state_file("file-publication-cancel").with_extension("dir");
+        let device = SystemDevice::with_transfer_root(&root).unwrap();
+        let control = FileCommitControl::default();
+        device
+            .write_file_with_control("result.bin", b"safe fixture", false, &control)
+            .await
+            .unwrap();
+        let request_id = RequestId::new();
+        let terminal = Arc::new(AtomicTaskTerminal::running());
+        let worker_terminal = terminal.clone();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            wait.await.unwrap();
+            worker_terminal.try_commit(TaskTerminal::Completed).unwrap();
+        });
+        let tasks = Arc::new(Mutex::new(BTreeMap::from([(
+            request_id,
+            PendingTask {
+                file_transfer_id: None,
+                file_commit: Some(control),
+                session_id: SessionId::new(),
+                task,
+                terminal: terminal.clone(),
+                interactive_shell: None,
+            },
+        )])));
+        let recent = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut cancelling = Box::pin(cancel_pending_task(&tasks, &recent, request_id));
+        assert!(
+            timeout(Duration::from_millis(10), &mut cancelling)
+                .await
+                .is_err()
+        );
+        assert_eq!(terminal.load(), TaskTerminal::Running);
+        release.send(()).unwrap();
+        assert_eq!(cancelling.await, CancelTaskOutcome::Completed);
+        assert_eq!(terminal.load(), TaskTerminal::Completed);
+        assert_eq!(
+            std::fs::read(root.join("result.bin")).unwrap(),
+            b"safe fixture"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_file_request_cancellation_prevents_starting_publication() {
+        let root = test_state_file("file-preparation-cancel").with_extension("dir");
+        let device = SystemDevice::with_transfer_root(&root).unwrap();
+        let control = FileCommitControl::default();
+        let request_id = RequestId::new();
+        let terminal = Arc::new(AtomicTaskTerminal::running());
+        let tasks = Arc::new(Mutex::new(BTreeMap::from([(
+            request_id,
+            PendingTask {
+                file_transfer_id: None,
+                file_commit: Some(control.clone()),
+                session_id: SessionId::new(),
+                task: tokio::spawn(std::future::pending()),
+                terminal: terminal.clone(),
+                interactive_shell: None,
+            },
+        )])));
+        let recent = Arc::new(Mutex::new(BTreeMap::new()));
+        assert_eq!(
+            cancel_pending_task(&tasks, &recent, request_id).await,
+            CancelTaskOutcome::Cancelled
+        );
+        assert!(
+            device
+                .write_file_with_control("result.bin", b"safe fixture", false, &control)
+                .await
+                .is_err()
+        );
+        assert!(!root.join("result.bin").exists());
+        assert_eq!(terminal.load(), TaskTerminal::Cancelled);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn cancellation_claims_running_task_and_blocks_late_completion() {
         let request_id = RequestId::new();
         let terminal = Arc::new(AtomicTaskTerminal::running());
@@ -4577,6 +4908,8 @@ mod tests {
         tasks.lock().await.insert(
             request_id,
             PendingTask {
+                file_transfer_id: None,
+                file_commit: None,
                 session_id: SessionId::new(),
                 task: tokio::spawn(std::future::pending()),
                 terminal: terminal.clone(),
@@ -4614,6 +4947,8 @@ mod tests {
             tasks.insert(
                 running_id,
                 PendingTask {
+                    file_transfer_id: None,
+                    file_commit: None,
                     session_id: SessionId::new(),
                     task: tokio::spawn(std::future::pending()),
                     terminal: running.clone(),
@@ -4623,6 +4958,8 @@ mod tests {
             tasks.insert(
                 completed_id,
                 PendingTask {
+                    file_transfer_id: None,
+                    file_commit: None,
                     session_id: SessionId::new(),
                     task: tokio::spawn(async {}),
                     terminal: completed.clone(),
@@ -5224,6 +5561,365 @@ mod tests {
         );
     }
 
+    fn shell_test_state(
+        shell_sessions: Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
+    ) -> RequestRuntimeState {
+        RequestRuntimeState {
+            file_commit: FileCommitControl::default(),
+            shell_sessions,
+            serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
+            used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+            visual_provider: default_visual_provider(),
+        }
+    }
+
+    async fn execute_test_shell_request(
+        runtime_state: &RequestRuntimeState,
+        session_id: SessionId,
+        operation: RemoteOperation,
+    ) -> (TaskTerminal, RemoteResponse) {
+        let request = RemoteRequest {
+            control_proof: None,
+            request_id: RequestId::new(),
+            session_id,
+            source: EventSource::Human,
+            operation,
+            approval_id: None,
+            payload_base64: None,
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let terminal = execute_request(
+            &SystemDevice::new(),
+            &sender,
+            &Arc::new(AtomicU64::new(1)),
+            runtime_state,
+            AgentInstanceId::new(),
+            &CredentialEncryptionKeyPair::generate(),
+            request,
+            &AtomicTaskTerminal::running(),
+        )
+        .await;
+        let response = std::iter::from_fn(|| receiver.try_recv().ok())
+            .find_map(|message| match message {
+                WireMessage::RemoteResponse(response) => Some(response),
+                _ => None,
+            })
+            .expect("执行请求应返回终态响应");
+        (terminal, response)
+    }
+
+    fn lifecycle_test_shell() -> ShellKind {
+        if cfg!(windows) {
+            ShellKind::Cmd
+        } else {
+            ShellKind::System
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_shell_prunes_closed_entries_before_global_and_session_quota() {
+        let shell = lifecycle_test_shell();
+        let session_id = SessionId::new();
+        let session = SystemDevice::new()
+            .open_interactive_shell(shell)
+            .await
+            .unwrap();
+        session.close().await.unwrap();
+        let runtime = ShellRuntime {
+            session_id,
+            shell,
+            session,
+            identity: Arc::new(()),
+        };
+        let sessions = Arc::new(Mutex::new(
+            (0..MAX_SHELL_SESSIONS)
+                .map(|_| (ShellId::new(), runtime.clone()))
+                .collect(),
+        ));
+        let state = shell_test_state(sessions.clone());
+        let (terminal, response) =
+            execute_test_shell_request(&state, session_id, RemoteOperation::OpenShell { shell })
+                .await;
+        assert_eq!(terminal, TaskTerminal::Completed);
+        assert!(response.error_code.is_none());
+        assert_eq!(sessions.lock().await.len(), 1);
+        close_agent_resources(&sessions, &state.serial_sessions).await;
+    }
+
+    #[tokio::test]
+    async fn failed_shell_command_removes_closed_runtime_and_reports_shell_closed() {
+        let shell = lifecycle_test_shell();
+        let session_id = SessionId::new();
+        let shell_id = ShellId::new();
+        let session = SystemDevice::new()
+            .open_interactive_shell(shell)
+            .await
+            .unwrap();
+        session.interrupt().await.unwrap();
+        let state = shell_test_state(Arc::new(Mutex::new(BTreeMap::from([(
+            shell_id,
+            ShellRuntime {
+                session_id,
+                shell,
+                session,
+                identity: Arc::new(()),
+            },
+        )]))));
+        let (terminal, response) = execute_test_shell_request(
+            &state,
+            session_id,
+            RemoteOperation::RunShellCommand {
+                shell_id,
+                shell,
+                command: "echo must-not-run".to_owned(),
+                readonly: false,
+            },
+        )
+        .await;
+        assert_eq!(terminal, TaskTerminal::Failed);
+        assert!(response.error_code.is_some());
+        assert_eq!(response.details.unwrap()["shell_closed"], true);
+        assert!(state.shell_sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_cleanup_preserves_replacement_and_only_prunes_closed_sessions() {
+        let shell = lifecycle_test_shell();
+        let device = SystemDevice::new();
+        let old = ShellRuntime {
+            session_id: SessionId::new(),
+            shell,
+            session: device.open_interactive_shell(shell).await.unwrap(),
+            identity: Arc::new(()),
+        };
+        old.session.close().await.unwrap();
+        let replacement = ShellRuntime {
+            session_id: old.session_id,
+            shell,
+            session: device.open_interactive_shell(shell).await.unwrap(),
+            identity: Arc::new(()),
+        };
+        let shell_id = ShellId::new();
+        let sessions = Arc::new(Mutex::new(BTreeMap::from([
+            (shell_id, replacement.clone()),
+            (ShellId::new(), old.clone()),
+        ])));
+        remove_shell_runtime(&sessions, shell_id, &old).await;
+        prune_closed_shells(&sessions).await;
+        assert_eq!(sessions.lock().await.len(), 1);
+        assert!(!replacement.session.is_closed());
+        close_agent_resources(&sessions, &Arc::new(Mutex::new(BTreeMap::new()))).await;
+    }
+
+    struct MockAgentSerialPort {
+        input: Mutex<mpsc::UnboundedReceiver<Result<Vec<u8>, remoteops_device::DeviceError>>>,
+        started: Arc<Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for MockAgentSerialPort {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[async_trait]
+    impl AgentSerialPort for MockAgentSerialPort {
+        async fn read(&self, _: usize) -> Result<Vec<u8>, remoteops_device::DeviceError> {
+            self.started.notify_one();
+            self.input.lock().await.recv().await.unwrap_or_else(|| {
+                Err(remoteops_device::DeviceError::Operation(
+                    "模拟串口已断开".to_owned(),
+                ))
+            })
+        }
+
+        async fn write(&self, bytes: Vec<u8>) -> Result<usize, remoteops_device::DeviceError> {
+            Ok(bytes.len())
+        }
+    }
+
+    struct MockSerialControls {
+        input: mpsc::UnboundedSender<Result<Vec<u8>, remoteops_device::DeviceError>>,
+        started: Arc<Notify>,
+        dropped: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+        reader_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    }
+
+    async fn register_mock_serial(
+        serial_sessions: &Arc<Mutex<BTreeMap<SerialSessionId, SerialRuntime>>>,
+        serial_session_id: SerialSessionId,
+        session_id: SessionId,
+        sender: mpsc::UnboundedSender<WireMessage>,
+    ) -> MockSerialControls {
+        let (input, receiver) = mpsc::unbounded_channel();
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let port: Arc<dyn AgentSerialPort> = Arc::new(MockAgentSerialPort {
+            input: Mutex::new(receiver),
+            started: started.clone(),
+            dropped: dropped.clone(),
+        });
+        let transcript = Arc::new(Mutex::new(SerialTranscript::default()));
+        let activity = Arc::new(Notify::new());
+        let mut sessions = serial_sessions.lock().await;
+        let reader = spawn_serial_reader(
+            serial_session_id,
+            session_id,
+            RequestId::new(),
+            EventSource::Human,
+            port.clone(),
+            transcript.clone(),
+            activity.clone(),
+            cancelled.clone(),
+            serial_sessions.clone(),
+            sender,
+            Arc::new(AtomicU64::new(1)),
+        );
+        let reader_task = Arc::new(Mutex::new(Some(reader)));
+        sessions.insert(
+            serial_session_id,
+            SerialRuntime {
+                session_id,
+                port_name: "mock-port".to_owned(),
+                writable: true,
+                port,
+                transcript,
+                activity,
+                operation_lock: Arc::new(Mutex::new(())),
+                cancelled: cancelled.clone(),
+                reader_task: reader_task.clone(),
+            },
+        );
+        MockSerialControls {
+            input,
+            started,
+            dropped,
+            cancelled,
+            reader_task,
+        }
+    }
+
+    async fn wait_for_flag(flag: &AtomicBool) {
+        timeout(Duration::from_secs(2), async {
+            while !flag.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("生命周期状态应及时更新");
+    }
+
+    #[tokio::test]
+    async fn serial_reader_releases_session_on_closed_sender_and_read_failure() {
+        for read_failure in [false, true] {
+            let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let serial_id = SerialSessionId::new();
+            let controls =
+                register_mock_serial(&sessions, serial_id, SessionId::new(), sender).await;
+            controls.started.notified().await;
+            let result = if read_failure {
+                Err(remoteops_device::DeviceError::Operation(
+                    "模拟读取失败".to_owned(),
+                ))
+            } else {
+                drop(receiver);
+                Ok(b"late bytes".to_vec())
+            };
+            controls.input.send(result).expect("模拟读取应仍在等待");
+            let reader = controls.reader_task.lock().await.take().unwrap();
+            timeout(Duration::from_secs(2), reader)
+                .await
+                .expect("读取任务应结束")
+                .expect("读取任务不应 panic");
+            assert!(sessions.lock().await.is_empty());
+            assert!(controls.cancelled.load(Ordering::Acquire));
+            assert!(controls.dropped.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_resource_cleanup_waits_for_serial_read_and_closes_idle_shell() {
+        let shell = if cfg!(windows) {
+            ShellKind::Cmd
+        } else {
+            ShellKind::System
+        };
+        let session = SystemDevice::new()
+            .open_interactive_shell(shell)
+            .await
+            .unwrap();
+        let shell_sessions = Arc::new(Mutex::new(BTreeMap::from([(
+            ShellId::new(),
+            ShellRuntime {
+                session_id: SessionId::new(),
+                shell,
+                session: session.clone(),
+                identity: Arc::new(()),
+            },
+        )])));
+        let serial_sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let controls = register_mock_serial(
+            &serial_sessions,
+            SerialSessionId::new(),
+            SessionId::new(),
+            sender,
+        )
+        .await;
+        controls.started.notified().await;
+        let shells = shell_sessions.clone();
+        let serials = serial_sessions.clone();
+        let cleanup = tokio::spawn(async move { close_agent_resources(&shells, &serials).await });
+        wait_for_flag(&controls.cancelled).await;
+        assert!(!cleanup.is_finished(), "不得把仍在读取的句柄误报为已释放");
+        controls.input.send(Ok(Vec::new())).unwrap();
+        timeout(Duration::from_secs(2), cleanup)
+            .await
+            .expect("设备清理应及时完成")
+            .unwrap();
+        assert!(session.is_closed());
+        assert!(shell_sessions.lock().await.is_empty());
+        assert!(serial_sessions.lock().await.is_empty());
+        assert!(controls.dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn old_serial_reader_does_not_remove_replacement_session() {
+        let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let serial_id = SerialSessionId::new();
+        let session_id = SessionId::new();
+        let (old_sender, old_receiver) = mpsc::unbounded_channel();
+        let old = register_mock_serial(&sessions, serial_id, session_id, old_sender).await;
+        old.started.notified().await;
+        let (new_sender, _new_receiver) = mpsc::unbounded_channel();
+        let new = register_mock_serial(&sessions, serial_id, session_id, new_sender).await;
+        new.started.notified().await;
+        drop(old_receiver);
+        old.input.send(Ok(Vec::new())).unwrap();
+        let reader = old.reader_task.lock().await.take().unwrap();
+        timeout(Duration::from_secs(2), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sessions.lock().await.len(), 1);
+        assert!(!new.cancelled.load(Ordering::Acquire));
+        assert!(old.dropped.load(Ordering::Acquire));
+        new.input.send(Ok(Vec::new())).unwrap();
+        close_session_resources(
+            &Arc::new(Mutex::new(BTreeMap::new())),
+            &sessions,
+            session_id,
+        )
+        .await;
+        assert!(new.dropped.load(Ordering::Acquire));
+        assert!(sessions.lock().await.is_empty());
+    }
+
     #[test]
     fn serial_output_is_redacted_before_remote_event_delivery() {
         let output = serial_output_for_remote_event(
@@ -5326,6 +6022,7 @@ mod tests {
         let device = SystemDevice::with_transfer_root(&transfer_root).expect("应创建交换目录");
         let ssh_provider = RecordingSshProvider::default();
         let runtime_state = RequestRuntimeState {
+            file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
@@ -5422,6 +6119,7 @@ mod tests {
             ),
         };
         let runtime_state = RequestRuntimeState {
+            file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),

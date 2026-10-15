@@ -22,6 +22,7 @@ use remoteops_domain::{
     ControllerInstanceId, ControllerOwnerId, EventSource, PairingCode, PairingLease,
     PermissionMode, RemoteOperation, RequestId, SessionId, SessionRole,
 };
+use remoteops_enrollment_store::{EnrollmentStore, StoreError};
 use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel, approval_operations_match};
 use remoteops_protocol::{
     AgentHello, AgentLeaseRenewed, AgentResumeCommitted, AgentWelcome, ApprovalDecision,
@@ -47,6 +48,7 @@ use crate::admin::{
 
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const CLIENT_HELLO_TIMEOUT: time::Duration = time::Duration::from_secs(10);
+const CONTROLLER_IDLE_TIMEOUT: time::Duration = time::Duration::from_secs(45);
 const MAX_REGISTERED_AGENTS: usize = 1024;
 const UNPAIRED_AGENT_RETENTION: Duration = Duration::hours(24);
 const MAX_AUDIT_EVENTS: usize = 1_000;
@@ -133,7 +135,10 @@ struct PendingResume {
 }
 
 struct ControllerRecord {
+    /// Durable MCP credential; legacy token connections have no installation.
+    installation_id: Option<Uuid>,
     sender: Sender,
+    last_seen: time::Instant,
     sessions: BTreeSet<SessionId>,
     owner_id: ControllerOwnerId,
     kind: ControllerKind,
@@ -289,6 +294,7 @@ struct RelayApprovalRecord {
 
 #[derive(Clone)]
 struct InFlightRequest {
+    binding_token: String,
     agent_id: AgentInstanceId,
     session_id: SessionId,
     controller_id: ControllerInstanceId,
@@ -386,6 +392,9 @@ type ShutdownWaiters = Arc<Mutex<BTreeMap<RequestId, ShutdownWaiter>>>;
 pub struct Relay {
     state: Arc<Mutex<RelayState>>,
     state_path: Option<PathBuf>,
+    enrollment_store: Option<Arc<EnrollmentStore>>,
+    /// Serializes credential validation + registration against durable revoke + disconnect.
+    enrollment_gate: Mutex<()>,
     lease_lifetime: Duration,
     approval_lifetime: Duration,
     heartbeat_seconds: u64,
@@ -410,6 +419,8 @@ impl Relay {
         Self {
             state: Arc::new(Mutex::new(RelayState::default())),
             state_path: None,
+            enrollment_store: None,
+            enrollment_gate: Mutex::new(()),
             lease_lifetime: if lease_lifetime <= Duration::zero() {
                 Duration::seconds(1)
             } else {
@@ -852,6 +863,7 @@ impl Relay {
             state.in_flight.insert(
                 request_id,
                 InFlightRequest {
+                    binding_token: binding.binding_token.clone(),
                     control_state: None,
                     agent_id: agent.hello.agent_instance_id,
                     session_id,
@@ -1103,6 +1115,10 @@ impl Relay {
         load_persisted_state(&state_path, &mut restored)?;
         save_persisted_state(&state_path, &restored)?;
         relay.state = Arc::new(Mutex::new(restored));
+        relay.enrollment_store = Some(Arc::new(EnrollmentStore::open(
+            enrollment_database_path(&state_path),
+            controller_owner_id,
+        )?));
         Ok(relay)
     }
 
@@ -1254,19 +1270,20 @@ impl Relay {
             writer_closed.notify_one();
         });
 
-        match hello {
+        let result = match hello {
             WireMessage::Hello(ClientHello::Agent(hello)) => {
                 self.handle_agent(hello, sender, connection_closed, &mut reader)
-                    .await?;
+                    .await
             }
             WireMessage::Hello(ClientHello::Controller(hello)) => {
                 self.handle_controller(hello, sender, connection_closed, &mut reader)
-                    .await?;
+                    .await
             }
-            _ => bail!("第一条消息必须是 Agent 或 Controller Hello"),
-        }
+            _ => Err(anyhow!("第一条消息必须是 Agent 或 Controller Hello")),
+        };
         writer_task.abort();
-        Ok(())
+        let _ = writer_task.await;
+        result
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1438,25 +1455,22 @@ impl Relay {
         if hello.protocol_version != PROTOCOL_VERSION {
             bail!("Controller 协议版本不兼容：{}", hello.protocol_version);
         }
-        self.authenticate_controller(&hello)?;
         let controller_id = hello.controller_instance_id;
         let owner_id = hello.owner_id;
         let controller_kind = hello.kind;
         let connection_generation = self
-            .register_controller(
-                controller_id,
-                owner_id,
-                controller_kind,
-                hello.hostname.clone(),
-                hello.mac_address.clone(),
-                sender.clone(),
-            )
+            .authenticate_and_register_controller(&hello, sender.clone())
             .await?;
-        sender
+        if sender
             .send(WireMessage::ControllerWelcome {
                 protocol_version: PROTOCOL_VERSION,
             })
-            .map_err(|()| anyhow!("Controller 连接已关闭"))?;
+            .is_err()
+        {
+            self.remove_controller(controller_id, connection_generation)
+                .await;
+            bail!("Controller 连接已关闭");
+        }
         info!(
             controller_instance_id = %controller_id,
             owner_id = %owner_id,
@@ -1474,6 +1488,13 @@ impl Relay {
                 }
                 result = read_frame::<WireMessage, _>(reader) => result,
             };
+            if message.is_ok()
+                && !self
+                    .touch_controller(controller_id, connection_generation)
+                    .await
+            {
+                break;
+            }
             match message {
                 Ok(WireMessage::ControlStateRequest(request)) => {
                     self.handle_controller_control_state(
@@ -1546,7 +1567,7 @@ impl Relay {
         Ok(())
     }
 
-    fn authenticate_controller(&self, hello: &ControllerHello) -> anyhow::Result<()> {
+    fn authenticate_controller(&self, hello: &ControllerHello) -> anyhow::Result<Option<Uuid>> {
         if hello.owner_id != self.controller_owner_id {
             bail!("Controller Owner 身份不匹配");
         }
@@ -1554,12 +1575,113 @@ impl Relay {
             ControllerKind::Human => &self.human_controller_token,
             ControllerKind::Ai => &self.ai_controller_token,
         };
-        if !constant_time_eq(hello.auth_token.as_bytes(), expected.as_bytes()) {
-            bail!("Controller 认证失败");
+        // Preserve arbitrary configured legacy token values, including a coincidental roc1 prefix.
+        if !expected.is_empty()
+            && constant_time_eq(hello.auth_token.as_bytes(), expected.as_bytes())
+        {
+            return Ok(None);
         }
-        Ok(())
+        if hello.auth_token.starts_with("roc1.") {
+            if hello.kind != ControllerKind::Ai {
+                bail!("MCP 安装凭据仅允许 AI Controller 角色");
+            }
+            let identity = self
+                .enrollment_store()?
+                .authenticate_token(&hello.auth_token, Utc::now())?;
+            if identity.owner_id != self.controller_owner_id {
+                bail!("Controller Owner 身份不匹配");
+            }
+            return Ok(Some(identity.installation_id));
+        }
+        bail!("Controller 认证失败");
     }
 
+    pub(crate) fn enrollment_store(&self) -> Result<&EnrollmentStore, StoreError> {
+        self.enrollment_store
+            .as_deref()
+            .ok_or(StoreError::NotConfigured)
+    }
+
+    /// The gate remains held until the newly authenticated connection is visible to revoke.
+    async fn authenticate_and_register_controller(
+        &self,
+        hello: &ControllerHello,
+        sender: Sender,
+    ) -> anyhow::Result<u64> {
+        let _gate = self.enrollment_gate.lock().await;
+        let installation_id = self.authenticate_controller(hello)?;
+        self.register_controller_record(
+            hello.controller_instance_id,
+            ControllerRecord {
+                installation_id,
+                sender,
+                last_seen: time::Instant::now(),
+                sessions: BTreeSet::new(),
+                owner_id: hello.owner_id,
+                kind: hello.kind,
+                connection_generation: 0,
+                hostname: hello.hostname.clone(),
+                mac_address: hello.mac_address.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Include recent activity of live connections without writing SQLite on every heartbeat.
+    pub(crate) async fn mcp_clients(
+        &self,
+    ) -> Result<Vec<remoteops_enrollment::ClientSummary>, StoreError> {
+        let mut clients = self.enrollment_store()?.list_clients()?;
+        let state = self.state.lock().await;
+        let now = Utc::now();
+        for client in &mut clients {
+            for controller in state
+                .controllers
+                .values()
+                .filter(|controller| controller.installation_id == Some(client.installation_id))
+            {
+                if let Ok(elapsed) = Duration::from_std(controller.last_seen.elapsed()) {
+                    let last_seen = now - elapsed;
+                    if client.last_seen.is_none_or(|saved| saved < last_seen) {
+                        client.last_seen = Some(last_seen);
+                    }
+                }
+            }
+        }
+        Ok(clients)
+    }
+
+    /// Commit revocation before removing every live connection under the same registration gate.
+    pub(crate) async fn revoke_mcp_client(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        let _gate = self.enrollment_gate.lock().await;
+        // Acquire the state lock before committing. No await may intervene between the durable
+        // revoke and live cleanup, even if the requesting HTTP connection gets cancelled.
+        let mut state = self.state.lock().await;
+        let changed = self.enrollment_store()?.revoke_client(installation_id)?;
+        let connections = state
+            .controllers
+            .iter()
+            .filter(|(_, controller)| controller.installation_id == Some(installation_id))
+            .map(|(id, controller)| (*id, controller.connection_generation))
+            .collect::<Vec<_>>();
+        let mut revocations = Vec::new();
+        for (id, generation) in connections {
+            revocations.extend(remove_controller_locked(&mut state, id, generation, None));
+        }
+        drop(state);
+        for (sender, session_id, binding_token) in revocations {
+            let _ = sender.send(WireMessage::ControllerBindingRevoked {
+                session_id,
+                binding_token,
+            });
+        }
+        Ok(changed)
+    }
+
+    #[cfg(test)]
     async fn register_controller(
         &self,
         controller_id: ControllerInstanceId,
@@ -1568,6 +1690,28 @@ impl Relay {
         hostname: Option<String>,
         mac_address: Option<String>,
         sender: Sender,
+    ) -> anyhow::Result<u64> {
+        self.register_controller_record(
+            controller_id,
+            ControllerRecord {
+                installation_id: None,
+                sender,
+                last_seen: time::Instant::now(),
+                sessions: BTreeSet::new(),
+                owner_id,
+                kind,
+                connection_generation: 0,
+                hostname,
+                mac_address,
+            },
+        )
+        .await
+    }
+
+    async fn register_controller_record(
+        &self,
+        controller_id: ControllerInstanceId,
+        mut controller: ControllerRecord,
     ) -> anyhow::Result<u64> {
         let mut state = self.state.lock().await;
         if state.controllers.contains_key(&controller_id) {
@@ -1578,18 +1722,8 @@ impl Relay {
             .checked_add(1)
             .ok_or_else(|| anyhow!("Controller 连接代次已经耗尽"))?;
         let connection_generation = state.next_controller_generation;
-        state.controllers.insert(
-            controller_id,
-            ControllerRecord {
-                sender,
-                sessions: BTreeSet::new(),
-                owner_id,
-                kind,
-                connection_generation,
-                hostname,
-                mac_address,
-            },
-        );
+        controller.connection_generation = connection_generation;
+        state.controllers.insert(controller_id, controller);
         Ok(connection_generation)
     }
 
@@ -2250,11 +2384,23 @@ impl Relay {
                     || approval.controller_id != binding.controller_id
                     || approval.controller_generation != binding.controller_generation
             });
-            state.in_flight.retain(|_, in_flight| {
-                in_flight.session_id != session_id
-                    || in_flight.controller_id != binding.controller_id
-                    || in_flight.controller_generation != binding.controller_generation
-            });
+            // 另一角色仍绑定时 Agent 保留已开始操作，不能提前遗忘原归属。
+            let another_role_remains =
+                state
+                    .session_bindings
+                    .get(&session_id)
+                    .is_some_and(|bindings| {
+                        bindings
+                            .all()
+                            .any(|active| active.controller_kind != binding.controller_kind)
+                    });
+            if !another_role_remains {
+                state.in_flight.retain(|_, request| {
+                    request.session_id != session_id
+                        || request.controller_id != binding.controller_id
+                        || request.controller_generation != binding.controller_generation
+                });
+            }
         }
         if let Some(bindings) = state.session_bindings.get(&session_id) {
             apply_session_bindings(&mut connection, bindings);
@@ -2334,6 +2480,9 @@ impl Relay {
             }
             if bindings.is_empty() {
                 state.session_bindings.remove(&request.session_id);
+                state
+                    .in_flight
+                    .retain(|_, entry| entry.session_id != request.session_id);
             }
         }
         state.approvals.retain(|_, approval| {
@@ -2341,11 +2490,7 @@ impl Relay {
                 || approval.controller_id != controller_id
                 || approval.controller_generation != controller_generation
         });
-        state.in_flight.retain(|_, in_flight| {
-            in_flight.session_id != request.session_id
-                || in_flight.controller_id != controller_id
-                || in_flight.controller_generation != controller_generation
-        });
+        // 另一角色仍绑定时，解绑只撤销后续执行权；在途归属保留至 Agent 终态。
         send_session_connection_update(&state, request.session_id, None);
         let agent_sender = removed_binding.as_ref().and_then(|_| {
             state
@@ -2827,6 +2972,7 @@ impl Relay {
         state.in_flight.insert(
             request.request_id,
             InFlightRequest {
+                binding_token: binding.binding_token.clone(),
                 control_state: binding.control_state.clone(),
                 agent_id,
                 session_id: request.session_id,
@@ -2905,6 +3051,7 @@ impl Relay {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn forward_agent_message(
         &self,
         agent_id: AgentInstanceId,
@@ -2962,23 +3109,22 @@ impl Relay {
                 );
                 return;
             }
-            let Some(controller) = state.controllers.get(&in_flight.controller_id) else {
-                state.in_flight.remove(&request_id);
-                return;
-            };
-            if controller.connection_generation != in_flight.controller_generation
-                || controller.kind != in_flight.controller_kind
+            let original_binding_active = in_flight_binding_is_active(&state, &in_flight);
+            let mut senders = Vec::new();
+            if original_binding_active
+                && let Some(controller) = state.controllers.get(&in_flight.controller_id)
+                && controller.connection_generation == in_flight.controller_generation
+                && controller.kind == in_flight.controller_kind
             {
-                state.in_flight.remove(&request_id);
-                return;
+                senders.push(controller.sender.clone());
             }
-            let mut senders = vec![controller.sender.clone()];
             if in_flight.controller_kind == ControllerKind::Ai
                 && let Some(human_binding) = state
                     .session_bindings
                     .get(&session_id)
                     .and_then(|bindings| bindings.get(ControllerKind::Human))
                 && human_binding.controller_id != in_flight.controller_id
+                && human_binding.owner_id == in_flight.owner_id
                 && let Some(human_controller) = state
                     .controllers
                     .get(&human_binding.controller_id)
@@ -2989,13 +3135,16 @@ impl Relay {
                 senders.push(human_controller.sender.clone());
             }
             if terminal && let Some(completed) = state.in_flight.remove(&request_id) {
-                control::renew_after_success(&mut state, &completed, &message);
+                if original_binding_active {
+                    control::renew_after_success(&mut state, &completed, &message);
+                }
                 let failed = matches!(
                     &message,
                     WireMessage::RemoteResponse(response)
                         if response.error_code.is_some()
                 );
                 if failed
+                    && original_binding_active
                     && let Some(previous_takeover) = completed.previous_takeover
                     && let Some(bindings) = state.session_bindings.get_mut(&session_id)
                 {
@@ -3096,65 +3245,41 @@ impl Relay {
         }
     }
 
+    async fn touch_controller(&self, controller_id: ControllerInstanceId, generation: u64) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(controller) = state.controllers.get_mut(&controller_id) else {
+            return false;
+        };
+        if controller.connection_generation != generation {
+            return false;
+        }
+        controller.last_seen = time::Instant::now();
+        true
+    }
+
     async fn remove_controller(
         &self,
         controller_id: ControllerInstanceId,
         connection_generation: u64,
     ) {
+        self.remove_controller_before(controller_id, connection_generation, None)
+            .await;
+    }
+
+    async fn remove_controller_before(
+        &self,
+        controller_id: ControllerInstanceId,
+        connection_generation: u64,
+        stale_before: Option<time::Instant>,
+    ) {
         let revocations = {
             let mut state = self.state.lock().await;
-            if state
-                .controllers
-                .get(&controller_id)
-                .is_none_or(|controller| controller.connection_generation != connection_generation)
-            {
-                return;
-            }
-            let controller = state
-                .controllers
-                .remove(&controller_id)
-                .expect("Controller 已在同一锁内验证");
-            let mut revocations = Vec::new();
-            for session_id in controller.sessions {
-                let removed_binding =
-                    state
-                        .session_bindings
-                        .get_mut(&session_id)
-                        .and_then(|bindings| {
-                            bindings.remove_owned(
-                                controller.kind,
-                                controller_id,
-                                connection_generation,
-                            )
-                        });
-                if let Some(binding) = removed_binding
-                    && let Some(agent_sender) = state
-                        .agents
-                        .values()
-                        .find(|agent| agent.session_id == session_id && agent.ready)
-                        .and_then(|agent| agent.sender.clone())
-                {
-                    revocations.push((agent_sender, session_id, binding.binding_token));
-                }
-                if let Some(bindings) = state.session_bindings.get_mut(&session_id) {
-                    if controller.kind == ControllerKind::Human {
-                        bindings.human_takeover = false;
-                    }
-                    if bindings.is_empty() {
-                        state.session_bindings.remove(&session_id);
-                    }
-                }
-                send_session_connection_update(&state, session_id, None);
-            }
-            state.approvals.retain(|_, approval| {
-                approval.controller_id != controller_id
-                    || approval.controller_generation != connection_generation
-            });
-            state.in_flight.retain(|_, request| {
-                request.controller_id != controller_id
-                    || request.controller_generation != connection_generation
-            });
-            revocations
+            remove_controller_locked(
+                &mut state,
+                controller_id,
+                connection_generation,
+                stale_before,
+            )
         };
         for (sender, session_id, binding_token) in revocations {
             let _ = sender.send(WireMessage::ControllerBindingRevoked {
@@ -3164,8 +3289,27 @@ impl Relay {
         }
     }
 
+    async fn cleanup_stale_controllers(&self) {
+        let stale_before = time::Instant::now() - CONTROLLER_IDLE_TIMEOUT;
+        let stale = {
+            let state = self.state.lock().await;
+            state
+                .controllers
+                .iter()
+                .filter(|(_, controller)| controller.last_seen <= stale_before)
+                .map(|(id, controller)| (*id, controller.connection_generation))
+                .collect::<Vec<_>>()
+        };
+        for (id, generation) in stale {
+            // 在删除锁内再次检查活性，防止与刚收到的心跳或新代次竞态。
+            self.remove_controller_before(id, generation, Some(stale_before))
+                .await;
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn cleanup_expired(&self) {
+        self.cleanup_stale_controllers().await;
         let now = Utc::now();
         let (notifications, failures) = {
             let mut state = self.state.lock().await;
@@ -3295,6 +3439,75 @@ fn append_audit(
         let remove = state.audit_log.len() - MAX_AUDIT_EVENTS;
         state.audit_log.drain(0..remove);
     }
+}
+
+/// The existing disconnect cleanup, shared with atomic installation revocation.
+fn remove_controller_locked(
+    state: &mut RelayState,
+    controller_id: ControllerInstanceId,
+    connection_generation: u64,
+    stale_before: Option<time::Instant>,
+) -> Vec<(Sender, SessionId, String)> {
+    if state
+        .controllers
+        .get(&controller_id)
+        .is_none_or(|controller| {
+            controller.connection_generation != connection_generation
+                || stale_before.is_some_and(|deadline| controller.last_seen > deadline)
+        })
+    {
+        return Vec::new();
+    }
+    let controller = state
+        .controllers
+        .remove(&controller_id)
+        .expect("Controller 已在同一锁内验证");
+    controller.sender.slow_consumer.notify_one();
+    let mut revocations = Vec::new();
+    for session_id in controller.sessions {
+        let removed_binding = state
+            .session_bindings
+            .get_mut(&session_id)
+            .and_then(|bindings| {
+                bindings.remove_owned(controller.kind, controller_id, connection_generation)
+            });
+        if let Some(binding) = removed_binding
+            && let Some(agent_sender) = state
+                .agents
+                .values()
+                .find(|agent| agent.session_id == session_id && agent.ready)
+                .and_then(|agent| agent.sender.clone())
+        {
+            revocations.push((agent_sender, session_id, binding.binding_token));
+        }
+        if let Some(bindings) = state.session_bindings.get_mut(&session_id) {
+            if controller.kind == ControllerKind::Human {
+                bindings.human_takeover = false;
+            }
+            if bindings.is_empty() {
+                state.session_bindings.remove(&session_id);
+                // 最后一个绑定被撤销时，沿用 Agent 的整 session 清理边界。
+                state
+                    .in_flight
+                    .retain(|_, request| request.session_id != session_id);
+            }
+        }
+        send_session_connection_update(state, session_id, None);
+    }
+    state.approvals.retain(|_, approval| {
+        approval.controller_id != controller_id
+            || approval.controller_generation != connection_generation
+    });
+    // 保留在途请求的原代次；断线不等于 Agent 已确认取消。
+    revocations
+}
+
+/// Append to the complete JSON filename, including its extension, so arbitrary legacy
+/// state filenames cannot collide with the separate enrollment database.
+fn enrollment_database_path(state_path: &Path) -> PathBuf {
+    let mut filename = state_path.as_os_str().to_os_string();
+    filename.push(".mcp.sqlite3");
+    PathBuf::from(filename)
 }
 
 fn token_fingerprint(token: &str) -> Option<String> {
@@ -3562,6 +3775,19 @@ fn ai_operation_allowed_after_takeover(
     ) && policy.classify(operation) == RiskLevel::ReadOnly
 }
 
+fn in_flight_binding_is_active(state: &RelayState, request: &InFlightRequest) -> bool {
+    state
+        .session_bindings
+        .get(&request.session_id)
+        .and_then(|bindings| bindings.get(request.controller_kind))
+        .is_some_and(|binding| {
+            binding.controller_id == request.controller_id
+                && binding.controller_generation == request.controller_generation
+                && binding.owner_id == request.owner_id
+                && binding.binding_token == request.binding_token
+        })
+}
+
 fn agent_message_request(message: &WireMessage) -> Option<(RequestId, bool)> {
     match message {
         WireMessage::RemoteResponse(response) => Some((response.request_id, true)),
@@ -3729,6 +3955,7 @@ fn new_secret_token() -> String {
 #[cfg(test)]
 mod tests {
     include!("relay_control_tests.rs");
+    include!("relay_enrollment_tests.rs");
     use std::path::PathBuf;
 
     use remoteops_domain::{
@@ -5356,6 +5583,7 @@ mod tests {
         relay.state.lock().await.in_flight.insert(
             stopped_request_id,
             InFlightRequest {
+                binding_token: String::new(),
                 control_state: None,
                 agent_id,
                 session_id,
@@ -5436,6 +5664,7 @@ mod tests {
         relay.state.lock().await.in_flight.insert(
             stopped_request_id,
             InFlightRequest {
+                binding_token: String::new(),
                 control_state: None,
                 agent_id,
                 session_id,
@@ -5505,6 +5734,405 @@ mod tests {
                 .unwrap()
                 .human_takeover,
             before_takeover
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum DetachTest {
+        Disconnect,
+        Release,
+        Replace,
+        Reconnect,
+        Repair,
+    }
+
+    fn test_remote_request(session_id: SessionId, operation: RemoteOperation) -> RemoteRequest {
+        RemoteRequest {
+            request_id: RequestId::new(),
+            session_id,
+            source: EventSource::Ai,
+            operation,
+            approval_id: None,
+            payload_base64: None,
+            control_proof: None,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn check_detached_ai_remains_cancellable(detach: DetachTest) {
+        let relay = relay(Duration::minutes(10));
+        let agent_id = AgentInstanceId::new();
+        let (agent, mut agent_receiver, session_id) = ready_agent(&relay, agent_id, None).await;
+        let (ai_id, ai_generation, mut ai_receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        let (human_id, human_generation, mut human_receiver) =
+            register_controller(&relay, ControllerKind::Human).await;
+        for (id, generation) in [(ai_id, ai_generation), (human_id, human_generation)] {
+            assert!(
+                relay
+                    .pair_controller(
+                        id,
+                        generation,
+                        PairRequest {
+                            request_id: RequestId::new(),
+                            pairing_code: agent.welcome.pairing_code.clone(),
+                            permission_mode: PermissionMode::ApprovalRequired,
+                        }
+                    )
+                    .await
+                    .error
+                    .is_none()
+            );
+        }
+        while agent_receiver.try_recv().is_ok() {}
+        while ai_receiver.try_recv().is_ok() {}
+        while human_receiver.try_recv().is_ok() {}
+        let ai_request = test_remote_request(session_id, run_command("Get-Process", true));
+        let human_request = test_remote_request(session_id, run_command("Get-Process", true));
+        for (id, generation, request) in [
+            (ai_id, ai_generation, ai_request.clone()),
+            (human_id, human_generation, human_request.clone()),
+        ] {
+            relay
+                .forward_controller_request(id, generation, request, &ai_sender(&relay, id).await)
+                .await;
+            let _ = recv_authorized(&mut agent_receiver).await;
+        }
+        let mut replacement_receiver = None;
+        match detach {
+            DetachTest::Disconnect => relay.remove_controller(ai_id, ai_generation).await,
+            DetachTest::Release | DetachTest::Repair => {
+                assert!(
+                    relay
+                        .release_controller_session(
+                            ai_id,
+                            ai_generation,
+                            ReleaseSessionRequest {
+                                request_id: RequestId::new(),
+                                session_id,
+                            }
+                        )
+                        .await
+                        .released
+                );
+                if matches!(detach, DetachTest::Repair) {
+                    assert!(
+                        relay
+                            .pair_controller(
+                                ai_id,
+                                ai_generation,
+                                PairRequest {
+                                    request_id: RequestId::new(),
+                                    pairing_code: agent.welcome.pairing_code.clone(),
+                                    permission_mode: PermissionMode::ApprovalRequired,
+                                }
+                            )
+                            .await
+                            .error
+                            .is_none()
+                    );
+                }
+            }
+            DetachTest::Replace | DetachTest::Reconnect => {
+                let (new_id, new_generation, mut receiver) =
+                    if matches!(detach, DetachTest::Reconnect) {
+                        relay.remove_controller(ai_id, ai_generation).await;
+                        let (sender, receiver) = test_channel();
+                        let generation = relay
+                            .register_controller(
+                                ai_id,
+                                test_owner_id(),
+                                ControllerKind::Ai,
+                                None,
+                                None,
+                                sender,
+                            )
+                            .await
+                            .unwrap();
+                        (ai_id, generation, receiver)
+                    } else {
+                        register_controller(&relay, ControllerKind::Ai).await
+                    };
+                assert!(
+                    relay
+                        .pair_controller(
+                            new_id,
+                            new_generation,
+                            PairRequest {
+                                request_id: RequestId::new(),
+                                pairing_code: agent.welcome.pairing_code.clone(),
+                                permission_mode: PermissionMode::ApprovalRequired,
+                            }
+                        )
+                        .await
+                        .error
+                        .is_none()
+                );
+                while receiver.try_recv().is_ok() {}
+                relay
+                    .forward_controller_request(
+                        new_id,
+                        new_generation,
+                        test_remote_request(
+                            session_id,
+                            RemoteOperation::CancelRequest {
+                                request_id: ai_request.request_id,
+                            },
+                        ),
+                        &ai_sender(&relay, new_id).await,
+                    )
+                    .await;
+                assert!(
+                    matches!(receiver.try_recv(), Ok(WireMessage::Error { code, .. }) if code == "cancel_target_not_owned")
+                );
+                replacement_receiver = Some(receiver);
+            }
+        }
+        assert!(
+            relay
+                .state
+                .lock()
+                .await
+                .in_flight
+                .contains_key(&ai_request.request_id)
+        );
+        assert!(
+            relay
+                .state
+                .lock()
+                .await
+                .in_flight
+                .contains_key(&human_request.request_id)
+        );
+        assert!(agent_receiver.try_recv().is_ok(), "解绑必须通知 Agent");
+        while agent_receiver.try_recv().is_ok() {}
+        while ai_receiver.try_recv().is_ok() {}
+        while human_receiver.try_recv().is_ok() {}
+        let cancel = test_remote_request(
+            session_id,
+            RemoteOperation::CancelRequest {
+                request_id: ai_request.request_id,
+            },
+        );
+        relay
+            .forward_controller_request(
+                human_id,
+                human_generation,
+                cancel,
+                &ai_sender(&relay, human_id).await,
+            )
+            .await;
+        let authorized = recv_authorized(&mut agent_receiver).await;
+        assert!(
+            matches!(authorized.request.operation, RemoteOperation::CancelRequest { request_id } if request_id == ai_request.request_id)
+        );
+        assert_eq!(
+            authorized.authorization.controller_kind,
+            ControllerKind::Human
+        );
+        let completed = WireMessage::RemoteResponse(remoteops_protocol::RemoteResponse {
+            request_id: ai_request.request_id,
+            session_id,
+            exit_code: Some(0),
+            summary: "done".to_owned(),
+            error_code: None,
+            payload_base64: None,
+            sha256: None,
+            details: None,
+        });
+        relay
+            .forward_agent_message(agent_id, agent.connection_generation + 1, completed.clone())
+            .await;
+        assert!(
+            relay
+                .state
+                .lock()
+                .await
+                .in_flight
+                .contains_key(&ai_request.request_id)
+        );
+        relay
+            .forward_agent_message(agent_id, agent.connection_generation, completed.clone())
+            .await;
+        relay
+            .forward_agent_message(agent_id, agent.connection_generation, completed)
+            .await;
+        assert!(
+            matches!(human_receiver.try_recv(), Ok(WireMessage::RemoteResponse(response)) if response.request_id == ai_request.request_id)
+        );
+        assert!(human_receiver.try_recv().is_err(), "原请求终态只能交付一次");
+        assert!(
+            ai_receiver.try_recv().is_err(),
+            "已解绑 Controller 不得收到旧响应"
+        );
+        if let Some(receiver) = &mut replacement_receiver {
+            assert!(receiver.try_recv().is_err(), "新 AI 绑定不得继承旧请求响应");
+        }
+        assert!(
+            !relay
+                .state
+                .lock()
+                .await
+                .in_flight
+                .contains_key(&ai_request.request_id)
+        );
+        assert!(
+            relay
+                .state
+                .lock()
+                .await
+                .in_flight
+                .contains_key(&human_request.request_id)
+        );
+        relay
+            .forward_controller_request(
+                human_id,
+                human_generation,
+                test_remote_request(
+                    session_id,
+                    RemoteOperation::CancelRequest {
+                        request_id: ai_request.request_id,
+                    },
+                ),
+                &ai_sender(&relay, human_id).await,
+            )
+            .await;
+        assert!(
+            matches!(human_receiver.try_recv(), Ok(WireMessage::Error { code, .. }) if code == "cancel_target_not_found")
+        );
+        relay
+            .mark_agent_disconnected(agent_id, agent.connection_generation)
+            .await;
+        assert!(relay.state.lock().await.in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnected_ai_request_remains_cancellable_by_human() {
+        check_detached_ai_remains_cancellable(DetachTest::Disconnect).await;
+    }
+
+    #[tokio::test]
+    async fn released_ai_request_remains_cancellable_by_human() {
+        check_detached_ai_remains_cancellable(DetachTest::Release).await;
+    }
+
+    #[tokio::test]
+    async fn replaced_ai_request_remains_owned_by_original_generation() {
+        check_detached_ai_remains_cancellable(DetachTest::Replace).await;
+    }
+
+    #[tokio::test]
+    async fn reconnected_instance_cannot_inherit_prior_generation_requests() {
+        check_detached_ai_remains_cancellable(DetachTest::Reconnect).await;
+    }
+
+    #[tokio::test]
+    async fn same_generation_repair_does_not_reactivate_old_binding_results() {
+        check_detached_ai_remains_cancellable(DetachTest::Repair).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn controller_idle_cleanup_revokes_binding_and_allows_new_generation() {
+        let relay = relay(Duration::minutes(10));
+        let (agent, mut agent_receiver, session_id) =
+            ready_agent(&relay, AgentInstanceId::new(), None).await;
+        let (id, generation, _receiver) = register_controller(&relay, ControllerKind::Ai).await;
+        assert!(
+            relay
+                .pair_controller(
+                    id,
+                    generation,
+                    PairRequest {
+                        request_id: RequestId::new(),
+                        pairing_code: agent.welcome.pairing_code,
+                        permission_mode: PermissionMode::ApprovalRequired,
+                    }
+                )
+                .await
+                .error
+                .is_none()
+        );
+        while agent_receiver.try_recv().is_ok() {}
+        tokio::time::advance(CONTROLLER_IDLE_TIMEOUT).await;
+        relay.cleanup_stale_controllers().await;
+        assert!(!relay.state.lock().await.controllers.contains_key(&id));
+        assert!(
+            !relay
+                .state
+                .lock()
+                .await
+                .session_bindings
+                .contains_key(&session_id)
+        );
+        assert!(matches!(
+            agent_receiver.try_recv(),
+            Ok(WireMessage::ControllerBindingRevoked { .. })
+        ));
+        let (sender, _receiver) = test_channel();
+        let next = relay
+            .register_controller(id, test_owner_id(), ControllerKind::Ai, None, None, sender)
+            .await
+            .unwrap();
+        assert!(next > generation);
+        assert!(!relay.touch_controller(id, generation).await);
+        relay.remove_controller(id, generation).await;
+        assert!(relay.state.lock().await.controllers.contains_key(&id));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_racing_idle_cleanup_preserves_active_controller() {
+        let relay = relay(Duration::minutes(10));
+        let (id, generation, _receiver) = register_controller(&relay, ControllerKind::Ai).await;
+        tokio::time::advance(CONTROLLER_IDLE_TIMEOUT).await;
+        let stale_before = time::Instant::now() - CONTROLLER_IDLE_TIMEOUT;
+        assert!(relay.touch_controller(id, generation).await);
+        relay
+            .remove_controller_before(id, generation, Some(stale_before))
+            .await;
+        assert!(relay.state.lock().await.controllers.contains_key(&id));
+        relay.cleanup_stale_controllers().await;
+        assert!(relay.state.lock().await.controllers.contains_key(&id));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_controller_partial_frame_is_closed_without_reusing_transport() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let relay = Arc::new(relay(Duration::minutes(10)));
+        let (stream, mut peer) = tokio::io::duplex(4096);
+        let controller_id = ControllerInstanceId::new();
+        write_frame(
+            &mut peer,
+            &WireMessage::Hello(ClientHello::Controller(ControllerHello {
+                protocol_version: PROTOCOL_VERSION,
+                controller_instance_id: controller_id,
+                owner_id: test_owner_id(),
+                kind: ControllerKind::Ai,
+                auth_token: AI_TOKEN.to_owned(),
+                hostname: None,
+                mac_address: None,
+            })),
+        )
+        .await
+        .unwrap();
+        let server = relay.clone();
+        let task = tokio::spawn(async move { server.handle_client(stream).await });
+        assert!(matches!(
+            read_frame::<WireMessage, _>(&mut peer).await.unwrap(),
+            WireMessage::ControllerWelcome { .. }
+        ));
+        peer.write_all(&[0, 0]).await.unwrap();
+        tokio::time::advance(CONTROLLER_IDLE_TIMEOUT).await;
+        relay.cleanup_stale_controllers().await;
+        assert!(task.await.unwrap().is_ok());
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+        assert!(
+            !relay
+                .state
+                .lock()
+                .await
+                .controllers
+                .contains_key(&controller_id)
         );
     }
 

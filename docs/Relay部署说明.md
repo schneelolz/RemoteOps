@@ -200,3 +200,7 @@ docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml l
    ```
 
 禁止使用 `docker compose down -v`，也不要删除 `remoteops-relay-data`。该卷保存 Agent 恢复状态、控制码、会话绑定和审计数据。
+
+## MCP 一次性安装配置
+
+管理页新增「MCP 接入」：管理员显式设置对外 TLS 地址、HTTPS 登记地址和可选公开 CA 后，可签发默认 24 小时的一次性安装码/文件，并查看状态或撤销独立客户端。登记只配置 Codex MCP，不配对 Agent 或授予完全控制。登记 SQLite 与原 JSON 状态需要一致备份；完整部署、重试和撤销边界见 [MCP 一次性安装配置](mcp-one-time-setup.md)。
