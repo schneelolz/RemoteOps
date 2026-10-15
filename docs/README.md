@@ -11,7 +11,7 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 ## 安装和使用
 
 - [Relay 部署说明](Relay部署说明.md)
-- [现场被控端 GUI 使用说明](现场被控端GUI使用说明.md)
+- [现场被控端 GUI 使用说明](现场被控端GUI使用说明.md)（含空闲高 CPU 与渲染恢复诊断）
 - [控制权限与默认模式](control-permissions.md)
 - [Agent Windows Service 部署说明](../deploy/agent-service/windows/README.md)
 - Linux Headless Agent：`deploy/agent-service/linux`（Ubuntu 24.04 x86_64，systemd）

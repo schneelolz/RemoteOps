@@ -13,6 +13,7 @@ use std::{
 };
 
 mod appearance;
+mod render_recovery;
 use appearance::{Appearance, Palette};
 
 use chrono::{DateTime, Local, Utc};
@@ -2386,14 +2387,15 @@ impl eframe::App for RemoteOpsAgentApp {
             egui::CentralPanel::default()
                 .frame(Frame::new().fill(background).inner_margin(Margin::ZERO))
                 .show(ui, |ui| self.render_setup(ui));
-            ctx.request_repaint_after(Duration::from_secs(1));
+            ctx.request_repaint_after(render_recovery::REPAINT_INTERVAL);
             return;
         }
         if self.receive_events() {
             ctx.request_repaint();
         }
-        // 加载动画仅在控制码区域可见时请求重绘；其余状态按秒刷新。
-        ctx.request_repaint_after(Duration::from_secs(1));
+        // 同时保证表面失效、立即重试被抑制后仍有下一次恢复机会。
+        // 不可移除此定时唤醒；加载动画仅在控制码区域可见时额外请求重绘。
+        ctx.request_repaint_after(render_recovery::REPAINT_INTERVAL);
         if matches!(self.status, UiStatus::Stopped) && !self.allow_close {
             self.allow_close = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -2419,7 +2421,6 @@ impl eframe::App for RemoteOpsAgentApp {
         self.render_stop_confirmation(&ctx);
         self.render_advanced_settings(&ctx);
         self.render_certificate_confirmation(&ctx);
-        ctx.request_repaint_after(Duration::from_secs(1));
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -3033,6 +3034,9 @@ fn run_gui(args: Args, diagnostics: &StartupDiagnostics) -> std::process::ExitCo
     let initial_setup = matches!(&startup, StartupState::Setup(_));
     diagnostics.record_detail("renderer", renderer);
     let mut native_options = agent_native_options(renderer, initial_setup);
+    if renderer == eframe::Renderer::Wgpu {
+        render_recovery::configure_surface_recovery(&mut native_options, diagnostics.clone());
+    }
     if let Some(path) = demo_persistence {
         native_options.persistence_path = Some(path);
     }
@@ -3934,6 +3938,44 @@ mod tests {
                         .expect("应实际绘制设置按钮");
                     assert!(mode_rect.right() < settings_text.pos.x);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn connected_idle_ui_keeps_a_bounded_surface_recovery_wakeup() {
+        let ctx = egui::Context::default();
+        configure_fonts(&ctx);
+        install_style(&ctx);
+        let mut app = test_app();
+        app.status = UiStatus::Controlled;
+        app.pairing_code = Some("123456789".into());
+        app.pairing_code_expires_at = Some(Utc::now() + chrono::Duration::minutes(5));
+        app.layout_is_setup = Some(false);
+        app.window_centering = WindowCenteringState::Complete;
+        let mut frame = eframe::Frame::_new_kittest();
+        for tick in 0..8 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(f64::from(tick)),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        RUNNING_WINDOW_SIZE,
+                    )),
+                    ..Default::default()
+                },
+                |ui| eframe::App::ui(&mut app, ui, &mut frame),
+            );
+            if tick >= 4 {
+                let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+                assert!(
+                    delay >= Duration::from_millis(900),
+                    "idle busy loop: {delay:?}"
+                );
+                assert!(
+                    delay <= render_recovery::REPAINT_INTERVAL,
+                    "recovery stalled: {delay:?}"
+                );
             }
         }
     }
