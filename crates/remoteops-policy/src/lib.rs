@@ -179,7 +179,7 @@ impl DefaultPolicy {
             } if self.classify_command(Some(*shell), command) != RiskLevel::ReadOnly
         ) {
             return PolicyDecision::Deny {
-                reason: "命令未匹配结构化只读白名单，已拒绝执行".to_owned(),
+                reason: "命令未匹配结构化只读白名单，已拒绝执行。仅支持白名单中的单条查询，最长 4096 字节；命令文本不得包含换行、分号、管道、重定向、命令连接符或反引号。PowerShell 参数只接受字面量，不支持变量展开、子表达式、脚本块或会写入变量的参数；环境变量可单独查询（如 $env:LOCALAPPDATA），再用返回的实际路径进行下一次查询。请拆分查询，并在控制端筛选和格式化输出；完全控制也不会放宽只读白名单。".to_owned(),
             };
         }
         if matches!(
@@ -1418,6 +1418,57 @@ mod tests {
                 PolicyDecision::Allow,
                 "白名单命令应允许：{command}"
             );
+        }
+    }
+
+    #[test]
+    fn directory_diagnostic_can_be_split_into_readonly_queries() {
+        let policy = DefaultPolicy::default();
+        for shell in [ShellKind::WindowsPowerShell, ShellKind::PowerShell] {
+            for command in [
+                "$env:LOCALAPPDATA",
+                r"Get-ChildItem -LiteralPath 'C:\Users\example\AppData\Local\A HUB' -Recurse -Depth 2 -ErrorAction SilentlyContinue",
+                r"Get-ChildItem -LiteralPath 'C:\Program Files' -Directory -ErrorAction SilentlyContinue",
+                r"Get-ChildItem -LiteralPath 'C:\Program Files (x86)' -Directory -ErrorAction SilentlyContinue",
+            ] {
+                let operation = RemoteOperation::RunCommand {
+                    shell,
+                    command: command.to_owned(),
+                    readonly: true,
+                };
+                assert_eq!(
+                    policy.evaluate(EventSource::Ai, &operation),
+                    PolicyDecision::Allow,
+                    "拆分后的目录查询应允许：{shell:?} {command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn composite_directory_diagnostic_is_denied_in_every_permission_mode() {
+        let policy = DefaultPolicy::default();
+        let command = r#"Write-Output '=== A HUB in LOCALAPPDATA ==='; Get-ChildItem "$env:LOCALAPPDATA\A HUB" -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 300; Write-Output '=== A HUB install dirs ==='; Get-ChildItem -Path 'C:\Program Files','C:\Program Files (x86)' -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'HUB|Rapoo|雷柏' } | Select-Object FullName"#;
+        for shell in [ShellKind::WindowsPowerShell, ShellKind::PowerShell] {
+            let operation = RemoteOperation::RunCommand {
+                shell,
+                command: command.to_owned(),
+                readonly: true,
+            };
+            for mode in [
+                PermissionMode::ReadOnly,
+                PermissionMode::ApprovalRequired,
+                PermissionMode::ControllerApproved,
+                PermissionMode::FullAccess,
+            ] {
+                assert!(
+                    matches!(
+                        policy.evaluate_with_mode(mode, EventSource::Ai, &operation),
+                        PolicyDecision::Deny { .. }
+                    ),
+                    "复合查询不能通过权限切换绕过只读校验：{shell:?} {mode:?}"
+                );
+            }
         }
     }
 
