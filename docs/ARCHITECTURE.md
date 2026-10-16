@@ -20,7 +20,7 @@
 | `remoteops-audit` | 审计记录、哈希和敏感信息脱敏 |
 | `remoteops-application` | 把连接、策略、审批和事件串成 Controller 用例 |
 | `remoteops-ai` | 调用 OpenAI 兼容接口和执行工具循环 |
-| `remoteops-agent` | 当前 Agent 的运行逻辑和 CLI 入口，后续会拆出 runtime 类库 |
+| `remoteops-agent` | 已可复用的 Agent 运行库与 CLI 入口 |
 | `remoteops-controller-gui` | Controller 窗口、按钮、终端和状态展示 |
 | `remoteops-controller-cli` | Controller 命令行参数和终端输出 |
 | `remoteops-controller-mcp` | 把 MCP 工具和确认请求接到核心服务 |
@@ -38,7 +38,11 @@
 
 1. 先保持当前接口和行为不变，记录每个模块的职责。
 2. 从 Controller GUI 后端提取可共享的 AI 会话和操作编排。
-3. 从 `apps/remoteops-agent` 提取 `remoteops-agent-runtime` 类库，让 CLI、GUI 和 Service 共用。
+3. 持续复用已有 Agent 运行库和 GUI 公共宿主，避免产品复制底座实现。
 4. 补齐公共接口说明和依赖边界检查。
 
 这是一项维护性整理，不要求为了拆文件而改变用户操作方式、协议或配置格式。
+
+## 公共底座与薄产品
+
+Agent GUI 现提供公共库入口；产品配置与构建资源分别位于 `remoteops-product` 和 `remoteops-build`。RemoteOps 默认入口与独立中性示例复用同一宿主。职责、实际接口、固定依赖版本、外部构建验证及迁移步骤见 [薄产品接入与迁移](product-integration.md)。

@@ -778,7 +778,7 @@ mod tests {
         );
         state.sessions.lock().await.insert(
             "valid-session".to_owned(),
-            Instant::now() + StdDuration::from_secs(60),
+            Instant::now() + StdDuration::from_mins(1),
         );
         assert!(
             authorize(&state, &headers).await.is_ok(),

@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-agent"
-version = "0.2.0-preview.26"
+version = "0.2.0-preview.27"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,8 @@ OriginalFilename = "remoteops-agent.exe"
 LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [dependencies]
+remoteops-product = { path = "../../crates/remoteops-product" }
+tempfile = "3"
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
@@ -37,6 +39,7 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [build-dependencies]
+remoteops-build = { path = "../../crates/remoteops-build" }
 winresource.workspace = true
 
 [lints]

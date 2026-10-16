@@ -1,4 +1,4 @@
-//! Bounded HTTP host for one-time MCP enrollment. The SQLite crate owns durable rules.
+//! Bounded HTTP host for one-time MCP enrollment. The `SQLite` crate owns durable rules.
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -25,7 +25,7 @@ use crate::admin::{AdminState, ErrorResponse, authorize};
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ErrorResponse>)>;
 const BODY_LIMIT: usize = MAX_SETUP_BYTES;
-const WINDOW: Duration = Duration::from_secs(60);
+const WINDOW: Duration = Duration::from_mins(1);
 const MAX_PEERS: usize = 1024;
 const PER_PEER_LIMIT: u32 = 30;
 const GLOBAL_LIMIT: u32 = 240;

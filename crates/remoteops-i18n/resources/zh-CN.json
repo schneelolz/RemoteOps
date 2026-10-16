@@ -1,4 +1,6 @@
 {
+  "agent.operation.result_cancelled": "已取消",
+  "agent.operation.result_interrupted": "已中断",
   "control.unavailable": "连接不可用，请等待重连后重试",
   "control.full": "完全控制",
   "control.title": "控制权限",

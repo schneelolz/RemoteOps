@@ -44,6 +44,7 @@ keyring = "4.1"
 keyring-core = "1.0"
 
 [build-dependencies]
+remoteops-build = { path = "../../crates/remoteops-build" }
 winresource.workspace = true
 
 # Supply winit's platform backend for Linux workspace checks.

@@ -4,7 +4,19 @@
 //! 状态。GUI 和 Windows Service 只负责宿主生命周期与展示，不能绕过这里的
 //! 权限、Session 和操作校验。
 
+/// Redact host diagnostic text using the same public audit policy as operation logs.
+#[must_use]
+pub fn redact_diagnostic(text: &str) -> String {
+    static REDACTOR: std::sync::OnceLock<remoteops_audit::Redactor> = std::sync::OnceLock::new();
+    REDACTOR
+        .get_or_init(remoteops_audit::Redactor::default)
+        .redact(text)
+}
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod operation_log;
+mod product;
+pub use remoteops_product::{EndpointPolicy, ProductProfile};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -63,6 +75,7 @@ use tokio::{
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+static NEXT_EVENT_EPOCH: AtomicU64 = AtomicU64::new(1);
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TRANSFER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_PENDING_TASKS: usize = 32;
@@ -164,21 +177,37 @@ impl AgentConfig {
     ///
     /// 显式配置文件不存在、无法读取或 JSON 格式无效时返回错误。
     pub fn load_file(config_path: Option<&Path>) -> anyhow::Result<Self> {
-        let path = config_path.map_or_else(active_agent_config_path, Path::to_path_buf);
+        Self::load_file_with_profile(config_path, &ProductProfile::default())
+    }
+
+    /// Load once, retaining the difference between absent and explicitly false preferences.
+    /// # Errors
+    /// Reports invalid JSON, paths, and fixed endpoint conflicts.
+    pub fn load_file_with_profile(
+        config_path: Option<&Path>,
+        profile: &ProductProfile,
+    ) -> anyhow::Result<Self> {
+        profile.validate()?;
+        let path =
+            config_path.map_or_else(|| Self::product_config_path(profile), Path::to_path_buf);
         if !path.exists() {
             if config_path.is_some() {
                 bail!("Agent 配置文件不存在：{}", path.display());
             }
-            return Ok(Self::default());
+            return Ok(Self::for_product(profile));
         }
 
         let text = fs::read_to_string(&path)
             .with_context(|| format!("无法读取 Agent 配置文件 {}", path.display()))?;
-        let file_config: AgentFileConfig = serde_json::from_str(&text)
+        let stored: product::StoredAgentConfig = serde_json::from_str(&text)
             .with_context(|| format!("Agent 配置文件格式无效：{}", path.display()))?;
+        let file_config = stored.config;
         let base_directory = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut config = Self::default();
+        let mut config = Self::for_product(profile);
         if let Some(relay) = file_config.relay {
+            if relay != config.relay && file_config.server_name.is_none() {
+                config.server_name.clear();
+            }
             config.relay = relay;
         }
         if let Some(server_name) = file_config.server_name {
@@ -187,7 +216,9 @@ impl AgentConfig {
         config.ca_cert = file_config
             .ca_cert
             .map(|path| resolve_config_path(base_directory, path));
-        config.default_full_control = file_config.default_full_control;
+        config.default_full_control = stored
+            .default_full_control
+            .unwrap_or(profile.default_full_control);
         config.tls_fingerprint = file_config.tls_fingerprint;
         if let Some(retry_seconds) = file_config.retry_seconds {
             config.retry_seconds = retry_seconds;
@@ -316,34 +347,10 @@ fn select_agent_config_path(portable: PathBuf, legacy: PathBuf) -> PathBuf {
 fn replace_file_recoverably(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map_or_else(|| "tmp".to_owned(), |value| format!("{value}.tmp"));
-    let temporary = path.with_extension(extension);
-    let backup = path.with_extension("json.bak");
-    {
-        let mut file = fs::File::create(&temporary)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-    }
-    let had_original = path.exists();
-    if had_original {
-        if backup.exists() {
-            fs::remove_file(&backup)?;
-        }
-        fs::rename(path, &backup)?;
-    }
-    if let Err(error) = fs::rename(&temporary, path) {
-        if had_original {
-            let _ = fs::rename(&backup, path);
-        }
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if had_original {
-        let _ = fs::remove_file(backup);
-    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -373,6 +380,10 @@ fn infer_server_name(relay: &str) -> anyhow::Result<String> {
 /// Agent 向表现层报告的生命周期事件。
 #[derive(Clone, Debug)]
 pub enum AgentEvent {
+    /// A new transport epoch for opt-in presentation hosts.
+    ConnectionEpoch(u64),
+    /// Task events scoped to the transport that produced them.
+    ScopedOperation { epoch: u64, event: Box<AgentEvent> },
     /// Relay 已确认或拒绝现场控制权限请求。
     ControlStateResult(ControlStateResult),
     /// 自动授权已发出，等待 Relay 确认。
@@ -440,6 +451,10 @@ pub enum AgentEvent {
 /// 供本地表现层跟踪的远程请求执行阶段。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentOperationState {
+    /// Request was explicitly cancelled.
+    Cancelled,
+    /// Transport or session ended before completion.
+    Interrupted,
     /// 操作已经开始执行。
     Running,
     /// 操作已成功完成。
@@ -500,6 +515,7 @@ pub struct AgentPermissionControl {
     control_requests: tokio::sync::broadcast::Sender<ControlStateRequest>,
     default_full: Arc<AtomicBool>,
     auto_suppressed: Arc<AtomicBool>,
+    scoped_events: Arc<AtomicBool>,
     locally_revoked: Arc<RwLock<Option<SessionControlState>>>,
 }
 
@@ -513,6 +529,7 @@ impl AgentPermissionControl {
             control_requests: tokio::sync::broadcast::channel(16).0,
             default_full: Arc::new(AtomicBool::new(false)),
             auto_suppressed: Arc::new(AtomicBool::new(false)),
+            scoped_events: Arc::new(AtomicBool::new(false)),
             locally_revoked: Arc::new(RwLock::new(None)),
         }
     }
@@ -1090,6 +1107,31 @@ pub async fn run_agent_with_permission_control(
     .await
 }
 
+/// Run the existing runtime with transport-scoped task events for GUI consumers.
+/// # Errors
+/// Returns the same connection, device, and state errors as the default runtime.
+pub async fn run_agent_with_scoped_events(
+    config: AgentConfig,
+    event_sender: Option<AgentEventSender>,
+    shutdown: watch::Receiver<bool>,
+    permission_control: AgentPermissionControl,
+    visual_provider: Arc<dyn VisualProvider>,
+    visual_enabled: bool,
+) -> anyhow::Result<()> {
+    permission_control
+        .scoped_events
+        .store(true, Ordering::SeqCst);
+    run_agent_with_visual_provider(
+        config,
+        event_sender,
+        shutdown,
+        permission_control,
+        visual_provider,
+        visual_enabled,
+    )
+    .await
+}
+
 /// 使用表现层显式提供的视觉 Provider 运行 Agent。
 /// GUI 宿主通过此入口启用本机视觉能力，无需依赖进程环境变量。
 ///
@@ -1359,6 +1401,14 @@ where
         },
     );
 
+    let epoch = local_permission_policy
+        .permission_control
+        .scoped_events
+        .load(Ordering::SeqCst)
+        .then(|| NEXT_EVENT_EPOCH.fetch_add(1, Ordering::Relaxed));
+    if let Some(epoch) = epoch {
+        emit_agent_event(event_sender, AgentEvent::ConnectionEpoch(epoch));
+    }
     let (reader, mut writer) = tokio::io::split(stream);
     let (sender, mut receiver) = mpsc::unbounded_channel::<WireMessage>();
     let _ = sender.send(WireMessage::AgentPermissionModeChanged(
@@ -1366,9 +1416,9 @@ where
             permission_mode: *permission_mode_updates.borrow_and_update(),
         },
     ));
-    let log_observer = Arc::new(std::sync::Mutex::new(operation_log::LogObserver::new(
-        event_sender.cloned(),
-    )));
+    let log_observer = Arc::new(std::sync::Mutex::new(
+        operation_log::LogObserver::new(event_sender.cloned()).with_epoch(epoch),
+    ));
     let writer_logs = log_observer.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(message) = receiver.recv().await {
@@ -1391,6 +1441,7 @@ where
         BTreeMap::<FileTransferId, FileUploadRuntime>::new(),
     ));
     let mut controller_bindings = BTreeMap::<ControllerInstanceId, ControllerBinding>::new();
+    let mut default_queries = BTreeMap::<RequestId, (SessionControlState, Instant)>::new();
     let execution_bindings = Arc::new(RwLock::new(controller_bindings.clone()));
     let mut control_requests = local_permission_policy
         .permission_control
@@ -1496,10 +1547,19 @@ where
                         request_id,
                         session_id: state.session_id,
                         expected: Some(state.clone()),
-                        mode: Some(ControllerControlMode::FullAccess),
-                        source: Some(ControlSource::LocalDefault),
+                        mode: None,
+                        source: None,
                     }));
-                    emit_agent_event(event_sender, AgentEvent::ControlStatePending(request_id));
+                    default_queries
+                        .retain(|_, (_, started)| started.elapsed() < Duration::from_secs(5));
+                    default_queries.insert(request_id, (state.clone(), Instant::now()));
+                }
+                if let Some(state) = &binding.control_state {
+                    observe_control_transition(
+                        &controller_bindings,
+                        state,
+                        &local_permission_policy.permission_control,
+                    );
                 }
                 controller_bindings.insert(binding.controller_instance_id, binding);
                 publish_execution_bindings(&execution_bindings, &controller_bindings);
@@ -1517,6 +1577,11 @@ where
                 );
             }
             Ok(WireMessage::ControlStateUpdated(state)) => {
+                observe_control_transition(
+                    &controller_bindings,
+                    &state,
+                    &local_permission_policy.permission_control,
+                );
                 apply_control_state(&mut controller_bindings, &state);
                 publish_execution_bindings(&execution_bindings, &controller_bindings);
                 emit_controller_bindings(
@@ -1527,6 +1592,11 @@ where
             }
             Ok(WireMessage::ControlStateResult(result)) => {
                 if let Some(state) = &result.state {
+                    observe_control_transition(
+                        &controller_bindings,
+                        state,
+                        &local_permission_policy.permission_control,
+                    );
                     apply_control_state(&mut controller_bindings, state);
                     publish_execution_bindings(&execution_bindings, &controller_bindings);
                 }
@@ -1535,6 +1605,36 @@ where
                     &controller_bindings,
                     &local_permission_policy,
                 );
+                if let Some((queried, started)) = default_queries.remove(&result.request_id)
+                    && started.elapsed() < Duration::from_secs(5)
+                    && result.error.is_none()
+                    && let Some(state) = &result.state
+                    && same_control_binding(Some(&queried), Some(state))
+                    && controller_bindings
+                        .values()
+                        .any(|b| b.control_state.as_ref() == Some(state))
+                    && local_permission_policy
+                        .permission_control
+                        .default_full_control()
+                    && !local_permission_policy
+                        .permission_control
+                        .auto_suppressed
+                        .load(Ordering::SeqCst)
+                    && matches!(
+                        state.mode,
+                        ControllerControlMode::StepByStep | ControllerControlMode::Expired
+                    )
+                {
+                    let request_id = RequestId::new();
+                    let _ = sender.send(WireMessage::ControlStateRequest(ControlStateRequest {
+                        request_id,
+                        session_id: state.session_id,
+                        expected: Some(state.clone()),
+                        mode: Some(ControllerControlMode::FullAccess),
+                        source: Some(ControlSource::LocalDefault),
+                    }));
+                    emit_agent_event(event_sender, AgentEvent::ControlStatePending(request_id));
+                }
                 emit_agent_event(event_sender, AgentEvent::ControlStateResult(result));
             }
             Ok(WireMessage::AgentLeaseRenewed(AgentLeaseRenewed { lease_expires_at })) => {
@@ -1627,7 +1727,7 @@ where
                         continue;
                     }
                 };
-                operation_log::record_request(event_sender, &request);
+                operation_log::record_request(event_sender, &request, epoch);
                 if let RemoteOperation::CancelRequest {
                     request_id: target_request_id,
                 } = &request.operation
@@ -1882,6 +1982,27 @@ fn publish_execution_bindings(
 ) {
     if let Ok(mut snapshot) = target.write() {
         *snapshot = current.clone();
+    }
+}
+
+fn observe_control_transition(
+    bindings: &BTreeMap<ControllerInstanceId, ControllerBinding>,
+    state: &SessionControlState,
+    control: &AgentPermissionControl,
+) {
+    // Only an authoritative, newer explicit downgrade of this binding is revocation.
+    // Expiry, initial synchronization, and delayed events are not user intent.
+    if bindings
+        .values()
+        .filter_map(|b| b.control_state.as_ref())
+        .any(|old| {
+            same_control_binding(Some(old), Some(state))
+                && state.revision > old.revision
+                && old.mode == ControllerControlMode::FullAccess
+                && state.mode == ControllerControlMode::StepByStep
+        })
+    {
+        control.auto_suppressed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -4068,12 +4189,13 @@ fn print_agent_event(event: &AgentEvent) {
                 );
             }
         }
+        AgentEvent::ConnectionEpoch(_) | AgentEvent::OperationStateChanged { .. } => {}
+        AgentEvent::ScopedOperation { event, .. } => print_agent_event(event),
         AgentEvent::ControlStatePending(_) => println!("正在同步现场控制权限"),
         AgentEvent::ControlStateResult(result) => println!(
             "控制状态确认：{}",
             result.error.as_deref().unwrap_or("成功")
         ),
-        AgentEvent::OperationStateChanged { .. } => {}
         AgentEvent::OperationLog(log) => {
             println!("{}：{}", log.occurred_at.to_rfc3339(), log.message);
         }
@@ -5014,6 +5136,42 @@ mod tests {
             control_state: Some(test_control_state(session_id, controller_instance_id)),
             binding_token: "relay-only-binding-token".to_owned(),
         }
+    }
+
+    #[test]
+    fn only_new_authoritative_revocation_suppresses_defaults() {
+        let controller = ControllerInstanceId::new();
+        let session = SessionId::new();
+        let mut binding = binding(session, controller);
+        let mut old = binding.control_state.clone().unwrap();
+        old.mode = ControllerControlMode::FullAccess;
+        old.revision = 5;
+        binding.control_state = Some(old.clone());
+        let bindings = BTreeMap::from([(controller, binding)]);
+        let control = AgentPermissionControl::default();
+        control.set_default_full_control(true);
+        let mut state = old.clone();
+        state.revision = 6;
+        state.mode = ControllerControlMode::Expired;
+        observe_control_transition(&bindings, &state, &control);
+        assert!(!control.auto_suppressed.load(Ordering::SeqCst));
+        state.mode = ControllerControlMode::StepByStep;
+        state.revision = 4;
+        observe_control_transition(&bindings, &state, &control);
+        assert!(!control.auto_suppressed.load(Ordering::SeqCst));
+        state.revision = 6;
+        state.agent_generation += 1;
+        observe_control_transition(&bindings, &state, &control);
+        assert!(!control.auto_suppressed.load(Ordering::SeqCst));
+        state.agent_generation = old.agent_generation;
+        observe_control_transition(&bindings, &state, &control);
+        assert!(control.auto_suppressed.load(Ordering::SeqCst));
+        assert!(control.default_full_control());
+        assert!(
+            !AgentPermissionControl::default()
+                .auto_suppressed
+                .load(Ordering::SeqCst)
+        );
     }
 
     fn authorized_request(

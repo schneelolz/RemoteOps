@@ -16,6 +16,7 @@ OriginalFilename = "remoteops-ssh-askpass.exe"
 LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [build-dependencies]
+remoteops-build = { path = "../../crates/remoteops-build" }
 winresource.workspace = true
 
 [lints]

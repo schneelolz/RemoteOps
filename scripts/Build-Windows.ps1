@@ -129,6 +129,12 @@ try {
         @{ File = 'remoteops-serial-demo.exe'; Package = 'remoteops-serial-demo' },
         @{ File = 'remoteops-mcp-smoke.exe'; Package = 'remoteops-mcp-smoke' }
     )
+    $sourceCommit = (& git -C $workspaceRoot rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) { throw '无法确定实际源码提交' }
+    $sourceDirty = [bool](& git -C $workspaceRoot status --porcelain)
+    $protocolSource = Get-Content -LiteralPath (Join-Path $workspaceRoot 'crates/remoteops-protocol/src/message.rs') -Raw
+    if ($protocolSource -notmatch 'PROTOCOL_VERSION: u16 = (\d+)') { throw '无法读取实际协议版本' }
+    $protocolVersion = [int]$Matches[1]
     $manifest = foreach ($binary in $binaries) {
         $releaseVersion = $packageVersions[$binary.Package]
         if ([string]::IsNullOrWhiteSpace($releaseVersion)) {
@@ -157,6 +163,9 @@ try {
         [PSCustomObject]@{
             File = $item.Name
             Package = $binary.Package
+            SourceCommit = $sourceCommit
+            SourceDirty = $sourceDirty
+            ProtocolVersion = $protocolVersion
             CargoVersion = $releaseVersion
             FileVersion = $fileVersion
             ProductVersion = $productVersion

@@ -166,6 +166,47 @@ async fn verify_local_execution(
             && local.expires_at.is_none(),
         "现场授权状态错误"
     );
+    let repeated = client
+        .request_control_state(ControlStateRequest {
+            request_id: RequestId::new(),
+            session_id: session,
+            expected: Some(local.clone()),
+            mode: Some(ControllerControlMode::FullAccess),
+            source: Some(ControlSource::Mcp),
+        })
+        .await?;
+    ensure!(repeated == local, "Relay 必须保留有效现场授权");
+    write_frame(
+        agent,
+        &WireMessage::AgentPermissionModeChanged(AgentPermissionModeChanged {
+            permission_mode: PermissionMode::ControllerApproved,
+        }),
+    )
+    .await?;
+    // Agent-side query orders the assertion after the repeated permission report on the same stream.
+    let query = RequestId::new();
+    write_frame(
+        agent,
+        &WireMessage::ControlStateRequest(ControlStateRequest {
+            request_id: query,
+            session_id: session,
+            expected: None,
+            mode: None,
+            source: None,
+        }),
+    )
+    .await?;
+    loop {
+        if let WireMessage::ControlStateResult(result) = receive(agent).await?
+            && result.request_id == query
+        {
+            ensure!(
+                result.state.as_ref() == Some(&local),
+                "重复权限上报不能清空授权"
+            );
+            break;
+        }
+    }
     let target = session.to_string();
     let execute = client.execute_with_control(
         &target,

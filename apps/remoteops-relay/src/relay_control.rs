@@ -263,6 +263,18 @@ impl Relay {
                         .as_mut()
                         .and_then(|binding| binding.control_state.as_mut())
                         .expect("已验证授权快照");
+                    // Repeated MCP requests cannot shorten or relabel an active local grant.
+                    if mode == ControllerControlMode::FullAccess
+                        && latest.mode == ControllerControlMode::FullAccess
+                        && request.source == Some(ControlSource::Mcp)
+                    {
+                        let _ = sender.send(WireMessage::ControlStateResult(ControlStateResult {
+                            request_id: request.request_id,
+                            state: Some(latest.clone()),
+                            error: None,
+                        }));
+                        return;
+                    }
                     latest.mode = mode;
                     latest.revision = next_revision();
                     latest.source = (mode == ControllerControlMode::FullAccess)

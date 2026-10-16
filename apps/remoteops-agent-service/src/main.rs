@@ -159,6 +159,8 @@ fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: Agen
         // 操作日志不改变服务状态，避免按输出行重复写入状态文件。
         AgentEvent::OperationLog(_)
         | AgentEvent::OperationStateChanged { .. }
+        | AgentEvent::ConnectionEpoch(_)
+        | AgentEvent::ScopedOperation { .. }
         | AgentEvent::ControlStatePending(_)
         | AgentEvent::ControlStateResult(_) => return,
         AgentEvent::Reconnecting { .. } => {

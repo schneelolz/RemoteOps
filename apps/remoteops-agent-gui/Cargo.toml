@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.27"
+version = "0.2.0-preview.28"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,8 @@ OriginalFilename = "remoteops-agent-gui.exe"
 LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [dependencies]
+remoteops-product = { path = "../../crates/remoteops-product" }
+serde_json.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -36,6 +38,7 @@ rfd = { version = "0.15.4", default-features = false }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
 [build-dependencies]
+remoteops-build = { path = "../../crates/remoteops-build" }
 winresource.workspace = true
 
 # Allow workspace checks on Linux; the Linux release still ships headless only.

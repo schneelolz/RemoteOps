@@ -1911,6 +1911,14 @@ impl RemoteOpsMcp {
             McpControlMode::StepByStep => ControllerControlMode::StepByStep,
             McpControlMode::FullAccess => ControllerControlMode::FullAccess,
         };
+        if mode == ControllerControlMode::FullAccess
+            && expected.mode == ControllerControlMode::FullAccess
+            && expected
+                .expires_at
+                .is_none_or(|expires| expires > chrono::Utc::now())
+        {
+            return Ok(Json(control_output(&expected)));
+        }
         let state = self
             .client
             .request_control_state(ControlStateRequest {

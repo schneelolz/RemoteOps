@@ -3759,7 +3759,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.26"
+version = "0.2.0-preview.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3767,15 +3767,18 @@ dependencies = [
  "chrono",
  "clap",
  "remoteops-audit",
+ "remoteops-build",
  "remoteops-device",
  "remoteops-domain",
  "remoteops-host-identity",
  "remoteops-policy",
+ "remoteops-product",
  "remoteops-protocol",
  "remoteops-serial",
  "remoteops-visual",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3785,7 +3788,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.27"
+version = "0.2.0-preview.28"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3793,14 +3796,17 @@ dependencies = [
  "eframe",
  "egui-phosphor",
  "remoteops-agent",
+ "remoteops-build",
  "remoteops-device",
  "remoteops-domain",
  "remoteops-i18n",
+ "remoteops-product",
  "remoteops-protocol",
  "remoteops-visual",
  "rfd",
  "rustls",
  "serde",
+ "serde_json",
  "tokio",
  "winit",
  "winresource",
@@ -3814,6 +3820,7 @@ dependencies = [
  "chrono",
  "clap",
  "remoteops-agent",
+ "remoteops-build",
  "remoteops-domain",
  "serde",
  "serde_json",
@@ -3870,6 +3877,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "remoteops-build"
+version = "0.1.0"
+dependencies = [
+ "winresource",
+]
+
+[[package]]
 name = "remoteops-control-smoke"
 version = "0.2.0-preview.5"
 dependencies = [
@@ -3894,6 +3908,7 @@ dependencies = [
  "hex",
  "remoteops-application",
  "remoteops-audit",
+ "remoteops-build",
  "remoteops-domain",
  "remoteops-protocol",
  "serde_json",
@@ -3919,6 +3934,7 @@ dependencies = [
  "remoteops-ai",
  "remoteops-application",
  "remoteops-audit",
+ "remoteops-build",
  "remoteops-domain",
  "remoteops-i18n",
  "remoteops-protocol",
@@ -3935,7 +3951,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-mcp"
-version = "0.2.0-preview.13"
+version = "0.2.0-preview.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3949,6 +3965,7 @@ dependencies = [
  "rcgen",
  "remoteops-application",
  "remoteops-audit",
+ "remoteops-build",
  "remoteops-domain",
  "remoteops-enrollment",
  "remoteops-protocol",
@@ -3976,6 +3993,7 @@ version = "0.2.0-preview.5"
 dependencies = [
  "anyhow",
  "clap",
+ "remoteops-build",
  "serde",
  "serde_json",
  "winresource",
@@ -4075,6 +4093,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
+ "remoteops-build",
  "rmcp",
  "serde_json",
  "tokio",
@@ -4090,6 +4109,13 @@ dependencies = [
  "remoteops-domain",
  "remoteops-serial",
  "serde",
+]
+
+[[package]]
+name = "remoteops-product"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
@@ -4117,7 +4143,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-relay"
-version = "0.2.0-preview.7"
+version = "0.2.0-preview.8"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4127,6 +4153,7 @@ dependencies = [
  "hex",
  "rand",
  "rcgen",
+ "remoteops-build",
  "remoteops-domain",
  "remoteops-enrollment",
  "remoteops-enrollment-store",
@@ -4166,6 +4193,7 @@ dependencies = [
  "crossterm",
  "hex",
  "remoteops-ai",
+ "remoteops-build",
  "remoteops-device",
  "remoteops-domain",
  "remoteops-serial",
@@ -4187,6 +4215,7 @@ dependencies = [
 name = "remoteops-ssh-askpass"
 version = "0.2.0-preview.6"
 dependencies = [
+ "remoteops-build",
  "winresource",
 ]
 
@@ -6399,9 +6428,9 @@ dependencies = [
 
 [[package]]
 name = "winresource"
-version = "0.1.31"
+version = "0.1.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
 dependencies = [
  "toml",
  "version_check",
