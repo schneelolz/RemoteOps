@@ -38,6 +38,16 @@ impl Language {
             .map_or(Self::ZhCn, |value| Self::parse(&value))
     }
 
+    /// Detect system language without consulting another product's environment prefix.
+    #[must_use]
+    pub fn detect_system() -> Self {
+        env::var("LANGUAGE")
+            .or_else(|_| env::var("LANG"))
+            .ok()
+            .or_else(sys_locale::get_locale)
+            .map_or(Self::ZhCn, |value| Self::parse(&value))
+    }
+
     /// 返回稳定语言标识。
     #[must_use]
     pub const fn code(self) -> &'static str {
@@ -132,6 +142,13 @@ impl Translator {
     pub fn overlay_file(&mut self, path: impl AsRef<Path>) -> Result<(), I18nError> {
         let text = fs::read_to_string(path)?;
         let entries: BTreeMap<String, String> = serde_json::from_str(&text)?;
+        self.overlay_entries(entries)
+    }
+
+    /// Overlay product-owned localized text.
+    /// # Errors
+    /// Empty keys or values are rejected.
+    pub fn overlay_entries(&mut self, entries: BTreeMap<String, String>) -> Result<(), I18nError> {
         for (key, value) in &entries {
             if key.trim().is_empty() || value.trim().is_empty() {
                 return Err(I18nError::InvalidEntry);

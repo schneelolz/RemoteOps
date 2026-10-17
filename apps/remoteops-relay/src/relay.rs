@@ -1627,7 +1627,7 @@ impl Relay {
         .await
     }
 
-    /// Include recent activity of live connections without writing SQLite on every heartbeat.
+    /// Include recent activity of live connections without writing `SQLite` on every heartbeat.
     pub(crate) async fn mcp_clients(
         &self,
     ) -> Result<Vec<remoteops_enrollment::ClientSummary>, StoreError> {
@@ -2527,6 +2527,9 @@ impl Relay {
                     return;
                 };
                 if agent.connection_generation != connection_generation || !agent.ready {
+                    return;
+                }
+                if agent.permission_mode == permission_mode {
                     return;
                 }
                 agent.permission_mode = permission_mode;

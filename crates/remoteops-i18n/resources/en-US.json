@@ -1,4 +1,6 @@
 {
+  "agent.operation.result_cancelled": "Cancelled",
+  "agent.operation.result_interrupted": "Interrupted",
   "control.unavailable": "Connection unavailable. Retry after reconnecting.",
   "control.full": "Full control",
   "control.title": "Control permissions",

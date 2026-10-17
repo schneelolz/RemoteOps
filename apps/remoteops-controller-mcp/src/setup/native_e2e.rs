@@ -659,7 +659,7 @@ async fn native_os_store_real_relay_onboarding() -> anyhow::Result<()> {
     };
 
     let mut fixture = NativeFixture::start().await?;
-    let outcome = tokio::time::timeout(Duration::from_secs(120), fixture.exercise())
+    let outcome = tokio::time::timeout(Duration::from_mins(2), fixture.exercise())
         .await
         .context("native onboarding exceeded its bounded verification window");
     let cleanup = fixture.cleanup().await;

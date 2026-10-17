@@ -155,6 +155,7 @@ fn append_tail(previous: &str, piece: &str) -> String {
 
 /// 旁路观察已有协议事件；不影响请求执行、授权和网络消息。
 pub(super) struct LogObserver {
+    epoch: Option<u64>,
     /// 可选的本地表现层订阅端。
     sender: Option<AgentEventSender>,
     /// 重用现有审计层的脱敏规则。
@@ -171,12 +172,18 @@ impl LogObserver {
     /// 创建本地日志观察器。
     pub(super) fn new(sender: Option<AgentEventSender>) -> Self {
         Self {
+            epoch: None,
             sender,
             redactor: Redactor::default(),
             streams: BTreeMap::new(),
             interrupted_requests: BTreeSet::new(),
             discarded_streams: BTreeSet::new(),
         }
+    }
+
+    pub(super) fn with_epoch(mut self, epoch: Option<u64>) -> Self {
+        self.epoch = epoch;
+        self
     }
 
     /// 只读取操作事件和失败响应，绝不读取认证或文件二进制载荷。
@@ -275,7 +282,7 @@ impl LogObserver {
                     AgentLogLevel::Error,
                     "操作已中断",
                 );
-                self.emit_state(request_id, AgentOperationState::Failed);
+                self.emit_state(request_id, AgentOperationState::Cancelled);
             }
             _ => {}
         }
@@ -339,12 +346,13 @@ impl LogObserver {
         }
         self.interrupted_requests.insert((session_id, request_id));
         self.emit(Some(request_id), occurred_at, AgentLogLevel::Error, message);
-        self.emit_state(request_id, AgentOperationState::Failed);
+        self.emit_state(request_id, AgentOperationState::Interrupted);
     }
 
     /// 只在真实执行阶段变化时通知本地表现层，标准错误输出不改变执行状态。
     fn emit_state(&self, request_id: RequestId, state: AgentOperationState) {
-        emit_agent_event(
+        emit_scoped(
+            self.epoch,
             self.sender.as_ref(),
             AgentEvent::OperationStateChanged { request_id, state },
         );
@@ -383,7 +391,8 @@ impl LogObserver {
         level: AgentLogLevel,
         message: &str,
     ) {
-        emit_agent_event(
+        emit_scoped(
+            self.epoch,
             self.sender.as_ref(),
             AgentEvent::OperationLog(AgentOperationLog {
                 request_id,
@@ -396,7 +405,11 @@ impl LogObserver {
 }
 
 /// 格式化已授权的操作名称，只读取操作本身，不读取请求附带的凭据载荷。
-pub(super) fn record_request(sender: Option<&AgentEventSender>, request: &RemoteRequest) {
+pub(super) fn record_request(
+    sender: Option<&AgentEventSender>,
+    request: &RemoteRequest,
+    epoch: Option<u64>,
+) {
     static REDACTOR: OnceLock<Redactor> = OnceLock::new();
     if sender.is_none() {
         return;
@@ -412,7 +425,8 @@ pub(super) fn record_request(sender: Option<&AgentEventSender>, request: &Remote
         }
         _ => format!("收到操作：{}", operation_label(operation)),
     };
-    emit_agent_event(
+    emit_scoped(
+        epoch,
         sender,
         AgentEvent::OperationLog(AgentOperationLog {
             request_id: Some(request.request_id),
@@ -421,6 +435,18 @@ pub(super) fn record_request(sender: Option<&AgentEventSender>, request: &Remote
             message: safe_text(redactor, &message),
         }),
     );
+}
+
+fn emit_scoped(epoch: Option<u64>, sender: Option<&AgentEventSender>, event: AgentEvent) {
+    let event = if let Some(epoch) = epoch {
+        AgentEvent::ScopedOperation {
+            epoch,
+            event: Box::new(event),
+        }
+    } else {
+        event
+    };
+    emit_agent_event(sender, event);
 }
 
 /// 对可能很长的诊断文本先脱敏，再保留可展示的开头部分。
@@ -610,7 +636,10 @@ mod tests {
             second,
             EventPayload::OperationCancelled,
         );
-        assert_eq!(states(&receiver), [(second, AgentOperationState::Failed)]);
+        assert_eq!(
+            states(&receiver),
+            [(second, AgentOperationState::Cancelled)]
+        );
         let failed = RequestId::new();
         observe(
             &mut observer,
@@ -626,7 +655,7 @@ mod tests {
         observer.interrupt(session, interrupted, Utc::now(), "连接中断");
         assert_eq!(
             states(&receiver),
-            [(interrupted, AgentOperationState::Failed)]
+            [(interrupted, AgentOperationState::Interrupted)]
         );
         observe(
             &mut observer,

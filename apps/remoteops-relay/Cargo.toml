@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-relay"
-version = "0.2.0-preview.7"
+version = "0.2.0-preview.8"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -38,6 +38,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [build-dependencies]
+remoteops-build = { path = "../../crates/remoteops-build" }
 winresource.workspace = true
 
 [dev-dependencies]

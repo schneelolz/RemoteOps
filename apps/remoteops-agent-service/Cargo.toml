@@ -28,6 +28,7 @@ tokio.workspace = true
 windows-service = "0.8"
 
 [build-dependencies]
+remoteops-build = { path = "../../crates/remoteops-build" }
 winresource.workspace = true
 
 [lints]

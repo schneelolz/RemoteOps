@@ -1,5 +1,5 @@
 //! Durable, single-use MCP enrollment. Only domain-separated credential hashes
-//! reach SQLite; setup documents and installation tokens never do.
+//! reach `SQLite`; setup documents and installation tokens never do.
 
 use std::{
     fs::OpenOptions,
@@ -61,8 +61,8 @@ pub struct AuthenticatedInstallation {
     pub owner_id: ControllerOwnerId,
 }
 
-/// SQLite-backed enrollment authority. Independent processes coordinate through
-/// SQLite IMMEDIATE transactions, not only through this process-local mutex.
+/// `SQLite`-backed enrollment authority. Independent processes coordinate through
+/// `SQLite` IMMEDIATE transactions, not only through this process-local mutex.
 pub struct EnrollmentStore {
     connection: Mutex<Connection>,
     owner_id: ControllerOwnerId,
@@ -92,7 +92,7 @@ impl EnrollmentStore {
 
     /// Creates an ephemeral store for tests or explicitly nonpersistent hosts.
     /// # Errors
-    /// Returns an error if SQLite initialization fails.
+    /// Returns an error if `SQLite` initialization fails.
     pub fn in_memory(owner_id: ControllerOwnerId) -> Result<Self, StoreError> {
         Self::initialize(Connection::open_in_memory()?, owner_id, false)
     }

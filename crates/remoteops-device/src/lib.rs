@@ -3582,7 +3582,7 @@ mod tests {
             },
             "中文"
         );
-        assert!(pending.is_empty());
+        assert_eq!(pending, [] as [u8; 0]);
     }
 
     #[cfg(windows)]

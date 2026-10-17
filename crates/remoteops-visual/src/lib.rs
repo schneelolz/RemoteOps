@@ -1626,7 +1626,10 @@ $foreground=Get-RemoteOpsForeground
             observation.state,
             remoteops_domain::VisualSessionState::Ready
         );
-        assert!(!observation.windows.is_empty());
+        assert_ne!(
+            observation.windows,
+            [] as [remoteops_domain::VisualWindow; 0]
+        );
         assert!(observation.active_window_fingerprint.is_some());
         let tree = observation.ui_tree.unwrap();
         assert!(tree["diagnostics"]["process_session_id"].as_u64().unwrap() > 0);

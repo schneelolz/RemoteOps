@@ -12,6 +12,7 @@ pub enum Appearance {
 }
 
 impl Appearance {
+    #[must_use]
     pub fn label_key(self) -> &'static str {
         match self {
             Self::System => "agent.preferences.system",
@@ -49,10 +50,12 @@ pub struct Palette {
 }
 
 impl Palette {
+    #[must_use]
     pub fn current(ctx: &egui::Context) -> Self {
         Self::for_theme(ctx.theme())
     }
 
+    #[must_use]
     pub fn for_theme(theme: egui::Theme) -> Self {
         if theme == egui::Theme::Dark {
             Self {

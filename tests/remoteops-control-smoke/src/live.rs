@@ -247,6 +247,7 @@ async fn scenarios(
     events: &mpsc::Receiver<AgentEvent>,
     control: &AgentPermissionControl,
     default_full: bool,
+    disconnect: &watch::Sender<u64>,
 ) -> Result<()> {
     let code = pairing_code(events).await?;
     let paired = call(client, "pair_connection", json!({"pairing_code":code})).await?;
@@ -311,6 +312,44 @@ async fn scenarios(
         .await?;
         assert_mcp_mode(client, session, "full_access", Some("local_default")).await?;
         println!("通过：真实解绑重配后，新绑定按保存的默认偏好自动完全控制");
+    }
+    if default_full {
+        let duplicate = call(
+            client,
+            "set_control_mode",
+            json!({"session_id":session,"mode":"full_access"}),
+        )
+        .await?;
+        ensure!(
+            duplicate["source"] == "local_default"
+                && duplicate["revision"] == initial.revision
+                && duplicate["expires_at"].is_null(),
+            "重复 MCP 授权改变了现场授权"
+        );
+        call(
+            client,
+            "set_control_mode",
+            json!({"session_id":session,"mode":"step_by_step"}),
+        )
+        .await?;
+        let revoked = agent_state(events, ControllerControlMode::StepByStep, None).await?;
+        while events.try_recv().is_ok() {}
+        disconnect.send_modify(|generation| *generation += 1);
+        let restored = agent_state(events, ControllerControlMode::StepByStep, None).await?;
+        ensure!(
+            restored.agent_generation > revoked.agent_generation,
+            "必须实际重建 TLS 连接"
+        );
+        sleep(Duration::from_millis(300)).await;
+        assert_mcp_mode(client, session, "step_by_step", None).await?;
+        control.request_control(restored, ControllerControlMode::FullAccess)?;
+        initial = agent_state(
+            events,
+            ControllerControlMode::FullAccess,
+            Some(ControlSource::Local),
+        )
+        .await?;
+        println!("通过：MCP 重复授权保持现场来源；主动撤销后 TLS 重连不恢复默认授权");
     }
     control.request_control(initial, ControllerControlMode::StepByStep)?;
     let _ = agent_state(events, ControllerControlMode::StepByStep, None).await?;
@@ -382,9 +421,11 @@ async fn main() -> Result<()> {
 }
 
 async fn run_case(root: &Path, address: &str, cert: &Path, default_full: bool) -> Result<()> {
+    let (proxy_address, disconnect, proxy) = start_proxy(address).await?;
     let config = AgentConfig {
         default_full_control: default_full,
-        relay: address.to_owned(),
+        retry_seconds: 1,
+        relay: proxy_address,
         server_name: "localhost".into(),
         ca_cert: Some(cert.to_owned()),
         transfer_root: root.join("agent-transfers"),
@@ -402,7 +443,7 @@ async fn run_case(root: &Path, address: &str, cert: &Path, default_full: bool) -
     ));
     let result = async {
         let client = start_mcp(root, address, cert).await?;
-        let result = scenarios(&client, root, &events, &control, default_full).await;
+        let result = scenarios(&client, root, &events, &control, default_full, &disconnect).await;
         let _ = client.cancel().await;
         result
     }
@@ -418,7 +459,40 @@ async fn run_case(root: &Path, address: &str, cert: &Path, default_full: bool) -
         let _ = agent.await;
         Err(anyhow::anyhow!("真实 Agent 未在期限内停止"))
     };
+    proxy.abort();
+    let _ = proxy.await;
+    drop(disconnect);
     result?;
     shutdown_result?;
     Ok(())
+}
+
+// A loopback byte proxy forces a real TLS transport break while the Agent process lives.
+async fn start_proxy(
+    target: &str,
+) -> Result<(String, watch::Sender<u64>, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?.to_string();
+    let target = target.to_owned();
+    let (disconnect, changes) = watch::channel(0_u64);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut incoming, _)) = listener.accept().await else {
+                break;
+            };
+            let target = target.clone();
+            let mut changes = changes.clone();
+            changes.borrow_and_update();
+            tokio::spawn(async move {
+                let Ok(mut outgoing) = tokio::net::TcpStream::connect(target).await else {
+                    return;
+                };
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing) => {},
+                    _ = changes.changed() => {},
+                }
+            });
+        }
+    });
+    Ok((address, disconnect, task))
 }

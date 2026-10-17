@@ -6,7 +6,7 @@ KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"
 CONFIG_PATH="$CODEX_HOME/config.toml"
 CONNECTION_CONFIG="$CODEX_HOME/remoteops/controller-config.json"
-BINARY="$CODEX_HOME/remoteops/remoteops-controller-mcp-0.2.0-preview.13"
+BINARY="$CODEX_HOME/remoteops/remoteops-controller-mcp-0.2.0-preview.14"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "此卸载脚本仅支持 macOS。" >&2
