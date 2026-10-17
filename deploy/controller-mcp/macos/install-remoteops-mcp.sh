@@ -3,7 +3,7 @@ set +x
 set -euo pipefail
 umask 077
 
-MCP_PACKAGE_VERSION="0.2.0-preview.13"
+MCP_PACKAGE_VERSION="0.2.0-preview.14"
 CREDENTIAL_PROMPT_VERSION="0.2.0-preview.5"
 KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"

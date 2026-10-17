@@ -14,15 +14,18 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import signal
 import subprocess
 import tempfile
 import time
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.2.0-preview.13"
+with (ROOT / "apps/remoteops-controller-mcp/Cargo.toml").open("rb") as manifest:
+    VERSION = tomllib.load(manifest)["package"]["version"]
 DUMMY_GRANT = "installer-test-only-not-a-real-grant-0000000000000000"
 SETUP = json.dumps({"version": 1, "grant": DUMMY_GRANT, "fixture_label": "測試"}, ensure_ascii=False)
 # The fake deliberately writes only nonsecret outputs. Credential logic belongs
@@ -167,6 +170,31 @@ def fixture_process_alive(pid):
         return True
     except ProcessLookupError:
         return False
+
+
+class InstallerVersionTests(unittest.TestCase):
+    def test_templates_match_mcp_manifest(self):
+        declarations = {
+            "windows/Install-RemoteOpsMcp.ps1": r"^\$mcpVersion = '([^']+)'$",
+            "windows/Test-RemoteOpsMcp.ps1": r"^\$expectedMcpVersion = '([^']+)'$",
+            "macos/install-remoteops-mcp.sh": r'^MCP_PACKAGE_VERSION="([^"]+)"$',
+            "macos/test-remoteops-mcp.sh": r'^EXPECTED_MCP_VERSION="([^"]+)"$',
+            "macos/uninstall-remoteops-mcp.sh": r'^BINARY=".*remoteops-controller-mcp-([^"]+)"$',
+        }
+        for relative, pattern in declarations.items():
+            with self.subTest(template=relative):
+                source = (ROOT / "deploy/controller-mcp" / relative).read_text(encoding="utf-8")
+                self.assertEqual(re.findall(pattern, source, re.MULTILINE), [VERSION],
+                                 f"{relative} must match the MCP Cargo version")
+
+    def test_package_readmes_match_mcp_manifest(self):
+        for target in ("windows", "macos"):
+            with self.subTest(target=target):
+                source = (ROOT / "deploy/controller-mcp" / target / "README.md").read_text(encoding="utf-8")
+                self.assertEqual(re.findall(r"^- 版本：`([^`]+)`$", source, re.MULTILINE), [VERSION])
+                binaries = re.findall(r"remoteops-controller-mcp-(\d[^\s`]*?)(?:\.exe)?(?=\s|`|$)", source)
+                self.assertTrue(binaries, "README must include the installed versioned executable")
+                self.assertEqual(set(binaries), {VERSION})
 
 
 class InstallerTests(unittest.TestCase):
@@ -635,7 +663,14 @@ def main():
     parser.add_argument("--platform", choices=["macos", "windows", "all"], default="all")
     parser.add_argument("--powershell", default="powershell.exe" if os.name == "nt" else "pwsh")
     parser.add_argument("--helper", type=Path, help="Use an already-built real MCP binary for TOML editing; otherwise build it")
+    parser.add_argument("--check-versions", action="store_true",
+                        help="Check package templates against Cargo.toml without building or running installers (Python 3.11+)")
     options = parser.parse_args()
+    version_suite = unittest.defaultTestLoader.loadTestsFromTestCase(InstallerVersionTests)
+    if not unittest.TextTestRunner(verbosity=2).run(version_suite).wasSuccessful():
+        return 1
+    if options.check_versions:
+        return 0
     if options.helper is None:
         subprocess.run(["cargo", "build", "--locked", "-p", "remoteops-controller-mcp"], cwd=ROOT, check=True)
         options.helper = ROOT / "target/debug" / ("remoteops-controller-mcp.exe" if os.name == "nt" else "remoteops-controller-mcp")

@@ -59,24 +59,31 @@ impl AgentConfig {
             self.tls_fingerprint = None;
         }
         if !profile.legacy_remoteops_paths || changed {
-            let key = sha256_bytes(
-                format!("{}\n{}\n{}", profile.id, self.relay, self.server_name).as_bytes(),
-            );
-            let stem = self
-                .state_file
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("identity");
-            let stem = stem
-                .rsplit_once('-')
-                .filter(|(_, hash)| hash.len() == 24 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-                .map_or(stem, |(stem, _)| stem);
-            self.state_file = self
-                .state_file
-                .with_file_name(format!("{stem}-{}.json", &key[..24]));
+            self.isolate_state_file(profile);
         }
         Ok(self)
     }
+    /// 按产品及已解析端点隔离身份路径，重复调用保持同一文件名。
+    ///
+    /// 调用前应通过 `resolve_product` 完成产品和端点校验；显式路径同样需要隔离。
+    pub fn isolate_state_file(&mut self, profile: &ProductProfile) {
+        let key = sha256_bytes(
+            format!("{}\n{}\n{}", profile.id, self.relay, self.server_name).as_bytes(),
+        );
+        let stem = self
+            .state_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("identity");
+        let stem = stem
+            .rsplit_once('-')
+            .filter(|(_, hash)| hash.len() == 24 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map_or(stem, |(stem, _)| stem);
+        self.state_file = self
+            .state_file
+            .with_file_name(format!("{stem}-{}.json", &key[..24]));
+    }
+
     /// Save atomically, falling back only for the implicit portable configuration location.
     /// # Errors
     /// Returns every policy or write failure without changing runtime preferences.
@@ -183,6 +190,17 @@ mod tests {
         fs::write(&file, r#"{"default_full_control":null}"#).unwrap();
         assert!(AgentConfig::load_file_with_profile(Some(&file), &p).is_err());
     }
+    #[test]
+    fn config_save_rejects_directories_without_changing_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = AgentConfig::default();
+        for path in [std::env::temp_dir(), directory.path().to_path_buf()] {
+            assert!(path.is_dir());
+            assert!(config.save_file(&path).is_err());
+            assert!(path.is_dir());
+        }
+    }
+
     #[test]
     fn fixed_endpoint_and_failed_save() {
         let p = ProductProfile {

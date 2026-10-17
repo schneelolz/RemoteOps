@@ -9,7 +9,7 @@
 | `remoteops-product::ProductProfile`、`EndpointPolicy` | 产品标识、默认值、固定端点、路径及环境变量命名 |
 | `AgentConfig::load_file_with_profile`、`resolve_product`、`save_for_product` | 一次解析缺字段与显式布尔值、输入合并后的策略检查、端点信任隔离、原子写入与便携回退 |
 | `remoteops_agent_gui::run`、`run_default`、`resolve_config` | 同一个默认与外部产品宿主；无窗口、无网络的配置检查入口 |
-| `GuiOptions`、`GuiExtension`、`GuiSnapshot`、`GuiAction` | 可选活动组件、Logo、外观、双语文案，以及受控呈现扩展 |
+| `GuiOptions`、`GuiLayout`、`GuiExtension`、`GuiEvent`、`GuiSnapshot`、`GuiAction` | 布局模板、可选活动组件、Logo、外观、双语文案及受控呈现扩展 |
 | `activity::ActivityModel` | 有界摘要、并发任务与明确终态；不以 stderr 或日志级别推断完成 |
 | `remoteops_build::WindowsResources`、`compile_windows_resources` | 外部产品自行提供资源路径、产品版本与 EXE 名称 |
 | `build_info` | 实际链接的 Agent、GUI、协议版本及源码提交、dirty 状态 |
@@ -17,6 +17,35 @@
 产品配置目前适用于 Agent GUI 的公共宿主及显式调用产品配置 API 的宿主。既有 CLI、Service 不隐式读取 GUI 产品配置，仍保留原来的 RemoteOps 默认值。默认 GUI 关闭活动摘要，维持原布局。新增本地事件枚举变体可能要求外部 Rust 消费者更新穷尽匹配；线协议版本未更改。
 
 `GuiSnapshot` 不暴露可变 App、绑定令牌或恢复凭据。扩展只能提交动作；保存错误、确认、请求超时和权限执行均由宿主处理。产品组件使用 `remoteops_agent_gui::egui` 的重导出，不能自行引入另一版 egui。
+
+`GuiExtension::mode(slot)` 默认返回 `ExtensionMode::Append`，保留既有追加行为；产品可对页头、连接卡片或活动区域返回 `ExtensionMode::Replace`，替换该区域的默认内容。替换页头时由产品接管包含设置菜单在内的页头布局，底部操作栏和宿主权限对话框仍保留；扩展动作继续交给底座执行。示例：
+
+```rust,ignore
+fn mode(&self, slot: ExtensionSlot) -> ExtensionMode {
+    if slot == ExtensionSlot::Activity {
+        ExtensionMode::Replace
+    } else {
+        ExtensionMode::Append
+    }
+}
+```
+
+公共活动摘要最多保留 64 条记录，优先保护最近 16 条终态；更旧的结果允许淘汰，新任务输出不会因历史终态占满队列而被丢弃。
+
+`GuiOptions.layout` 默认为 `GuiLayout::Standard`；启用公共活动摘要或扩展时使用 540×560 逻辑像素。需要紧凑产品界面时明确选择 `GuiLayout::Compact`，启动及运行中均为 500×375，活动区域紧接控制码，并省略页头重复 Logo。产品可让活动区域返回 `Replace`，复用其已有的纯呈现组件，而不恢复旧连接、配置或权限实现：
+
+```rust,ignore
+GuiOptions {
+    layout: GuiLayout::Compact,
+    activity: false,
+    extension: Some(Box::new(ProductActivity::default())),
+    ..GuiOptions::default()
+}
+```
+
+`GuiExtension::observe(&GuiEvent)` 默认不处理，产品可按需消费只读呈现事件。宿主先校验连接代次，且仅在受控连接中分发 `OperationLog`（已脱敏）及 `OperationState`（含请求 ID 与真实阶段）；控制端连接发送 `ControllerConnected`，连接清理或控制端归零发送 `Reset`。扩展应在重置时清理摘要及动画，不应从 stderr 或成功文字推断终态，也不应把任务间隙提示当作模型实际推理状态。此回调不提供连接、配置、权限或执行的可变访问；宿主动作仍通过 `GuiAction` 处理。
+
+产品自行负责其纯呈现组件的有界缓存、按需重绘、字体/缩放和裁切验证。公共窗口模板不能自动保证任意扩展高度均适配；上线前应观察真实日志、并发任务、断线和任务间隙的界面。
 
 ## 最小产品
 
@@ -30,7 +59,7 @@
 
 默认值不是有效授权。有效权限来自当前 Relay 快照，仍受只读和强制外部审批上限约束。新绑定先查询最新快照，再以绑定、连接代次及修订号申请默认授权。明确撤销会抑制本 Agent 进程内后续默认自动授权；重连不恢复，进程重启才重新读取默认偏好。自然到期、初始同步和陈旧事件不会触发该抑制。重复 MCP 完全控制不替换有效现场授权的来源、修订号和期限；重复相同 Agent 上限不清除授权。
 
-切换 Relay 或 TLS 服务名会清除原 CA/指纹并隔离身份状态；明确为新端点传入的 CA 或指纹在清理后应用。不同产品使用各自配置、状态、交换目录、GUI 偏好和诊断目录。默认 RemoteOps 继续兼容旧配置发现路径。
+切换 Relay 或 TLS 服务名会清除原 CA/指纹并隔离身份状态；明确为新端点传入的 CA 或指纹在清理后应用。`--state-file` 和产品状态环境变量指定的是身份文件基名，GUI 入口统一按产品 ID 与端点派生隔离文件；保存配置后重启仍使用相同派生路径，不能回退到旧端点文件。旧显式路径不自动迁移恢复凭据，升级后可能需要重新配对；既有 CLI/Service 的路径契约保持原状。不同产品使用各自配置、状态、交换目录、GUI 偏好和诊断目录。默认 RemoteOps 继续兼容旧配置发现路径。
 
 ## 独立构建与版本固定
 
@@ -54,7 +83,7 @@ remoteops-build = { git = "https://github.com/schneelolz/RemoteOps.git", rev = "
 
 不要混用 tag、branch、不同 URL 或不同 rev。若产品直接依赖 domain、protocol 等公共包，也使用完全相同来源；通过 `cargo tree -d` 和集成测试检查类型来源。依赖内部的路径包由同一 Git checkout 提供。维护产品自己的 Cargo.lock、工具链、目标平台、链接器和构建设置，升级通常只调整 rev 与锁文件并重新验证。
 
-启动时 `ProductProfile.version` 由产品包 `env!("CARGO_PKG_VERSION")` 提供。库内同名宏表示底座包版本，不能用作产品版本。编译时在产品 `build.rs` 调用资源工具，图标路径从**产品自身** `CARGO_MANIFEST_DIR` 构造，设置 `binary_name` 与产品资源信息。工具只链接到指定二进制，不向依赖者传递底座的图标资源。不得复制仓库资源脚本。
+启动时 `ProductProfile.version` 由产品包 `env!("CARGO_PKG_VERSION")` 提供。库内同名宏表示底座包版本，不能用作产品版本。公共 GUI 在首次启动和运行中切换语言时统一生成窗口标题：`<当前语言的产品名称> v<ProductProfile.version>`。通用版传入自身 GUI 包版本，外部产品传入自己的产品包版本；版本为空或只有空白时仅显示名称，不回填底座版本。产品文案只提供名称，不应自行再拼接版本。编译时在产品 `build.rs` 调用资源工具，图标路径从**产品自身** `CARGO_MANIFEST_DIR` 构造，设置 `binary_name` 与产品资源信息。工具只链接到指定二进制，不向依赖者传递底座的图标资源。不得复制仓库资源脚本。
 
 库依赖不会交付 CLI、服务、SSH 密码窗口、凭据窗口等伴随程序。由独立发布步骤从同一个审核 rev 构建所需程序，或取得明确记录源码提交和协议版本的兼容发布产物，并验 SHA-256。构建清单应读取实际依赖 `build_info`/Cargo metadata 和实际产物版本，不能手填陈旧协议号。源码归档无法确定 Git 来源时明确报告 `unknown`，不可伪造提交。未提交源码会标记 dirty，不能当作可固定的发布 rev。
 
@@ -71,4 +100,4 @@ remoteops-build = { git = "https://github.com/schneelolz/RemoteOps.git", rev = "
 
 ## 验收边界
 
-Linux 构建和无窗口测试不能代替 Windows 原生资源和交互验收。仓库 Windows CI 执行独立示例的 EXE 资源验证及原有权限 E2E。GUI 的视觉与人工信任流程仍需 Windows 人工验收。CI 只能验证已提交且被推送的源码；本次任务不自动提交、推送、合并或部署。
+Linux 构建和无窗口测试不能代替 Windows 原生资源和交互验收。仓库 Windows CI 执行独立示例的 EXE 资源验证及原有权限 E2E。GUI 的视觉与人工信任流程仍需 Windows 人工验收。CI 只能验证已提交且被推送的源码；提交、推送、合并和部署遵循维护者明确授权；合并前须等待最新提交的 CI 通过。

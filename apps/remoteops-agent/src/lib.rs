@@ -345,6 +345,13 @@ fn select_agent_config_path(portable: PathBuf, legacy: PathBuf) -> PathBuf {
 }
 
 fn replace_file_recoverably(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    // 先拒绝目录，避免 Windows 应用重定向把目标保存成另一路径的文件。
+    if path.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "配置文件路径不能是目录",
+        ));
+    }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;

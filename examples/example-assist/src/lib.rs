@@ -102,6 +102,33 @@ mod tests {
         assert!(remoteops_agent_gui::resolve_config(&profile(), input).is_err());
     }
     #[test]
+    fn explicit_state_path_cannot_reuse_identity_across_products_or_relays() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let base = root.path().join("identity.json");
+        let mut identities = Vec::new();
+        for (id, relay) in [
+            ("example-assist", "first.invalid:7443"),
+            ("example-assist", "second.invalid:7443"),
+            ("another-product", "first.invalid:7443"),
+        ] {
+            let mut product = profile();
+            product.id = id.into();
+            product.endpoint = EndpointPolicy::Default {
+                relay: relay.into(),
+                server_name: String::new(),
+            };
+            let mut input = args(&path);
+            input.extend(["--state-file".into(), base.as_os_str().to_owned()]);
+            let config = remoteops_agent_gui::resolve_config(&product, input).unwrap();
+            assert_ne!(config.state_file, base);
+            assert!(!identities.contains(&config.state_file));
+            identities.push(config.state_file);
+        }
+    }
+
+    #[test]
     fn resources_and_versions_come_from_the_product_and_linked_library() {
         assert!(options().activity);
         assert_ne!(

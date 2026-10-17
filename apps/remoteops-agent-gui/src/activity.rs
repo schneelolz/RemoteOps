@@ -4,6 +4,9 @@ use remoteops_agent::{AgentEvent, AgentOperationState};
 use remoteops_domain::RequestId;
 use remoteops_i18n::Language;
 use std::collections::{BTreeSet, VecDeque};
+
+const SUMMARY_CAPACITY: usize = 64;
+const RECENT_TERMINAL_COUNT: usize = 16;
 #[derive(Clone, Debug)]
 pub struct Summary {
     pub text: String,
@@ -76,14 +79,19 @@ impl ActivityModel {
             last.repetitions = last.repetitions.saturating_add(1);
             return;
         }
-        if self.summaries.len() == 64 {
-            if terminal.is_none() && self.summaries.iter().all(|s| s.terminal.is_some()) {
-                return;
-            }
+        if self.summaries.len() == SUMMARY_CAPACITY {
+            // 保留最近的终态；更旧的结果与普通输出按时间淘汰，避免历史结果挤掉新输出。
+            let terminal_count = self
+                .summaries
+                .iter()
+                .filter(|summary| summary.terminal.is_some())
+                .count();
+            let can_evict_terminal =
+                terminal_count + usize::from(terminal.is_some()) > RECENT_TERMINAL_COUNT;
             let i = self
                 .summaries
                 .iter()
-                .position(|s| s.terminal.is_none())
+                .position(|summary| summary.terminal.is_none() || can_evict_terminal)
                 .unwrap_or(0);
             self.summaries.remove(i);
         }
@@ -207,6 +215,70 @@ mod tests {
         });
         assert_eq!(model.running_count(), 0);
     }
+    #[test]
+    fn long_session_keeps_new_output_and_recent_results() {
+        let mut model = ActivityModel::default();
+        model.observe(&AgentEvent::ControllerCountChanged {
+            active_connections: 1,
+        });
+        let outcomes = [
+            AgentOperationState::Succeeded,
+            AgentOperationState::Failed,
+            AgentOperationState::Cancelled,
+            AgentOperationState::Interrupted,
+        ];
+        let mut expected_results = Vec::new();
+        for index in 0..64 {
+            let request_id = RequestId::new();
+            model.observe(&AgentEvent::OperationStateChanged {
+                request_id,
+                state: AgentOperationState::Running,
+            });
+            model.observe(&AgentEvent::OperationLog(
+                remoteops_agent::AgentOperationLog {
+                    request_id: Some(request_id),
+                    occurred_at: chrono::Utc::now(),
+                    level: remoteops_agent::AgentLogLevel::Running,
+                    message: format!("任务 {index} 正在执行"),
+                },
+            ));
+            let outcome = outcomes[index % outcomes.len()];
+            expected_results.push(outcome);
+            model.observe(&AgentEvent::OperationStateChanged {
+                request_id,
+                state: outcome,
+            });
+        }
+        assert_eq!(model.running_count(), 0);
+        assert_eq!(model.summaries().len(), 64);
+
+        let next_request = RequestId::new();
+        model.observe(&AgentEvent::OperationStateChanged {
+            request_id: next_request,
+            state: AgentOperationState::Running,
+        });
+        for index in 0..256 {
+            let message = format!("新任务输出 {index}");
+            model.observe(&AgentEvent::OperationLog(
+                remoteops_agent::AgentOperationLog {
+                    request_id: Some(next_request),
+                    occurred_at: chrono::Utc::now(),
+                    level: remoteops_agent::AgentLogLevel::Running,
+                    message: message.clone(),
+                },
+            ));
+            assert_eq!(model.summaries().back().unwrap().text, message);
+            assert_eq!(model.summaries().len(), 64);
+        }
+        assert_eq!(model.running_count(), 1);
+        let retained_results: Vec<_> = model
+            .summaries()
+            .iter()
+            .filter_map(|summary| summary.terminal)
+            .collect();
+        assert_eq!(retained_results, expected_results[48..]);
+    }
+
     #[test]
     fn bounded_unicode_and_terminal_priority() {
         let mut model = ActivityModel::default();

@@ -145,3 +145,32 @@ python3 scripts/Test-ExternalProduct.py
 - `examples/example-assist/src/main.rs`
 - `scripts/Test-ControlPermissions.py`
 - `scripts/Test-ExternalProduct.py`
+
+
+## 2026-10-16 本地复核修复（阶段记录）
+
+在分支 `codex/public-product-separation` 的 `68bf2ff` 基础上完成以下修复；本节记录当时尚未提交的验证状态：
+
+- GUI 显式身份路径先合并，再按产品与端点隔离；通用产品切换端点并保存配置后，重启仍使用同一派生身份文件。旧恢复凭据不自动跨端点迁移。
+- 公共保存函数在创建临时文件前拒绝目录目标，避免 Windows 打包应用路径重定向把目录保存误判为成功；保留原失败测试并增加目录回归。
+- 活动摘要仍限制 64 条，保护最近 16 条终态，允许淘汰旧结果，确保新任务输出始终可见；增加长连接连续任务与输出洪峰回归。
+- `GuiExtension::mode` 默认追加；产品可按区域选择 `ExtensionMode::Replace`。替换只影响呈现，权限动作仍由宿主执行；验证单区替换保留其他区域与底部停止入口。
+- Windows/macOS MCP 安装、检查、卸载与说明同步为 `preview.14`。安装测试从 Cargo 清单读取版本，增加不构建即可执行的版本一致性检查；测试工具需要 Python 3.11+。
+- 修正 Windows 原生安装验收测试的 Duration 写法，解除严格 Clippy 阻塞。
+- 独立产品增加显式状态路径跨产品/端点隔离回归。Windows PowerShell 5.1 和 PowerShell 7 的隔离安装测试各 27 通过、1 项 macOS 专用测试跳过，版本检查各 2 项通过。测试环境仅对进程设置 UTF-8 与执行策略，不改变系统策略或实际用户配置。
+
+本地最终验证结果：
+
+| 命令/验证 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | 通过，保留修改前的文件行尾 |
+| `cargo check --workspace --locked` | 通过 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 通过 |
+| `cargo test --workspace --locked --no-fail-fast --quiet` | 495 通过、0 失败、3 项既有忽略 |
+| `python scripts/Test-ExternalProduct.py` | 独立工作区 check/test/build 通过，4 项测试通过，Windows EXE 图标/文件资源通过 |
+| `python scripts/Test-ControlPermissions.py` | 真实回环 TLS Relay、MCP、Agent 的授权、撤销与重连验收通过 |
+| `python scripts/Test-McpSetupInstallers.py --check-versions` | 2 项版本一致性测试通过 |
+| 隔离安装测试 `--platform windows --powershell powershell.exe` / `pwsh`，指定已构建 `--helper` | 每组 27 通过、1 项 macOS 专用测试跳过；各自版本检查 2 项通过 |
+| `scripts/Test-Documentation.ps1`、`git diff --check` | 通过 |
+
+本轮没有执行被忽略的原生凭据库/完整注册与交互桌面观察测试。未执行 macOS 原生验收、生产部署或真实 JLAI 迁移；未提交或推送，因此远端 CI 尚未包含这些修复。

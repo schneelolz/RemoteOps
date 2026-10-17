@@ -3,8 +3,8 @@ pub use eframe::egui;
 pub use remoteops_product::{EndpointPolicy, ProductProfile};
 pub mod extension;
 pub use extension::{
-    ConnectionPhase, EffectiveControl, ExtensionSlot, GuiAction, GuiExtension, GuiOptions,
-    GuiSnapshot,
+    ConnectionPhase, EffectiveControl, ExtensionMode, ExtensionSlot, GuiAction, GuiEvent,
+    GuiExtension, GuiLayout, GuiOptions, GuiSnapshot,
 };
 pub mod activity;
 static DIAGNOSTIC_PRODUCT: std::sync::OnceLock<ProductProfile> = std::sync::OnceLock::new();
@@ -64,9 +64,15 @@ const MAX_EVENTS_PER_FRAME: usize = 200;
 /// 原生窗口和界面标题使用的 `RemoteOps` 品牌图标。
 const BRAND_ICON_PNG: &[u8] = include_bytes!("../../../assets/brand/remoteops-mark.png");
 
-/// 原生标题只保留产品名称；版本号在设置菜单内显示。
-fn agent_window_title(translator: &Translator) -> String {
-    translator.text("app.agent_title")
+/// 原生标题统一显示本地化名称和产品自身版本，未提供版本时只保留名称。
+fn agent_window_title(translator: &Translator, profile: &ProductProfile) -> String {
+    let title = translator.text("app.agent_title");
+    let version = profile.version.trim();
+    if version.is_empty() {
+        title
+    } else {
+        format!("{title} v{version}")
+    }
 }
 
 /// 从仓库品牌资源加载原生窗口图标。
@@ -269,7 +275,15 @@ impl Args {
             config.relay = "demo.invalid:7443".into();
             config.server_name = "demo.invalid".into();
         }
+        // 显式身份路径也先参与合并，再由产品和端点统一派生隔离文件。
+        if let Some(value) = &self.state_file {
+            config.state_file.clone_from(value);
+        }
         config = config.resolve_product(profile, Some((&old.0, &old.1)))?;
+        if self.state_file.is_some() {
+            // 通用版显式路径也保持隔离，保存配置后重启不会退回未隔离的旧文件。
+            config.isolate_state_file(profile);
+        }
         if let Some(value) = &self.ca_cert {
             config.ca_cert = Some(value.clone());
         }
@@ -281,9 +295,6 @@ impl Args {
         }
         if let Some(value) = &self.transfer_root {
             config.transfer_root.clone_from(value);
-        }
-        if let Some(value) = &self.state_file {
-            config.state_file.clone_from(value);
         }
         Ok(config)
     }
@@ -624,7 +635,10 @@ impl RemoteOpsAgentApp {
         }
         apply_product_texts(&mut translator, &profile, &options);
         cc.egui_ctx
-            .send_viewport_cmd(ViewportCommand::Title(agent_window_title(&translator)));
+            .send_viewport_cmd(ViewportCommand::Title(agent_window_title(
+                &translator,
+                &profile,
+            )));
         saved_settings
             .appearance
             .unwrap_or(options.appearance)
@@ -812,6 +826,7 @@ impl RemoteOpsAgentApp {
             return;
         }
         self.activity.observe(&event);
+        self.observe_extension_event(&event);
         match event {
             AgentEvent::ConnectionEpoch(epoch) => {
                 self.event_epoch = Some(epoch);
@@ -925,6 +940,9 @@ impl RemoteOpsAgentApp {
     fn clear_controller_state(&mut self) {
         self.event_epoch = None;
         self.activity.disconnect();
+        if let Some(extension) = self.options.extension.as_mut() {
+            extension.observe(&GuiEvent::Reset);
+        }
         self.active_connections = 0;
         self.controller_bindings.clear();
         self.running_operations.clear();
@@ -990,7 +1008,10 @@ impl RemoteOpsAgentApp {
             let _ = self.translator.overlay_file(path);
         }
         apply_product_texts(&mut self.translator, &self.profile, &self.options);
-        ctx.send_viewport_cmd(ViewportCommand::Title(agent_window_title(&self.translator)));
+        ctx.send_viewport_cmd(ViewportCommand::Title(agent_window_title(
+            &self.translator,
+            &self.profile,
+        )));
     }
 
     /// 保存首次配置并开始 TLS 预检。
@@ -1961,6 +1982,60 @@ impl RemoteOpsAgentApp {
         });
     }
 
+    // 默认页头保留既有布局，定制产品可替换整个区域。
+    fn render_header(&mut self, ui: &mut egui::Ui, scale: f32) {
+        let colors = Palette::current(ui.ctx());
+        ui.horizontal(|ui| {
+            if self.options.layout != GuiLayout::Compact
+                && let Some(logo) = &self.logo
+            {
+                ui.image((logo.id(), Vec2::splat(28.0)));
+            }
+            let status_color = match self.status {
+                UiStatus::Controlled => colors.success,
+                UiStatus::Failed(_) => colors.danger,
+                _ => colors.secondary,
+            };
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(14.0 * scale), egui::Sense::hover());
+            ui.painter()
+                .circle_filled(dot.center(), 6.0 * scale, status_color);
+            ui.add_space(6.0 * scale);
+            ui.vertical(|ui| {
+                ui.set_max_width(390.0 * scale);
+                ui.label(
+                    RichText::new(self.connection_heading())
+                        .font(FontId::new(
+                            23.0 * scale,
+                            FontFamily::Name("display".into()),
+                        ))
+                        .strong()
+                        .color(colors.text),
+                );
+                if let Some(mode_label) = self.controller_control_mode_label() {
+                    ui.add_space(3.0 * scale);
+                    let response = ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("{}  {}", icons::SHIELD_CHECK, mode_label))
+                                .size(14.0)
+                                .color(colors.secondary),
+                        )
+                        .wrap()
+                        .sense(egui::Sense::click()),
+                    );
+                    if response
+                        .on_hover_text(self.translator.text("control.title"))
+                        .clicked()
+                    {
+                        self.control_ui.open = true;
+                    }
+                }
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.render_preferences(ui, scale);
+            });
+        });
+    }
+
     /// 主界面布局，返回内容边界以验证固定窗口下不会裁切。
     fn render_main(&mut self, ui: &mut egui::Ui) -> egui::Rect {
         apply_product_texts(&mut self.translator, &self.profile, &self.options);
@@ -1974,72 +2049,31 @@ impl RemoteOpsAgentApp {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let scale = ui.available_width() / 544.0;
-                ui.horizontal(|ui| {
-                    if let Some(logo) = &self.logo {
-                        ui.image((logo.id(), Vec2::splat(28.0)));
-                    }
-                    let status_color = match self.status {
-                        UiStatus::Controlled => colors.success,
-                        UiStatus::Failed(_) => colors.danger,
-                        _ => colors.secondary,
-                    };
-                    let (dot, _) =
-                        ui.allocate_exact_size(Vec2::splat(14.0 * scale), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(dot.center(), 6.0 * scale, status_color);
-                    ui.add_space(6.0 * scale);
-                    ui.vertical(|ui| {
-                        ui.set_max_width(390.0 * scale);
-                        ui.label(
-                            RichText::new(self.connection_heading())
-                                .font(FontId::new(
-                                    23.0 * scale,
-                                    FontFamily::Name("display".into()),
-                                ))
-                                .strong()
-                                .color(colors.text),
-                        );
-                        if let Some(mode_label) = self.controller_control_mode_label() {
-                            ui.add_space(3.0 * scale);
-                            let response = ui.add(
-                                egui::Label::new(
-                                    RichText::new(format!(
-                                        "{}  {}",
-                                        icons::SHIELD_CHECK,
-                                        mode_label
-                                    ))
-                                    .size(14.0)
-                                    .color(colors.secondary),
-                                )
-                                .wrap()
-                                .sense(egui::Sense::click()),
-                            );
-                            if response
-                                .on_hover_text(self.translator.text("control.title"))
-                                .clicked()
-                            {
-                                self.control_ui.open = true;
-                            }
-                        }
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        self.render_preferences(ui, scale);
-                    });
+                let compact = self.options.layout == GuiLayout::Compact;
+                self.render_region(ExtensionSlot::Header, ui, |app, ui| {
+                    app.render_header(ui, scale);
                 });
-                self.render_extension(ExtensionSlot::Header, ui);
-                ui.add_space(24.0 * scale);
-                self.render_status_card(ui);
-                self.render_extension(ExtensionSlot::ConnectionHint, ui);
-                ui.add_space((ui.available_height() - 151.0 * scale).max(25.0 * scale));
-                ui.separator();
-                ui.add_space(12.0 * scale);
-                if self.options.activity {
-                    self.activity.render(ui, self.translator.language());
-                } else {
-                    self.render_operation_status(ui);
+                ui.add_space(if compact { 8.0 } else { 24.0 } * scale);
+                self.render_region(ExtensionSlot::ConnectionHint, ui, |app, ui| {
+                    app.render_status_card(ui);
+                });
+                if !compact {
+                    // 有日志时公共活动区需要完整四行，不能只按空面板的高度留空间。
+                    let activity_height = if self.options.activity { 80.0 } else { 0.0 };
+                    ui.add_space(
+                        (ui.available_height() - 151.0 * scale - activity_height).max(25.0 * scale),
+                    );
+                    ui.separator();
                 }
-                self.render_extension(ExtensionSlot::Activity, ui);
                 ui.add_space(12.0 * scale);
+                self.render_region(ExtensionSlot::Activity, ui, |app, ui| {
+                    if app.options.activity {
+                        app.activity.render(ui, app.translator.language());
+                    } else {
+                        app.render_operation_status(ui);
+                    }
+                });
+                ui.add_space(if compact { 2.0 } else { 12.0 } * scale);
                 ui.separator();
                 ui.add_space((ui.available_height() - 44.0 * scale).max(16.0 * scale));
                 self.render_action_bar(ui);
@@ -3177,8 +3211,8 @@ fn run_gui(
     if !profile.legacy_remoteops_paths {
         native_options.persistence_path = Some(profile.paths().gui_preferences);
     }
-    if !initial_setup && (options.activity || options.extension.is_some()) {
-        let size = Vec2::new(540.0, 560.0);
+    if !initial_setup {
+        let size = options.running_size();
         native_options.viewport = native_options
             .viewport
             .with_inner_size(size)
@@ -3195,7 +3229,7 @@ fn run_gui(
         let _ = translator.overlay_file(path);
     }
     apply_product_texts(&mut translator, &profile, &options);
-    let title = agent_window_title(&translator);
+    let title = agent_window_title(&translator, &profile);
     let app_diagnostics = diagnostics.clone();
     diagnostics.record("starting_native_window");
     let result = eframe::run_native(
@@ -3341,9 +3375,78 @@ mod tests {
     }
 
     #[test]
-    fn native_window_title_uses_localized_product_name() {
-        let translator = Translator::new(Language::ZhCn);
-        assert_eq!(agent_window_title(&translator), "RemoteOps 远程协助");
+    fn native_window_title_uses_localized_name_and_own_product_version() {
+        for language in [Language::ZhCn, Language::EnUs] {
+            let mut translator = Translator::new(language);
+            let default_profile = ProductProfile {
+                version: env!("CARGO_PKG_VERSION").into(),
+                ..ProductProfile::default()
+            };
+            assert_eq!(
+                agent_window_title(&translator, &default_profile),
+                format!(
+                    "{} v{}",
+                    translator.text("app.agent_title"),
+                    env!("CARGO_PKG_VERSION")
+                )
+            );
+            let title = if language == Language::ZhCn {
+                "精灵 AI 远程协助"
+            } else {
+                "JLAI Remote Assistance"
+            };
+            translator
+                .overlay_entries(std::collections::BTreeMap::from([(
+                    "app.agent_title".into(),
+                    title.into(),
+                )]))
+                .unwrap();
+            let custom = ProductProfile {
+                version: "9.8.7-preview.6".into(),
+                ..ProductProfile::default()
+            };
+            assert_eq!(
+                agent_window_title(&translator, &custom),
+                format!("{title} v9.8.7-preview.6")
+            );
+            for version in ["", " ", "\t"] {
+                let no_version = ProductProfile {
+                    version: version.into(),
+                    ..custom.clone()
+                };
+                assert_eq!(agent_window_title(&translator, &no_version), title);
+            }
+        }
+    }
+
+    #[test]
+    fn language_switch_updates_native_title_and_keeps_product_version() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.profile.version = "9.8.7-preview.6".into();
+        app.options.texts = [
+            (Language::ZhCn, "精灵 AI 远程协助"),
+            (Language::EnUs, "JLAI Remote Assistance"),
+        ]
+        .into_iter()
+        .map(|(language, title)| {
+            (
+                language,
+                std::collections::BTreeMap::from([("app.agent_title".into(), title.into())]),
+            )
+        })
+        .collect();
+        for (language, title) in [
+            (Language::ZhCn, "精灵 AI 远程协助"),
+            (Language::EnUs, "JLAI Remote Assistance"),
+            (Language::ZhCn, "精灵 AI 远程协助"),
+        ] {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.set_language(language, ui.ctx());
+            });
+            let expected = format!("{title} v9.8.7-preview.6");
+            assert!(output.viewport_output[&egui::ViewportId::ROOT].commands.iter().any(|command| matches!(command, ViewportCommand::Title(value) if value == &expected)));
+        }
     }
 
     #[test]
@@ -3645,6 +3748,205 @@ mod tests {
         }
     }
 
+    struct RegionExtension(ExtensionMode);
+
+    impl GuiExtension for RegionExtension {
+        fn mode(&self, _slot: ExtensionSlot) -> ExtensionMode {
+            self.0
+        }
+
+        fn render(
+            &mut self,
+            _slot: ExtensionSlot,
+            ui: &mut egui::Ui,
+            _state: &GuiSnapshot,
+        ) -> Vec<GuiAction> {
+            ui.label("custom-region");
+            vec![GuiAction::OpenLogs]
+        }
+    }
+
+    #[test]
+    fn region_replacement_keeps_host_actions_and_append_keeps_default_content() {
+        for slot in [
+            ExtensionSlot::Header,
+            ExtensionSlot::ConnectionHint,
+            ExtensionSlot::Activity,
+        ] {
+            for mode in [ExtensionMode::Append, ExtensionMode::Replace] {
+                let ctx = egui::Context::default();
+                let mut app = test_app();
+                app.options.extension = Some(Box::new(RegionExtension(mode)));
+                let mut default_rendered = false;
+                let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    app.render_region(slot, ui, |_, ui| {
+                        default_rendered = true;
+                        ui.label("default-region");
+                    });
+                });
+                assert_eq!(default_rendered, mode == ExtensionMode::Append);
+                assert!(app.log_drawer_open);
+                let texts: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape {
+                            Some(text.galley.job.text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(texts.contains(&"custom-region"));
+                assert_eq!(
+                    texts.contains(&"default-region"),
+                    mode == ExtensionMode::Append
+                );
+            }
+        }
+    }
+
+    struct SingleRegionExtension(ExtensionSlot);
+
+    impl GuiExtension for SingleRegionExtension {
+        fn mode(&self, slot: ExtensionSlot) -> ExtensionMode {
+            if slot == self.0 {
+                ExtensionMode::Replace
+            } else {
+                ExtensionMode::Append
+            }
+        }
+
+        fn render(
+            &mut self,
+            slot: ExtensionSlot,
+            ui: &mut egui::Ui,
+            _state: &GuiSnapshot,
+        ) -> Vec<GuiAction> {
+            if slot == self.0 {
+                ui.label("custom-region");
+                vec![GuiAction::OpenLogs]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_one_main_region_keeps_other_regions_and_stop_action() {
+        for replaced in [
+            ExtensionSlot::Header,
+            ExtensionSlot::ConnectionHint,
+            ExtensionSlot::Activity,
+        ] {
+            let ctx = egui::Context::default();
+            configure_fonts(&ctx);
+            install_style(&ctx);
+            let mut app = test_app();
+            app.status = UiStatus::Controlled;
+            app.options.extension = Some(Box::new(SingleRegionExtension(replaced)));
+            let markers = [
+                (ExtensionSlot::Header, app.connection_heading()),
+                (
+                    ExtensionSlot::ConnectionHint,
+                    app.translator.text("agent.pairing_code"),
+                ),
+                (ExtensionSlot::Activity, app.operation_status_label()),
+            ];
+            let stop = app.translator.text("agent.action.stop_remote");
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        app.running_size(),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.render_main(ui);
+                },
+            );
+            let texts: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some(text.galley.job.text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(texts.contains(&"custom-region"));
+            for (slot, marker) in markers {
+                assert_eq!(
+                    texts.contains(&marker.as_str()),
+                    slot != replaced,
+                    "{slot:?}"
+                );
+            }
+            assert!(texts.iter().any(|text| text.contains(&stop)));
+            assert!(app.log_drawer_open);
+        }
+    }
+
+    #[test]
+    fn explicit_identity_path_is_isolated_by_product_and_endpoint() {
+        let directory =
+            std::env::temp_dir().join(format!("remoteops-identity-test-{}", RequestId::new()));
+        std::fs::create_dir(&directory).unwrap();
+        let config_path = directory.join("config.json");
+        std::fs::write(&config_path, "{}").unwrap();
+        let base = directory.join("identity.json");
+        for legacy_remoteops_paths in [false, true] {
+            let mut profile = ProductProfile {
+                id: "identity-test".into(),
+                legacy_remoteops_paths,
+                ..ProductProfile::default()
+            };
+            let resolve = |profile: &ProductProfile, relay: &str| {
+                resolve_config(
+                    profile,
+                    vec![
+                        std::ffi::OsString::from("identity-test"),
+                        "--config".into(),
+                        config_path.as_os_str().to_owned(),
+                        "--relay".into(),
+                        relay.into(),
+                        "--state-file".into(),
+                        base.as_os_str().to_owned(),
+                    ],
+                )
+                .unwrap()
+            };
+            let first = resolve(&profile, "first.invalid:7443");
+            let second = resolve(&profile, "second.invalid:7443");
+            assert_ne!(first.state_file, base);
+            assert_ne!(first.state_file, second.state_file);
+            assert_eq!(
+                first.state_file,
+                resolve(&profile, "first.invalid:7443").state_file
+            );
+            first.save_file(&config_path).unwrap();
+            assert_eq!(
+                first.state_file,
+                resolve(&profile, "first.invalid:7443").state_file
+            );
+            second.save_file(&config_path).unwrap();
+            assert_eq!(
+                second.state_file,
+                resolve(&profile, "second.invalid:7443").state_file
+            );
+            profile.id = "another-product".into();
+            assert_ne!(
+                first.state_file,
+                resolve(&profile, "first.invalid:7443").state_file
+            );
+        }
+        std::fs::remove_file(config_path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
     fn test_app() -> RemoteOpsAgentApp {
         let (event_sender, events) = mpsc::channel();
         let (trust_sender, trust_events) = mpsc::channel();
@@ -3766,6 +4068,250 @@ mod tests {
             });
             assert!(app.running_operations.is_empty());
             assert!(app.last_operation_result.is_none());
+        }
+    }
+
+    struct CompactActivity;
+    impl GuiExtension for CompactActivity {
+        fn mode(&self, slot: ExtensionSlot) -> ExtensionMode {
+            if slot == ExtensionSlot::Activity {
+                ExtensionMode::Replace
+            } else {
+                ExtensionMode::Append
+            }
+        }
+        fn render(
+            &mut self,
+            slot: ExtensionSlot,
+            ui: &mut egui::Ui,
+            _: &GuiSnapshot,
+        ) -> Vec<GuiAction> {
+            if slot == ExtensionSlot::Activity {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 86.0),
+                    egui::Sense::hover(),
+                );
+                assert!(rect.top() < 230.0, "紧凑活动区不能推到窗口底部：{rect:?}");
+                for row in 0_u16..4 {
+                    ui.painter().text(
+                        rect.left_top() + egui::vec2(0.0, 10.0 + f32::from(row) * 19.0),
+                        egui::Align2::LEFT_TOP,
+                        "15:37:54 activity",
+                        egui::FontId::proportional(11.5),
+                        ui.visuals().text_color(),
+                    );
+                }
+            }
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn compact_product_layout_matches_original_window_and_keeps_all_actions_visible() {
+        for language in [Language::ZhCn, Language::EnUs] {
+            for appearance in [Appearance::Light, Appearance::Dark] {
+                for controlled in [false, true] {
+                    for pixels_per_point in [1.0, 1.25, 1.5] {
+                        let ctx = egui::Context::default();
+                        configure_fonts(&ctx);
+                        install_style(&ctx);
+                        appearance.apply(&ctx);
+                        let mut app = test_app();
+                        app.options.layout = GuiLayout::Compact;
+                        app.options.extension = Some(Box::new(CompactActivity));
+                        app.translator = Translator::new(language);
+                        app.status = if controlled {
+                            UiStatus::Controlled
+                        } else {
+                            UiStatus::Waiting
+                        };
+                        app.active_connections = usize::from(controlled);
+                        app.pairing_code = Some("482-915-307".into());
+                        if controlled {
+                            app.controller_bindings = vec![demo_controller_binding()];
+                        }
+                        assert_eq!(app.running_size(), egui::vec2(500.0, 375.0));
+                        let viewport =
+                            egui::Rect::from_min_size(egui::Pos2::ZERO, app.running_size());
+                        let mut input = egui::RawInput {
+                            screen_rect: Some(viewport),
+                            ..Default::default()
+                        };
+                        input
+                            .viewports
+                            .get_mut(&egui::ViewportId::ROOT)
+                            .unwrap()
+                            .native_pixels_per_point = Some(pixels_per_point);
+                        let action = app.translator.text(if controlled {
+                            "agent.action.stop_remote"
+                        } else {
+                            "agent.action.exit_agent"
+                        });
+                        let output = ctx.run_ui(input, |ui| {
+                            let content = app.render_main(ui);
+                            assert!(viewport.contains_rect(content), "{language:?} {appearance:?} {controlled} {pixels_per_point}: {content:?}");
+                        });
+                        let text = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::Shape::Text(text)
+                                    if text.galley.job.text.contains(&action) =>
+                                {
+                                    Some(text)
+                                }
+                                _ => None,
+                            })
+                            .expect("紧凑界面仍应绘制停止或退出按钮");
+                        assert!(viewport.contains_rect(egui::Rect::from_min_size(
+                            text.pos,
+                            text.galley.size()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    struct EventObserver(std::sync::Arc<std::sync::Mutex<Vec<GuiEvent>>>);
+    impl GuiExtension for EventObserver {
+        fn observe(&mut self, event: &GuiEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+        fn render(
+            &mut self,
+            _: ExtensionSlot,
+            _: &mut egui::Ui,
+            _: &GuiSnapshot,
+        ) -> Vec<GuiAction> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn presentation_events_reject_stale_epochs_and_reset_on_disconnect() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut app = test_app();
+        app.options.extension = Some(Box::new(EventObserver(events.clone())));
+        app.status = UiStatus::Controlled;
+        app.apply_event(AgentEvent::ConnectionEpoch(7));
+        let request_id = RequestId::new();
+        for epoch in [6, 7] {
+            app.apply_event(AgentEvent::ScopedOperation {
+                epoch,
+                event: Box::new(AgentEvent::OperationStateChanged {
+                    request_id,
+                    state: AgentOperationState::Running,
+                }),
+            });
+        }
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert!(matches!(
+            events.lock().unwrap()[0],
+            GuiEvent::OperationState {
+                state: AgentOperationState::Running,
+                ..
+            }
+        ));
+        app.apply_event(AgentEvent::Connecting);
+        assert!(matches!(
+            events.lock().unwrap().last().unwrap(),
+            GuiEvent::Reset
+        ));
+        let count = events.lock().unwrap().len();
+        app.apply_event(AgentEvent::ScopedOperation {
+            epoch: 7,
+            event: Box::new(AgentEvent::OperationStateChanged {
+                request_id,
+                state: AgentOperationState::Succeeded,
+            }),
+        });
+        app.apply_event(AgentEvent::OperationStateChanged {
+            request_id,
+            state: AgentOperationState::Succeeded,
+        });
+        assert_eq!(events.lock().unwrap().len(), count);
+        app.status = UiStatus::Waiting;
+        app.apply_event(AgentEvent::ControllerCountChanged {
+            active_connections: 1,
+        });
+        assert!(matches!(
+            events.lock().unwrap().last().unwrap(),
+            GuiEvent::ControllerConnected
+        ));
+        app.apply_event(AgentEvent::ControllerCountChanged {
+            active_connections: 0,
+        });
+        assert!(matches!(
+            events.lock().unwrap().last().unwrap(),
+            GuiEvent::Reset
+        ));
+    }
+
+    #[test]
+    fn product_activity_layout_keeps_stop_action_inside_fixed_window() {
+        for language in [Language::ZhCn, Language::EnUs] {
+            for appearance in [Appearance::Light, Appearance::Dark] {
+                for pixels_per_point in [1.0, 1.25, 1.5] {
+                    let ctx = egui::Context::default();
+                    configure_fonts(&ctx);
+                    install_style(&ctx);
+                    appearance.apply(&ctx);
+                    let mut app = test_app();
+                    app.options.activity = true;
+                    app.translator = Translator::new(language);
+                    app.status = UiStatus::Controlled;
+                    app.pairing_code = Some("482-915-307".into());
+                    app.controller_bindings = vec![demo_controller_binding()];
+                    app.apply_event(AgentEvent::ControllerCountChanged {
+                        active_connections: 1,
+                    });
+                    app.apply_event(AgentEvent::OperationStateChanged {
+                        request_id: RequestId::new(),
+                        state: AgentOperationState::Running,
+                    });
+                    for index in 0..8 {
+                        app.apply_event(AgentEvent::OperationLog(AgentOperationLog {
+                            request_id: None,
+                            occurred_at: Utc::now(),
+                            level: AgentLogLevel::Info,
+                            message: format!("actual output row {index}"),
+                        }));
+                    }
+                    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, app.running_size());
+                    let mut input = egui::RawInput {
+                        screen_rect: Some(viewport),
+                        ..Default::default()
+                    };
+                    input
+                        .viewports
+                        .get_mut(&egui::ViewportId::ROOT)
+                        .unwrap()
+                        .native_pixels_per_point = Some(pixels_per_point);
+                    let stop = app.translator.text("agent.action.stop_remote");
+                    let output = ctx.run_ui(input, |ui| {
+                        let content = app.render_main(ui);
+                        assert!(
+                            viewport.contains_rect(content),
+                            "{language:?} {appearance:?} {pixels_per_point}: {content:?}"
+                        );
+                    });
+                    let text = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.job.text.contains(&stop) => {
+                                Some(text)
+                            }
+                            _ => None,
+                        })
+                        .expect("启用活动区域后仍应绘制停止协助按钮");
+                    assert!(
+                        viewport
+                            .contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                    );
+                }
+            }
         }
     }
 
@@ -4317,10 +4863,32 @@ pub fn build_info(profile: &ProductProfile) -> BuildInfo {
 }
 impl RemoteOpsAgentApp {
     fn running_size(&self) -> Vec2 {
-        if self.options.activity || self.options.extension.is_some() {
-            Vec2::new(540.0, 560.0)
-        } else {
-            RUNNING_WINDOW_SIZE
+        self.options.running_size()
+    }
+    // 先由宿主校验连接代次，再向呈现扩展发送不可变事件。
+    fn observe_extension_event(&mut self, event: &AgentEvent) {
+        let Some(extension) = self.options.extension.as_mut() else {
+            return;
+        };
+        match event {
+            AgentEvent::ControllerCountChanged {
+                active_connections: 0,
+            } => extension.observe(&GuiEvent::Reset),
+            AgentEvent::ControllerCountChanged { .. } => {
+                extension.observe(&GuiEvent::ControllerConnected);
+            }
+            AgentEvent::OperationLog(log) if matches!(self.status, UiStatus::Controlled) => {
+                extension.observe(&GuiEvent::OperationLog(log.clone()));
+            }
+            AgentEvent::OperationStateChanged { request_id, state }
+                if matches!(self.status, UiStatus::Controlled) =>
+            {
+                extension.observe(&GuiEvent::OperationState {
+                    request_id: *request_id,
+                    state: *state,
+                });
+            }
+            _ => {}
         }
     }
     fn snapshot(&self) -> GuiSnapshot {
@@ -4370,6 +4938,24 @@ impl RemoteOpsAgentApp {
             language: self.translator.language(),
         }
     }
+    // 仅跳过呈现组件；扩展返回的动作仍统一交给宿主处理。
+    fn render_region(
+        &mut self,
+        slot: ExtensionSlot,
+        ui: &mut egui::Ui,
+        render_default: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) {
+        let mode = self
+            .options
+            .extension
+            .as_ref()
+            .map_or(ExtensionMode::Append, |extension| extension.mode(slot));
+        if mode == ExtensionMode::Append {
+            render_default(self, ui);
+        }
+        self.render_extension(slot, ui);
+    }
+
     fn render_extension(&mut self, slot: ExtensionSlot, ui: &mut egui::Ui) {
         let snapshot = self.snapshot();
         let actions = self

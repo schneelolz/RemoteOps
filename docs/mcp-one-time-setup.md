@@ -65,6 +65,7 @@ macOS 安装包：
 
 - `cargo test -p remoteops-enrollment -p remoteops-enrollment-store -p remoteops-relay -p remoteops-controller-mcp --locked`
 - `node scripts/test-relay-admin.mjs`
+- `python3 scripts/Test-McpSetupInstallers.py --check-versions`（Python 3.11+；无需构建，核对安装、验证、卸载脚本及安装说明与 MCP Cargo 版本一致；完整安装器测试也会先执行此检查）。
 - `python3 scripts/Test-McpSetupInstallers.py`
 - 全工作区 fmt、check、clippy、test，以及 Windows/macOS CI 的安装器测试。
 
