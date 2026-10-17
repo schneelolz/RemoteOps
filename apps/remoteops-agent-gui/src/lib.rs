@@ -3743,7 +3743,7 @@ mod tests {
                         app.render_main(ui);
                     },
                 );
-                assert!(!output.shapes.is_empty());
+                assert_ne!(output.shapes, [] as [eframe::epaint::ClippedShape; 0]);
             }
         }
     }
