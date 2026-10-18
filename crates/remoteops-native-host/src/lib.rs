@@ -118,7 +118,7 @@ mod tests {
     #[test]
     fn local_facts_are_consistent_without_claiming_service_validation() {
         let facts = super::collect();
-        assert!(!facts.reason.is_empty());
+        assert_ne!(facts.reason, "");
         if facts.process_session_id == Some(0) {
             assert_eq!(facts.interactive_desktop, Some(false));
         }

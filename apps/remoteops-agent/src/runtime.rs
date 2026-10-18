@@ -573,7 +573,7 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(a.context.product_id, b.context.product_id);
-        assert!(b.context.guidance.is_empty());
+        assert_eq!(b.context.guidance, Vec::<TargetGuidance>::new());
         assert!(a.check(&visual_operations()[0]).is_err());
     }
 }
