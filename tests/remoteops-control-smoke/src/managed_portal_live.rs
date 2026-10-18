@@ -146,13 +146,22 @@ pub(super) async fn run(root: &Path, address: &str, cert: &Path) -> Result<()> {
     })
     .await
     .context("受管 Agent 注册超时")??;
-    let status = portal.status(portal_token).await?;
-    ensure!(
-        status["online"] == true
-            && status["invitation"].is_null()
-            && status["connection"].is_null(),
-        "待命状态不正确"
-    );
+    // Registered 表示 Agent 已发送最终确认，门户还需等待 Relay 消费确认并发布 ready。
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let status = portal.status(portal_token).await?;
+            ensure!(
+                status["invitation"].is_null() && status["connection"].is_null(),
+                "受管待命不应产生邀请或连接"
+            );
+            if status["online"] == true {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .context("Agent 已注册但门户未在截止前发布上线状态")??;
     let proxy = pair_result_proxy::start(address, cert).await?;
     let client = start_mcp(root, &proxy.address, cert).await?;
     let issued = portal.issue(portal_token).await?;
