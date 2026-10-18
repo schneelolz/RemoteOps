@@ -9,7 +9,7 @@ use remoteops_domain::{RequestId, TargetGuidance};
 use remoteops_protocol::PairingMode;
 use reqwest::{Client, Method};
 use serde_json::{Value, json};
-use std::{env, path::Path, sync::mpsc, time::Duration};
+use std::{env, io::Write, path::Path, sync::mpsc, time::Duration};
 use tokio::{
     sync::watch,
     time::{sleep, timeout},
@@ -79,12 +79,19 @@ pub(super) async fn run(root: &Path, address: &str, cert: &Path) -> Result<()> {
     let asset = portal.request(Method::POST, "/api/admin/portal/assets", &admin,
         json!({"asset_id":"service-smoke","principal_id":principal["principal"]["principal_id"]})).await?;
     let enrollment_file = root.join("enrollment.json");
-    std::fs::write(
-        &enrollment_file,
-        serde_json::to_vec(&json!({
+    let mut enrollment_options = std::fs::OpenOptions::new();
+    enrollment_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 写入凭据前就限制权限，符合运行库的 Unix 凭据文件检查。
+        enrollment_options.mode(0o600);
+    }
+    enrollment_options
+        .open(&enrollment_file)?
+        .write_all(&serde_json::to_vec(&json!({
             "target_id":asset["asset"]["target_id"],"token":asset["enrollment_token"]
-        }))?,
-    )?;
+        }))?)?;
     let profile = ProductProfile {
         id: "managed-service-smoke".into(),
         ..ProductProfile::default()
