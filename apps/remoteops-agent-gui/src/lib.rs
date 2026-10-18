@@ -33,8 +33,8 @@ use eframe::egui::{
 use egui_phosphor::regular as icons;
 use remoteops_agent::{
     AgentConfig, AgentControllerBinding, AgentEvent, AgentEventSender, AgentLogLevel,
-    AgentOperationLog, AgentOperationState, AgentPermissionControl, active_agent_config_path,
-    initialize_tracing, run_agent_with_scoped_events,
+    AgentOperationLog, AgentOperationState, AgentPermissionControl, AgentRuntimeOptions,
+    active_agent_config_path, initialize_tracing, run_agent_with_scoped_options,
 };
 use remoteops_domain::{AgentInstanceId, Capability, CapabilitySet, RequestId};
 use remoteops_i18n::{Language, Translator};
@@ -770,6 +770,7 @@ impl RemoteOpsAgentApp {
             config,
             self.shutdown.subscribe(),
             self.permission_control.clone(),
+            self.profile.clone(),
         ));
     }
 
@@ -860,6 +861,11 @@ impl RemoteOpsAgentApp {
                 } else {
                     UiStatus::Waiting
                 };
+            }
+            AgentEvent::Registered { .. } => {
+                self.pairing_code = None;
+                self.pairing_code_expires_at = None;
+                self.status = UiStatus::Waiting;
             }
             AgentEvent::LeaseRenewed { lease_expires_at } => {
                 self.pairing_code_expires_at = Some(lease_expires_at);
@@ -2697,6 +2703,7 @@ fn spawn_live(
     config: AgentConfig,
     shutdown_receiver: watch::Receiver<bool>,
     permission_control: AgentPermissionControl,
+    profile: ProductProfile,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("remoteops-agent-runtime".to_owned())
@@ -2708,13 +2715,12 @@ fn spawn_live(
                 .thread_name("remoteops-agent-worker")
                 .build();
             let result = match runtime {
-                Ok(runtime) => runtime.block_on(run_agent_with_scoped_events(
+                Ok(runtime) => runtime.block_on(run_agent_with_scoped_options(
                     config,
                     Some(event_sender.clone()),
                     shutdown_receiver,
                     permission_control,
-                    remoteops_visual::default_visual_provider(),
-                    cfg!(windows),
+                    AgentRuntimeOptions::interactive(profile),
                 )),
                 Err(error) => Err(anyhow::Error::new(error).context("无法创建 Agent 异步运行时")),
             };

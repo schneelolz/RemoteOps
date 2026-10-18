@@ -1,10 +1,15 @@
 ﻿[CmdletBinding()]
 param(
+    [ValidatePattern('^[A-Za-z0-9_.-]{1,128}$')]
+    [string]$ServiceName = 'RemoteOpsAgent',
     [string]$StatusFile = "$env:ProgramData\RemoteOps\Agent\runtime-status.json"
 )
 
 $ErrorActionPreference = 'Stop'
-$service = Get-Service -Name 'RemoteOpsAgent' -ErrorAction SilentlyContinue
+if ($ServiceName -ne 'RemoteOpsAgent' -and -not $PSBoundParameters.ContainsKey('StatusFile')) {
+    throw '查询定制服务必须显式指定对应 StatusFile'
+}
+$service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 $status = if (Test-Path -LiteralPath $StatusFile) {
     Get-Content -LiteralPath $StatusFile -Raw | ConvertFrom-Json
 }
@@ -12,7 +17,7 @@ else {
     $null
 }
 [PSCustomObject]@{
-    ServiceName = 'RemoteOpsAgent'
+    ServiceName = $ServiceName
     ServiceStatus = if ($null -eq $service) { 'NotInstalled' } else { $service.Status.ToString() }
     RuntimeStatus = if ($null -eq $status) { $null } else { $status.status }
     AgentInstanceId = if ($null -eq $status) { $null } else { $status.agent_instance_id }

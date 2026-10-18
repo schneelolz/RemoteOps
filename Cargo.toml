@@ -16,6 +16,8 @@ members = [
     "crates/remoteops-ai",
     "crates/remoteops-i18n",
     "crates/remoteops-host-identity",
+    "crates/remoteops-native-host",
+    "crates/remoteops-portal",
     "crates/remoteops-visual",
     "apps/remoteops-relay",
     "apps/remoteops-agent",
@@ -64,6 +66,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "2.0"
+tempfile = "3"
 tokio = { version = "1.47", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"

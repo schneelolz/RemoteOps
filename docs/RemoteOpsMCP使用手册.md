@@ -2,11 +2,12 @@
 
 > 文档状态：当前 Codex 操作手册。底层配置原理见[Codex MCP 接入说明](CodexMCP接入说明.md)，不要从历史验收报告复制安装参数。
 
-- 更新日期：2026-08-16
+- 更新日期：2026-10-18
 - 发布状态：`0.2.0-preview.5` Technical Preview
 - MCP 版本：`0.2.0-preview.5`
 - 现场 Agent 版本：`0.2.0-preview.5`
 - Relay：由部署者配置
+- 控制码生命周期说明适用于协议 17 配套构建；下列历史发布包示例不能证明已包含本次变更，实际可用版本、测试和部署状态以交付清单为准。
 
 ## 一、推荐安装方式
 
@@ -58,7 +59,7 @@ Codex 桌面端、CLI 和 IDE 扩展共享 MCP 配置。官方说明：[Model Co
 
 Agent 不内置共享中继服务，必须连接部署者提供的自托管 Relay。使用公网 CA 时不需要 `relay-cert.pem`、启动参数或入站端口；私有 CA 可设置 `ca_cert`。没有 PEM 的未知自签名证书会在 GUI 中显示 SHA-256 指纹，由现场用户取消、仅本次继续或核对后信任并保存。
 
-GUI 窗口必须保持运行。窗口会显示连接状态、临时控制码、当前控制方和本机能力；关闭窗口并确认后会终止本次远程入口。控制码只用于配对，不要写入配置、文档或长期记录。
+GUI 窗口必须保持运行。窗口会显示连接状态、临时控制码、当前控制方和本机能力；关闭窗口并确认后会终止本次远程入口。每次重新启动 Agent 都会更换控制码和 `session_id`，旧会话终止，需使用新码重新配对；同次运行的网络断线重连保留控制码。CLI 和 Windows Service 重启也遵循这一规则。控制码只用于配对，不要写入配置、文档或长期记录。
 
 全新机器首次运行只需填写 Relay 地址，不需要先启动 Codex、申请入网码或获取部署级 Agent 注册 Token。Agent 显示九位控制码后，再由已安装并已认证的 RemoteOps MCP 完成配对。
 
@@ -74,7 +75,9 @@ Agent 状态和文件传输目录默认位于：
 
 不要公开或随意删除 `agent-state.json`，其中包含 Agent 身份和恢复信息。
 
-Relay 临时中断或长时间停机时保持 Agent 运行即可。有效恢复令牌可用于恢复控制码和 `session_id`，同一 MCP 进程会重试已知配对；这不代表旧连接的完全控制仍然有效。Agent 默认 `default_full_control=false`；只有已保存默认完全控制且本次运行未手动撤销时，才为新绑定自动重新授权。断线前审批和在途写操作不会自动重放。
+Relay 临时中断或长时间停机时保持 Agent 运行即可。同次 Agent 运行使用有效恢复令牌恢复控制码和 `session_id`，同一 MCP 进程仅按原会话自动恢复；预期会话不匹配或旧会话已终止时停止恢复，避免旧码回收后误配。Agent 程序已退出再打开时，应取得新码重新配对。这些恢复行为不代表旧连接的完全控制仍然有效。Agent 默认 `default_full_control=false`；只有已保存默认完全控制且本次运行未手动撤销时，才为新绑定自动重新授权。断线前审批和在途写操作不会自动重放。
+
+协议 17 必须同批更新 Relay、Agent 和所有 Controller，不能只更换 Agent。升级前备份旧产物、配置和 Relay/Agent 状态；旧状态首次迁移后的有效注册会换码换会话。替换 MCP 后重启实际宿主连接。需要回滚时停止相关进程，恢复配套旧产物及升级前状态；不要只替换二进制后复用已迁移状态。备份含恢复凭据，应受限保存。详见[安全模型](安全模型.md)。
 
 ## 四、在 Codex 中配对
 
@@ -163,7 +166,7 @@ Get-NetIPAddress -AddressFamily IPv4
 --command-mode agent-controlled
 ```
 
-安装器设置 `default_tools_approval_mode = "approve"`、`set_control_mode.approval_mode = "prompt"` 和当前 Codex 支持的内联 `approval_policy = { granular = { ... mcp_elicitations = true ... } }`。未获完全控制时写操作由 MCP 逐项确认；MCP 主动授权使用 `set_control_mode` 工具确认，现场授权使用 Agent 一次确认。RemoteOps 内部免审批不改变宿主独立的工具授权规则。推荐保持 `agent-controlled`；协议 16 的 `full-access` 启动参数仅设置上限，不自动授权。
+安装器设置 `default_tools_approval_mode = "approve"`、`set_control_mode.approval_mode = "prompt"` 和当前 Codex 支持的内联 `approval_policy = { granular = { ... mcp_elicitations = true ... } }`。未获完全控制时写操作由 MCP 逐项确认；MCP 主动授权使用 `set_control_mode` 工具确认，现场授权使用 Agent 一次确认。RemoteOps 内部免审批不改变宿主独立的工具授权规则。推荐保持 `agent-controlled`；协议 17 的 `full-access` 启动参数仅设置上限，不自动授权。
 
 规则如下：
 
@@ -300,7 +303,7 @@ Test-NetConnection relay.example.com -Port 7443
 
 ### 配对失败
 
-确认 Agent 窗口仍在运行并显示 `Relay 已连接`，使用窗口当前显示的完整控制码。Relay 或 Agent 正在恢复时可以等待自动重试，不要仅因 Relay 曾离线就删除 `agent-state.json`。完全退出 Codex、MCP 进程退出或已经调用 `close_connection` 后，自动恢复记录不再存在，需要重新调用 `pair_connection`。
+确认 Agent 窗口仍在运行并显示 `Relay 已连接`，使用窗口当前显示的完整控制码。同次 Agent 运行的 Relay 或网络连接正在恢复时可以等待自动重试；Agent 已重启则必须使用新控制码重新配对。不要仅因 Relay 曾离线就删除 `agent-state.json`。完全退出 Codex、MCP 进程退出或已经调用 `close_connection` 后，自动恢复记录不再存在，需要重新调用 `pair_connection`。
 
 ### 不支持 `power_shell`
 

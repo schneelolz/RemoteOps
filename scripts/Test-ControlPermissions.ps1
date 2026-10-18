@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('remoteops-control-' + [guid]::NewGuid().ToString('N'))
 $relayProcess = $null
-$envNames = @('REMOTEOPS_HUMAN_CONTROLLER_TOKEN','REMOTEOPS_AI_CONTROLLER_TOKEN','REMOTEOPS_CONTROLLER_OWNER_ID','CONTROL_SMOKE_ADDRESS','CONTROL_SMOKE_CERT','REMOTEOPS_ADMIN_TOKEN','REMOTEOPS_ADMIN_USERNAME','REMOTEOPS_ADMIN_PASSWORD','REMOTEOPS_VISUAL_PROVIDER_ENABLED','CONTROL_SMOKE_MCP_EXECUTABLE')
+$envNames = @('REMOTEOPS_HUMAN_CONTROLLER_TOKEN','REMOTEOPS_AI_CONTROLLER_TOKEN','REMOTEOPS_CONTROLLER_OWNER_ID','CONTROL_SMOKE_ADDRESS','CONTROL_SMOKE_CERT','REMOTEOPS_ADMIN_TOKEN','REMOTEOPS_ADMIN_USERNAME','REMOTEOPS_ADMIN_PASSWORD','REMOTEOPS_VISUAL_PROVIDER_ENABLED','CONTROL_SMOKE_MCP_EXECUTABLE','CONTROL_SMOKE_RELAY_STATE','CONTROL_SMOKE_ADMIN_ADDRESS')
 $previous = @{}
 foreach ($name in $envNames) { $previous[$name] = [Environment]::GetEnvironmentVariable($name) }
 function Get-FreePort {
@@ -15,7 +15,7 @@ try {
     if (-not $SkipBuild) {
         Push-Location $workspace
         try {
-            cargo build --locked -p remoteops-relay -p remoteops-controller-mcp -p remoteops-control-smoke
+            cargo build --locked -p remoteops-relay -p remoteops-controller-mcp -p remoteops-agent -p remoteops-control-smoke
             if ($LASTEXITCODE -ne 0) { throw '控制权限专项构建失败' }
         } finally { Pop-Location }
     }
@@ -23,19 +23,21 @@ try {
     $env:REMOTEOPS_HUMAN_CONTROLLER_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
     $env:REMOTEOPS_AI_CONTROLLER_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
     $env:REMOTEOPS_CONTROLLER_OWNER_ID = [guid]::NewGuid().ToString()
-    $env:REMOTEOPS_ADMIN_TOKEN = $null
+    $env:REMOTEOPS_ADMIN_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
     $env:REMOTEOPS_ADMIN_USERNAME = $null
     $env:REMOTEOPS_ADMIN_PASSWORD = $null
     $env:REMOTEOPS_VISUAL_PROVIDER_ENABLED = $null
     $env:CONTROL_SMOKE_MCP_EXECUTABLE = Join-Path $workspace 'target/debug/remoteops-controller-mcp.exe'
     $env:CONTROL_SMOKE_ADDRESS = '127.0.0.1:' + (Get-FreePort)
+    $env:CONTROL_SMOKE_ADMIN_ADDRESS = '127.0.0.1:' + (Get-FreePort)
     $env:CONTROL_SMOKE_CERT = Join-Path $testRoot 'cert.pem'
+    $env:CONTROL_SMOKE_RELAY_STATE = Join-Path $testRoot 'state.json'
     $healthAddress = '127.0.0.1:' + (Get-FreePort)
     $relayExe = Join-Path $workspace 'target/debug/remoteops-relay.exe'
     $smokeExe = Join-Path $workspace 'target/debug/remoteops-control-smoke.exe'
     $liveExe = Join-Path $workspace 'target/debug/remoteops-control-live.exe'
     # 只启动本次专属的回环 Relay；凭据不放入参数或输出。
-    $arguments = @('--bind',$env:CONTROL_SMOKE_ADDRESS,'--health-bind',$healthAddress,'--tls-cert',('"'+$env:CONTROL_SMOKE_CERT+'"'),'--tls-key',('"'+(Join-Path $testRoot 'key.pem')+'"'),'--state-file',('"'+(Join-Path $testRoot 'state.json')+'"'))
+    $arguments = @('--bind',$env:CONTROL_SMOKE_ADDRESS,'--health-bind',$healthAddress,'--admin-bind',$env:CONTROL_SMOKE_ADMIN_ADDRESS,'--tls-cert',('"'+$env:CONTROL_SMOKE_CERT+'"'),'--tls-key',('"'+(Join-Path $testRoot 'key.pem')+'"'),'--state-file',('"'+(Join-Path $testRoot 'state.json')+'"'))
     $relayProcess = Start-Process -FilePath $relayExe -ArgumentList $arguments -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $testRoot 'relay.out') -RedirectStandardError (Join-Path $testRoot 'relay.err')
     $ready = $false
     for ($attempt=0; $attempt -lt 50; $attempt++) {

@@ -27,6 +27,7 @@ async fn agent_connect(
     address: &str,
     cert: &str,
     id: AgentInstanceId,
+    boot_id: remoteops_domain::AgentBootId,
     token: Option<String>,
 ) -> Result<(Stream, AgentWelcome)> {
     let initial = token.is_none();
@@ -34,6 +35,10 @@ async fn agent_connect(
     write_frame(
         &mut stream,
         &WireMessage::Hello(ClientHello::Agent(AgentHello {
+            boot_id,
+            target_context: None,
+            pairing_mode: remoteops_protocol::PairingMode::AutoPerBoot,
+            managed_enrollment: None,
             protocol_version: PROTOCOL_VERSION,
             agent_instance_id: id,
             resume_token: token,
@@ -248,14 +253,23 @@ async fn controller_connect(address: &str, cert: &str) -> Result<RelayClient> {
     .map_err(Into::into)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run() -> Result<()> {
     let address = env::var("CONTROL_SMOKE_ADDRESS")?;
     ensure!(address.starts_with("127.0.0.1:"), "只允许本地回环 Relay");
     let cert = env::var("CONTROL_SMOKE_CERT")?;
     let agent_id = AgentInstanceId::new();
-    let (mut agent, welcome) = agent_connect(&address, &cert, agent_id, None).await?;
+    let boot_id = remoteops_domain::AgentBootId::new();
+    let (mut agent, welcome) = agent_connect(&address, &cert, agent_id, boot_id, None).await?;
     let client = controller_connect(&address, &cert).await?;
-    let connection = client.pair(welcome.pairing_code.clone()).await?;
+    let connection = client
+        .pair(
+            welcome
+                .pairing_code
+                .clone()
+                .context("交互模拟Agent必须返回控制码")?,
+        )
+        .await?;
     let session = connection.session_id;
     let step = client.query_control_state(session).await?;
     ensure!(
@@ -309,8 +323,14 @@ async fn run() -> Result<()> {
     println!("通过：现场撤销同步至 MCP，旧请求被拒绝");
     let local = verify_local_execution(&client, &mut agent, session, &revoked).await?;
     drop(agent);
-    let (mut resumed, _) =
-        agent_connect(&address, &cert, agent_id, Some(welcome.resume_token)).await?;
+    let (mut resumed, _) = agent_connect(
+        &address,
+        &cert,
+        agent_id,
+        boot_id,
+        Some(welcome.resume_token),
+    )
+    .await?;
     let reset = loop {
         match receive(&mut resumed).await? {
             WireMessage::ControlStateUpdated(state) => break state,

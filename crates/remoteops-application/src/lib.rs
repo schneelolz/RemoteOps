@@ -19,16 +19,17 @@ use remoteops_audit::{JsonlAuditStore, sha256_bytes};
 use remoteops_domain::{
     ApprovalId, ApprovalState, AuditEvent, ConnectionDescriptor, ConnectionState,
     ControllerOwnerId, DomainError, EventPayload, EventSource, PairingCode, PermissionMode,
-    RemoteEvent, RemoteOperation, RequestId, SessionId,
+    RemoteEvent, RemoteOperation, RequestId, SessionId, TargetContext,
 };
 use remoteops_policy::{DefaultPolicy, PolicyDecision};
 pub use remoteops_protocol::ControllerKind;
 use remoteops_protocol::{
     ApprovalDecision, ApprovalRequest, ApprovalResult, ClientHello, ControlProof,
     ControlStateRequest, ControlStateResult, ControllerControlModeUpdate, ControllerHello,
-    PROTOCOL_VERSION, PairResult, ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest,
-    RemoteResponse, SessionControlState, WireMessage, connect_tls, load_client_config,
-    load_native_client_config, load_pinned_client_config, read_frame, write_frame,
+    PROTOCOL_VERSION, PairResult, PairingErrorCode, ReleaseSessionRequest, ReleaseSessionResult,
+    RemoteRequest, RemoteResponse, SessionControlState, WireMessage, connect_tls,
+    load_client_config, load_native_client_config, load_pinned_client_config, read_frame,
+    write_frame,
 };
 use remoteops_session::ConnectionRegistry;
 use thiserror::Error;
@@ -172,8 +173,25 @@ impl ControllerCore {
         operation: RemoteOperation,
         approval_id: Option<ApprovalId>,
     ) -> Result<RemoteRequest, ApplicationError> {
-        if self.registry.get(session_id).is_none() {
-            return Err(ApplicationError::Domain(DomainError::ConnectionNotFound));
+        let connection = self
+            .registry
+            .get(session_id)
+            .ok_or(ApplicationError::Domain(DomainError::ConnectionNotFound))?;
+        if operation.is_visual() {
+            let reason = if connection.environment.protocol_version < 18 {
+                Some("host_context_unknown")
+            } else {
+                connection.target_context.as_ref().map_or(
+                    Some("host_context_unknown"),
+                    TargetContext::visual_disabled_reason,
+                )
+            };
+            if let Some(reason) = reason {
+                return Err(ApplicationError::Remote {
+                    code: reason.to_owned(),
+                    message: "当前目标上下文未允许图形操作".to_owned(),
+                });
+            }
         }
 
         match self.policy.evaluate(source, &operation) {
@@ -286,17 +304,29 @@ struct ClientInner {
     connected: watch::Sender<bool>,
     core: Mutex<ControllerCore>,
     pending: Arc<PendingRegistry>,
-    pair_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<PairResult>>>,
+    pair_pending: Mutex<BTreeMap<RequestId, PendingPairRequest>>,
     release_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ReleaseSessionResult>>>,
     approval_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ApprovalResult>>>,
     controller_modes: Mutex<Vec<ControllerControlModeUpdate>>,
     control_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ControlStateResult>>>,
     control_states: Mutex<BTreeMap<SessionId, SessionControlState>>,
-    known_pairings: Mutex<BTreeMap<PairingCode, Option<SessionId>>>,
-    automatic_pair_pending: Mutex<BTreeMap<RequestId, PairingCode>>,
+    known_pairings: Mutex<BTreeMap<PairingCode, SessionId>>,
+    // 受管连接不保留已兑换的一次码，凭据仅存在本Controller进程。
+    managed_pairings: Mutex<BTreeMap<SessionId, String>>,
+    automatic_pair_pending: Mutex<BTreeMap<RequestId, (Option<PairingCode>, SessionId)>>,
     events: broadcast::Sender<RemoteEvent>,
     event_history: Mutex<VecDeque<RemoteEvent>>,
     audit: Option<Arc<JsonlAuditStore>>,
+}
+
+struct PendingPairRequest {
+    // 仅由仍在等待的人工请求建立连接并记录恢复目标。
+    pairing_code: PairingCode,
+    // 只记录本请求等待期间已结束的会话，随请求完成或取消一起释放。
+    excluded_sessions: BTreeSet<SessionId>,
+    // 同一传输只发送一次；重连时复用同一请求标识进行幂等兑换。
+    last_sent_generation: Option<u64>,
+    sender: oneshot::Sender<PairResult>,
 }
 
 struct PendingRemoteResponse {
@@ -372,6 +402,7 @@ impl RelayClient {
             control_pending: Mutex::new(BTreeMap::new()),
             control_states: Mutex::new(BTreeMap::new()),
             known_pairings: Mutex::new(BTreeMap::new()),
+            managed_pairings: Mutex::new(BTreeMap::new()),
             automatic_pair_pending: Mutex::new(BTreeMap::new()),
             events,
             event_history: Mutex::new(VecDeque::with_capacity(2048)),
@@ -432,50 +463,39 @@ impl RelayClient {
         &self,
         pairing_code: remoteops_domain::PairingCode,
     ) -> Result<ConnectionDescriptor, ApplicationError> {
+        let deadline = Instant::now() + TokioDuration::from_secs(20);
         let request_id = RequestId::new();
         let (sender, receiver) = oneshot::channel();
-        self.inner
-            .pair_pending
-            .lock()
-            .await
-            .insert(request_id, sender);
-        if let Err(error) = self
-            .send_wire(WireMessage::PairRequest(remoteops_protocol::PairRequest {
-                request_id,
-                pairing_code: pairing_code.clone(),
-                permission_mode: self.inner.config.permission_mode,
-            }))
-            .await
-        {
-            self.inner.pair_pending.lock().await.remove(&request_id);
-            return Err(error);
-        }
-        let result = receive_pending(
-            &self.inner.pair_pending,
+        self.inner.pair_pending.lock().await.insert(
             request_id,
-            receiver,
-            TokioDuration::from_secs(20),
-            "Relay 配对响应通道已关闭",
-        )
-        .await?;
-        if let Some(error) = result.error {
+            PendingPairRequest {
+                pairing_code: pairing_code.clone(),
+                excluded_sessions: BTreeSet::new(),
+                last_sent_generation: None,
+                sender,
+            },
+        );
+        // 未收到结果的兑换请求跨传输保留；只重发配对，不重放任何远程操作。
+        let transport = self.inner.transport.lock().await.clone();
+        if let Some(transport) = transport {
+            let _ =
+                send_pending_pairings(&self.inner, &transport.sender, transport.generation).await;
+        }
+        let response = timeout_at(deadline, receiver).await;
+        self.inner.pair_pending.lock().await.remove(&request_id);
+        let result = response
+            .map_err(|_| ApplicationError::Timeout)?
+            .map_err(|_| ApplicationError::Transport("Relay 配对响应通道已关闭".to_owned()))?;
+        if result.error.is_some() || result.error_code.is_some() {
             return Err(ApplicationError::Remote {
                 code: "pairing_failed".to_owned(),
-                message: error,
+                message: result.error.unwrap_or_else(|| "Relay 拒绝配对".to_owned()),
             });
         }
         let connection = result.connection.ok_or_else(|| ApplicationError::Remote {
             code: "pairing_failed".to_owned(),
             message: "Relay 未返回连接描述".to_owned(),
         })?;
-        self.inner
-            .known_pairings
-            .lock()
-            .await
-            .insert(pairing_code, Some(connection.session_id));
-        let mut core = self.inner.core.lock().await;
-        let connection = core.upsert_connection(connection);
-        drop(core);
         self.append_audit(AuditEvent {
             session_id: connection.session_id,
             request_id: Some(request_id),
@@ -979,8 +999,58 @@ impl RelayClient {
             });
         }
         forget_session_pairing(&self.inner, session_id).await;
-        self.inner.core.lock().await.remove_connection(session_id)?;
+        // 受管会话会先收到ConnectionRemoved，成功释放后的本地收尾必须幂等。
+        let _ = self.inner.core.lock().await.remove_connection(session_id);
         Ok(result)
+    }
+
+    /// 实时读取指定会话的安全上下文；不会调用图形 Provider。
+    pub async fn refresh_target_context(
+        &self,
+        session_id: SessionId,
+    ) -> Result<TargetContext, ApplicationError> {
+        {
+            let core = self.inner.core.lock().await;
+            let connection = core
+                .get_connection(session_id)
+                .ok_or_else(|| ApplicationError::Transport("目标会话已结束".to_owned()))?;
+            if connection.environment.protocol_version < 18
+                || connection
+                    .target_context
+                    .as_ref()
+                    .is_none_or(|context| context.validate().is_err())
+            {
+                return Err(ApplicationError::Remote {
+                    code: "unsupported_mode".to_owned(),
+                    message: "目标未声明安全上下文查询能力".to_owned(),
+                });
+            }
+        }
+        let result = self
+            .execute(
+                &session_id.to_string(),
+                EventSource::Ai,
+                RemoteOperation::GetTargetContext,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        let value = result
+            .response
+            .details
+            .ok_or_else(|| ApplicationError::Transport("Agent 未返回目标上下文".to_owned()))?;
+        let context: TargetContext = serde_json::from_value(value)
+            .map_err(|_| ApplicationError::Transport("Agent 返回了无效目标上下文".to_owned()))?;
+        context.validate().map_err(ApplicationError::Transport)?;
+        let mut core = self.inner.core.lock().await;
+        let mut connection = core
+            .get_connection(session_id)
+            .cloned()
+            .ok_or_else(|| ApplicationError::Transport("目标会话已结束".to_owned()))?;
+        connection.target_context = Some(context.clone());
+        core.upsert_connection(connection);
+        Ok(context)
     }
 
     /// 将指定会话的脱敏审计事件导出为 JSON。
@@ -1233,7 +1303,15 @@ async fn run_transport(
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             retry.tick().await;
-            if !send_recoverable_pairings(&pairing_recovery_inner, &pairing_recovery_sender).await {
+            if !send_pending_pairings(
+                &pairing_recovery_inner,
+                &pairing_recovery_sender,
+                generation,
+            )
+            .await
+                || !send_recoverable_pairings(&pairing_recovery_inner, &pairing_recovery_sender)
+                    .await
+            {
                 break;
             }
         }
@@ -1266,56 +1344,70 @@ async fn run_transport(
     result
 }
 
+async fn send_pending_pairings(
+    inner: &ClientInner,
+    sender: &mpsc::UnboundedSender<WireMessage>,
+    generation: u64,
+) -> bool {
+    let mut pending = inner.pair_pending.lock().await;
+    pending.retain(|_, request| !request.sender.is_closed());
+    for (request_id, request) in pending.iter_mut() {
+        if request.last_sent_generation == Some(generation) {
+            continue;
+        }
+        let message = WireMessage::PairRequest(remoteops_protocol::PairRequest {
+            request_id: *request_id,
+            pairing_code: Some(request.pairing_code.clone()),
+            expected_session_id: None,
+            connection_resume_token: None,
+            permission_mode: inner.config.permission_mode,
+        });
+        if sender.send(message).is_err() {
+            return false;
+        }
+        request.last_sent_generation = Some(generation);
+    }
+    true
+}
+
 async fn send_recoverable_pairings(
     inner: &ClientInner,
     sender: &mpsc::UnboundedSender<WireMessage>,
 ) -> bool {
-    let known_pairings = inner.known_pairings.lock().await.clone();
-    if known_pairings.is_empty() {
-        return true;
-    }
-    let pending_codes = inner
-        .automatic_pair_pending
-        .lock()
-        .await
-        .values()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let pairing_codes = {
-        let core = inner.core.lock().await;
-        known_pairings
-            .into_iter()
-            .filter_map(|(pairing_code, session_id)| {
-                if pending_codes.contains(&pairing_code) {
-                    return None;
-                }
-                let online = session_id
-                    .and_then(|session_id| core.get_connection(session_id))
-                    .is_some_and(|connection| connection.state == ConnectionState::Online);
-                (!online).then_some(pairing_code)
-            })
-            .collect::<Vec<_>>()
-    };
-    for pairing_code in pairing_codes {
+    // 同一锁序覆盖缓存、凭据和在途目标，结束会话后不会再次排队。
+    let known = inner.known_pairings.lock().await;
+    let managed = inner.managed_pairings.lock().await;
+    let mut pending = inner.automatic_pair_pending.lock().await;
+    let core = inner.core.lock().await;
+    let targets = known
+        .iter()
+        .map(|(code, session)| (Some(code.clone()), *session, None))
+        .chain(
+            managed
+                .iter()
+                .map(|(session, token)| (None, *session, Some(token.clone()))),
+        );
+    for (pairing_code, session_id, connection_resume_token) in targets {
+        if pending.values().any(|(_, session)| *session == session_id)
+            || core
+                .get_connection(session_id)
+                .is_some_and(|connection| connection.state == ConnectionState::Online)
+        {
+            continue;
+        }
         let request_id = RequestId::new();
-        inner
-            .automatic_pair_pending
-            .lock()
-            .await
-            .insert(request_id, pairing_code.clone());
+        pending.insert(request_id, (pairing_code.clone(), session_id));
         if sender
             .send(WireMessage::PairRequest(remoteops_protocol::PairRequest {
                 request_id,
                 pairing_code,
+                expected_session_id: Some(session_id),
+                connection_resume_token,
                 permission_mode: inner.config.permission_mode,
             }))
             .is_err()
         {
-            inner
-                .automatic_pair_pending
-                .lock()
-                .await
-                .remove(&request_id);
+            pending.remove(&request_id);
             return false;
         }
     }
@@ -1323,24 +1415,17 @@ async fn send_recoverable_pairings(
 }
 
 async fn forget_session_pairing(inner: &ClientInner, session_id: SessionId) {
-    let removed_codes = {
-        let mut known_pairings = inner.known_pairings.lock().await;
-        let removed_codes = known_pairings
-            .iter()
-            .filter_map(|(pairing_code, paired_session_id)| {
-                (*paired_session_id == Some(session_id)).then_some(pairing_code.clone())
-            })
-            .collect::<BTreeSet<_>>();
-        known_pairings.retain(|pairing_code, _| !removed_codes.contains(pairing_code));
-        removed_codes
-    };
-    if !removed_codes.is_empty() {
-        inner
-            .automatic_pair_pending
-            .lock()
-            .await
-            .retain(|_, pairing_code| !removed_codes.contains(pairing_code));
-    }
+    inner
+        .known_pairings
+        .lock()
+        .await
+        .retain(|_, paired| *paired != session_id);
+    inner.managed_pairings.lock().await.remove(&session_id);
+    inner
+        .automatic_pair_pending
+        .lock()
+        .await
+        .retain(|_, (_, paired)| *paired != session_id);
 }
 
 async fn run_transport_io<R, W>(
@@ -1444,14 +1529,13 @@ async fn fail_pending_requests(inner: &ClientInner, message: &str) {
             .sender
             .send(Err(ApplicationError::Transport(message.to_owned())));
     }
-    let pair_pending = std::mem::take(&mut *inner.pair_pending.lock().await);
-    for (request_id, sender) in pair_pending {
-        let _ = sender.send(PairResult {
-            request_id,
-            connection: None,
-            error: Some(message.to_owned()),
-        });
-    }
+    // PairRequest 的消费结果可能已提交。保留仍在等待的调用，由下一传输使用
+    // 原 request_id 找回同一连接；普通远程请求仍按上面的逻辑立即失败。
+    inner
+        .pair_pending
+        .lock()
+        .await
+        .retain(|_, pending| !pending.sender.is_closed());
     let release_pending = std::mem::take(&mut *inner.release_pending.lock().await);
     drop(release_pending);
     let approval_pending = std::mem::take(&mut *inner.approval_pending.lock().await);
@@ -1483,29 +1567,86 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
                 let _ = sender.send(result);
             }
         }
-        WireMessage::PairResult(result) => {
-            let automatic_pairing = inner
+        WireMessage::PairResult(mut result) => {
+            let manual = inner.pair_pending.lock().await.remove(&result.request_id);
+            let mut known = inner.known_pairings.lock().await;
+            let mut managed = inner.managed_pairings.lock().await;
+            let automatic = inner
                 .automatic_pair_pending
                 .lock()
                 .await
                 .remove(&result.request_id);
-            if let Some(connection) = result.connection.clone() {
-                inner
-                    .core
-                    .lock()
-                    .await
-                    .upsert_connection(connection.clone());
-                if let Some(pairing_code) = automatic_pairing {
-                    inner
-                        .known_pairings
+            if let Some(pending) = manual {
+                if result.error.is_none()
+                    && result.error_code.is_none()
+                    && let Some(connection) = result.connection.clone()
+                {
+                    if pending.excluded_sessions.contains(&connection.session_id) {
+                        result.connection = None;
+                        result.error =
+                            Some("Agent 会话已经结束，请使用新控制码重新配对".to_owned());
+                        result.error_code = Some(PairingErrorCode::SessionEnded);
+                        let _ = pending.sender.send(result);
+                        return;
+                    }
+                    let mut core = inner.core.lock().await;
+                    if pending.sender.is_closed() {
+                        return;
+                    }
+                    // 先在副本中分配序号和别名；接收端仍在等待时才同步提交连接和恢复目标。
+                    let mut registry = core.registry.clone();
+                    result.connection = Some(registry.upsert(connection.clone()));
+                    let resume_token = result.connection_resume_token.clone();
+                    if pending.sender.send(result).is_ok() {
+                        core.registry = registry;
+                        if let Some(token) = resume_token {
+                            known.retain(|_, paired| *paired != connection.session_id);
+                            managed.insert(connection.session_id, token);
+                        } else {
+                            known.insert(pending.pairing_code, connection.session_id);
+                        }
+                    }
+                } else {
+                    let _ = pending.sender.send(result);
+                }
+            } else if let Some((pairing_code, expected_session_id)) = automatic {
+                let still_expected = match &pairing_code {
+                    Some(code) => known.get(code) == Some(&expected_session_id),
+                    None => managed.contains_key(&expected_session_id),
+                };
+                if !still_expected {
+                    return;
+                }
+                if result.error.is_none()
+                    && result.error_code.is_none()
+                    && let Some(connection) = result.connection
+                    && connection.session_id == expected_session_id
+                {
+                    inner.core.lock().await.upsert_connection(connection);
+                    if pairing_code.is_none()
+                        && let Some(token) = result.connection_resume_token
+                    {
+                        managed.insert(expected_session_id, token);
+                    }
+                } else if result.error_code != Some(PairingErrorCode::AgentOffline) {
+                    // 无结构化原因的失败也停止恢复，避免退回仅凭控制码重试。
+                    if let Some(code) = pairing_code {
+                        known.remove(&code);
+                    }
+                    managed.remove(&expected_session_id);
+                    let _ = inner
+                        .core
                         .lock()
                         .await
-                        .insert(pairing_code, Some(connection.session_id));
+                        .remove_connection(expected_session_id);
+                    inner
+                        .control_states
+                        .lock()
+                        .await
+                        .remove(&expected_session_id);
                 }
             }
-            if let Some(sender) = inner.pair_pending.lock().await.remove(&result.request_id) {
-                let _ = sender.send(result);
-            }
+            // 没有匹配的待处理请求时丢弃迟到结果，不能重新插入已结束连接。
         }
         WireMessage::ReleaseSessionResult(result) => {
             if let Some(sender) = inner
@@ -1614,9 +1755,20 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
             let _ = inner.events.send(event);
         }
         WireMessage::ConnectionUpdated(connection) => {
-            inner.core.lock().await.upsert_connection(connection);
+            let mut core = inner.core.lock().await;
+            // 更新只作用于已配对的连接，迟到的状态不能重新建立已结束会话。
+            if core.get_connection(connection.session_id).is_some() {
+                core.upsert_connection(connection);
+            }
         }
         WireMessage::ConnectionRemoved { session_id, reason } => {
+            {
+                let mut pending = inner.pair_pending.lock().await;
+                pending.retain(|_, request| !request.sender.is_closed());
+                for request in pending.values_mut() {
+                    request.excluded_sessions.insert(session_id);
+                }
+            }
             inner.control_states.lock().await.remove(&session_id);
             forget_session_pairing(inner, session_id).await;
             let _ = inner.core.lock().await.remove_connection(session_id);
@@ -1699,6 +1851,7 @@ fn take_matching_pending(
 
 fn audit_operation(operation: &RemoteOperation) -> String {
     match operation {
+        RemoteOperation::GetTargetContext => "get_target_context".to_owned(),
         RemoteOperation::RunCommand {
             shell,
             command,
@@ -1859,6 +2012,7 @@ mod tests {
         ConnectionDescriptor {
             session_id,
             agent_instance_id: AgentInstanceId::new(),
+            target_context: None,
             display_index: 0,
             alias: None,
             hostname: "LAB-WIN-A".to_owned(),
@@ -1913,6 +2067,7 @@ mod tests {
             control_pending: Mutex::new(BTreeMap::new()),
             control_states: Mutex::new(BTreeMap::new()),
             known_pairings: Mutex::new(BTreeMap::new()),
+            managed_pairings: Mutex::new(BTreeMap::new()),
             automatic_pair_pending: Mutex::new(BTreeMap::new()),
             events,
             event_history: Mutex::new(VecDeque::new()),
@@ -2086,14 +2241,283 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lost_pair_result_recovers_same_call_and_request_without_replaying_operations() {
+        let inner = transport_test_inner();
+        let (operation, mut first_transport, _) = queue_test_operation(&inner).await;
+        assert!(matches!(
+            first_transport.recv().await,
+            Some(WireMessage::RemoteRequest(_))
+        ));
+        let client = RelayClient {
+            inner: inner.clone(),
+        };
+        let pairing =
+            tokio::spawn(
+                async move { client.pair(PairingCode::parse("123456789").unwrap()).await },
+            );
+        let WireMessage::PairRequest(first) = first_transport.recv().await.unwrap() else {
+            panic!("应为首次配对")
+        };
+        // 模拟Relay已消费邀请并创建连接，但首次PairResult随旧传输丢失。
+        set_transport_disconnected(&inner, None).await;
+        assert!(!pairing.is_finished());
+        assert!(
+            inner
+                .pair_pending
+                .lock()
+                .await
+                .contains_key(&first.request_id)
+        );
+        assert!(matches!(
+            operation.wait().await,
+            Err(ApplicationError::Transport(_))
+        ));
+        assert!(
+            inner.pending.lock().is_empty(),
+            "普通操作必须失败并释放，不能跨连接重放"
+        );
+        let (sender, mut second_transport) = mpsc::unbounded_channel();
+        *inner.transport.lock().await = Some(ActiveTransport {
+            generation: 2,
+            sender: sender.clone(),
+        });
+        set_connected(&inner.connected, true);
+        assert!(send_pending_pairings(&inner, &sender, 2).await);
+        let WireMessage::PairRequest(retry) = second_transport.recv().await.unwrap() else {
+            panic!("只可重发配对")
+        };
+        assert_eq!(retry, first, "同一次调用必须复用请求标识和参数");
+        assert!(send_pending_pairings(&inner, &sender, 2).await);
+        assert!(
+            second_transport.try_recv().is_err(),
+            "同一传输不能重复兑换或重放操作"
+        );
+        let session_id = SessionId::new();
+        handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                request_id: retry.request_id,
+                connection: Some(test_connection(session_id, ConnectionState::Online)),
+                connection_resume_token: Some("recovered-managed-connection-token".to_owned()),
+                error: None,
+                error_code: None,
+            }),
+        )
+        .await;
+        assert_eq!(pairing.await.unwrap().unwrap().session_id, session_id);
+        assert!(inner.pair_pending.lock().await.is_empty());
+        assert!(
+            inner
+                .managed_pairings
+                .lock()
+                .await
+                .contains_key(&session_id)
+        );
+        assert!(inner.known_pairings.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_pair_retry_ends_at_original_deadline() {
+        let inner = transport_test_inner();
+        let client = RelayClient {
+            inner: inner.clone(),
+        };
+        let pairing =
+            tokio::spawn(
+                async move { client.pair(PairingCode::parse("123456789").unwrap()).await },
+            );
+        tokio::task::yield_now().await;
+        tokio::time::advance(TokioDuration::from_secs(20)).await;
+        assert!(matches!(
+            pairing.await.unwrap(),
+            Err(ApplicationError::Timeout)
+        ));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        assert!(send_pending_pairings(&inner, &sender, 3).await);
+        assert!(inner.pair_pending.lock().await.is_empty());
+        assert!(receiver.try_recv().is_err(), "到期调用不能在后续连接重放");
+    }
+
+    #[tokio::test]
+    async fn context_refresh_never_sends_unknown_operation_to_legacy_or_undeclared_agent() {
+        for (version, report_context) in [(17, true), (17, false), (18, false)] {
+            let inner = transport_test_inner();
+            let session_id = SessionId::new();
+            let mut connection = test_connection(session_id, ConnectionState::Online);
+            connection.environment.protocol_version = version;
+            connection.target_context = report_context.then(TargetContext::default);
+            inner.core.lock().await.upsert_connection(connection);
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            *inner.transport.lock().await = Some(ActiveTransport {
+                generation: 1,
+                sender,
+            });
+            let client = RelayClient { inner };
+            assert!(matches!(client.refresh_target_context(session_id).await,
+                Err(ApplicationError::Remote { code, .. }) if code == "unsupported_mode"));
+            assert!(receiver.try_recv().is_err(), "旧Agent不能接收到新操作");
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_pairing_recovers_with_token_without_redeeming_invitation_again() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let (sender, receiver) = oneshot::channel();
+        inner.pair_pending.lock().await.insert(
+            request_id,
+            PendingPairRequest {
+                pairing_code: PairingCode::parse("123456789").unwrap(),
+                excluded_sessions: BTreeSet::new(),
+                last_sent_generation: None,
+                sender,
+            },
+        );
+        let token = "high-entropy-test-connection-credential".to_owned();
+        handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                request_id,
+                connection: Some(test_connection(session_id, ConnectionState::Online)),
+                error: None,
+                error_code: None,
+                connection_resume_token: Some(token.clone()),
+            }),
+        )
+        .await;
+        assert!(receiver.await.unwrap().connection.is_some());
+        assert!(
+            inner.known_pairings.lock().await.is_empty(),
+            "不能保留已消费邀请供自动恢复使用"
+        );
+        assert_eq!(
+            inner.managed_pairings.lock().await.get(&session_id),
+            Some(&token)
+        );
+        inner.core.lock().await.mark_all_reconnecting();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        assert!(send_recoverable_pairings(&inner, &sender).await);
+        let WireMessage::PairRequest(request) = receiver.recv().await.unwrap() else {
+            panic!("应发送恢复请求")
+        };
+        assert!(request.pairing_code.is_none());
+        assert_eq!(request.connection_resume_token, Some(token));
+        assert_eq!(request.expected_session_id, Some(session_id));
+        handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                request_id: request.request_id,
+                connection: None,
+                error: Some("offline".to_owned()),
+                error_code: Some(PairingErrorCode::AgentOffline),
+                connection_resume_token: None,
+            }),
+        )
+        .await;
+        assert!(
+            inner
+                .managed_pairings
+                .lock()
+                .await
+                .contains_key(&session_id)
+        );
+        assert!(send_recoverable_pairings(&inner, &sender).await);
+        let WireMessage::PairRequest(request) = receiver.recv().await.unwrap() else {
+            panic!("应继续等待同会话上线")
+        };
+        handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                request_id: request.request_id,
+                connection: None,
+                error: Some("revoked".to_owned()),
+                error_code: Some(PairingErrorCode::AccessRevoked),
+                connection_resume_token: None,
+            }),
+        )
+        .await;
+        assert!(inner.managed_pairings.lock().await.is_empty());
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+        assert!(send_recoverable_pairings(&inner, &sender).await);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn session_end_erases_managed_credentials_and_discards_late_success() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        inner
+            .managed_pairings
+            .lock()
+            .await
+            .insert(session_id, "opaque-test-resume-token".to_owned());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        assert!(send_recoverable_pairings(&inner, &sender).await);
+        let WireMessage::PairRequest(request) = receiver.recv().await.unwrap() else {
+            panic!("应发送恢复请求")
+        };
+        handle_wire_message(
+            &inner,
+            WireMessage::ConnectionRemoved {
+                session_id,
+                reason: "access revoked".to_owned(),
+            },
+        )
+        .await;
+        handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                request_id: request.request_id,
+                connection: Some(test_connection(session_id, ConnectionState::Online)),
+                error: None,
+                error_code: None,
+                connection_resume_token: Some("late-token".to_owned()),
+            }),
+        )
+        .await;
+        assert!(inner.managed_pairings.lock().await.is_empty());
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+    }
+
+    #[test]
+    fn target_context_gates_visual_operations_before_transport() {
+        let (mut core, session_id) = core_with_connection();
+        assert!(matches!(core.prepare_request(session_id, EventSource::Ai,
+            RemoteOperation::VisualObserve { include_screenshot: true, include_ui_tree: true }, None),
+            Err(ApplicationError::Remote { code, .. }) if code == "host_context_unknown"));
+        assert!(
+            core.prepare_request(
+                session_id,
+                EventSource::Ai,
+                RemoteOperation::GetTargetContext,
+                None
+            )
+            .is_ok()
+        );
+        let mut connection = core.get_connection(session_id).unwrap().clone();
+        connection.environment.protocol_version = 18;
+        connection.target_context = Some(TargetContext {
+            run_mode: remoteops_domain::AgentRunMode::WindowsService,
+            ..TargetContext::default()
+        });
+        core.upsert_connection(connection);
+        assert!(
+            matches!(core.prepare_request(session_id, EventSource::Ai, RemoteOperation::VisualStop, None),
+            Err(ApplicationError::Remote { code, .. }) if code == "product_policy_disabled")
+        );
+    }
+
+    #[tokio::test]
     async fn recoverable_pairing_retries_until_target_is_online() {
         let inner = transport_test_inner();
+        let session_id = SessionId::new();
         let pairing_code = PairingCode::parse("123-456-789").expect("测试控制码应有效");
         inner
             .known_pairings
             .lock()
             .await
-            .insert(pairing_code.clone(), None);
+            .insert(pairing_code.clone(), session_id);
         let (sender, mut receiver) = mpsc::unbounded_channel();
 
         assert!(send_recoverable_pairings(&inner, &sender).await);
@@ -2101,7 +2525,8 @@ mod tests {
             WireMessage::PairRequest(request) => request,
             other => panic!("应发送配对请求，实际为 {other:?}"),
         };
-        assert_eq!(first_request.pairing_code, pairing_code);
+        assert_eq!(first_request.pairing_code, Some(pairing_code.clone()));
+        assert_eq!(first_request.expected_session_id, Some(session_id));
 
         assert!(send_recoverable_pairings(&inner, &sender).await);
         assert!(receiver.try_recv().is_err(), "在途配对不应重复发送");
@@ -2109,9 +2534,11 @@ mod tests {
         handle_wire_message(
             &inner,
             WireMessage::PairResult(PairResult {
+                connection_resume_token: None,
                 request_id: first_request.request_id,
                 connection: None,
                 error: Some("Agent 当前离线".to_owned()),
+                error_code: Some(PairingErrorCode::AgentOffline),
             }),
         )
         .await;
@@ -2121,11 +2548,12 @@ mod tests {
             other => panic!("应发送配对请求，实际为 {other:?}"),
         };
 
-        let session_id = SessionId::new();
         handle_wire_message(
             &inner,
             WireMessage::PairResult(PairResult {
+                connection_resume_token: None,
                 request_id: second_request.request_id,
+                error_code: None,
                 connection: Some(test_connection(session_id, ConnectionState::Online)),
                 error: None,
             }),
@@ -2138,10 +2566,381 @@ mod tests {
                 .await
                 .get(&pairing_code)
                 .copied(),
-            Some(Some(session_id))
+            Some(session_id)
         );
         assert!(send_recoverable_pairings(&inner, &sender).await);
         assert!(receiver.try_recv().is_err(), "在线目标不应继续重复配对");
+    }
+
+    #[tokio::test]
+    async fn terminal_pairing_errors_stop_automatic_recovery() {
+        for error_code in [
+            PairingErrorCode::UnknownOrExpired,
+            PairingErrorCode::SessionMismatch,
+            PairingErrorCode::SessionEnded,
+            PairingErrorCode::Rejected,
+        ] {
+            let inner = transport_test_inner();
+            let session_id = SessionId::new();
+            let pairing_code = PairingCode::parse("123456789").unwrap();
+            inner
+                .known_pairings
+                .lock()
+                .await
+                .insert(pairing_code.clone(), session_id);
+            inner
+                .core
+                .lock()
+                .await
+                .upsert_connection(test_connection(session_id, ConnectionState::Reconnecting));
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            assert!(send_recoverable_pairings(&inner, &sender).await);
+            let WireMessage::PairRequest(request) = receiver.recv().await.unwrap() else {
+                panic!("应为恢复请求")
+            };
+            handle_wire_message(
+                &inner,
+                WireMessage::PairResult(PairResult {
+                    connection_resume_token: None,
+                    request_id: request.request_id,
+                    connection: None,
+                    error: Some("需要重新配对".to_owned()),
+                    error_code: Some(error_code),
+                }),
+            )
+            .await;
+            assert!(inner.known_pairings.lock().await.is_empty());
+            assert!(inner.core.lock().await.get_connection(session_id).is_none());
+            assert!(send_recoverable_pairings(&inner, &sender).await);
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_pairing_rejects_a_success_for_another_session() {
+        let inner = transport_test_inner();
+        let original_session = SessionId::new();
+        let other_session = SessionId::new();
+        let pairing_code = PairingCode::parse("123456789").unwrap();
+        inner
+            .known_pairings
+            .lock()
+            .await
+            .insert(pairing_code.clone(), original_session);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        assert!(send_recoverable_pairings(&inner, &sender).await);
+        let WireMessage::PairRequest(request) = receiver.recv().await.unwrap() else {
+            panic!("应为恢复请求")
+        };
+        handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                connection_resume_token: None,
+                request_id: request.request_id,
+                connection: Some(test_connection(other_session, ConnectionState::Online)),
+                error: None,
+                error_code: None,
+            }),
+        )
+        .await;
+        assert!(
+            inner
+                .core
+                .lock()
+                .await
+                .get_connection(other_session)
+                .is_none()
+        );
+        assert!(inner.known_pairings.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removed_automatic_pairing_discards_its_late_success() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        let pairing_code = PairingCode::parse("123456789").unwrap();
+        inner
+            .known_pairings
+            .lock()
+            .await
+            .insert(pairing_code.clone(), session_id);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        assert!(send_recoverable_pairings(&inner, &sender).await);
+        let WireMessage::PairRequest(request) = receiver.recv().await.unwrap() else {
+            panic!("应为恢复请求")
+        };
+        handle_wire_message(
+            &inner,
+            WireMessage::ConnectionRemoved {
+                session_id,
+                reason: "Agent 已重启".to_owned(),
+            },
+        )
+        .await;
+        handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                connection_resume_token: None,
+                request_id: request.request_id,
+                connection: Some(test_connection(session_id, ConnectionState::Online)),
+                error: None,
+                error_code: None,
+            }),
+        )
+        .await;
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+        assert!(inner.known_pairings.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_pair_result_is_applied_once_before_session_removal() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let pairing_code = PairingCode::parse("123456789").unwrap();
+        let (sender, receiver) = oneshot::channel();
+        inner.pair_pending.lock().await.insert(
+            request_id,
+            PendingPairRequest {
+                pairing_code,
+                excluded_sessions: BTreeSet::new(),
+                last_sent_generation: None,
+                sender,
+            },
+        );
+        handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                connection_resume_token: None,
+                request_id,
+                connection: Some(test_connection(session_id, ConnectionState::Online)),
+                error: None,
+                error_code: None,
+            }),
+        )
+        .await;
+        assert!(inner.core.lock().await.get_connection(session_id).is_some());
+        handle_wire_message(
+            &inner,
+            WireMessage::ConnectionRemoved {
+                session_id,
+                reason: "Agent 已重启".to_owned(),
+            },
+        )
+        .await;
+        assert!(receiver.await.unwrap().connection.is_some());
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+        assert!(inner.known_pairings.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timed_out_manual_pairing_discards_its_late_success() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let pairing_code = PairingCode::parse("123456789").unwrap();
+        let (sender, receiver) = oneshot::channel();
+        inner.pair_pending.lock().await.insert(
+            request_id,
+            PendingPairRequest {
+                pairing_code,
+                excluded_sessions: BTreeSet::new(),
+                last_sent_generation: None,
+                sender,
+            },
+        );
+        drop(receiver);
+        handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                connection_resume_token: None,
+                request_id,
+                connection: Some(test_connection(session_id, ConnectionState::Online)),
+                error: None,
+                error_code: None,
+            }),
+        )
+        .await;
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+        assert!(inner.known_pairings.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removed_session_rejects_pending_manual_pair_result() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let (sender, receiver) = oneshot::channel();
+        inner.pair_pending.lock().await.insert(
+            request_id,
+            PendingPairRequest {
+                pairing_code: PairingCode::parse("123456789").unwrap(),
+                excluded_sessions: BTreeSet::new(),
+                last_sent_generation: None,
+                sender,
+            },
+        );
+        handle_wire_message(
+            &inner,
+            WireMessage::ConnectionRemoved {
+                session_id,
+                reason: "Agent 已重启".to_owned(),
+            },
+        )
+        .await;
+        handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                connection_resume_token: None,
+                request_id,
+                connection: Some(test_connection(session_id, ConnectionState::Online)),
+                error: None,
+                error_code: None,
+            }),
+        )
+        .await;
+        let result = receiver.await.unwrap();
+        assert_eq!(result.error_code, Some(PairingErrorCode::SessionEnded));
+        assert!(result.connection.is_none());
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+        assert!(inner.known_pairings.lock().await.is_empty());
+        assert!(inner.pair_pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_pair_cancellation_while_waiting_for_core_does_not_commit() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let (sender, receiver) = oneshot::channel();
+        inner.pair_pending.lock().await.insert(
+            request_id,
+            PendingPairRequest {
+                pairing_code: PairingCode::parse("123456789").unwrap(),
+                excluded_sessions: BTreeSet::new(),
+                last_sent_generation: None,
+                sender,
+            },
+        );
+        let core = inner.core.lock().await;
+        let mut handling = Box::pin(handle_wire_message(
+            &inner,
+            WireMessage::PairResult(PairResult {
+                connection_resume_token: None,
+                request_id,
+                connection: Some(test_connection(session_id, ConnectionState::Online)),
+                error: None,
+                error_code: None,
+            }),
+        ));
+        // 读帧已取走请求且等待注册表锁，此时取消人工配对。
+        tokio::select! {
+            biased;
+            () = &mut handling => panic!("配对必须等待注册表锁"),
+            () = std::future::ready(()) => {},
+        }
+        assert!(inner.pair_pending.lock().await.is_empty());
+        drop(receiver);
+        drop(core);
+        handling.await;
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+        assert!(inner.known_pairings.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_updates_only_update_existing_pairings() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        let online = test_connection(session_id, ConnectionState::Online);
+        handle_wire_message(&inner, WireMessage::ConnectionUpdated(online.clone())).await;
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+        inner.core.lock().await.upsert_connection(online.clone());
+        let mut reconnecting = online.clone();
+        reconnecting.state = ConnectionState::Reconnecting;
+        handle_wire_message(&inner, WireMessage::ConnectionUpdated(reconnecting)).await;
+        assert_eq!(
+            inner
+                .core
+                .lock()
+                .await
+                .get_connection(session_id)
+                .unwrap()
+                .state,
+            ConnectionState::Reconnecting
+        );
+        handle_wire_message(
+            &inner,
+            WireMessage::ConnectionRemoved {
+                session_id,
+                reason: "Agent 已重启".to_owned(),
+            },
+        )
+        .await;
+        handle_wire_message(&inner, WireMessage::ConnectionUpdated(online)).await;
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_close_succeeds_when_removal_notification_precedes_release_result() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        inner
+            .core
+            .lock()
+            .await
+            .upsert_connection(test_connection(session_id, ConnectionState::Online));
+        inner
+            .managed_pairings
+            .lock()
+            .await
+            .insert(session_id, "test-managed-resume".to_owned());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        *inner.transport.lock().await = Some(ActiveTransport {
+            generation: 1,
+            sender,
+        });
+        let client = RelayClient {
+            inner: inner.clone(),
+        };
+        let closing =
+            tokio::spawn(async move { client.close_connection(&session_id.to_string()).await });
+        let WireMessage::RemoteRequest(request) = receiver.recv().await.unwrap() else {
+            panic!("应先请求结束Agent资源")
+        };
+        assert_eq!(request.operation, RemoteOperation::CloseConnection);
+        handle_wire_message(
+            &inner,
+            WireMessage::RemoteResponse(successful_response(request.request_id, session_id)),
+        )
+        .await;
+        let WireMessage::ReleaseSessionRequest(release) = receiver.recv().await.unwrap() else {
+            panic!("应请求Relay释放绑定")
+        };
+        handle_wire_message(
+            &inner,
+            WireMessage::ConnectionRemoved {
+                session_id,
+                reason: "受管会话已关闭".to_owned(),
+            },
+        )
+        .await;
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+        assert!(inner.managed_pairings.lock().await.is_empty());
+        handle_wire_message(
+            &inner,
+            WireMessage::ReleaseSessionResult(ReleaseSessionResult {
+                request_id: release.request_id,
+                session_id,
+                released: true,
+                error: None,
+            }),
+        )
+        .await;
+        assert!(
+            closing.await.unwrap().is_ok(),
+            "已成功关闭不能因通知先到而误报失败"
+        );
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
     }
 
     #[tokio::test]
@@ -2153,13 +2952,13 @@ mod tests {
             .known_pairings
             .lock()
             .await
-            .insert(pairing_code.clone(), Some(session_id));
+            .insert(pairing_code.clone(), session_id);
         let pending_request_id = RequestId::new();
         inner
             .automatic_pair_pending
             .lock()
             .await
-            .insert(pending_request_id, pairing_code);
+            .insert(pending_request_id, (Some(pairing_code), session_id));
 
         forget_session_pairing(&inner, session_id).await;
 
@@ -2181,12 +2980,12 @@ mod tests {
             .known_pairings
             .lock()
             .await
-            .insert(pairing_code.clone(), Some(session_id));
+            .insert(pairing_code.clone(), session_id);
         inner
             .automatic_pair_pending
             .lock()
             .await
-            .insert(RequestId::new(), pairing_code);
+            .insert(RequestId::new(), (Some(pairing_code), session_id));
         let request_id = RequestId::new();
         let (response_sender, response_receiver) = oneshot::channel();
         inner.pending.lock().insert(
@@ -2245,16 +3044,22 @@ mod tests {
         let inner = transport_test_inner();
         let request_id = RequestId::new();
         let (pair_sender, pair_receiver) = oneshot::channel();
-        inner
-            .pair_pending
-            .lock()
-            .await
-            .insert(request_id, pair_sender);
+        inner.pair_pending.lock().await.insert(
+            request_id,
+            PendingPairRequest {
+                pairing_code: PairingCode::parse("123456789").unwrap(),
+                excluded_sessions: BTreeSet::new(),
+                last_sent_generation: None,
+                sender: pair_sender,
+            },
+        );
 
         let incoming = WireMessage::PairResult(PairResult {
+            connection_resume_token: None,
             request_id,
             connection: None,
             error: Some("expected-test-error".to_owned()),
+            error_code: Some(PairingErrorCode::Rejected),
         });
         let payload = serde_json::to_vec(&incoming).expect("应序列化测试帧");
         let length = u32::try_from(payload.len()).expect("测试帧长度应有效");

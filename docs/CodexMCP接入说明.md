@@ -38,7 +38,7 @@ RemoteOps 只启动本地 STDIO MCP，不开放公网 MCP HTTP。公网只部署
 
 授权绑定精确 `session_id`、Agent 连接代次及 Controller 实例和代次，由 Relay 确认并同步；不同 Agent 不能继承授权。断线、解绑、控制方变化或进程重启使原绑定授权失效。Agent 默认 `default_full_control=false`；保存默认完全控制后，新连接/重连会创建新的现场默认授权。现场手动切回逐项确认会撤销双方授权，并抑制本次 Agent 运行期间后续自动授权；手动再授权不解除抑制，重启后重新按默认值执行。
 
-`readonly`、`approval` 和 `full-access` 启动参数保留给受控部署：`readonly` 禁止修改；`approval` 强制独立 Human Controller 的一次性审批；协议 16 的 `full-access` 仅表示权限上限，不会自动授予完全控制或绕过现场撤销。默认使用 `agent-controlled`，如需重连自动授权请由现场保存默认偏好。
+`readonly`、`approval` 和 `full-access` 启动参数保留给受控部署：`readonly` 禁止修改；`approval` 强制独立 Human Controller 的一次性审批；`full-access` 仅表示权限上限，不会自动授予完全控制或绕过现场撤销。默认使用 `agent-controlled`，如需重连自动授权请由现场保存默认偏好。当前配套协议及旧端迁移范围见[兼容矩阵](integrations/custom-service-agent.md)。
 
 ## 三、推荐安装和配置
 

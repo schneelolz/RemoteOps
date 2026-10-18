@@ -1,5 +1,7 @@
 #[path = "relay_control.rs"]
 mod control;
+#[path = "relay_portal.rs"]
+mod portal_access;
 use control::{broadcast_control_state, refresh_control_state};
 use remoteops_protocol::{
     ControlBasis, ControlSource, ControlStateRequest, ControlStateResult, SessionControlState,
@@ -18,18 +20,20 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_ha
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
 use remoteops_domain::{
-    AgentInstanceId, ApprovalId, ApprovalState, ConnectionDescriptor, ConnectionState,
+    AgentBootId, AgentInstanceId, ApprovalId, ApprovalState, ConnectionDescriptor, ConnectionState,
     ControllerInstanceId, ControllerOwnerId, EventSource, PairingCode, PairingLease,
     PermissionMode, RemoteOperation, RequestId, SessionId, SessionRole,
 };
 use remoteops_enrollment_store::{EnrollmentStore, StoreError};
 use remoteops_policy::{DefaultPolicy, PolicyDecision, RiskLevel, approval_operations_match};
+use remoteops_portal::PortalStore;
 use remoteops_protocol::{
     AgentHello, AgentLeaseRenewed, AgentResumeCommitted, AgentWelcome, ApprovalDecision,
     ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest, ClientHello, ControllerBinding,
     ControllerControlMode, ControllerControlModeUpdate, ControllerHello, ControllerKind,
-    PROTOCOL_VERSION, PairRequest, PairResult, RelayAuthorization, ReleaseSessionRequest,
-    ReleaseSessionResult, RemoteRequest, WireMessage, read_frame, write_frame,
+    PROTOCOL_VERSION, PairRequest, PairResult, PairingErrorCode, PairingMode, RelayAuthorization,
+    ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest, WireMessage, read_frame,
+    write_frame,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -52,6 +56,8 @@ const CONTROLLER_IDLE_TIMEOUT: time::Duration = time::Duration::from_secs(45);
 const MAX_REGISTERED_AGENTS: usize = 1024;
 const UNPAIRED_AGENT_RETENTION: Duration = Duration::hours(24);
 const MAX_AUDIT_EVENTS: usize = 1_000;
+// 未完成令牌交接时限制连续启动次数，防止退役标识无限积累。
+const MAX_UNCONFIRMED_BOOTS: usize = 64;
 
 /// 有界出站队列。队列耗尽表示客户端持续消费过慢，连接任务会主动结束。
 #[derive(Clone)]
@@ -101,12 +107,19 @@ where
 }
 
 #[derive(Clone)]
+// 握手确认、在线及历史启动状态是互相独立的持久事实。
+#[allow(clippy::struct_excessive_bools)]
 struct AgentRecord {
     hello: AgentHello,
     lease: PairingLease,
     resume_token: Option<String>,
     previous_resume_token: Option<PreviousResumeToken>,
     pending_resume: Option<PendingResume>,
+    managed_target_id: Option<String>,
+    // 旧格式尚未确认启动边界，首次认证恢复时必须轮换会话。
+    legacy_boot: bool,
+    // 恢复令牌容错窗口内禁止旧启动重新抢占当前身份。
+    retired_boots: BTreeSet<AgentBootId>,
     connection_generation: u64,
     ready: bool,
     session_id: SessionId,
@@ -135,6 +148,8 @@ struct PendingResume {
 }
 
 struct ControllerRecord {
+    protocol_version: u16,
+    peer_ip: Option<std::net::IpAddr>,
     /// Durable MCP credential; legacy token connections have no installation.
     installation_id: Option<Uuid>,
     sender: Sender,
@@ -170,6 +185,7 @@ struct SessionBindings {
     human: Option<SessionBinding>,
     ai: Option<SessionBinding>,
     human_takeover: bool,
+    managed_connection_id: Option<Uuid>,
 }
 
 impl SessionBindings {
@@ -322,6 +338,7 @@ struct RelayState {
     approvals: BTreeMap<ApprovalId, RelayApprovalRecord>,
     in_flight: BTreeMap<RequestId, InFlightRequest>,
     next_controller_generation: u64,
+    pairing_limits: portal_access::PairingLimits,
     audit_log: Vec<AdminAuditEvent>,
     admin_password_hash: Option<AdminPasswordHash>,
 }
@@ -352,6 +369,8 @@ pub struct AdminAuditEvent {
 struct PersistedAgent {
     /// Agent 身份和能力快照。
     hello: AgentHello,
+    #[serde(default)]
+    managed_target_id: Option<String>,
     /// 控制码和逻辑会话的租约。
     lease: PairingLease,
     /// 最近一次已经确认的 Agent 恢复令牌。
@@ -359,6 +378,10 @@ struct PersistedAgent {
     /// 恢复令牌两阶段确认期间仍可接受的上一个令牌。
     #[serde(default)]
     previous_resume_token: Option<PreviousResumeToken>,
+    #[serde(default)]
+    legacy_boot: bool,
+    #[serde(default)]
+    retired_boots: BTreeSet<AgentBootId>,
     /// 跨 Relay 重启保持不变的逻辑会话标识。
     session_id: SessionId,
     /// 传输连接代次。
@@ -393,6 +416,7 @@ pub struct Relay {
     state: Arc<Mutex<RelayState>>,
     state_path: Option<PathBuf>,
     enrollment_store: Option<Arc<EnrollmentStore>>,
+    portal_store: Option<Arc<PortalStore>>,
     /// Serializes credential validation + registration against durable revoke + disconnect.
     enrollment_gate: Mutex<()>,
     lease_lifetime: Duration,
@@ -420,6 +444,7 @@ impl Relay {
             state: Arc::new(Mutex::new(RelayState::default())),
             state_path: None,
             enrollment_store: None,
+            portal_store: None,
             enrollment_gate: Mutex::new(()),
             lease_lifetime: if lease_lifetime <= Duration::zero() {
                 Duration::seconds(1)
@@ -631,84 +656,100 @@ impl Relay {
     }
 
     /// 管理员关闭 Session，释放全部 Controller 绑定并清理相关状态。
+    #[allow(clippy::too_many_lines)]
     pub async fn admin_close_session(
         &self,
         session_id: SessionId,
         source: &str,
     ) -> AdminActionOutcome {
-        let (revocations, removals, failures, found) = {
-            let mut state = self.state.lock().await;
-            let Some(bindings) = state.session_bindings.remove(&session_id) else {
-                let exists = state
-                    .agents
-                    .values()
-                    .any(|agent| agent.session_id == session_id);
+        let (revocations, removals, failures, found) =
+            {
+                let mut state = self.state.lock().await;
+                if state.agents.values().any(|agent| {
+                    agent.session_id == session_id && agent.managed_target_id.is_some()
+                }) {
+                    let result = self.close_managed_target(&mut state, session_id);
+                    return AdminActionOutcome {
+                        success: result.is_ok(),
+                        changed: result.is_ok(),
+                        message: if result.is_ok() {
+                            "受管 Session 已关闭".to_owned()
+                        } else {
+                            "受管授权撤销失败，请重试".to_owned()
+                        },
+                    };
+                }
+                let Some(bindings) = state.session_bindings.remove(&session_id) else {
+                    let exists = state
+                        .agents
+                        .values()
+                        .any(|agent| agent.session_id == session_id);
+                    append_audit(
+                        &mut state,
+                        "session_close",
+                        Some(session_id.to_string()),
+                        exists,
+                        source,
+                        if exists {
+                            "Session 已经没有活动绑定"
+                        } else {
+                            "Session 不存在"
+                        },
+                    );
+                    let _ = self.persist_state_locked(&state);
+                    return AdminActionOutcome {
+                        success: exists,
+                        changed: false,
+                        message: if exists {
+                            "Session 已经关闭".to_owned()
+                        } else {
+                            "Session 不存在".to_owned()
+                        },
+                    };
+                };
+                let mut revocations = Vec::new();
+                let mut removals = Vec::new();
+                for binding in bindings.all() {
+                    if let Some(agent_sender) = state
+                        .agents
+                        .values()
+                        .find(|agent| agent.session_id == session_id && agent.ready)
+                        .and_then(|agent| agent.sender.clone())
+                    {
+                        revocations.push((agent_sender, session_id, binding.binding_token.clone()));
+                    }
+                    if let Some(controller) = state.controllers.get_mut(&binding.controller_id) {
+                        controller.sessions.remove(&session_id);
+                        removals.push((controller.sender.clone(), session_id));
+                    }
+                }
+                let abandoned = state
+                    .in_flight
+                    .iter()
+                    .filter(|(_, request)| request.session_id == session_id)
+                    .map(|(id, request)| (*id, request.clone()))
+                    .collect::<Vec<_>>();
+                let mut failures = Vec::new();
+                for (request_id, request) in abandoned {
+                    state.in_flight.remove(&request_id);
+                    if let Some(controller) = state.controllers.get(&request.controller_id) {
+                        failures.push((controller.sender.clone(), request_id));
+                    }
+                }
+                state
+                    .approvals
+                    .retain(|_, approval| approval.session_id != session_id);
                 append_audit(
                     &mut state,
                     "session_close",
                     Some(session_id.to_string()),
-                    exists,
+                    true,
                     source,
-                    if exists {
-                        "Session 已经没有活动绑定"
-                    } else {
-                        "Session 不存在"
-                    },
+                    "管理员关闭 Session",
                 );
                 let _ = self.persist_state_locked(&state);
-                return AdminActionOutcome {
-                    success: exists,
-                    changed: false,
-                    message: if exists {
-                        "Session 已经关闭".to_owned()
-                    } else {
-                        "Session 不存在".to_owned()
-                    },
-                };
+                (revocations, removals, failures, true)
             };
-            let mut revocations = Vec::new();
-            let mut removals = Vec::new();
-            for binding in bindings.all() {
-                if let Some(agent_sender) = state
-                    .agents
-                    .values()
-                    .find(|agent| agent.session_id == session_id && agent.ready)
-                    .and_then(|agent| agent.sender.clone())
-                {
-                    revocations.push((agent_sender, session_id, binding.binding_token.clone()));
-                }
-                if let Some(controller) = state.controllers.get_mut(&binding.controller_id) {
-                    controller.sessions.remove(&session_id);
-                    removals.push((controller.sender.clone(), session_id));
-                }
-            }
-            let abandoned = state
-                .in_flight
-                .iter()
-                .filter(|(_, request)| request.session_id == session_id)
-                .map(|(id, request)| (*id, request.clone()))
-                .collect::<Vec<_>>();
-            let mut failures = Vec::new();
-            for (request_id, request) in abandoned {
-                state.in_flight.remove(&request_id);
-                if let Some(controller) = state.controllers.get(&request.controller_id) {
-                    failures.push((controller.sender.clone(), request_id));
-                }
-            }
-            state
-                .approvals
-                .retain(|_, approval| approval.session_id != session_id);
-            append_audit(
-                &mut state,
-                "session_close",
-                Some(session_id.to_string()),
-                true,
-                source,
-                "管理员关闭 Session",
-            );
-            let _ = self.persist_state_locked(&state);
-            (revocations, removals, failures, true)
-        };
         for (sender, session_id, binding_token) in revocations {
             let _ = sender.send(WireMessage::ControllerBindingRevoked {
                 session_id,
@@ -751,7 +792,7 @@ impl Relay {
         let removed = removable_ids.len();
         for agent_id in removable_ids {
             if let Some(agent) = state.agents.remove(&agent_id) {
-                state.pairing_index.remove(&agent.lease.pairing_code);
+                remove_pairing_index(&mut state, agent.lease.pairing_code.as_ref());
             }
         }
         append_audit(
@@ -1119,6 +1160,10 @@ impl Relay {
             enrollment_database_path(&state_path),
             controller_owner_id,
         )?));
+        relay.portal_store = Some(Arc::new(PortalStore::open(
+            portal_access::portal_database_path(&state_path),
+            controller_owner_id,
+        )?));
         Ok(relay)
     }
 
@@ -1253,7 +1298,20 @@ impl Relay {
     }
 
     /// 处理一个已完成 TLS 握手的客户端。
+    #[cfg(test)]
     pub async fn handle_client<S>(&self, stream: S) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.handle_client_from(stream, None).await
+    }
+
+    /// 处理业务连接并记录真实传输对端，仅用于配对限流。
+    pub async fn handle_client_from<S>(
+        &self,
+        stream: S,
+        peer: Option<std::net::IpAddr>,
+    ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1276,7 +1334,7 @@ impl Relay {
                     .await
             }
             WireMessage::Hello(ClientHello::Controller(hello)) => {
-                self.handle_controller(hello, sender, connection_closed, &mut reader)
+                self.handle_controller(hello, sender, connection_closed, &mut reader, peer)
                     .await
             }
             _ => Err(anyhow!("第一条消息必须是 Agent 或 Controller Hello")),
@@ -1297,7 +1355,7 @@ impl Relay {
     where
         R: AsyncRead + Unpin,
     {
-        if hello.protocol_version != PROTOCOL_VERSION {
+        if !remoteops_protocol::supports_protocol_version(hello.protocol_version) {
             bail!("Agent 协议版本不兼容：{}", hello.protocol_version);
         }
         let agent_id = hello.agent_instance_id;
@@ -1348,6 +1406,19 @@ impl Relay {
                             connection_generation,
                             "Agent 恢复令牌已确认，连接可用"
                         );
+                    } else if self
+                        .state
+                        .lock()
+                        .await
+                        .agents
+                        .get(&agent_id)
+                        .is_some_and(|agent| {
+                            agent.connection_generation == connection_generation
+                                && agent.managed_target_id.is_some()
+                                && !agent.ready
+                        })
+                    {
+                        bail!("无法持久确认受管登记，请携带恢复令牌重连");
                     }
                 }
                 Ok(WireMessage::Heartbeat { .. }) => {
@@ -1448,11 +1519,12 @@ impl Relay {
         sender: Sender,
         connection_closed: Arc<Notify>,
         reader: &mut R,
+        peer: Option<std::net::IpAddr>,
     ) -> anyhow::Result<()>
     where
         R: AsyncRead + Unpin,
     {
-        if hello.protocol_version != PROTOCOL_VERSION {
+        if !remoteops_protocol::supports_protocol_version(hello.protocol_version) {
             bail!("Controller 协议版本不兼容：{}", hello.protocol_version);
         }
         let controller_id = hello.controller_instance_id;
@@ -1461,9 +1533,12 @@ impl Relay {
         let connection_generation = self
             .authenticate_and_register_controller(&hello, sender.clone())
             .await?;
+        if let Some(controller) = self.state.lock().await.controllers.get_mut(&controller_id) {
+            controller.peer_ip = peer;
+        }
         if sender
             .send(WireMessage::ControllerWelcome {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: hello.protocol_version,
             })
             .is_err()
         {
@@ -1613,6 +1688,8 @@ impl Relay {
         self.register_controller_record(
             hello.controller_instance_id,
             ControllerRecord {
+                protocol_version: hello.protocol_version,
+                peer_ip: None,
                 installation_id,
                 sender,
                 last_seen: time::Instant::now(),
@@ -1694,6 +1771,8 @@ impl Relay {
         self.register_controller_record(
             controller_id,
             ControllerRecord {
+                protocol_version: PROTOCOL_VERSION,
+                peer_ip: None,
                 installation_id: None,
                 sender,
                 last_seen: time::Instant::now(),
@@ -1973,58 +2052,112 @@ impl Relay {
         let now = Utc::now();
         let mut state = self.state.lock().await;
         let agent_id = hello.agent_instance_id;
-        if state.agents.contains_key(&agent_id) {
-            let original = state
-                .agents
-                .get(&agent_id)
-                .expect("Agent 已在同一锁内确认存在")
-                .clone();
-            let (welcome, connection_generation, previous_sender) = {
-                let existing = state
-                    .agents
-                    .get_mut(&agent_id)
-                    .expect("Agent 已在同一锁内确认存在");
-                if !resume_token_matches(existing, hello.resume_token.as_ref()) {
-                    return Err(anyhow!("Agent 恢复令牌无效"));
+        if let Some(original) = state.agents.get(&agent_id).cloned() {
+            if original.retired_boots.contains(&hello.boot_id) {
+                bail!("Agent 启动标识已经退役");
+            }
+            if original.hello.pairing_mode != hello.pairing_mode {
+                bail!("已登记 Agent 不能切换配对授权模式");
+            }
+            let managed_target_id = self.validate_managed_agent(&hello)?;
+            if original.managed_target_id != managed_target_id {
+                bail!("受管目标登记归属不一致");
+            }
+            // 登记证明只恢复尚未交接完成的首次身份，不替代已完成注册的恢复令牌。
+            let managed_bootstrap = managed_target_id.is_some()
+                && hello.resume_token.is_none()
+                && !original.ready
+                && !original.ever_paired
+                && (original.resume_token.is_none()
+                    || matches!(
+                        original.previous_resume_token,
+                        Some(PreviousResumeToken::Absent)
+                    ));
+            if !managed_bootstrap && !resume_token_matches(&original, hello.resume_token.as_ref()) {
+                bail!("Agent 恢复令牌无效");
+            }
+            let new_boot = original.legacy_boot || original.hello.boot_id != hello.boot_id;
+            if new_boot
+                && !managed_bootstrap
+                && hello.resume_token.as_ref().is_none_or(String::is_empty)
+            {
+                bail!("新启动必须提供已签发的 Agent 恢复令牌");
+            }
+            let mut replacement = original.clone();
+            if managed_bootstrap {
+                replacement.resume_token = None;
+                replacement.previous_resume_token = None;
+            }
+            if new_boot {
+                if replacement.retired_boots.len() >= MAX_UNCONFIRMED_BOOTS {
+                    bail!("Agent 未完成的启动切换次数过多，请恢复当前启动的握手");
                 }
-                if hello.resume_token == existing.resume_token {
-                    existing.previous_resume_token = None;
-                }
-                let previous_sender = existing.sender.replace(sender);
-                existing.connection_generation = existing
-                    .connection_generation
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("Agent 连接代次已经耗尽"))?;
-                existing.hello = hello;
-                existing.last_seen = now;
-                existing.lease.renew(now, self.lease_lifetime);
-                existing.lease_expired = false;
-                existing.ready = false;
-                let proposed_resume_token = new_secret_token();
-                existing.pending_resume = Some(PendingResume {
-                    token: proposed_resume_token.clone(),
-                    authenticated_token: existing.hello.resume_token.clone(),
-                });
-                let welcome = AgentWelcome {
-                    pairing_code: existing.lease.pairing_code.clone(),
-                    lease_expires_at: existing.lease.expires_at,
-                    resume_token: proposed_resume_token,
-                    connection_generation: existing.connection_generation,
-                    heartbeat_interval_seconds: self.heartbeat_seconds,
-                };
-                (welcome, existing.connection_generation, previous_sender)
+                replacement.retired_boots.insert(original.hello.boot_id);
+                replacement.lease =
+                    self.lease_for_agent(&state, agent_id, hello.pairing_mode, now)?;
+                replacement.session_id = SessionId::new();
+                replacement.permission_mode = PermissionMode::ApprovalRequired;
+            } else {
+                replacement.lease.renew(now, self.lease_lifetime);
+            }
+            replacement.connection_generation = original
+                .connection_generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("Agent 连接代次已经耗尽"))?;
+            replacement.sender = Some(sender);
+            replacement.hello = hello;
+            replacement.managed_target_id = managed_target_id;
+            replacement.legacy_boot = false;
+            replacement.last_seen = now;
+            replacement.lease_expired = false;
+            replacement.ready = false;
+            let proposed_resume_token = new_secret_token();
+            replacement.pending_resume = Some(PendingResume {
+                token: proposed_resume_token.clone(),
+                authenticated_token: replacement.hello.resume_token.clone(),
+            });
+            let welcome = AgentWelcome {
+                pairing_code: replacement.lease.pairing_code.clone(),
+                pairing_mode: replacement.hello.pairing_mode,
+                managed_target_id: replacement.managed_target_id.clone(),
+                lease_expires_at: replacement.lease.expires_at,
+                resume_token: proposed_resume_token,
+                connection_generation: replacement.connection_generation,
+                heartbeat_interval_seconds: self.heartbeat_seconds,
             };
+            replacement.persisted_lease_expires_at = replacement.lease.expires_at;
+            let connection_generation = replacement.connection_generation;
+            if new_boot {
+                remove_pairing_index(&mut state, original.lease.pairing_code.as_ref());
+                insert_pairing_index(
+                    &mut state,
+                    replacement.lease.pairing_code.as_ref(),
+                    agent_id,
+                );
+            }
+            state.agents.insert(agent_id, replacement);
             if let Err(error) = self.persist_state_locked(&state) {
+                if new_boot {
+                    remove_pairing_index(&mut state, welcome.pairing_code.as_ref());
+                    insert_pairing_index(
+                        &mut state,
+                        original.lease.pairing_code.as_ref(),
+                        agent_id,
+                    );
+                }
                 state.agents.insert(agent_id, original);
-                return Err(error.context("保存 Agent 重连状态失败"));
+                return Err(error.context("保存 Agent 恢复状态失败"));
             }
-            if let Some(existing) = state.agents.get_mut(&agent_id) {
-                existing.persisted_lease_expires_at = existing.lease.expires_at;
+            if new_boot {
+                end_restarted_session(&mut state, original.session_id);
             }
-            if let Some(previous_sender) = previous_sender {
+            if original.managed_target_id.is_some() {
+                self.reconcile_managed_boot(agent_id, state.agents[&agent_id].hello.boot_id)?;
+            }
+            if let Some(previous_sender) = original.sender {
                 let _ = previous_sender.send(WireMessage::Error {
-                    code: "connection_superseded".to_owned(),
-                    message: "Agent 已建立更新的传输连接".to_owned(),
+                    code: "connection_superseded".into(),
+                    message: "Agent 已建立更新的传输连接".into(),
                     request_id: None,
                 });
             }
@@ -2033,38 +2166,40 @@ impl Relay {
                 connection_generation,
             });
         }
-
         ensure_agent_capacity(state.agents.len())?;
-        let pairing_code = unique_pairing_code(&state)?;
+        let managed_target_id = self.validate_managed_agent(&hello)?;
+        let lease = self.lease_for_agent(&state, agent_id, hello.pairing_mode, now)?;
         let resume_token = new_secret_token();
-        let session_id = SessionId::new();
-        let lease = PairingLease::new(agent_id, pairing_code.clone(), now, self.lease_lifetime);
         let welcome = AgentWelcome {
-            pairing_code: pairing_code.clone(),
+            pairing_code: lease.pairing_code.clone(),
+            pairing_mode: hello.pairing_mode,
+            managed_target_id: managed_target_id.clone(),
             lease_expires_at: lease.expires_at,
             resume_token: resume_token.clone(),
             connection_generation: 1,
             heartbeat_interval_seconds: self.heartbeat_seconds,
         };
-        let persisted_lease_expires_at = lease.expires_at;
-        state.pairing_index.insert(pairing_code.clone(), agent_id);
+        insert_pairing_index(&mut state, lease.pairing_code.as_ref(), agent_id);
         state.agents.insert(
             agent_id,
             AgentRecord {
                 hello,
-                lease,
+                managed_target_id,
+                lease: lease.clone(),
                 resume_token: None,
                 previous_resume_token: None,
+                legacy_boot: false,
+                retired_boots: BTreeSet::new(),
                 pending_resume: Some(PendingResume {
                     token: resume_token,
                     authenticated_token: None,
                 }),
                 connection_generation: 1,
                 ready: false,
-                session_id,
+                session_id: SessionId::new(),
                 sender: Some(sender),
                 last_seen: now,
-                persisted_lease_expires_at,
+                persisted_lease_expires_at: lease.expires_at,
                 ever_paired: false,
                 lease_expired: false,
                 permission_mode: PermissionMode::ApprovalRequired,
@@ -2072,13 +2207,36 @@ impl Relay {
         );
         if let Err(error) = self.persist_state_locked(&state) {
             state.agents.remove(&agent_id);
-            state.pairing_index.remove(&pairing_code);
+            remove_pairing_index(&mut state, welcome.pairing_code.as_ref());
             return Err(error.context("保存新 Agent 注册状态失败"));
         }
         Ok(AgentRegistration {
             welcome,
             connection_generation: 1,
         })
+    }
+
+    fn lease_for_agent(
+        &self,
+        state: &RelayState,
+        agent_id: AgentInstanceId,
+        mode: PairingMode,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<PairingLease> {
+        if mode == PairingMode::ManagedOnDemand {
+            Ok(PairingLease::without_code(
+                agent_id,
+                now,
+                self.lease_lifetime,
+            ))
+        } else {
+            Ok(PairingLease::new(
+                agent_id,
+                unique_pairing_code(state, self.portal_store.as_deref())?,
+                now,
+                self.lease_lifetime,
+            ))
+        }
     }
 
     async fn commit_agent_resume(
@@ -2130,6 +2288,11 @@ impl Relay {
         connection_generation: u64,
     ) -> Option<ConnectionDescriptor> {
         let mut state = self.state.lock().await;
+        let original_managed = state
+            .agents
+            .get(&agent_id)
+            .filter(|agent| agent.managed_target_id.is_some())
+            .cloned();
         let (session_id, mut update) = {
             let agent = state.agents.get_mut(&agent_id)?;
             if agent.connection_generation != connection_generation
@@ -2140,11 +2303,18 @@ impl Relay {
                 return None;
             }
             agent.previous_resume_token = None;
+            agent.retired_boots.clear();
             agent.pending_resume = None;
             agent.ready = true;
             (agent.session_id, descriptor(agent, ConnectionState::Online))
         };
         if let Err(error) = self.persist_state_locked(&state) {
+            if let Some(original) = original_managed {
+                state.agents.insert(agent_id, original);
+                warn!(agent_instance_id = %agent_id, error = %error,
+                    "受管登记未持久完成，拒绝标记就绪并等待认证重连");
+                return None;
+            }
             warn!(
                 agent_instance_id = %agent_id,
                 connection_generation,
@@ -2250,24 +2420,59 @@ impl Relay {
     ) -> PairResult {
         let now = Utc::now();
         let mut state = self.state.lock().await;
-        let Some(agent_id) = state.pairing_index.get(&request.pairing_code).copied() else {
-            return PairResult {
-                request_id: request.request_id,
-                connection: None,
-                error: Some("控制码不存在或已经过期".to_owned()),
+        if active_controller(&state, controller_id, controller_generation).is_none() {
+            return portal_access::reject_pair(
+                &mut state,
+                controller_id,
+                request.request_id,
+                PairingErrorCode::Rejected,
+                "Controller 连接已经关闭或被替换",
+            );
+        }
+        let (agent_id, connection_resume_token, managed_connection_id) =
+            match self.resolve_pairing_target(&state, controller_id, &request, now) {
+                Ok(value) => value,
+                Err((code, message)) => {
+                    return portal_access::reject_pair(
+                        &mut state,
+                        controller_id,
+                        request.request_id,
+                        code,
+                        message,
+                    );
+                }
             };
-        };
         let Some(agent) = state.agents.get(&agent_id) else {
             return PairResult {
                 request_id: request.request_id,
                 connection: None,
+                connection_resume_token: None,
+                error_code: Some(PairingErrorCode::Rejected),
                 error: Some("Agent 不存在".to_owned()),
             };
         };
+        if request
+            .expected_session_id
+            .is_some_and(|expected| expected != agent.session_id)
+        {
+            return PairResult {
+                request_id: request.request_id,
+                connection: None,
+                connection_resume_token: None,
+                error: Some("原会话已结束，控制码当前属于其他会话".to_owned()),
+                error_code: Some(PairingErrorCode::SessionMismatch),
+            };
+        }
         if !agent.lease.is_valid_at(now) {
             return PairResult {
                 request_id: request.request_id,
                 connection: None,
+                connection_resume_token: None,
+                error_code: Some(if request.expected_session_id.is_some() {
+                    PairingErrorCode::AgentOffline
+                } else {
+                    PairingErrorCode::UnknownOrExpired
+                }),
                 error: Some("控制码租约已经过期".to_owned()),
             };
         }
@@ -2275,6 +2480,8 @@ impl Relay {
             return PairResult {
                 request_id: request.request_id,
                 connection: None,
+                connection_resume_token: None,
+                error_code: Some(PairingErrorCode::AgentOffline),
                 error: Some("Agent 当前离线，仍在等待恢复".to_owned()),
             };
         }
@@ -2287,6 +2494,8 @@ impl Relay {
             return PairResult {
                 request_id: request.request_id,
                 connection: None,
+                connection_resume_token: None,
+                error_code: Some(PairingErrorCode::Rejected),
                 error: Some("Controller 连接已经关闭".to_owned()),
             };
         };
@@ -2294,6 +2503,8 @@ impl Relay {
             return PairResult {
                 request_id: request.request_id,
                 connection: None,
+                connection_resume_token: None,
+                error_code: Some(PairingErrorCode::Rejected),
                 error: Some("Controller 连接已经被替换".to_owned()),
             };
         }
@@ -2305,11 +2516,28 @@ impl Relay {
             return PairResult {
                 request_id: request.request_id,
                 connection: None,
+                connection_resume_token: None,
+                error_code: Some(PairingErrorCode::Rejected),
                 error: Some("ControllerApproved 只允许已认证 AI Controller 使用".to_owned()),
             };
         }
         let (binding_messages, replaced_binding) = {
             let bindings = state.session_bindings.entry(session_id).or_default();
+            if managed_connection_id.is_some() {
+                if bindings.all().any(|binding| {
+                    binding.controller_id != controller_id
+                        || binding.controller_kind != ControllerKind::Ai
+                }) {
+                    return PairResult {
+                        request_id: request.request_id,
+                        connection: None,
+                        connection_resume_token: None,
+                        error: Some("受管目标已有其他控制连接".into()),
+                        error_code: Some(PairingErrorCode::Rejected),
+                    };
+                }
+                bindings.managed_connection_id = managed_connection_id;
+            }
             if bindings
                 .owner_id
                 .is_some_and(|bound_owner_id| bound_owner_id != owner_id)
@@ -2317,6 +2545,8 @@ impl Relay {
                 return PairResult {
                     request_id: request.request_id,
                     connection: None,
+                    connection_resume_token: None,
+                    error_code: Some(PairingErrorCode::Rejected),
                     error: Some("该 Agent Session 已绑定其他 Controller Owner".to_owned()),
                 };
             }
@@ -2442,6 +2672,8 @@ impl Relay {
         PairResult {
             request_id: request.request_id,
             connection: Some(connection),
+            connection_resume_token,
+            error_code: None,
             error: None,
         }
     }
@@ -2463,6 +2695,26 @@ impl Relay {
             };
         };
         let controller_kind = controller.kind;
+        let owned_managed =
+            state
+                .session_bindings
+                .get(&request.session_id)
+                .is_some_and(|bindings| {
+                    bindings.managed_connection_id.is_some()
+                        && bindings.get(controller_kind).is_some_and(|binding| {
+                            binding.controller_id == controller_id
+                                && binding.controller_generation == controller_generation
+                        })
+                });
+        if owned_managed {
+            let result = self.close_managed_target(&mut state, request.session_id);
+            return ReleaseSessionResult {
+                request_id: request.request_id,
+                session_id: request.session_id,
+                released: result.is_ok(),
+                error: result.err().map(|_| "受管授权撤销失败，请重试".to_owned()),
+            };
+        }
         let removed_binding = state
             .session_bindings
             .get_mut(&request.session_id)
@@ -2675,6 +2927,38 @@ impl Relay {
                 &request,
                 "session_not_owned",
                 "Controller 未绑定该 session_id",
+            );
+            return;
+        }
+        if !self.managed_request_allowed(
+            &state,
+            request.session_id,
+            controller_id,
+            controller_generation,
+        ) {
+            send_request_error(
+                controller_sender,
+                &request,
+                "access_revoked",
+                "当前目标访问授权已结束",
+            );
+            return;
+        }
+        if request.operation.is_visual()
+            && let Some(context) = state
+                .agents
+                .values()
+                .find(|agent| agent.session_id == request.session_id)
+                .and_then(|agent| agent.hello.target_context.as_ref())
+            && !context.visual_allowed()
+        {
+            send_request_error(
+                controller_sender,
+                &request,
+                context
+                    .visual_disabled_reason()
+                    .unwrap_or("product_policy_disabled"),
+                "目标产品或当前运行环境不允许图形操作",
             );
             return;
         }
@@ -3393,7 +3677,7 @@ impl Relay {
             let removed_any = !removable_ids.is_empty();
             for agent_id in removable_ids {
                 if let Some(agent) = state.agents.remove(&agent_id) {
-                    state.pairing_index.remove(&agent.lease.pairing_code);
+                    remove_pairing_index(&mut state, agent.lease.pairing_code.as_ref());
                     info!(agent_instance_id = %agent_id, "已回收长期过期且未配对的 Agent 身份");
                 }
             }
@@ -3415,7 +3699,7 @@ impl Relay {
     }
 }
 
-const PERSISTED_STATE_VERSION: u16 = 1;
+const PERSISTED_STATE_VERSION: u16 = 3;
 
 fn append_audit(
     state: &mut RelayState,
@@ -3582,13 +3866,47 @@ fn legacy_agent_was_paired() -> bool {
     true
 }
 
+// 旧磁盘格式的迁移只作用于状态快照，不放宽在线 AgentHello 的必填字段。
+fn decode_persisted_state(contents: &str) -> anyhow::Result<PersistedRelayState> {
+    let mut value: serde_json::Value = serde_json::from_str(contents)?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .context("Relay 状态文件缺少版本")?;
+    if version == 1 {
+        let agents = value
+            .get_mut("agents")
+            .and_then(serde_json::Value::as_array_mut)
+            .context("旧 Relay 状态缺少 Agent 列表")?;
+        for agent in agents {
+            let record = agent.as_object_mut().context("旧 Agent 状态必须是对象")?;
+            let hello = record
+                .get_mut("hello")
+                .and_then(serde_json::Value::as_object_mut)
+                .context("旧 Agent 状态缺少身份快照")?;
+            hello.insert(
+                "boot_id".to_owned(),
+                serde_json::to_value(AgentBootId::new())?,
+            );
+            record.insert("legacy_boot".to_owned(), true.into());
+            record.insert("retired_boots".to_owned(), serde_json::json!([]));
+        }
+        value["version"] = PERSISTED_STATE_VERSION.into();
+    } else if version == 2 {
+        value["version"] = PERSISTED_STATE_VERSION.into();
+    } else if version != u64::from(PERSISTED_STATE_VERSION) {
+        bail!("Relay 状态文件版本 {version} 不受支持，当前版本为 {PERSISTED_STATE_VERSION}");
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
 fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("无法读取 Relay 状态文件 {}", path.display()))?;
-    let persisted: PersistedRelayState = serde_json::from_str(&contents)
+    let persisted = decode_persisted_state(&contents)
         .with_context(|| format!("Relay 状态文件格式无效：{}", path.display()))?;
     if persisted
         .admin_password_hash
@@ -3624,9 +3942,20 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
         if persisted_agent.connection_generation == 0 {
             bail!("Relay 状态文件中的连接代次必须大于零");
         }
+        if persisted_agent.retired_boots.len() > MAX_UNCONFIRMED_BOOTS
+            || persisted_agent
+                .retired_boots
+                .contains(&persisted_agent.hello.boot_id)
+        {
+            bail!("Relay 状态文件中的 Agent 启动边界无效");
+        }
         let agent_id = persisted_agent.hello.agent_instance_id;
         let pairing_code = persisted_agent.lease.pairing_code.clone();
-        if state.agents.contains_key(&agent_id) || state.pairing_index.contains_key(&pairing_code) {
+        if state.agents.contains_key(&agent_id)
+            || pairing_code
+                .as_ref()
+                .is_some_and(|code| state.pairing_index.contains_key(code))
+        {
             bail!("Relay 状态文件包含重复的 Agent 或控制码");
         }
         if !session_ids.insert(persisted_agent.session_id) {
@@ -3635,7 +3964,8 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
         let mut hello = persisted_agent.hello;
         // 恢复令牌只用于当前握手，不重复写回内存快照。
         hello.resume_token = None;
-        state.pairing_index.insert(pairing_code, agent_id);
+        hello.managed_enrollment = None;
+        insert_pairing_index(state, pairing_code.as_ref(), agent_id);
         let lease_expired = !persisted_agent.lease.is_valid_at(now);
         let persisted_lease_expires_at = persisted_agent.lease.expires_at;
         state.agents.insert(
@@ -3645,7 +3975,10 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
                 lease: persisted_agent.lease,
                 resume_token: persisted_agent.resume_token,
                 previous_resume_token: persisted_agent.previous_resume_token,
+                legacy_boot: persisted_agent.legacy_boot,
+                retired_boots: persisted_agent.retired_boots,
                 pending_resume: None,
+                managed_target_id: persisted_agent.managed_target_id,
                 connection_generation: persisted_agent.connection_generation,
                 ready: false,
                 session_id: persisted_agent.session_id,
@@ -3674,11 +4007,15 @@ fn save_persisted_state(path: &Path, state: &RelayState) -> anyhow::Result<()> {
         .map(|agent| {
             let mut hello = agent.hello.clone();
             hello.resume_token = None;
+            hello.managed_enrollment = None;
             PersistedAgent {
                 hello,
+                managed_target_id: agent.managed_target_id.clone(),
                 lease: agent.lease.clone(),
                 resume_token: agent.resume_token.clone(),
                 previous_resume_token: agent.previous_resume_token.clone(),
+                legacy_boot: agent.legacy_boot,
+                retired_boots: agent.retired_boots.clone(),
                 session_id: agent.session_id,
                 connection_generation: agent.connection_generation,
                 ever_paired: agent.ever_paired,
@@ -3715,11 +4052,6 @@ fn save_persisted_state(path: &Path, state: &RelayState) -> anyhow::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("无法替换 Relay 状态文件 {}", path.display()))?;
     }
     std::fs::rename(&temporary_path, path)
         .with_context(|| format!("无法提交 Relay 状态文件 {}", path.display()))?;
@@ -3829,6 +4161,48 @@ fn send_request_error(sender: &Sender, request: &RemoteRequest, code: &str, mess
     });
 }
 
+// 新运行结束旧协助；通知与状态修改共用锁，迟到恢复结果不能重新建立旧会话。
+fn end_restarted_session(state: &mut RelayState, session_id: SessionId) {
+    end_session(
+        state,
+        session_id,
+        "Agent 已重新启动，请获取新控制码后重新配对",
+    );
+}
+
+fn end_session(state: &mut RelayState, session_id: SessionId, reason: &str) {
+    state.session_bindings.remove(&session_id);
+    state
+        .approvals
+        .retain(|_, approval| approval.session_id != session_id);
+    let abandoned = state
+        .in_flight
+        .iter()
+        .filter(|(_, request)| request.session_id == session_id)
+        .map(|(id, request)| (*id, request.clone()))
+        .collect::<Vec<_>>();
+    for (request_id, request) in abandoned {
+        state.in_flight.remove(&request_id);
+        if let Some(controller) = state.controllers.get(&request.controller_id)
+            && controller.connection_generation == request.controller_generation
+        {
+            let _ = controller.sender.send(WireMessage::Error {
+                code: "session_ended".to_owned(),
+                message: "Agent 已重新启动，原会话请求已结束".to_owned(),
+                request_id: Some(request_id),
+            });
+        }
+    }
+    for controller in state.controllers.values_mut() {
+        if controller.sessions.remove(&session_id) {
+            let _ = controller.sender.send(WireMessage::ConnectionRemoved {
+                session_id,
+                reason: reason.to_owned(),
+            });
+        }
+    }
+}
+
 fn resume_token_matches(agent: &AgentRecord, supplied: Option<&String>) -> bool {
     agent.resume_token.as_ref() == supplied
         || agent
@@ -3868,6 +4242,9 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn descriptor(agent: &AgentRecord, state: ConnectionState) -> ConnectionDescriptor {
+    let mut environment = agent.hello.environment.clone();
+    // 兼容判断使用握手协议，不能由环境摘要覆盖。
+    environment.protocol_version = agent.hello.protocol_version;
     ConnectionDescriptor {
         session_id: agent.session_id,
         agent_instance_id: agent.hello.agent_instance_id,
@@ -3876,7 +4253,8 @@ fn descriptor(agent: &AgentRecord, state: ConnectionState) -> ConnectionDescript
         hostname: agent.hello.hostname.clone(),
         operating_system: agent.hello.operating_system.clone(),
         capabilities: agent.hello.capabilities.clone(),
-        environment: agent.hello.environment.clone(),
+        target_context: agent.hello.target_context.clone(),
+        environment,
         credential_encryption_public_key: agent.hello.credential_encryption_public_key.clone(),
         credential_encryption_key_id: agent.hello.credential_encryption_key_id.clone(),
         mac_address: agent.hello.mac_address.clone(),
@@ -3932,12 +4310,35 @@ fn send_session_connection_update(
     }
 }
 
-fn unique_pairing_code(state: &RelayState) -> anyhow::Result<PairingCode> {
+fn remove_pairing_index(state: &mut RelayState, code: Option<&PairingCode>) {
+    if let Some(code) = code {
+        state.pairing_index.remove(code);
+    }
+}
+fn insert_pairing_index(
+    state: &mut RelayState,
+    code: Option<&PairingCode>,
+    agent_id: AgentInstanceId,
+) {
+    if let Some(code) = code {
+        state.pairing_index.insert(code.clone(), agent_id);
+    }
+}
+
+fn unique_pairing_code(
+    state: &RelayState,
+    portal: Option<&PortalStore>,
+) -> anyhow::Result<PairingCode> {
     let mut rng = rand::thread_rng();
     for _ in 0..100 {
         let value = format!("{:09}", rng.gen_range(0_u32..1_000_000_000));
         let code = PairingCode::parse(value).map_err(|error| anyhow!(error))?;
-        if !state.pairing_index.contains_key(&code) {
+        if !state.pairing_index.contains_key(&code)
+            && !portal
+                .map(|store| store.code_reserved(code.as_str(), Utc::now()))
+                .transpose()?
+                .unwrap_or(false)
+        {
             return Ok(code);
         }
     }
@@ -3959,6 +4360,8 @@ fn new_secret_token() -> String {
 mod tests {
     include!("relay_control_tests.rs");
     include!("relay_enrollment_tests.rs");
+    include!("relay_boot_tests.rs");
+    include!("relay_portal_tests.rs");
     use std::path::PathBuf;
 
     use remoteops_domain::{
@@ -4031,8 +4434,12 @@ mod tests {
 
     fn hello(agent_instance_id: AgentInstanceId, resume_token: Option<String>) -> AgentHello {
         AgentHello {
+            target_context: None,
+            pairing_mode: PairingMode::AutoPerBoot,
+            managed_enrollment: None,
             protocol_version: PROTOCOL_VERSION,
             agent_instance_id,
+            boot_id: AgentBootId::from_uuid(agent_instance_id.as_uuid()),
             resume_token,
             hostname: "LAB-WIN-A".to_owned(),
             operating_system: "Windows 11".to_owned(),
@@ -4148,6 +4555,8 @@ mod tests {
                 ai_id,
                 generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code.clone(),
                     permission_mode: PermissionMode::FullAccess,
@@ -4225,6 +4634,8 @@ mod tests {
                 ai_id,
                 generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code.clone(),
                     permission_mode: PermissionMode::FullAccess,
@@ -4323,6 +4734,8 @@ mod tests {
                     ai_id,
                     generation,
                     PairRequest {
+                        connection_resume_token: None,
+                        expected_session_id: None,
                         request_id: RequestId::new(),
                         pairing_code: agent.welcome.pairing_code,
                         permission_mode: PermissionMode::FullAccess,
@@ -5096,6 +5509,8 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: pairing_code.clone(),
                     permission_mode: PermissionMode::FullAccess,
@@ -5114,6 +5529,8 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: pairing_code.clone(),
                     permission_mode: PermissionMode::ReadOnly,
@@ -5132,6 +5549,8 @@ mod tests {
                 other_ai_id,
                 other_ai_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code,
                     permission_mode: PermissionMode::FullAccess,
@@ -5160,6 +5579,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn agent_permission_mode_controls_effective_session_access() {
         let relay = relay(Duration::minutes(10));
         let agent_id = AgentInstanceId::new();
@@ -5171,6 +5591,8 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code,
                     permission_mode: PermissionMode::FullAccess,
@@ -5279,6 +5701,8 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code,
                     permission_mode: PermissionMode::ControllerApproved,
@@ -5311,6 +5735,8 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: pairing_code.clone(),
                     permission_mode: PermissionMode::ControllerApproved,
@@ -5337,6 +5763,8 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code,
                     permission_mode: PermissionMode::ApprovalRequired,
@@ -5533,6 +5961,8 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code,
                     permission_mode: PermissionMode::ControllerApproved,
@@ -5562,6 +5992,8 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code.clone(),
                     permission_mode: PermissionMode::FullAccess,
@@ -5575,6 +6007,8 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code,
                     permission_mode: PermissionMode::FullAccess,
@@ -5657,6 +6091,8 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code,
                     permission_mode: PermissionMode::FullAccess,
@@ -5777,6 +6213,8 @@ mod tests {
                         id,
                         generation,
                         PairRequest {
+                            connection_resume_token: None,
+                            expected_session_id: None,
                             request_id: RequestId::new(),
                             pairing_code: agent.welcome.pairing_code.clone(),
                             permission_mode: PermissionMode::ApprovalRequired,
@@ -5825,6 +6263,8 @@ mod tests {
                                 ai_id,
                                 ai_generation,
                                 PairRequest {
+                                    connection_resume_token: None,
+                                    expected_session_id: None,
                                     request_id: RequestId::new(),
                                     pairing_code: agent.welcome.pairing_code.clone(),
                                     permission_mode: PermissionMode::ApprovalRequired,
@@ -5862,6 +6302,8 @@ mod tests {
                             new_id,
                             new_generation,
                             PairRequest {
+                                connection_resume_token: None,
+                                expected_session_id: None,
                                 request_id: RequestId::new(),
                                 pairing_code: agent.welcome.pairing_code.clone(),
                                 permission_mode: PermissionMode::ApprovalRequired,
@@ -6046,6 +6488,8 @@ mod tests {
                     id,
                     generation,
                     PairRequest {
+                        connection_resume_token: None,
+                        expected_session_id: None,
                         request_id: RequestId::new(),
                         pairing_code: agent.welcome.pairing_code,
                         permission_mode: PermissionMode::ApprovalRequired,
@@ -6237,6 +6681,8 @@ mod tests {
                 first_id,
                 first_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: pairing_code.clone(),
                     permission_mode: PermissionMode::ApprovalRequired,
@@ -6248,6 +6694,8 @@ mod tests {
                 second_id,
                 second_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: pairing_code.clone(),
                     permission_mode: PermissionMode::ApprovalRequired,
@@ -6303,6 +6751,8 @@ mod tests {
                 first_id,
                 first_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: pairing_code.clone(),
                     permission_mode: PermissionMode::ApprovalRequired,
@@ -6342,6 +6792,8 @@ mod tests {
                 second_id,
                 second_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code,
                     permission_mode: PermissionMode::ApprovalRequired,
@@ -6367,6 +6819,8 @@ mod tests {
                 controller_id,
                 generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code.clone(),
                     permission_mode: PermissionMode::ApprovalRequired,
@@ -6422,6 +6876,8 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code.clone(),
                     permission_mode: PermissionMode::ApprovalRequired,
@@ -6473,6 +6929,8 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code.clone(),
                     permission_mode: PermissionMode::ApprovalRequired,
@@ -6573,6 +7031,8 @@ mod tests {
                     controller_id,
                     generation,
                     PairRequest {
+                        connection_resume_token: None,
+                        expected_session_id: None,
                         request_id: RequestId::new(),
                         pairing_code: agent.welcome.pairing_code.clone(),
                         permission_mode: PermissionMode::ApprovalRequired,
@@ -6786,6 +7246,8 @@ mod tests {
                     controller_id,
                     generation,
                     PairRequest {
+                        connection_resume_token: None,
+                        expected_session_id: None,
                         request_id: RequestId::new(),
                         pairing_code,
                         permission_mode: PermissionMode::ApprovalRequired,
@@ -6909,7 +7371,7 @@ mod tests {
             assert!(
                 state
                     .pairing_index
-                    .contains_key(&registration.welcome.pairing_code)
+                    .contains_key(registration.welcome.pairing_code.as_ref().unwrap())
             );
         }
 

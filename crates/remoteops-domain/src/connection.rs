@@ -54,6 +54,9 @@ pub struct ConnectionDescriptor {
     /// 当前 HPKE 公钥的 SHA-256 标识。
     #[serde(default)]
     pub credential_encryption_key_id: String,
+    /// 当前启动上报的目标上下文；旧 Agent 未报告时为空。
+    #[serde(default)]
+    pub target_context: Option<crate::TargetContext>,
     /// 当前连接状态。
     pub state: ConnectionState,
     /// 当前写入角色。

@@ -17,6 +17,7 @@ LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [dependencies]
 remoteops-product = { path = "../../crates/remoteops-product" }
+remoteops-native-host = { path = "../../crates/remoteops-native-host" }
 tempfile = "3"
 anyhow.workspace = true
 async-trait.workspace = true

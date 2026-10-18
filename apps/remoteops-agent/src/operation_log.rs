@@ -462,6 +462,7 @@ fn safe_text(redactor: &Redactor, message: &str) -> String {
 /// 将核心操作映射为现场人员可理解的类型名称。
 fn operation_label(operation: &RemoteOperation) -> &'static str {
     match operation {
+        RemoteOperation::GetTargetContext => "读取目标上下文",
         RemoteOperation::OpenShell { .. } => "打开 Shell",
         RemoteOperation::RunShellCommand { .. } | RemoteOperation::RunCommand { .. } => "命令",
         RemoteOperation::CloseShell { .. } => "关闭 Shell",

@@ -178,6 +178,8 @@ pub enum PowerAction {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RemoteOperation {
+    /// 读取当前目标上下文与宿主事实，不启动图形 Provider。
+    GetTargetContext,
     /// 打开持久交互式 Shell。
     OpenShell {
         /// Shell 类型。
@@ -453,6 +455,22 @@ pub enum RemoteOperation {
     },
     /// 停止当前图形 Provider 会话。
     VisualStop,
+}
+
+impl RemoteOperation {
+    /// 判断操作是否会访问图形 Provider，包括能力探测和会话停止。
+    #[must_use]
+    pub const fn is_visual(&self) -> bool {
+        matches!(
+            self,
+            Self::VisualObserve { .. }
+                | Self::VisualWaitFor { .. }
+                | Self::VisualInvoke { .. }
+                | Self::VisualTypeText { .. }
+                | Self::VisualSendInput { .. }
+                | Self::VisualStop
+        )
+    }
 }
 
 /// 统一事件负载。

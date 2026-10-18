@@ -28,6 +28,7 @@ remoteops-enrollment = { path = "../../crates/remoteops-enrollment" }
 remoteops-enrollment-store = { path = "../../crates/remoteops-enrollment-store" }
 remoteops-domain = { path = "../../crates/remoteops-domain" }
 remoteops-policy = { path = "../../crates/remoteops-policy" }
+remoteops-portal = { path = "../../crates/remoteops-portal" }
 remoteops-protocol = { path = "../../crates/remoteops-protocol" }
 serde.workspace = true
 serde_json.workspace = true

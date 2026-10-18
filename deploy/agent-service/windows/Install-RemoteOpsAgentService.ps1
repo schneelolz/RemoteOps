@@ -5,12 +5,18 @@ param(
     [string]$ServiceExecutable = (Join-Path $PSScriptRoot '..\..\..\target\release\remoteops-agent-service.exe'),
     [string]$InstallRoot = "$env:ProgramFiles\RemoteOps\Agent",
     [string]$DataRoot = "$env:ProgramData\RemoteOps\Agent",
+    [ValidatePattern('^[A-Za-z0-9_.-]{1,128}$')]
+    [string]$ServiceName = 'RemoteOpsAgent',
+    [ValidateNotNullOrEmpty()]
+    [string]$DisplayName = 'RemoteOps Agent',
     [switch]$AllowLocalSystem,
     [switch]$StartService
 )
 
 $ErrorActionPreference = 'Stop'
-$serviceName = 'RemoteOpsAgent'
+if ($ServiceName -ne 'RemoteOpsAgent' -and (-not $PSBoundParameters.ContainsKey('InstallRoot') -or -not $PSBoundParameters.ContainsKey('DataRoot'))) {
+    throw '定制服务必须显式指定独立 InstallRoot 与 DataRoot，避免覆盖通用服务目录'
+}
 $resolvedExecutable = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $ServiceExecutable).Path)
 $resolvedConfig = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $ConfigPath).Path)
 $resolvedInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
@@ -41,12 +47,12 @@ $account = if ($AllowLocalSystem) { 'LocalSystem' } else { 'NT AUTHORITY\LocalSe
 $binPath = "`"$installedExecutable`" --config `"$installedConfig`" --status-file `"$statusFile`""
 $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($null -eq $existing) {
-    & sc.exe create $serviceName binPath= $binPath start= auto obj= $account DisplayName= 'RemoteOps Agent' | Out-Null
+    & sc.exe create $serviceName binPath= $binPath start= auto obj= $account DisplayName= $DisplayName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "创建 Windows Service 失败：$serviceName" }
 }
 else {
     if ($existing.Status -ne 'Stopped') { Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue }
-    & sc.exe config $serviceName binPath= $binPath start= auto obj= $account | Out-Null
+    & sc.exe config $serviceName binPath= $binPath start= auto obj= $account DisplayName= $DisplayName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "更新 Windows Service 失败：$serviceName" }
 }
 

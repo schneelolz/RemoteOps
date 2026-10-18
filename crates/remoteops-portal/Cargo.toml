@@ -1,0 +1,29 @@
+[package]
+name = "remoteops-portal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+hmac = "0.13"
+sha2 = { version = "0.11", default-features = false }
+rand.workspace = true
+remoteops-domain = { path = "../remoteops-domain" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle = "2.6"
+thiserror.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,5 +1,11 @@
 # 薄产品接入与迁移
 
+## 受管服务与门户后端
+
+长期运行的产品 Service 使用公共 `ManagedOnDemand` 流程：先由受控后台登记资产并安全下发部署证明，Agent 认证在线后默认不展示或签发控制码。OpsCenter 等产品后端通过独立、限定资产白名单的门户凭据，显式签发十分钟一次邀请。消费者仍使用公共 MCP；代码签发、单目标绑定、断线恢复、权限和撤销由公共 Relay/Agent 执行，不在产品中复制一套远控逻辑。
+
+资产映射使用稳定 `target_id` 与经登记证明锁定的 `agent_instance_id`，主机名、MAC、业务系统字符串只作为展示。产品网页不能持有 Relay 管理或全局 Controller 凭据。通用 GUI 继续每次运行自动换码，受管 Service 不因伪装模式字段退回自动签码。门户接口、幂等及凭据边界见[门户后端 API v1](integrations/portal-api-v1.md)；公共服务入口、能力上限、目标上下文、兼容矩阵和原生验收边界见[定制 Service Agent 公共接口](integrations/custom-service-agent.md)。受管模式由产品宿主显式选择 `.managed()`，兼容入口不会仅因运行于服务进程而自动切换。
+
 ## 边界与入口
 
 公共底座维护 TLS、配对、连接恢复、协议、执行与取消、权限权威同步、配置加载与原子保存、隔离目录、脱敏日志、GUI 宿主和 Windows 资源工具。产品只提供名称、版本、图片、文案、默认偏好、固定策略、目录命名及小型界面扩展。
@@ -10,11 +16,13 @@
 | `AgentConfig::load_file_with_profile`、`resolve_product`、`save_for_product` | 一次解析缺字段与显式布尔值、输入合并后的策略检查、端点信任隔离、原子写入与便携回退 |
 | `remoteops_agent_gui::run`、`run_default`、`resolve_config` | 同一个默认与外部产品宿主；无窗口、无网络的配置检查入口 |
 | `GuiOptions`、`GuiLayout`、`GuiExtension`、`GuiEvent`、`GuiSnapshot`、`GuiAction` | 布局模板、可选活动组件、Logo、外观、双语文案及受控呈现扩展 |
+| `remoteops_agent_service::run`、`ServiceOptions` | 公共 SCM 与前台宿主、机器级配置、状态、停止和受管模式入口 |
+| `AgentRuntimeOptions`、`AgentCapabilityPolicy`、`run_agent_with_options` | 可信宿主能力上限、延迟图形初始化和目标上下文 |
 | `activity::ActivityModel` | 有界摘要、并发任务与明确终态；不以 stderr 或日志级别推断完成 |
 | `remoteops_build::WindowsResources`、`compile_windows_resources` | 外部产品自行提供资源路径、产品版本与 EXE 名称 |
 | `build_info` | 实际链接的 Agent、GUI、协议版本及源码提交、dirty 状态 |
 
-产品配置目前适用于 Agent GUI 的公共宿主及显式调用产品配置 API 的宿主。既有 CLI、Service 不隐式读取 GUI 产品配置，仍保留原来的 RemoteOps 默认值。默认 GUI 关闭活动摘要，维持原布局。新增本地事件枚举变体可能要求外部 Rust 消费者更新穷尽匹配；线协议版本未更改。
+产品配置适用于公共 GUI 宿主、公共 Service 宿主及显式调用产品配置 API 的自定义宿主。Service 使用机器级产品配置入口，不读取 GUI 用户配置；通用 CLI 兼容入口继续使用 RemoteOps 默认产品。默认 GUI 关闭活动摘要，维持原布局。新增本地事件枚举变体可能要求外部 Rust 消费者更新穷尽匹配。本轮线协议升级为 18；Relay 仅保留协议 17 的自动签码兼容路径，协议 16 被拒绝，受管模式及完整目标上下文要求配套协议 18。
 
 `GuiSnapshot` 不暴露可变 App、绑定令牌或恢复凭据。扩展只能提交动作；保存错误、确认、请求超时和权限执行均由宿主处理。产品组件使用 `remoteops_agent_gui::egui` 的重导出，不能自行引入另一版 egui。
 
@@ -59,7 +67,7 @@ GuiOptions {
 
 默认值不是有效授权。有效权限来自当前 Relay 快照，仍受只读和强制外部审批上限约束。新绑定先查询最新快照，再以绑定、连接代次及修订号申请默认授权。明确撤销会抑制本 Agent 进程内后续默认自动授权；重连不恢复，进程重启才重新读取默认偏好。自然到期、初始同步和陈旧事件不会触发该抑制。重复 MCP 完全控制不替换有效现场授权的来源、修订号和期限；重复相同 Agent 上限不清除授权。
 
-切换 Relay 或 TLS 服务名会清除原 CA/指纹并隔离身份状态；明确为新端点传入的 CA 或指纹在清理后应用。`--state-file` 和产品状态环境变量指定的是身份文件基名，GUI 入口统一按产品 ID 与端点派生隔离文件；保存配置后重启仍使用相同派生路径，不能回退到旧端点文件。旧显式路径不自动迁移恢复凭据，升级后可能需要重新配对；既有 CLI/Service 的路径契约保持原状。不同产品使用各自配置、状态、交换目录、GUI 偏好和诊断目录。默认 RemoteOps 继续兼容旧配置发现路径。
+切换 Relay 或 TLS 服务名会清除原 CA/指纹并隔离身份状态；明确为新端点传入的 CA 或指纹在清理后应用。`--state-file` 和产品状态环境变量指定的是身份文件基名，GUI 入口统一按产品 ID 与端点派生隔离文件；保存配置后重启仍使用相同派生路径，不能回退到旧端点文件。旧显式路径不自动迁移恢复凭据，升级后可能需要重新配对；既有 CLI/通用 Service 的默认路径保持兼容；定制 Service 的缺省身份与交换目录跟随机器级配置目录，详见公共服务接口。不同产品使用各自配置、状态、交换目录、GUI 偏好和诊断目录。默认 RemoteOps 继续兼容旧配置发现路径。
 
 ## 独立构建与版本固定
 

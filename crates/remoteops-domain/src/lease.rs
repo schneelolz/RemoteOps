@@ -9,7 +9,7 @@ pub struct PairingLease {
     /// Agent 实例标识。
     pub agent_instance_id: AgentInstanceId,
     /// 租约有效期内保持不变的配对码。
-    pub pairing_code: PairingCode,
+    pub pairing_code: Option<PairingCode>,
     /// 租约到期时间。
     pub expires_at: DateTime<Utc>,
 }
@@ -25,7 +25,21 @@ impl PairingLease {
     ) -> Self {
         Self {
             agent_instance_id,
-            pairing_code,
+            pairing_code: Some(pairing_code),
+            expires_at: now + lifetime,
+        }
+    }
+
+    /// 创建没有公开控制码的受管在线租约。
+    #[must_use]
+    pub fn without_code(
+        agent_instance_id: AgentInstanceId,
+        now: DateTime<Utc>,
+        lifetime: Duration,
+    ) -> Self {
+        Self {
+            agent_instance_id,
+            pairing_code: None,
             expires_at: now + lifetime,
         }
     }
@@ -59,7 +73,7 @@ mod tests {
 
         lease.renew(now + Duration::minutes(4), Duration::minutes(5));
 
-        assert_eq!(lease.pairing_code, code);
+        assert_eq!(lease.pairing_code, Some(code));
         assert!(lease.is_valid_at(now + Duration::minutes(8)));
         assert!(!lease.is_valid_at(now + Duration::minutes(9)));
     }

@@ -320,7 +320,7 @@ enum CommandMode {
     /// 由 Agent 本地权限选择决定是否逐项审批。
     #[default]
     AgentControlled,
-    /// 兼容完全控制权限上限；协议16仍须 Relay 确认会话授权。
+    /// 兼容完全控制权限上限；当前协议仍须 Relay 确认会话授权。
     FullAccess,
 }
 
@@ -1104,6 +1104,12 @@ struct ConnectionOutput {
     /// MCP 本地（控制端）的实际文件交换目录，供 `local_path` 使用；不是 Agent 远端目录。
     transfer_root: String,
     capabilities: Vec<String>,
+    /// 当前目标专用上下文；旧组件缺少字段时明确显示未知。
+    target_context: serde_json::Value,
+    /// 上下文是否已报告或实时刷新失败。
+    target_context_status: String,
+    /// 指引仅为辅助资料，不能覆盖用户授权、硬权限或公共安全要求。
+    guidance_is_advisory: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1299,7 +1305,7 @@ impl RemoteOpsMcp {
     ) -> Self {
         if command_mode == CommandMode::FullAccess {
             tracing::warn!(
-                "协议16 full-access 参数只声明权限上限；使用 set_control_mode 或现场授权确认本次连接"
+                "full-access 参数只声明权限上限；使用 set_control_mode 或现场授权确认本次连接"
             );
         }
         let mcp = Self {
@@ -1602,7 +1608,7 @@ impl RemoteOpsMcp {
                     BooleanSchema::new()
                         .title(title)
                         .description(
-                            "在当前 MCP 确认界面点击允许即表示仅确认本次操作；这不是完全控制授权。协议 16 的 Agent 可由现场人员授权完全控制",
+                            "在当前 MCP 确认界面点击允许即表示仅确认本次操作；这不是完全控制授权。配套 Agent 可由现场人员授权完全控制",
                         )
                         .with_default(true),
                 ),
@@ -1881,7 +1887,7 @@ impl RemoteOpsMcp {
     /// 更改指定 Agent 在本 MCP 进程中的控制模式。
     #[tool(
         name = "set_control_mode",
-        description = "按精确 session_id 切换控制模式。默认保持 step_by_step；不得因为逐项确认界面不可用、超时或写操作被拒绝而调用 full_access。只有用户明确要求完全控制时才调用。调用 full_access 时只使用 Codex 对本工具的授权，不再嵌套弹出第二次确认；协议 16 的 Agent 支持现场授权；已生效时不要重复授权。切回逐项确认立即生效。",
+        description = "按精确 session_id 切换控制模式。默认保持 step_by_step；不得因为逐项确认界面不可用、超时或写操作被拒绝而调用 full_access。只有用户明确要求完全控制时才调用。调用 full_access 时只使用 Codex 对本工具的授权，不再嵌套弹出第二次确认；配套 Agent 支持现场授权；已生效时不要重复授权。切回逐项确认立即生效。",
         annotations(
             title = "切换控制模式",
             read_only_hint = false,
@@ -1949,37 +1955,31 @@ impl RemoteOpsMcp {
         Parameters(input): Parameters<TargetInput>,
     ) -> Result<Json<ConnectionOutput>, String> {
         let session_id = parse_session_id(&input.session_id)?;
-        let connection = self
+        let mut connection = self
             .client
             .list_connections()
             .await
             .into_iter()
             .find(|connection| connection.session_id == session_id)
             .ok_or_else(|| "未找到 session_id".to_owned())?;
-        let windows_target = connection
-            .environment
-            .os_family
-            .eq_ignore_ascii_case("windows");
+        // 运行事实通过专用只读操作刷新；信息查询不会创建或探测图形 Provider。
+        let mut stale = false;
+        if supports_target_context(&connection)
+            && connection.state == remoteops_domain::ConnectionState::Online
+        {
+            if let Ok(context) = self.client.refresh_target_context(session_id).await {
+                connection.target_context = Some(context);
+            } else {
+                stale = true;
+                if let Some(context) = connection.target_context.as_mut() {
+                    context.facts.interactive_desktop =
+                        remoteops_domain::CapabilityAvailability::Unknown;
+                }
+            }
+        }
         let mut output = connection_output(connection);
-        if windows_target {
-            // 桌面会随 RDP 登录、锁屏和 Provider 恢复而变化，不复用首次注册的旧结论。
-            let current = self
-                .execute_simple(
-                    session_id.to_string(),
-                    RemoteOperation::VisualObserve {
-                        include_screenshot: false,
-                        include_ui_tree: false,
-                    },
-                    None,
-                    None,
-                )
-                .await;
-            let initialized = current
-                .as_ref()
-                .ok()
-                .and_then(|result| result.0.details.as_ref())
-                .is_some_and(visual_provider_initialized);
-            refresh_visual_capability(&mut output.capabilities, initialized);
+        if stale {
+            "stale".clone_into(&mut output.target_context_status);
         }
         output.transfer_root = self.transfer_root.display().to_string();
         let state = self.control_mode_output(session_id).await;
@@ -2189,6 +2189,27 @@ impl RemoteOpsMcp {
         &self,
         Parameters(input): Parameters<TargetInput>,
     ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        let connection = self
+            .client
+            .list_connections()
+            .await
+            .into_iter()
+            .find(|connection| connection.session_id == session_id)
+            .ok_or_else(|| "未找到 session_id".to_owned())?;
+        if !supports_target_context(&connection) {
+            return Ok(Json(visual_unavailable_output(
+                session_id,
+                "host_context_unknown",
+            )));
+        }
+        if let Some(reason) = connection
+            .target_context
+            .as_ref()
+            .and_then(remoteops_domain::TargetContext::visual_disabled_reason)
+        {
+            return Ok(Json(visual_unavailable_output(session_id, reason)));
+        }
         let mut output = self
             .execute_simple(
                 input.session_id,
@@ -3733,7 +3754,7 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
     router = self.runtime_tool_router(),
     name = "remoteops-controller",
     version = "0.2.0-preview.5",
-    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。新 Agent 只需填写 Relay 地址并等待显示九位控制码，不需要入网码或部署级注册 Token。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。全新配置默认逐项确认；协议16及以上Agent支持现场临时授权和默认完全控制。配对后先查询有效模式，已生效的现场授权无需再次调用set_control_mode或逐项审批；旧组件无此能力时不得引导点击不存在的按钮。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command。run_readonly_command 只接受白名单中的单条查询，最长4096字节；命令文本不得包含换行、分号、管道、重定向、命令连接符或反引号。PowerShell参数只接受字面量，不支持变量展开、子表达式、脚本块或会写入变量的参数；环境变量先单独查询（如 $env:LOCALAPPDATA），再将返回的实际路径作为字面量传给下一条查询。多个目录分别调用，筛选和格式化在控制端完成。被拒绝时按限制改写或拆分，不要仅因此自动改走审批命令或切换完全控制；完全控制也不会放宽只读白名单。持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制由 Relay 确认并按当前连接绑定生效；MCP 授权空闲一小时失效，现场授权有效至连接结束，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。文件传输的 local_path 必须是 MCP 进程所在机器和账号的本地 transfer-root 内的相对路径，上传源文件须已放入该目录；remote_path 必须是 Agent 自己 transfer-root 内的相对路径，双方根目录可以不同。连接结果中的 transfer_root 始终是 MCP 本地目录，不是 Agent 远端目录；远端实际目录可在 Agent GUI 的连接详情中查看。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
+    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。交互式客户 Agent 只需填写 Relay 地址并等待显示九位控制码。受管服务 Agent 由授权部署流程登记，默认无码，用户通过已授权门户取得临时控制码；MCP 配对流程相同。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。全新配置默认逐项确认；当前兼容Agent支持现场临时授权和默认完全控制。配对后先查询有效模式，已生效的现场授权无需再次调用set_control_mode或逐项审批；旧组件无此能力时不得引导点击不存在的按钮。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command。run_readonly_command 只接受白名单中的单条查询，最长4096字节；命令文本不得包含换行、分号、管道、重定向、命令连接符或反引号。PowerShell参数只接受字面量，不支持变量展开、子表达式、脚本块或会写入变量的参数；环境变量先单独查询（如 $env:LOCALAPPDATA），再将返回的实际路径作为字面量传给下一条查询。多个目录分别调用，筛选和格式化在控制端完成。被拒绝时按限制改写或拆分，不要仅因此自动改走审批命令或切换完全控制；完全控制也不会放宽只读白名单。持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制由 Relay 确认并按当前连接绑定生效；MCP 授权空闲一小时失效，现场授权有效至连接结束，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。文件传输的 local_path 必须是 MCP 进程所在机器和账号的本地 transfer-root 内的相对路径，上传源文件须已放入该目录；remote_path 必须是 Agent 自己 transfer-root 内的相对路径，双方根目录可以不同。连接结果中的 transfer_root 始终是 MCP 本地目录，不是 Agent 远端目录；远端实际目录可在 Agent GUI 的连接详情中查看。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
 )]
 impl ServerHandler for RemoteOpsMcp {}
 
@@ -4151,26 +4172,38 @@ fn visual_uia_available(observation: &serde_json::Value) -> bool {
         == Some(true)
 }
 
-/// 只把当前观察确认的交互桌面能力公开给工具调用方。
-fn visual_provider_initialized(observation: &serde_json::Value) -> bool {
-    observation
-        .get("state")
-        .is_some_and(|state| state == "ready")
-        && observation
-            .get("displays")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|displays| !displays.is_empty())
-}
-
-/// 用实时探测覆盖可能因启动超时或锁屏而过期的 visual 标记。
-fn refresh_visual_capability(capabilities: &mut Vec<String>, initialized: bool) {
-    capabilities.retain(|capability| capability != "visual");
-    if initialized {
-        capabilities.push("visual".to_owned());
-    }
+/// 只有新协议且显式报告可识别上下文的目标才支持新查询操作。
+fn supports_target_context(connection: &remoteops_domain::ConnectionDescriptor) -> bool {
+    connection.environment.protocol_version >= 18
+        && connection
+            .target_context
+            .as_ref()
+            .is_some_and(|context| context.validate().is_ok())
 }
 
 fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> ConnectionOutput {
+    let reported = supports_target_context(&connection);
+    let visual_allowed = reported
+        && connection
+            .target_context
+            .as_ref()
+            .is_some_and(remoteops_domain::TargetContext::visual_allowed);
+    let mut target_context = if reported {
+        serde_json::to_value(&connection.target_context).unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::json!({"schema_version":null,"product_id":"unknown","name":"unknown","version":"unknown",
+            "run_mode":"unknown","facts":{"interactive_desktop":"unknown","source":"unknown","process_session_id":null,"observed_at":null},
+            "capabilities":[],"guidance":[]})
+    };
+    for field in ["product_id", "name", "version"] {
+        if target_context
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            target_context[field] = "unknown".into();
+        }
+    }
     ConnectionOutput {
         display_name: connection.display_name(),
         alias: connection.alias,
@@ -4189,11 +4222,34 @@ fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> Conn
         control_revision: None,
         control_sync_status: "pending".into(),
         transfer_root: String::new(),
+        target_context,
+        target_context_status: if reported { "reported" } else { "unknown" }.to_owned(),
+        guidance_is_advisory: true,
         capabilities: connection
             .capabilities
             .iter()
+            .filter(|capability| **capability != Capability::Visual || visual_allowed)
             .map(|capability| format!("{capability:?}").to_lowercase())
             .collect(),
+    }
+}
+
+/// 硬禁或未知目标的图形能力结果，不发送探测请求也不返回像素。
+fn visual_unavailable_output(session_id: SessionId, reason: &str) -> ActionOutput {
+    ActionOutput {
+        status: "unavailable".to_owned(),
+        session_id: session_id.to_string(),
+        request_id: None,
+        exit_code: None,
+        summary: "当前目标未提供可用的交互式图形能力".to_owned(),
+        approval_id: None,
+        sha256: None,
+        details: Some(
+            serde_json::json!({"code":reason,"state":"unavailable","initialized":false,
+            "capabilities":{"visual":false,"screenshot":false,"window_enumeration":false,"ui_automation":false,
+                "control_invoke":false,"text_input":false,"synthetic_input":false},
+            "unavailable_reasons":[reason],"observation":null}),
+        ),
     }
 }
 
@@ -4261,6 +4317,71 @@ fn application_error(error: ApplicationError) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn unavailable_graphics_output_has_reason_but_no_observation_or_request() {
+        let output = super::visual_unavailable_output(
+            remoteops_domain::SessionId::new(),
+            "product_policy_disabled",
+        );
+        assert_eq!(output.status, "unavailable");
+        assert!(output.request_id.is_none());
+        let details = output.details.unwrap();
+        assert_eq!(details["code"], "product_policy_disabled");
+        assert_eq!(details["capabilities"]["screenshot"], false);
+        assert!(details["observation"].is_null());
+    }
+
+    #[test]
+    fn target_context_outputs_are_session_scoped_and_missing_context_is_unknown() {
+        let make = |id: &str| remoteops_domain::ConnectionDescriptor {
+            session_id: remoteops_domain::SessionId::new(),
+            agent_instance_id: remoteops_domain::AgentInstanceId::new(),
+            display_index: 1,
+            alias: None,
+            hostname: id.to_owned(),
+            operating_system: "Windows".into(),
+            capabilities: remoteops_domain::CapabilitySet::new([
+                remoteops_domain::Capability::Visual,
+            ]),
+            environment: {
+                let mut environment = remoteops_domain::EnvironmentProfile::empty();
+                environment.protocol_version = 18;
+                environment
+            },
+            credential_encryption_public_key: String::new(),
+            credential_encryption_key_id: String::new(),
+            state: remoteops_domain::ConnectionState::Online,
+            role: remoteops_domain::SessionRole::AiReadOnly,
+            permission_mode: remoteops_domain::PermissionMode::ReadOnly,
+            updated_at: chrono::Utc::now(),
+            mac_address: None,
+            target_context: None,
+        };
+        let mut legacy_with_metadata = make("legacy-with-metadata");
+        legacy_with_metadata.environment.protocol_version = 17;
+        legacy_with_metadata.target_context = Some(remoteops_domain::TargetContext::default());
+        assert!(!super::supports_target_context(&legacy_with_metadata));
+        assert_eq!(
+            super::connection_output(legacy_with_metadata).target_context_status,
+            "unknown"
+        );
+        let mut service = make("service");
+        service.target_context = Some(remoteops_domain::TargetContext {
+            product_id: "opscenter-agent".into(),
+            run_mode: remoteops_domain::AgentRunMode::WindowsService,
+            ..remoteops_domain::TargetContext::default()
+        });
+        let service = super::connection_output(service);
+        let legacy = super::connection_output(make("legacy-gui"));
+        assert_ne!(service.session_id, legacy.session_id);
+        assert_eq!(service.target_context["product_id"], "opscenter-agent");
+        assert_eq!(legacy.target_context["product_id"], "unknown");
+        assert_eq!(legacy.target_context_status, "unknown");
+        assert!(!legacy.capabilities.iter().any(|cap| cap == "visual"));
+        assert!(!service.capabilities.iter().any(|cap| cap == "visual"));
+        assert!(service.guidance_is_advisory && legacy.guidance_is_advisory);
+    }
+
+    #[test]
     fn timed_out_operation_preserves_identity_and_unknown_execution_state() {
         let session_id = remoteops_domain::SessionId::new();
         let request_id = remoteops_domain::RequestId::new();
@@ -4291,31 +4412,6 @@ mod tests {
         assert!(super::visual_uia_available(&serde_json::json!({
             "ui_tree": {"available": true, "name": "Explorer", "children": []}
         })));
-    }
-
-    #[test]
-    fn visual_capability_refreshes_after_recovery_and_failure() {
-        let mut capabilities = vec!["cmd".to_owned(), "visual".to_owned()];
-        for observation in [
-            serde_json::json!({"state":"stopped","displays":[{}]}),
-            serde_json::json!({"state":"ready","displays":[]}),
-            serde_json::json!({"error":"initialization_failed"}),
-        ] {
-            super::refresh_visual_capability(
-                &mut capabilities,
-                super::visual_provider_initialized(&observation),
-            );
-            assert_eq!(capabilities, ["cmd"]);
-        }
-        let recovered = serde_json::json!({"state":"ready","displays":[{}],"windows":[]});
-        super::refresh_visual_capability(
-            &mut capabilities,
-            super::visual_provider_initialized(&recovered),
-        );
-        super::refresh_visual_capability(&mut capabilities, true);
-        assert_eq!(capabilities, ["cmd", "visual"]);
-        super::refresh_visual_capability(&mut capabilities, false);
-        assert_eq!(capabilities, ["cmd"]);
     }
 
     use super::*;

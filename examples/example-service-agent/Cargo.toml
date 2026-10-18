@@ -1,0 +1,18 @@
+[package]
+name = "example-service-agent"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+# 独立产品 workspace 与独立锁文件，公共实现只通过依赖复用。
+[workspace]
+
+[dependencies]
+anyhow = "1"
+remoteops-agent = { path = "../../apps/remoteops-agent" }
+remoteops-agent-service = { path = "../../apps/remoteops-agent-service" }
+remoteops-domain = { path = "../../crates/remoteops-domain" }
+
+[build-dependencies]
+remoteops-build = { path = "../../crates/remoteops-build" }

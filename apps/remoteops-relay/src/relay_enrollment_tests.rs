@@ -105,6 +105,8 @@ async fn revoking_installation_disconnects_every_connection_and_clears_bindings_
             hello.controller_instance_id,
             generation,
             PairRequest {
+                connection_resume_token: None,
+                expected_session_id: None,
                 request_id: RequestId::new(),
                 pairing_code: agent.welcome.pairing_code,
                 permission_mode: PermissionMode::ApprovalRequired,

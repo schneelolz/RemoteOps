@@ -1,12 +1,16 @@
 ﻿[CmdletBinding(SupportsShouldProcess)]
 param(
+    [ValidatePattern('^[A-Za-z0-9_.-]{1,128}$')]
+    [string]$ServiceName = 'RemoteOpsAgent',
     [string]$InstallRoot = "$env:ProgramFiles\RemoteOps\Agent",
     [string]$DataRoot = "$env:ProgramData\RemoteOps\Agent",
     [switch]$PurgeData
 )
 
 $ErrorActionPreference = 'Stop'
-$serviceName = 'RemoteOpsAgent'
+if ($ServiceName -ne 'RemoteOpsAgent' -and (-not $PSBoundParameters.ContainsKey('InstallRoot') -or -not $PSBoundParameters.ContainsKey('DataRoot'))) {
+    throw '卸载定制服务必须显式指定独立 InstallRoot 与 DataRoot'
+}
 function Assert-SafeChildPath([string]$Path, [string]$Root, [string]$Label) {
     $resolvedPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
     $resolvedRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')

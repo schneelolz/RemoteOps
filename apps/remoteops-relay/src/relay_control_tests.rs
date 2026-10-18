@@ -20,6 +20,8 @@ async fn control_fixture(
                 ai_id,
                 generation,
                 PairRequest {
+                    connection_resume_token: None,
+                    expected_session_id: None,
                     request_id: RequestId::new(),
                     pairing_code: agent.welcome.pairing_code.clone(),
                     permission_mode: permission,
@@ -309,6 +311,8 @@ async fn control_state_revokes_on_reconnect_and_repair_and_ignores_old_proofs() 
             ai,
             generation,
             PairRequest {
+                connection_resume_token: None,
+                expected_session_id: None,
                 request_id: RequestId::new(),
                 pairing_code: resumed.welcome.pairing_code,
                 permission_mode: PermissionMode::ControllerApproved,

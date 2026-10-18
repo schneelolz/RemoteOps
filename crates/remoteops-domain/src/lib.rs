@@ -8,6 +8,7 @@ mod event;
 mod identifiers;
 mod lease;
 mod permission;
+mod target_context;
 mod visual;
 mod visual_wait;
 
@@ -23,11 +24,16 @@ pub use event::{
     SerialSettings, SerialStopBits, SerialTerminalProfile, ServiceAction,
 };
 pub use identifiers::{
-    AgentInstanceId, ApprovalId, ControllerInstanceId, ControllerOwnerId, FileTransferId,
-    PairingCode, RequestId, SerialSessionId, SessionId, ShellId,
+    AgentBootId, AgentInstanceId, ApprovalId, ControllerInstanceId, ControllerOwnerId,
+    FileTransferId, PairingCode, RequestId, SerialSessionId, SessionId, ShellId,
 };
 pub use lease::PairingLease;
 pub use permission::PermissionMode;
+pub use target_context::{
+    AgentRunMode, CapabilityAvailability, GuidanceReference, MAX_TARGET_CONTEXT_BYTES,
+    TARGET_CONTEXT_SCHEMA_VERSION, TargetCapabilityStatus, TargetContext, TargetGuidance,
+    TargetRuntimeFacts,
+};
 pub use visual::{
     VisualActionResult, VisualCapability, VisualDisplay, VisualObservation, VisualSessionState,
     VisualTarget, VisualWindow,
