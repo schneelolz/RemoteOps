@@ -77,8 +77,11 @@ impl std::error::Error for RuntimeDenied {}
 
 // 每个运行边界独立持有图形探测状态，不能跨目标共享。
 struct VisualState {
+    // 最新探测结果与该次使用的宿主事实。
     context: TargetContext,
+    // 仅保留脱敏截断后的错误摘要和耗时。
     diagnostic: Option<String>,
+    // 完成实际探测的时刻，用于合并紧邻查询。
     last_probe: Option<Instant>,
 }
 
@@ -447,8 +450,11 @@ fn set_visual_status(context: &mut TargetContext, reason: Option<&str>) {
 
 // 工厂本身不接触图形，只有可信宿主事实允许时才初始化一次真实 Provider。
 struct DeferredVisualProvider {
+    // 与执行入口共享产品上限和当前探测结果。
     boundary: RuntimeBoundary,
+    // 可信产品宿主注入的同步构造工厂。
     factory: VisualProviderFactory,
+    // 首次允许探测后保留同一个真实 Provider。
     provider: OnceLock<Arc<dyn VisualProvider>>,
 }
 impl DeferredVisualProvider {
