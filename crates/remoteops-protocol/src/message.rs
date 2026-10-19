@@ -1,13 +1,53 @@
 use chrono::{DateTime, Utc};
 use remoteops_domain::{
-    AgentInstanceId, ApprovalId, ApprovalState, CapabilitySet, ConnectionDescriptor,
+    AgentBootId, AgentInstanceId, ApprovalId, ApprovalState, CapabilitySet, ConnectionDescriptor,
     ControllerInstanceId, ControllerOwnerId, EnvironmentProfile, EventSource, PairingCode,
     PermissionMode, RemoteEvent, RemoteOperation, RequestId, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
 /// 当前线协议版本。
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 18;
+/// 保留启动边界语义的旧版交互客户协议。
+pub const LEGACY_PROTOCOL_VERSION: u16 = 17;
+
+/// 判断 Relay 是否能够读取该客户端的握手。
+#[must_use]
+pub const fn supports_protocol_version(version: u16) -> bool {
+    version == PROTOCOL_VERSION || version == LEGACY_PROTOCOL_VERSION
+}
+
+/// Agent 控制码签发模式。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingMode {
+    /// 旧版交互 Agent 每次启动签发控制码。
+    #[default]
+    AutoPerBoot,
+    /// 受管 Agent 由授权门户按需签发一次性邀请。
+    ManagedOnDemand,
+    /// 无法识别的模式必须拒绝。
+    #[serde(other)]
+    Unknown,
+}
+
+/// 受管 Agent 部署时获得的身份凭据，不得写入公开上下文。
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagedAgentEnrollment {
+    /// 授权门户中稳定的目标标识。
+    pub target_id: String,
+    /// 部署凭据，只用于 Relay 注册认证。
+    pub token: String,
+}
+
+impl std::fmt::Debug for ManagedAgentEnrollment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedAgentEnrollment")
+            .field("target_id", &self.target_id)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
 
 /// Controller 的受信任调用身份。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -35,8 +75,19 @@ impl ControllerKind {
 pub struct AgentHello {
     /// 协议版本。
     pub protocol_version: u16,
-    /// 进程实例标识。
+    /// 跨进程启动保留的 Agent 安装实例标识。
     pub agent_instance_id: AgentInstanceId,
+    /// 本次运行标识；同一进程断线重连时保持不变。
+    pub boot_id: AgentBootId,
+    /// 当前启动的产品上下文；协议17客户可不提供。
+    #[serde(default)]
+    pub target_context: Option<remoteops_domain::TargetContext>,
+    /// 控制码签发模式；缺省保持旧版每次启动签发。
+    #[serde(default)]
+    pub pairing_mode: PairingMode,
+    /// 受管部署认证信息，不得出现在配对结果和普通日志。
+    #[serde(default)]
+    pub managed_enrollment: Option<ManagedAgentEnrollment>,
     /// Relay 上次签发的恢复令牌。
     pub resume_token: Option<String>,
     /// Agent 主机名。
@@ -95,7 +146,13 @@ pub enum ClientHello {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentWelcome {
     /// 租约有效期内不变的配对码。
-    pub pairing_code: PairingCode,
+    pub pairing_code: Option<PairingCode>,
+    /// Relay 确认的控制码签发模式。
+    #[serde(default)]
+    pub pairing_mode: PairingMode,
+    /// 受管目标标识；普通交互 Agent 为空。
+    #[serde(default)]
+    pub managed_target_id: Option<String>,
     /// 租约到期时间。
     pub lease_expires_at: DateTime<Utc>,
     /// 只用于恢复和传输鉴权的随机令牌。
@@ -178,25 +235,97 @@ pub struct AgentShutdownResult {
 }
 
 /// Controller 请求配对 Agent。
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PairRequest {
     /// 请求标识。
     pub request_id: RequestId,
     /// 人工输入的控制码。
-    pub pairing_code: PairingCode,
+    pub pairing_code: Option<PairingCode>,
+    /// 自动恢复时必须匹配的原会话；人工输入控制码时为空。
+    pub expected_session_id: Option<SessionId>,
+    /// 自动恢复受管连接的高熵凭据；此时不再提交一次性控制码。
+    #[serde(default)]
+    pub connection_resume_token: Option<String>,
     /// Human 首次绑定或重新配对时请求的会话权限。
     pub permission_mode: PermissionMode,
 }
 
+impl std::fmt::Debug for PairRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairRequest")
+            .field("request_id", &self.request_id)
+            .field(
+                "pairing_code",
+                &self.pairing_code.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expected_session_id", &self.expected_session_id)
+            .field(
+                "connection_resume_token",
+                &self.connection_resume_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("permission_mode", &self.permission_mode)
+            .finish()
+    }
+}
+
+/// 配对失败的结构化原因。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingErrorCode {
+    /// 控制码不存在或已经过期，无法继续恢复。
+    UnknownOrExpired,
+    /// 原会话的 Agent 暂时离线，可以稍后重试。
+    AgentOffline,
+    /// 控制码当前指向另一个会话，必须重新人工配对。
+    SessionMismatch,
+    /// 原会话已经结束，必须重新人工配对。
+    SessionEnded,
+    /// 当前协议或目标模式不支持此操作。
+    UnsupportedMode,
+    /// 一次性邀请已经到期。
+    InvitationExpired,
+    /// 一次性邀请已经兑换。
+    AlreadyRedeemed,
+    /// 会话或受管访问权已被撤销。
+    AccessRevoked,
+    /// 配对被认证、权限或绑定策略拒绝。
+    Rejected,
+    /// 当前组件无法识别的失败原因，停止自动恢复。
+    #[serde(other)]
+    Unknown,
+}
+
 /// Relay 返回配对结果。
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PairResult {
+    /// 受管会话的高熵恢复凭据；仅交给发起配对的 Controller。
+    #[serde(default)]
+    pub connection_resume_token: Option<String>,
     /// 对应请求。
     pub request_id: RequestId,
     /// 配对成功后的连接；失败时为空。
     pub connection: Option<ConnectionDescriptor>,
     /// 失败时可展示的信息。
     pub error: Option<String>,
+    /// 失败的结构化原因；成功时为空。
+    pub error_code: Option<PairingErrorCode>,
+}
+
+impl std::fmt::Debug for PairResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairResult")
+            .field(
+                "connection_resume_token",
+                &self.connection_resume_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("request_id", &self.request_id)
+            .field("connection", &self.connection)
+            .field("error", &self.error)
+            .field("error_code", &self.error_code)
+            .finish()
+    }
 }
 
 /// Controller 请求 Relay 释放当前实例持有的会话绑定。
@@ -455,6 +584,65 @@ pub enum WireMessage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pairing_wire_debug_redacts_invitation_and_connection_credentials() {
+        let code = "738291604";
+        let secret = "test-managed-resume-secret-must-not-enter-debug";
+        let request = WireMessage::PairRequest(PairRequest {
+            request_id: RequestId::new(),
+            pairing_code: Some(PairingCode::parse(code).unwrap()),
+            expected_session_id: None,
+            connection_resume_token: Some(secret.to_owned()),
+            permission_mode: PermissionMode::ReadOnly,
+        });
+        let result = WireMessage::PairResult(PairResult {
+            request_id: RequestId::new(),
+            connection: None,
+            connection_resume_token: Some(secret.to_owned()),
+            error: None,
+            error_code: None,
+        });
+        for message in [request, result] {
+            let debug = format!("{message:?}");
+            assert!(!debug.contains(secret));
+            assert!(!debug.contains(code));
+            assert!(!debug.contains("738-291-604"));
+            assert!(debug.contains("[REDACTED]"));
+            let json = serde_json::to_string(&message).unwrap();
+            assert!(
+                json.contains(secret),
+                "脱敏只影响Debug，不改变必需的线协议凭据"
+            );
+            assert_eq!(serde_json::from_str::<WireMessage>(&json).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn current_and_legacy_protocols_have_explicit_modes_and_optional_codes() {
+        assert!(super::supports_protocol_version(18));
+        assert!(super::supports_protocol_version(17));
+        assert!(!super::supports_protocol_version(16));
+        let mode: super::PairingMode = serde_json::from_str("\"future_mode\"").unwrap();
+        assert_eq!(mode, super::PairingMode::Unknown);
+        let enrollment = super::ManagedAgentEnrollment {
+            target_id: "service-a".into(),
+            token: "do-not-print-this-token".into(),
+        };
+        assert!(!format!("{enrollment:?}").contains(&enrollment.token));
+        let value = serde_json::to_value(super::AgentWelcome {
+            pairing_code: None,
+            pairing_mode: super::PairingMode::ManagedOnDemand,
+            managed_target_id: Some("service-a".into()),
+            lease_expires_at: chrono::Utc::now(),
+            resume_token: "test-resume".into(),
+            connection_generation: 1,
+            heartbeat_interval_seconds: 15,
+        })
+        .unwrap();
+        assert!(value["pairing_code"].is_null());
+        assert_eq!(value["pairing_mode"], "managed_on_demand");
+    }
+
     use remoteops_domain::{ApprovalState, SessionId, ShellKind};
 
     use super::*;

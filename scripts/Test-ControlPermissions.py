@@ -24,15 +24,16 @@ def main():
     repo = Path(__file__).resolve().parent.parent
     env = {k: v for k, v in os.environ.items() if not k.startswith(('REMOTEOPS_', 'CONTROL_SMOKE_'))}
     if not args.skip_build:
-        subprocess.run(['cargo', 'build', '--locked', '-p', 'remoteops-relay', '-p', 'remoteops-controller-mcp', '-p', 'remoteops-control-smoke'], cwd=repo, env=env, check=True)
+        subprocess.run(['cargo', 'build', '--locked', '-p', 'remoteops-relay', '-p', 'remoteops-controller-mcp', '-p', 'remoteops-agent', '-p', 'remoteops-control-smoke'], cwd=repo, env=env, check=True)
     suffix = '.exe' if os.name == 'nt' else ''
     binary = lambda name: str(repo / 'target/debug' / (name + suffix))
     with tempfile.TemporaryDirectory(prefix='remoteops-control-') as directory:
         root = Path(directory)
         env.update(REMOTEOPS_HUMAN_CONTROLLER_TOKEN=secrets.token_hex(32), REMOTEOPS_AI_CONTROLLER_TOKEN=secrets.token_hex(32), REMOTEOPS_CONTROLLER_OWNER_ID=str(uuid.uuid4()),
-                   CONTROL_SMOKE_ADDRESS=address(), CONTROL_SMOKE_CERT=str(root/'cert.pem'), CONTROL_SMOKE_MCP_EXECUTABLE=binary('remoteops-controller-mcp'))
+                   CONTROL_SMOKE_ADDRESS=address(), CONTROL_SMOKE_CERT=str(root/'cert.pem'), CONTROL_SMOKE_MCP_EXECUTABLE=binary('remoteops-controller-mcp'), CONTROL_SMOKE_RELAY_STATE=str(root/'state.json'),
+                   CONTROL_SMOKE_ADMIN_ADDRESS=address(), REMOTEOPS_ADMIN_TOKEN=secrets.token_hex(32))
         with (root/'relay.log').open('w') as log:
-            relay = subprocess.Popen([binary('remoteops-relay'), '--bind', env['CONTROL_SMOKE_ADDRESS'], '--health-bind', address(), '--tls-cert', env['CONTROL_SMOKE_CERT'], '--tls-key', str(root/'key.pem'), '--state-file', str(root/'state.json')], cwd=root, env=env, stdout=log, stderr=log)
+            relay = subprocess.Popen([binary('remoteops-relay'), '--bind', env['CONTROL_SMOKE_ADDRESS'], '--health-bind', address(), '--admin-bind', env['CONTROL_SMOKE_ADMIN_ADDRESS'], '--tls-cert', env['CONTROL_SMOKE_CERT'], '--tls-key', str(root/'key.pem'), '--state-file', str(root/'state.json')], cwd=root, env=env, stdout=log, stderr=log)
             try:
                 for _ in range(100):
                     if relay.poll() is not None: raise RuntimeError('isolated Relay exited')

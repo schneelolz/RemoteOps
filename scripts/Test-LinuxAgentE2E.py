@@ -328,16 +328,27 @@ def main():
         os.close(master); os.close(slave)
         ssh_result = tool('run_ssh', host='-invalid', port=22, username='test', command='true', readonly=True)
         check('SSH destination injection rejected', ssh_result.get('isError'))
-        cursor = max(e['sequence'] for e in tool('read_output', limit=500)['events'])
+        previous_session_id = sid
         stop(agent)
         check('SIGTERM graceful cleanup', agent.returncode == 0 and not status.exists())
         agent = spawn(agent_args, 'agent')
         restarted = wait_for(paired_status)
-        check('identity and pairing restored', restarted['agent_instance_id'] == initial['agent_instance_id'] and restarted['pairing_code'] == initial['pairing_code'])
-        verify_reconnect('Agent restart')
-        check('existing MCP session restored', True)
-        command('echo AFTER_AGENT_RESTART')
-        check('incremental output after Agent restart', 'AFTER_AGENT_RESTART' in json.dumps(tool('read_output', after_sequence=cursor, limit=500)))
+        check('Agent restart preserves stable identity', restarted['agent_instance_id'] == initial['agent_instance_id'])
+        check('Agent restart rotates pairing code', restarted['pairing_code'] != initial['pairing_code'])
+        check('Agent restart rejects previous pairing code',
+              mcp.tool('pair_connection', pairing_code=initial['pairing_code']).get('isError'))
+        check('Agent restart rejects previous session', tool('list_processes').get('status') == 'failed')
+        stale_marker = fixture/'previous-session-must-not-exist'
+        check('previous full access cannot mutate after Agent restart',
+              command('touch '+str(stale_marker)).get('isError') and not stale_marker.exists())
+        paired = mcp.tool('pair_connection', pairing_code=restarted['pairing_code'])
+        sid = paired['session_id']
+        check('Agent restart pairs a new session', bool(sid) and sid != previous_session_id)
+        verify_reconnect('new Agent session')
+        # 输出序号只在各自会话内递增，不能把旧会话游标应用到新会话。
+        cursor = max((e['sequence'] for e in tool('read_output', limit=500)['events']), default=0)
+        check('command after new session authorization', succeeded(command('echo AFTER_AGENT_RESTART')))
+        check('incremental output in new Agent session', 'AFTER_AGENT_RESTART' in json.dumps(tool('read_output', after_sequence=cursor, limit=500)))
         link.drop()
         verify_reconnect('short network interruption')
         check('short network interruption reconnect', True)
@@ -360,7 +371,9 @@ def main():
         check('SIGINT graceful cleanup', agent.returncode == 0 and not status.exists())
         for name in ['agent.log', 'mcp.log']:
             text = (fixture/name).read_text()
-            check(name+' secret redaction', token not in text and initial['pairing_code'] not in text and 'PRIVATE KEY' not in text)
+            check(name+' secret redaction', token not in text
+                  and all(code not in text for code in (initial['pairing_code'], restarted['pairing_code']))
+                  and 'PRIVATE KEY' not in text)
         check('audit exists', (fixture/'audit.jsonl').stat().st_size > 0)
     except Exception as exc:
         # No tool payloads, tokens or fixture state in the published failure record.

@@ -205,6 +205,13 @@ impl Relay {
                             })
                 }),
         };
+        let authorized = authorized
+            && match origin {
+                RequestOrigin::Controller(id, generation) => {
+                    self.managed_request_allowed(&state, request.session_id, id, generation)
+                }
+                RequestOrigin::Agent(..) => true,
+            };
         if !authorized {
             let _ = sender.send(WireMessage::ControlStateResult(ControlStateResult {
                 request_id: request.request_id,

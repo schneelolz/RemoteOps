@@ -263,7 +263,8 @@ impl DefaultPolicy {
             RemoteOperation::RunCommand { shell, command, .. } => {
                 self.classify_command(Some(*shell), command)
             }
-            RemoteOperation::OpenShell { .. }
+            RemoteOperation::GetTargetContext
+            | RemoteOperation::OpenShell { .. }
             | RemoteOperation::CloseShell { .. }
             | RemoteOperation::TestPort { .. }
             | RemoteOperation::GetFileMetadata { .. }

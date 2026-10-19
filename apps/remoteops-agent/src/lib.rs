@@ -16,7 +16,10 @@ pub fn redact_diagnostic(text: &str) -> String {
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod operation_log;
 mod product;
+mod runtime;
+pub use remoteops_domain::AgentRunMode;
 pub use remoteops_product::{EndpointPolicy, ProductProfile};
+pub use runtime::{AgentCapabilityPolicy, AgentRuntimeOptions, VisualProviderFactory};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -45,7 +48,7 @@ use remoteops_device::{
     SystemProvider, TcpExchangeProvider,
 };
 use remoteops_domain::{
-    AgentInstanceId, ApprovalState, Capability, CapabilitySet, ControllerInstanceId,
+    AgentBootId, AgentInstanceId, ApprovalState, Capability, CapabilitySet, ControllerInstanceId,
     ControllerOwnerId, EnvironmentProfile, EventPayload, FileTransferId, PermissionMode,
     RemoteEvent, RemoteOperation, RequestId, SerialSessionId, SessionId, ShellId, ShellKind,
     ShellProfile, ToolProfile, VisualWaitCondition, normalize_visual_wait_timeout,
@@ -64,7 +67,9 @@ use remoteops_serial::{
     SerialDirection, SerialObservedChunk, SerialQueryError, SerialQueryPlan, SerialQueryRunner,
     SerialQueryTransport, SerialTranscript,
 };
-use remoteops_visual::{VisualProvider, default_visual_provider};
+use remoteops_visual::VisualProvider;
+#[cfg(test)]
+use remoteops_visual::default_visual_provider;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -111,6 +116,9 @@ pub struct AgentFileConfig {
     pub transfer_root: Option<PathBuf>,
     /// Agent 身份和恢复令牌状态文件。
     pub state_file: Option<PathBuf>,
+    /// 受保护的受管部署凭据文件；普通配置仅保存路径。
+    #[serde(default)]
+    pub managed_enrollment_file: Option<PathBuf>,
     /// 由 Agent 本地用户持久授权 `FullAccess` 的可信 Owner。
     #[serde(default)]
     pub trusted_full_access_owners: Vec<TrustedOwnerAuthorization>,
@@ -146,6 +154,8 @@ pub struct AgentConfig {
     pub instance_id: Option<AgentInstanceId>,
     /// Agent 身份和恢复令牌状态文件。
     pub state_file: PathBuf,
+    /// 受管模式专用登记凭据文件，不在普通配置保存凭据内容。
+    pub managed_enrollment_file: Option<PathBuf>,
     /// 由配置文件持久授权 `FullAccess` 的可信 Owner 及变更时间。
     pub trusted_full_access_owners: BTreeMap<ControllerOwnerId, DateTime<Utc>>,
     /// 仅当前 Agent 进程生命周期授权 `FullAccess` 的 Owner。
@@ -164,6 +174,7 @@ impl Default for AgentConfig {
             transfer_root: default_transfer_root(),
             instance_id: None,
             state_file: default_state_file(),
+            managed_enrollment_file: None,
             trusted_full_access_owners: BTreeMap::new(),
             session_full_access_owners: BTreeSet::new(),
         }
@@ -187,6 +198,28 @@ impl AgentConfig {
         config_path: Option<&Path>,
         profile: &ProductProfile,
     ) -> anyhow::Result<Self> {
+        Self::load_file_with_defaults(config_path, profile, Self::for_product(profile))
+    }
+
+    /// 从机器级配置目录加载服务产品，缺省身份与交换目录不落入登录用户目录。
+    /// # Errors
+    /// 配置读取、产品校验或 JSON 格式失败时返回错误。
+    pub fn load_service_file_with_profile(
+        path: &Path,
+        profile: &ProductProfile,
+    ) -> anyhow::Result<Self> {
+        let mut defaults = Self::for_product(profile);
+        let directory = path.parent().context("服务配置路径缺少父目录")?;
+        defaults.state_file = directory.join(&profile.state_file_name);
+        defaults.transfer_root = directory.join("transfer");
+        Self::load_file_with_defaults(Some(path), profile, defaults)
+    }
+
+    fn load_file_with_defaults(
+        config_path: Option<&Path>,
+        profile: &ProductProfile,
+        defaults: Self,
+    ) -> anyhow::Result<Self> {
         profile.validate()?;
         let path =
             config_path.map_or_else(|| Self::product_config_path(profile), Path::to_path_buf);
@@ -194,7 +227,7 @@ impl AgentConfig {
             if config_path.is_some() {
                 bail!("Agent 配置文件不存在：{}", path.display());
             }
-            return Ok(Self::for_product(profile));
+            return Ok(defaults);
         }
 
         let text = fs::read_to_string(&path)
@@ -203,7 +236,7 @@ impl AgentConfig {
             .with_context(|| format!("Agent 配置文件格式无效：{}", path.display()))?;
         let file_config = stored.config;
         let base_directory = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut config = Self::for_product(profile);
+        let mut config = defaults;
         if let Some(relay) = file_config.relay {
             if relay != config.relay && file_config.server_name.is_none() {
                 config.server_name.clear();
@@ -220,6 +253,9 @@ impl AgentConfig {
             .default_full_control
             .unwrap_or(profile.default_full_control);
         config.tls_fingerprint = file_config.tls_fingerprint;
+        config.managed_enrollment_file = file_config
+            .managed_enrollment_file
+            .map(|path| resolve_config_path(base_directory, path));
         if let Some(retry_seconds) = file_config.retry_seconds {
             config.retry_seconds = retry_seconds;
         }
@@ -259,6 +295,7 @@ impl AgentConfig {
             retry_seconds: Some(self.retry_seconds),
             transfer_root: Some(self.transfer_root.clone()),
             state_file: Some(self.state_file.clone()),
+            managed_enrollment_file: self.managed_enrollment_file.clone(),
             trusted_full_access_owners: self
                 .trusted_full_access_owners
                 .iter()
@@ -414,6 +451,11 @@ pub enum AgentEvent {
         pairing_code: String,
         /// 控制码租约到期时间。
         lease_expires_at: DateTime<Utc>,
+    },
+    /// 已登记受管目标，保持无码待命，等待门户邀请。
+    Registered {
+        /// 门户稳定目标标识。
+        managed_target_id: Option<String>,
     },
     /// Relay 接受心跳续租后更新控制码租约到期时间。
     LeaseRenewed {
@@ -676,6 +718,9 @@ struct AgentState {
     agent_instance_id: AgentInstanceId,
     /// Relay 最近确认的恢复令牌。
     resume_token: Option<String>,
+    // 旧状态缺少此字段时，由恢复令牌是否存在推断登记结果。
+    #[serde(default)]
+    registration_completed: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -831,6 +876,8 @@ struct RequestRuntimeState {
     used_credential_envelopes: Arc<Mutex<BTreeSet<RequestId>>>,
     /// 当前用户 Session 的图形 Provider。
     visual_provider: Arc<dyn VisualProvider>,
+    // 同一运行的产品上限与宿主事实，断线重连不能放宽。
+    boundary: Arc<runtime::RuntimeBoundary>,
 }
 
 struct PendingTask {
@@ -1098,20 +1145,10 @@ pub async fn run_agent_with_permission_control(
     let visual_enabled = cfg!(windows)
         && env::var("REMOTEOPS_VISUAL_PROVIDER_ENABLED")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-    let visual_provider: Arc<dyn VisualProvider> = if visual_enabled {
-        default_visual_provider()
-    } else {
-        Arc::new(remoteops_visual::UnavailableVisualProvider)
-    };
-    run_agent_with_visual_provider(
-        config,
-        event_sender,
-        shutdown,
-        permission_control,
-        visual_provider,
-        visual_enabled,
-    )
-    .await
+    let mut options = AgentRuntimeOptions::interactive(ProductProfile::default());
+    options.run_mode = AgentRunMode::Console;
+    options.visual_enabled = visual_enabled;
+    run_agent_with_options(config, event_sender, shutdown, permission_control, options).await
 }
 
 /// Run the existing runtime with transport-scoped task events for GUI consumers.
@@ -1139,6 +1176,22 @@ pub async fn run_agent_with_scoped_events(
     .await
 }
 
+/// 使用产品约束和传输代次事件运行 GUI Agent。
+/// # Errors
+/// 返回产品、设备、状态和 Relay 生命周期错误。
+pub async fn run_agent_with_scoped_options(
+    config: AgentConfig,
+    event_sender: Option<AgentEventSender>,
+    shutdown: watch::Receiver<bool>,
+    permission_control: AgentPermissionControl,
+    options: AgentRuntimeOptions,
+) -> anyhow::Result<()> {
+    permission_control
+        .scoped_events
+        .store(true, Ordering::SeqCst);
+    run_agent_with_options(config, event_sender, shutdown, permission_control, options).await
+}
+
 /// 使用表现层显式提供的视觉 Provider 运行 Agent。
 /// GUI 宿主通过此入口启用本机视觉能力，无需依赖进程环境变量。
 ///
@@ -1149,11 +1202,38 @@ pub async fn run_agent_with_scoped_events(
 pub async fn run_agent_with_visual_provider(
     config: AgentConfig,
     event_sender: Option<AgentEventSender>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     permission_control: AgentPermissionControl,
     visual_provider: Arc<dyn VisualProvider>,
     visual_enabled: bool,
 ) -> anyhow::Result<()> {
+    let mut options = AgentRuntimeOptions::interactive(ProductProfile::default());
+    options.visual_enabled = visual_enabled;
+    options.visual_provider_factory = Some(Arc::new(move || visual_provider.clone()));
+    run_agent_with_options(config, event_sender, shutdown, permission_control, options).await
+}
+
+/// 使用可信宿主产品约束运行 Agent，图形工厂仅在能力边界允许时调用。
+/// # Errors
+/// 产品上下文、登记凭据、状态锁或 Relay 生命周期失败时返回错误。
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_agent_with_options(
+    config: AgentConfig,
+    event_sender: Option<AgentEventSender>,
+    mut shutdown: watch::Receiver<bool>,
+    permission_control: AgentPermissionControl,
+    options: AgentRuntimeOptions,
+) -> anyhow::Result<()> {
+    let mut config = config.resolve_product(&options.product, None)?;
+    if options.capability_policy.read_only() {
+        config.default_full_control = false;
+        permission_control.set_permission_mode(PermissionMode::ReadOnly);
+        permission_control
+            .default_full
+            .store(false, Ordering::SeqCst);
+    }
+    let _state_file_lock = lock_agent_state(&config.state_file)?;
+    let managed_enrollment = load_managed_enrollment(&config, options.pairing_mode)?;
     let client_config = if let Some(certificate_path) = config.ca_cert.as_deref() {
         load_client_config(certificate_path)
             .with_context(|| format!("无法加载 Relay 证书 {}", certificate_path.display()))?
@@ -1164,8 +1244,11 @@ pub async fn run_agent_with_visual_provider(
     } else {
         load_native_client_config().context("无法加载操作系统可信根证书")?
     };
-    let state = load_agent_state(&config.state_file, config.instance_id)?;
+    let state =
+        load_agent_state_for_mode(&config.state_file, config.instance_id, options.pairing_mode)?;
     let agent_instance_id = state.agent_instance_id;
+    // 启动标识只属于这次运行，网络重连复用，下一次运行重新生成。
+    let boot_id = AgentBootId::new();
     let device = Arc::new(
         SystemDevice::with_transfer_root(&config.transfer_root).with_context(|| {
             format!(
@@ -1175,39 +1258,20 @@ pub async fn run_agent_with_visual_provider(
         })?,
     );
     let environment = detect_environment_profile(device.as_ref()).await;
-    // Provider 必须跨请求复用，外部 Windows-MCP 的子进程和 Named Pipe
-    // 生命周期不能随着每个请求重新创建。
-    let visual_ready = if visual_enabled {
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            visual_provider.observe(RequestId::new(), SessionId::new(), false, true),
-        )
-        .await
-        {
-            Ok(Ok(observation)) => {
-                let ready = matches!(
-                    observation.state,
-                    remoteops_domain::VisualSessionState::Ready
-                ) && !observation.windows.is_empty()
-                    && observation.active_window_fingerprint.is_some();
-                if !ready {
-                    warn!(state = ?observation.state, windows = observation.windows.len(), "图形 Provider 未通过启动探测");
-                }
-                ready
-            }
-            Ok(Err(error)) => {
-                warn!(%error, "图形 Provider 启动探测失败");
-                false
-            }
-            Err(_) => {
-                warn!("图形 Provider 启动探测超时");
-                false
-            }
-        }
-    } else {
-        false
-    };
-    let capabilities = capabilities_from_environment(&environment, visual_ready);
+    let (boundary, visual_provider, capabilities) =
+        runtime::prepare(&options, &environment, runtime::native_facts()).await?;
+    if let Some(diagnostic) = boundary.visual_diagnostic() {
+        emit_agent_event(
+            event_sender.as_ref(),
+            AgentEvent::OperationLog(AgentOperationLog {
+                request_id: None,
+                occurred_at: Utc::now(),
+                level: AgentLogLevel::Info,
+                message: format!("图形探测：{diagnostic}"),
+            }),
+        );
+    }
+    let boundary = Arc::new(boundary);
     let host_identity = remoteops_host_identity::collect();
     let hostname = host_identity.hostname;
     let mac_address = host_identity.mac_address;
@@ -1267,6 +1331,10 @@ pub async fn run_agent_with_visual_provider(
         match run_connection(
             stream,
             agent_instance_id,
+            boot_id,
+            boundary.clone(),
+            options.pairing_mode,
+            managed_enrollment.clone(),
             current_resume_token,
             resume_token.clone(),
             config.state_file.clone(),
@@ -1322,6 +1390,10 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 async fn run_connection<S>(
     mut stream: S,
     agent_instance_id: AgentInstanceId,
+    boot_id: AgentBootId,
+    boundary: Arc<runtime::RuntimeBoundary>,
+    pairing_mode: remoteops_protocol::PairingMode,
+    managed_enrollment: Option<remoteops_protocol::ManagedAgentEnrollment>,
     resume_token: Option<String>,
     resume_token_state: Arc<Mutex<Option<String>>>,
     state_file: PathBuf,
@@ -1344,9 +1416,16 @@ async fn run_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let expected_target = managed_enrollment
+        .as_ref()
+        .map(|enrollment| enrollment.target_id.clone());
     let hello = WireMessage::Hello(ClientHello::Agent(AgentHello {
         protocol_version: PROTOCOL_VERSION,
         agent_instance_id,
+        boot_id,
+        target_context: Some(boundary.snapshot()),
+        pairing_mode,
+        managed_enrollment,
         resume_token,
         hostname,
         operating_system,
@@ -1363,44 +1442,36 @@ where
         WireMessage::Error { code, message, .. } => bail!("{code}: {message}"),
         other => bail!("Relay 返回了意外消息：{other:?}"),
     };
-    write_frame(
+    if welcome.pairing_mode != pairing_mode
+        || (pairing_mode == remoteops_protocol::PairingMode::ManagedOnDemand
+            && (welcome.managed_target_id != expected_target || welcome.pairing_code.is_some()))
+    {
+        bail!("Relay 返回的登记模式或受管目标不匹配，拒绝降级");
+    }
+    commit_agent_registration(
         &mut stream,
-        &WireMessage::AgentWelcomeAck(AgentWelcomeAck {
-            connection_generation: welcome.connection_generation,
-        }),
+        agent_instance_id,
+        &welcome,
+        &resume_token_state,
+        &state_file,
     )
     .await?;
-    match read_frame::<WireMessage, _>(&mut stream).await? {
-        WireMessage::AgentResumeCommitted(committed)
-            if committed.connection_generation == welcome.connection_generation =>
-        {
-            write_frame(
-                &mut stream,
-                &WireMessage::AgentResumeCommitAck(AgentResumeCommitAck {
-                    connection_generation: welcome.connection_generation,
-                }),
-            )
-            .await?;
-            *resume_token_state.lock().await = Some(welcome.resume_token.clone());
-            persist_agent_state(
-                &state_file,
-                &AgentState {
-                    agent_instance_id,
-                    resume_token: Some(welcome.resume_token.clone()),
-                },
-            )
-            .context("无法持久化 Agent 恢复令牌")?;
-        }
-        WireMessage::Error { code, message, .. } => bail!("{code}: {message}"),
-        other => bail!("Relay 返回了意外的恢复令牌确认消息：{other:?}"),
+    if let Some(code) = &welcome.pairing_code {
+        emit_agent_event(
+            event_sender,
+            AgentEvent::Connected {
+                pairing_code: code.display_grouped(),
+                lease_expires_at: welcome.lease_expires_at,
+            },
+        );
+    } else {
+        emit_agent_event(
+            event_sender,
+            AgentEvent::Registered {
+                managed_target_id: welcome.managed_target_id.clone(),
+            },
+        );
     }
-    emit_agent_event(
-        event_sender,
-        AgentEvent::Connected {
-            pairing_code: welcome.pairing_code.display_grouped(),
-            lease_expires_at: welcome.lease_expires_at,
-        },
-    );
     emit_agent_event(
         event_sender,
         AgentEvent::ControllerCountChanged {
@@ -1420,7 +1491,11 @@ where
     let (sender, mut receiver) = mpsc::unbounded_channel::<WireMessage>();
     let _ = sender.send(WireMessage::AgentPermissionModeChanged(
         AgentPermissionModeChanged {
-            permission_mode: *permission_mode_updates.borrow_and_update(),
+            permission_mode: if boundary.policy.read_only() {
+                PermissionMode::ReadOnly
+            } else {
+                *permission_mode_updates.borrow_and_update()
+            },
         },
     ));
     let log_observer = Arc::new(std::sync::Mutex::new(
@@ -1480,7 +1555,10 @@ where
         let incoming = tokio::select! {
             result = &mut incoming_future => Some(result),
             request = control_requests.recv() => {
-                if let Ok(request) = request { let _ = sender.send(WireMessage::ControlStateRequest(request)); }
+                if let Ok(mut request) = request {
+                    if boundary.policy.read_only() && request.mode.is_some() { request.mode = Some(ControllerControlMode::ReadOnly); }
+                    let _ = sender.send(WireMessage::ControlStateRequest(request));
+                }
                 continue;
             },
             _changed = async {
@@ -1489,6 +1567,7 @@ where
                 }
             } => {
                 let permission_mode = *permission_mode_updates.borrow_and_update();
+                let permission_mode = if boundary.policy.read_only() { PermissionMode::ReadOnly } else { permission_mode };
                 let _ = sender.send(WireMessage::AgentPermissionModeChanged(
                     AgentPermissionModeChanged { permission_mode },
                 ));
@@ -1538,6 +1617,7 @@ where
                     && local_permission_policy
                         .permission_control
                         .default_full_control()
+                    && !boundary.policy.read_only()
                     && !local_permission_policy
                         .permission_control
                         .auto_suppressed
@@ -1623,6 +1703,7 @@ where
                     && local_permission_policy
                         .permission_control
                         .default_full_control()
+                    && !boundary.policy.read_only()
                     && !local_permission_policy
                         .permission_control
                         .auto_suppressed
@@ -1734,6 +1815,17 @@ where
                         continue;
                     }
                 };
+                if let Err(error) = boundary.check_for_dispatch(&request.operation) {
+                    let code = error
+                        .downcast_ref::<runtime::RuntimeDenied>()
+                        .map_or("product_policy_disabled", |denied| denied.code.as_str());
+                    let _ = sender.send(WireMessage::Error {
+                        code: code.to_owned(),
+                        message: error.to_string(),
+                        request_id: Some(request_id),
+                    });
+                    continue;
+                }
                 operation_log::record_request(event_sender, &request, epoch);
                 if let RemoteOperation::CancelRequest {
                     request_id: target_request_id,
@@ -1866,6 +1958,7 @@ where
                     file_uploads: file_uploads.clone(),
                     used_credential_envelopes: used_credential_envelopes.clone(),
                     visual_provider: visual_provider.clone(),
+                    boundary: boundary.clone(),
                 };
                 let terminal = Arc::new(AtomicTaskTerminal::running());
                 let interactive_shell = pending_interactive_shell(&request, &shell_sessions).await;
@@ -2334,6 +2427,19 @@ async fn execute_request(
     }
     match result {
         Ok(mut response) => {
+            if matches!(request.operation, RemoteOperation::GetTargetContext)
+                && response.summary.starts_with("图形探测：")
+            {
+                send_event(
+                    sender,
+                    sequence,
+                    &request,
+                    EventPayload::OutputChunk {
+                        stderr: false,
+                        text: response.summary.clone(),
+                    },
+                );
+            }
             if let Some(details) = &response.details {
                 send_event(
                     sender,
@@ -2360,6 +2466,10 @@ async fn execute_request(
         }
         Err(error) => {
             let message = error.to_string();
+            let error_code = error
+                .downcast_ref::<runtime::RuntimeDenied>()
+                .map_or("agent_operation_failed", |denied| denied.code.as_str())
+                .to_owned();
             let details = error.downcast_ref::<ShellOperationError>().map(|error| {
                 serde_json::json!({
                     "shell_id": error.shell_id.to_string(),
@@ -2372,7 +2482,7 @@ async fn execute_request(
                 sequence,
                 &request,
                 EventPayload::OperationFailed {
-                    code: "agent_operation_failed".to_owned(),
+                    code: error_code.clone(),
                     message: message.clone(),
                 },
             );
@@ -2381,7 +2491,7 @@ async fn execute_request(
                 session_id: request.session_id,
                 exit_code: None,
                 summary: message,
-                error_code: Some("agent_operation_failed".to_owned()),
+                error_code: Some(error_code),
                 payload_base64: None,
                 sha256: None,
                 details,
@@ -2402,6 +2512,14 @@ async fn execute_operation(
     sender: &mpsc::UnboundedSender<WireMessage>,
     sequence: &Arc<AtomicU64>,
 ) -> anyhow::Result<RemoteResponse> {
+    // 只有已认证的只读观察请求能重试临时失败；输入和控件操作仍先拒绝。
+    if matches!(request.operation, RemoteOperation::VisualObserve { .. }) {
+        runtime_state
+            .boundary
+            .refresh_visual(runtime_state.visual_provider.as_ref())
+            .await;
+    }
+    runtime_state.boundary.check_current(&request.operation)?;
     let shell_sessions = &runtime_state.shell_sessions;
     let serial_sessions = &runtime_state.serial_sessions;
     let file_uploads = &runtime_state.file_uploads;
@@ -2416,6 +2534,14 @@ async fn execute_operation(
         details: None,
     };
     match &request.operation {
+        RemoteOperation::GetTargetContext => {
+            let context = runtime_state.boundary.snapshot();
+            response.summary = runtime_state.boundary.visual_diagnostic().map_or_else(
+                || "目标产品与运行上下文".to_owned(),
+                |diagnostic| format!("图形探测：{diagnostic}"),
+            );
+            response.details = Some(serde_json::to_value(context)?);
+        }
         RemoteOperation::OpenShell { shell } => {
             let session = device.open_interactive_shell(*shell).await?;
             let shell_id = ShellId::new();
@@ -3964,79 +4090,217 @@ fn default_agent_data_root() -> PathBuf {
     }
 }
 
+/// 验证受管模式的部署凭据，不返回或记录秘密。
+/// # Errors
+/// 凭据缺失、格式错误或 Unix 权限过宽时失败；Windows ACL 由受控部署流程保证。
+pub fn validate_managed_enrollment(
+    config: &AgentConfig,
+    mode: remoteops_protocol::PairingMode,
+) -> anyhow::Result<()> {
+    load_managed_enrollment(config, mode).map(|_| ())
+}
+
+fn load_managed_enrollment(
+    config: &AgentConfig,
+    mode: remoteops_protocol::PairingMode,
+) -> anyhow::Result<Option<remoteops_protocol::ManagedAgentEnrollment>> {
+    if mode != remoteops_protocol::PairingMode::ManagedOnDemand {
+        return Ok(None);
+    }
+    let path = config
+        .managed_enrollment_file
+        .as_deref()
+        .context("受管模式必须配置 managed_enrollment_file")?;
+    let metadata = fs::symlink_metadata(path).context("无法读取受管部署凭据文件")?;
+    if !metadata.file_type().is_file() || metadata.len() > 16 * 1024 {
+        bail!("受管部署凭据必须是受保护的小型普通文件");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("受管部署凭据文件不得允许组或其他用户访问");
+        }
+    }
+    let contents = zeroize::Zeroizing::new(fs::read(path).context("无法读取受管部署凭据")?);
+    let enrollment: remoteops_protocol::ManagedAgentEnrollment =
+        serde_json::from_slice(&contents).map_err(|_| anyhow!("受管部署凭据文件格式无效"))?;
+    if enrollment.target_id.is_empty()
+        || enrollment.target_id.len() > 128
+        || enrollment.token.len() < 32
+        || enrollment.token.len() > 4096
+    {
+        bail!("受管部署凭据无效");
+    }
+    Ok(Some(enrollment))
+}
+
+// 锁独立文件而不是可被原子替换的状态文件，确保整个运行期间只有一个凭据写入者。
+fn lock_agent_state(path: &Path) -> anyhow::Result<std::fs::File> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建 Agent 状态目录 {}", parent.display()))?;
+    }
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(&lock_path)
+        .with_context(|| format!("无法打开 Agent 状态锁 {}", lock_path.display()))?;
+    lock.try_lock().with_context(|| {
+        format!(
+            "无法独占 Agent 身份状态，同一状态文件只允许一个 Agent 运行：{}",
+            path.display()
+        )
+    })?;
+    // 退出只释放内核锁；保留锁文件，避免删除后出现两个不同文件的并行锁。
+    Ok(lock)
+}
+
+#[cfg(test)]
 fn load_agent_state(
     path: &std::path::Path,
     requested_instance_id: Option<AgentInstanceId>,
 ) -> anyhow::Result<AgentState> {
+    load_agent_state_for_mode(
+        path,
+        requested_instance_id,
+        remoteops_protocol::PairingMode::AutoPerBoot,
+    )
+}
+
+fn load_agent_state_for_mode(
+    path: &std::path::Path,
+    requested_instance_id: Option<AgentInstanceId>,
+    mode: remoteops_protocol::PairingMode,
+) -> anyhow::Result<AgentState> {
     if let Ok(contents) = std::fs::read_to_string(path) {
         let state: AgentState = serde_json::from_str(&contents)
             .with_context(|| format!("Agent 状态文件格式无效：{}", path.display()))?;
-        if let Some(requested) = requested_instance_id
-            && requested != state.agent_instance_id
+        if mode == remoteops_protocol::PairingMode::ManagedOnDemand
+            && requested_instance_id.is_some_and(|requested| requested != state.agent_instance_id)
         {
-            return Ok(AgentState {
-                agent_instance_id: requested,
-                resume_token: None,
-            });
+            bail!("受管 Agent 不允许覆盖已有安装身份");
         }
-        return Ok(state);
-    }
-    if path.exists() {
+        if requested_instance_id.is_none_or(|requested| requested == state.agent_instance_id) {
+            if state
+                .resume_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
+            {
+                return Ok(state);
+            }
+            if state
+                .registration_completed
+                .unwrap_or(state.resume_token.is_some())
+            {
+                bail!(
+                    "Agent 已完成登记但恢复令牌丢失，拒绝免认证恢复：{}",
+                    path.display()
+                );
+            }
+            if mode == remoteops_protocol::PairingMode::ManagedOnDemand {
+                // 高熵部署凭据由 Relay 独立认证；初始登记重试必须使用已落盘的准确身份。
+                // 已完成登记的令牌丢失已在上方失败关闭，不允许借部署凭据降级恢复。
+                return Ok(state);
+            }
+            if requested_instance_id.is_some() {
+                bail!(
+                    "固定 Agent 实例的首次登记尚未完成且缺少恢复令牌，无法安全恢复：{}",
+                    path.display()
+                );
+            }
+            // 上次首次登记未取得凭据，不复用可能已在 Relay 留存的身份。
+        }
+    } else if path.exists() {
         bail!("无法读取 Agent 状态文件：{}", path.display());
     }
     let state = AgentState {
         agent_instance_id: requested_instance_id.unwrap_or_default(),
         resume_token: None,
+        registration_completed: Some(false),
     };
-    persist_agent_state(
-        path,
-        &AgentState {
-            agent_instance_id: state.agent_instance_id,
-            resume_token: None,
-        },
-    )?;
+    persist_agent_state(path, &state)?;
     Ok(state)
+}
+
+// 最终确认只能在恢复令牌可靠落盘后发送，避免 Relay 撤销旧令牌时本地仍只保存旧值。
+async fn commit_agent_registration<S>(
+    stream: &mut S,
+    agent_instance_id: AgentInstanceId,
+    welcome: &remoteops_protocol::AgentWelcome,
+    resume_token_state: &Mutex<Option<String>>,
+    state_file: &Path,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame(
+        stream,
+        &WireMessage::AgentWelcomeAck(AgentWelcomeAck {
+            connection_generation: welcome.connection_generation,
+        }),
+    )
+    .await?;
+    match read_frame::<WireMessage, _>(stream).await? {
+        WireMessage::AgentResumeCommitted(committed)
+            if committed.connection_generation == welcome.connection_generation =>
+        {
+            persist_agent_state(
+                state_file,
+                &AgentState {
+                    agent_instance_id,
+                    resume_token: Some(welcome.resume_token.clone()),
+                    registration_completed: Some(true),
+                },
+            )
+            .context("无法持久化 Agent 恢复令牌")?;
+            *resume_token_state.lock().await = Some(welcome.resume_token.clone());
+            write_frame(
+                stream,
+                &WireMessage::AgentResumeCommitAck(AgentResumeCommitAck {
+                    connection_generation: welcome.connection_generation,
+                }),
+            )
+            .await?;
+            Ok(())
+        }
+        WireMessage::Error { code, message, .. } => bail!("{code}: {message}"),
+        other => bail!("Relay 返回了意外的恢复令牌确认消息：{other:?}"),
+    }
 }
 
 fn persist_agent_state(path: &std::path::Path, state: &AgentState) -> anyhow::Result<()> {
     let parent = path.parent().context("Agent 状态文件路径缺少父目录")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("无法创建 Agent 状态目录 {}", parent.display()))?;
-    let temporary_path = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or("agent-state.json"),
-        std::process::id()
-    ));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("无法创建 Agent 状态临时文件：{}", parent.display()))?;
     let contents = serde_json::to_vec_pretty(&state)?;
-    {
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temporary_path)
-            .with_context(|| format!("无法创建 Agent 状态临时文件 {}", temporary_path.display()))?;
-        file.write_all(&contents)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-    }
+    temporary.write_all(&contents)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o600))?;
     }
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("无法替换 Agent 状态文件 {}", path.display()))?;
-    }
-    std::fs::rename(&temporary_path, path)
+    // persist 原子替换既有文件，失败时保留原状态并自动清理临时文件。
+    temporary
+        .persist(path)
         .with_context(|| format!("无法提交 Agent 状态文件 {}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -4164,6 +4428,7 @@ fn print_agent_event(event: &AgentEvent) {
             println!("按 Ctrl+C 可随时停止远程协助");
         }
         AgentEvent::Connecting => println!("正在连接 Relay…"),
+        AgentEvent::Registered { .. } => println!("Relay 已连接，受管目标等待门户邀请"),
         AgentEvent::Connected {
             pairing_code,
             lease_expires_at,
@@ -4174,7 +4439,7 @@ fn print_agent_event(event: &AgentEvent) {
         }
         AgentEvent::LeaseRenewed { lease_expires_at } => {
             println!(
-                "控制码租约已续期，到期时间：{}",
+                "连接租约已续期，到期时间：{}",
                 lease_expires_at.to_rfc3339()
             );
         }
@@ -4282,6 +4547,7 @@ mod tests {
             file_uploads: Arc::clone(file_uploads),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
             visual_provider: default_visual_provider(),
+            boundary: Arc::new(runtime::RuntimeBoundary::default()),
         };
         let agent_instance_id = AgentInstanceId::new();
         let credential_encryption = CredentialEncryptionKeyPair::generate();
@@ -4430,6 +4696,70 @@ mod tests {
     }
 
     #[test]
+    fn managed_mode_requires_a_separate_valid_credential_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let credential = directory.path().join("enrollment.json");
+        let mut config = AgentConfig::default();
+        assert!(
+            validate_managed_enrollment(&config, remoteops_protocol::PairingMode::ManagedOnDemand)
+                .is_err()
+        );
+        let contents = serde_json::json!({ "target_id": "test-target", "token": "nonproduction-test-secret-32-characters" });
+        fs::write(&credential, serde_json::to_vec(&contents).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        config.managed_enrollment_file = Some(credential.clone());
+        let enrollment =
+            load_managed_enrollment(&config, remoteops_protocol::PairingMode::ManagedOnDemand)
+                .unwrap()
+                .unwrap();
+        assert_eq!(enrollment.target_id, "test-target");
+        let ordinary_config = directory.path().join("agent-config.json");
+        config.save_file(&ordinary_config).unwrap();
+        let serialized = fs::read_to_string(ordinary_config).unwrap();
+        assert!(!serialized.contains("nonproduction-test-secret"));
+        fs::write(
+            &credential,
+            br#"{"target_id":"test-target","token":{"secret":"do-not-echo"}}"#,
+        )
+        .unwrap();
+        let error =
+            validate_managed_enrollment(&config, remoteops_protocol::PairingMode::ManagedOnDemand)
+                .unwrap_err();
+        assert!(!format!("{error:#}").contains("do-not-echo"));
+    }
+
+    #[test]
+    fn agent_state_lock_excludes_same_path_and_releases_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_file = directory.path().join("agent-state.json");
+        let first = lock_agent_state(&state_file).expect("首次运行应取得状态锁");
+        let error = lock_agent_state(&state_file).expect_err("相同状态路径不能同时运行");
+        assert!(
+            error
+                .to_string()
+                .contains("同一状态文件只允许一个 Agent 运行")
+        );
+        let lock_file = directory.path().join("agent-state.json.lock");
+        assert!(lock_file.is_file());
+        drop(first);
+        assert!(lock_file.is_file(), "释放锁后不得删除锁文件");
+        let _next = lock_agent_state(&state_file).expect("上一实例退出后应重新取得状态锁");
+    }
+
+    #[test]
+    fn agent_state_locks_for_different_paths_are_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let _first = lock_agent_state(&directory.path().join("agent-state.json")).unwrap();
+        let _second = lock_agent_state(&directory.path().join("agent-state.other")).unwrap();
+        assert!(directory.path().join("agent-state.json.lock").is_file());
+        assert!(directory.path().join("agent-state.other.lock").is_file());
+    }
+
+    #[test]
     fn agent_identity_and_resume_token_survive_process_restart() {
         let state_file = test_state_file("restart");
         let first = load_agent_state(&state_file, None).expect("首次启动应创建 Agent 状态");
@@ -4440,6 +4770,7 @@ mod tests {
             &AgentState {
                 agent_instance_id: first.agent_instance_id,
                 resume_token: Some(resume_token.clone()),
+                registration_completed: Some(true),
             },
         )
         .expect("应持久化恢复令牌");
@@ -4448,6 +4779,187 @@ mod tests {
         assert_eq!(second.agent_instance_id, first.agent_instance_id);
         assert_eq!(second.resume_token.as_deref(), Some(resume_token.as_str()));
         let _ = std::fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn incomplete_registration_rotates_identity_on_next_startup() {
+        let state_file = test_state_file("incomplete-registration");
+        let first = load_agent_state(&state_file, None).expect("首次启动应创建身份");
+        let second = load_agent_state(&state_file, None).expect("下次启动应创建新身份");
+        assert_ne!(first.agent_instance_id, second.agent_instance_id);
+        assert_eq!(second.registration_completed, Some(false));
+        let contents = fs::read_to_string(&state_file).unwrap();
+        assert!(!contents.contains("boot_id"));
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn managed_initial_registration_preserves_durable_identity_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("agent-state.json");
+        let mode = remoteops_protocol::PairingMode::ManagedOnDemand;
+        let first = load_agent_state_for_mode(&path, None, mode).unwrap();
+        assert!(path.is_file(), "首次 Hello 前身份必须已落盘");
+        assert_eq!(first.registration_completed, Some(false));
+        let second = load_agent_state_for_mode(&path, None, mode).unwrap();
+        assert_eq!(first.agent_instance_id, second.agent_instance_id);
+        assert!(second.resume_token.is_none());
+        assert!(load_agent_state_for_mode(&path, Some(AgentInstanceId::new()), mode).is_err());
+        persist_agent_state(
+            &path,
+            &AgentState {
+                agent_instance_id: first.agent_instance_id,
+                resume_token: None,
+                registration_completed: Some(true),
+            },
+        )
+        .unwrap();
+        let error = load_agent_state_for_mode(&path, None, mode).unwrap_err();
+        assert!(error.to_string().contains("恢复令牌丢失"));
+    }
+
+    #[test]
+    fn fixed_identity_does_not_silently_recover_incomplete_registration() {
+        let state_file = test_state_file("incomplete-fixed-registration");
+        let identity = AgentInstanceId::new();
+        load_agent_state(&state_file, Some(identity)).expect("固定身份首次登记应允许");
+        let error = load_agent_state(&state_file, Some(identity)).unwrap_err();
+        assert!(error.to_string().contains("首次登记尚未完成"));
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn completed_registration_without_resume_token_is_rejected() {
+        let state_file = test_state_file("missing-credential");
+        let identity = AgentInstanceId::new();
+        persist_agent_state(
+            &state_file,
+            &AgentState {
+                agent_instance_id: identity,
+                resume_token: None,
+                registration_completed: Some(true),
+            },
+        )
+        .unwrap();
+        let error = load_agent_state(&state_file, None).unwrap_err();
+        assert!(error.to_string().contains("恢复令牌丢失"));
+        assert!(
+            fs::read_to_string(&state_file)
+                .unwrap()
+                .contains(&identity.to_string())
+        );
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn legacy_state_with_resume_token_preserves_identity() {
+        let state_file = test_state_file("legacy-state");
+        let identity = AgentInstanceId::new();
+        let contents = serde_json::json!({
+            "agent_instance_id": identity,
+            "resume_token": "legacy-resume-token",
+        });
+        fs::write(&state_file, serde_json::to_vec(&contents).unwrap()).unwrap();
+        let state = load_agent_state(&state_file, None).unwrap();
+        assert_eq!(state.agent_instance_id, identity);
+        assert_eq!(state.resume_token.as_deref(), Some("legacy-resume-token"));
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[tokio::test]
+    async fn registration_ack_requires_durable_resume_token() {
+        verify_registration_persistence(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn registration_persistence_failure_sends_no_final_ack() {
+        verify_registration_persistence(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn lost_final_ack_keeps_durable_resume_token() {
+        verify_registration_persistence(false, true).await;
+    }
+
+    async fn verify_registration_persistence(fail_persistence: bool, drop_before_ack: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let state_file = if fail_persistence {
+            directory.path().to_path_buf()
+        } else {
+            directory.path().join("state.json")
+        };
+        let identity = AgentInstanceId::new();
+        if !fail_persistence {
+            persist_agent_state(
+                &state_file,
+                &AgentState {
+                    agent_instance_id: identity,
+                    resume_token: Some("old-token".to_owned()),
+                    registration_completed: Some(true),
+                },
+            )
+            .unwrap();
+        }
+        let token_state = Arc::new(Mutex::new(Some("old-token".to_owned())));
+        let (mut relay, mut agent) = tokio::io::duplex(4096);
+        let target_state_file = state_file.clone();
+        let target_token_state = token_state.clone();
+        let task = tokio::spawn(async move {
+            commit_agent_registration(
+                &mut agent,
+                identity,
+                &AgentWelcome {
+                    pairing_code: Some(PairingCode::parse("123456789").unwrap()),
+                    pairing_mode: remoteops_protocol::PairingMode::AutoPerBoot,
+                    managed_target_id: None,
+                    lease_expires_at: Utc::now() + chrono::Duration::minutes(1),
+                    resume_token: "new-token".to_owned(),
+                    connection_generation: 7,
+                    heartbeat_interval_seconds: 1,
+                },
+                &target_token_state,
+                &target_state_file,
+            )
+            .await
+        });
+        assert!(matches!(
+            read_frame::<WireMessage, _>(&mut relay).await.unwrap(),
+            WireMessage::AgentWelcomeAck(AgentWelcomeAck {
+                connection_generation: 7
+            })
+        ));
+        write_frame(
+            &mut relay,
+            &WireMessage::AgentResumeCommitted(AgentResumeCommitted {
+                connection_generation: 7,
+            }),
+        )
+        .await
+        .unwrap();
+        if drop_before_ack {
+            drop(relay);
+            assert!(task.await.unwrap().is_err());
+            let state = load_agent_state(&state_file, None).unwrap();
+            assert_eq!(state.resume_token.as_deref(), Some("new-token"));
+            assert_eq!(token_state.lock().await.as_deref(), Some("new-token"));
+        } else if fail_persistence {
+            assert!(task.await.unwrap().is_err());
+            assert!(read_frame::<WireMessage, _>(&mut relay).await.is_err());
+            assert_eq!(token_state.lock().await.as_deref(), Some("old-token"));
+        } else {
+            assert!(matches!(
+                read_frame::<WireMessage, _>(&mut relay).await.unwrap(),
+                WireMessage::AgentResumeCommitAck(AgentResumeCommitAck {
+                    connection_generation: 7
+                })
+            ));
+            let state = load_agent_state(&state_file, None).unwrap();
+            assert_eq!(state.agent_instance_id, identity);
+            assert_eq!(state.resume_token.as_deref(), Some("new-token"));
+            assert_eq!(state.registration_completed, Some(true));
+            assert_eq!(token_state.lock().await.as_deref(), Some("new-token"));
+            task.await.unwrap().unwrap();
+        }
     }
 
     #[test]
@@ -4495,6 +5007,7 @@ mod tests {
     async fn keeps_heartbeat_and_remote_requests_independent() {
         let (agent_stream, mut relay_stream) = tokio::io::duplex(64 * 1024);
         let agent_instance_id = AgentInstanceId::new();
+        let boot_id = AgentBootId::new();
         let session_id = SessionId::new();
         let controller_instance_id = ControllerInstanceId::new();
         let binding_token = "relay-only-binding-token".to_owned();
@@ -4510,10 +5023,34 @@ mod tests {
         let serial_sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let connection_shells = shell_sessions.clone();
         let connection_serials = serial_sessions.clone();
+        let constructions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = constructions.clone();
+        let mut options = AgentRuntimeOptions::service(ProductProfile::default());
+        // 模拟有活动 RDP 桌面，并让外部图形开关请求启用，产品上限仍优先。
+        options.visual_enabled = true;
+        options.visual_provider_factory = Some(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            panic!("服务产品不能构造真实 Provider");
+        }));
+        let facts = remoteops_domain::TargetRuntimeFacts {
+            process_session_id: Some(5),
+            interactive_desktop: remoteops_domain::CapabilityAvailability::Available,
+            observed_at: Utc::now(),
+            source: "native_test_fixture".into(),
+        };
+        let (boundary, provider, _) =
+            runtime::prepare(&options, &EnvironmentProfile::empty(), facts)
+                .await
+                .unwrap();
+        let boundary = Arc::new(boundary);
         let connection_task = tokio::spawn(async move {
             run_connection(
                 agent_stream,
                 agent_instance_id,
+                boot_id,
+                boundary,
+                remoteops_protocol::PairingMode::AutoPerBoot,
+                None,
                 None,
                 Arc::new(Mutex::new(None)),
                 connection_state_file,
@@ -4522,14 +5059,17 @@ mod tests {
                 "test-os".to_owned(),
                 CapabilitySet::new([Capability::Cmd]),
                 EnvironmentProfile::empty(),
-                default_visual_provider(),
+                provider,
                 Arc::new(SystemDevice::new()),
                 Arc::new(AtomicU64::new(1)),
                 connection_shells,
                 connection_serials,
-                Arc::new(LocalPermissionPolicy::default()),
+                Arc::new(LocalPermissionPolicy {
+                    session_full_access_owners: BTreeSet::from([test_owner_id()]),
+                    ..LocalPermissionPolicy::default()
+                }),
                 Arc::new(CredentialEncryptionKeyPair::generate()),
-                watch::channel(PermissionMode::ApprovalRequired).1,
+                watch::channel(PermissionMode::FullAccess).1,
                 Some(&log_sender),
                 shutdown_receiver,
             )
@@ -4543,14 +5083,17 @@ mod tests {
             hello,
             WireMessage::Hello(ClientHello::Agent(AgentHello {
                 agent_instance_id: observed,
+                boot_id: observed_boot,
                 ..
-            })) if observed == agent_instance_id
+            })) if observed == agent_instance_id && observed_boot == boot_id
         ));
 
         write_frame(
             &mut relay_stream,
             &WireMessage::AgentWelcome(AgentWelcome {
-                pairing_code: PairingCode::parse("123456789").expect("测试控制码应有效"),
+                pairing_code: Some(PairingCode::parse("123456789").expect("测试控制码应有效")),
+                pairing_mode: remoteops_protocol::PairingMode::AutoPerBoot,
+                managed_target_id: None,
                 lease_expires_at: Utc::now() + chrono::Duration::minutes(1),
                 resume_token: "test-resume-token".to_owned(),
                 connection_generation: 1,
@@ -4606,7 +5149,7 @@ mod tests {
                 controller_instance_id,
                 owner_id: test_owner_id(),
                 controller_kind: ControllerKind::Human,
-                permission_mode: PermissionMode::ApprovalRequired,
+                permission_mode: PermissionMode::FullAccess,
                 controller_control_mode: None,
                 control_state: None,
                 binding_token: binding_token.clone(),
@@ -4614,6 +5157,52 @@ mod tests {
         )
         .await
         .expect("Relay 应发送 Controller 绑定");
+        for operation in runtime::visual_operations() {
+            let request_id = RequestId::new();
+            write_frame(
+                &mut relay_stream,
+                &WireMessage::AuthorizedRemoteRequest(AuthorizedRemoteRequest {
+                    request: RemoteRequest {
+                        control_proof: None,
+                        request_id,
+                        session_id,
+                        source: EventSource::Human,
+                        operation,
+                        approval_id: None,
+                        payload_base64: None,
+                    },
+                    authorization: remoteops_protocol::RelayAuthorization {
+                        controller_instance_id,
+                        owner_id: test_owner_id(),
+                        controller_kind: ControllerKind::Human,
+                        permission_mode: PermissionMode::FullAccess,
+                        binding_token: binding_token.clone(),
+                        approval: ApprovalState::NotRequired,
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if let WireMessage::Error {
+                        request_id: Some(observed),
+                        code,
+                        ..
+                    } = read_frame::<WireMessage, _>(&mut relay_stream)
+                        .await
+                        .unwrap()
+                        && observed == request_id
+                    {
+                        assert_eq!(code, "product_policy_disabled");
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("合法图形协议请求必须被Agent硬上限拒绝");
+        }
+        assert_eq!(constructions.load(Ordering::SeqCst), 0);
         let shell = if cfg!(windows) {
             ShellKind::Cmd
         } else {
@@ -4639,7 +5228,7 @@ mod tests {
                     controller_instance_id,
                     owner_id: test_owner_id(),
                     controller_kind: ControllerKind::Human,
-                    permission_mode: PermissionMode::ApprovalRequired,
+                    permission_mode: PermissionMode::FullAccess,
                     binding_token,
                     approval: ApprovalState::NotRequired,
                 },
@@ -4758,6 +5347,7 @@ mod tests {
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
             visual_provider: default_visual_provider(),
+            boundary: Arc::new(runtime::RuntimeBoundary::default()),
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let sequence = Arc::new(AtomicU64::new(1));
@@ -5736,6 +6326,7 @@ mod tests {
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
             visual_provider: default_visual_provider(),
+            boundary: Arc::new(runtime::RuntimeBoundary::default()),
         }
     }
 
@@ -6193,6 +6784,7 @@ mod tests {
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
             visual_provider: default_visual_provider(),
+            boundary: Arc::new(runtime::RuntimeBoundary::default()),
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let credential_encryption = CredentialEncryptionKeyPair::generate();
@@ -6290,6 +6882,7 @@ mod tests {
             file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
             visual_provider: default_visual_provider(),
+            boundary: Arc::new(runtime::RuntimeBoundary::default()),
         };
         let transfer_root = test_state_file("encrypted-ssh").with_extension("dir");
         let device = SystemDevice::with_transfer_root(&transfer_root).expect("应创建交换目录");

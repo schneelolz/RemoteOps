@@ -243,6 +243,7 @@ pub(crate) async fn serve(
         .route("/style.css", get(style_css))
         .layer(DefaultBodyLimit::max(8 * 1024))
         .merge(crate::enrollment::router())
+        .merge(crate::portal::router())
         .with_state(state)
         .fallback(index);
     axum::serve(

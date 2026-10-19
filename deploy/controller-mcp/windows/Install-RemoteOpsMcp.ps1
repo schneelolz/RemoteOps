@@ -38,7 +38,7 @@ elseif ([string]::IsNullOrWhiteSpace($RelayAddress) -or $OwnerId -eq [guid]::Emp
     throw '手工安装必须提供 RelayAddress 和非全零 OwnerId；推荐改用 SetupFile 或 SetupCode。'
 }
 
-$mcpVersion = '0.2.0-preview.14'
+$mcpVersion = '0.2.0-preview.15'
 $credentialPromptVersion = '0.2.0-preview.5'
 $tokenVariable = 'REMOTEOPS_CONTROLLER_TOKEN'
 $ownerVariable = 'REMOTEOPS_CONTROLLER_OWNER_ID'

@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-agent"
-version = "0.2.0-preview.27"
+version = "0.2.0-preview.28"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -17,6 +17,7 @@ LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [dependencies]
 remoteops-product = { path = "../../crates/remoteops-product" }
+remoteops-native-host = { path = "../../crates/remoteops-native-host" }
 tempfile = "3"
 anyhow.workspace = true
 async-trait.workspace = true

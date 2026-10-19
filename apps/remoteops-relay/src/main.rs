@@ -5,6 +5,7 @@
 
 mod admin;
 mod enrollment;
+mod portal;
 mod relay;
 
 use std::{path::PathBuf, sync::Arc};
@@ -221,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
                     .await
                     {
                         Ok(Ok(stream)) => {
-                            if let Err(error) = relay.handle_client(stream).await {
+                            if let Err(error) = relay.handle_client_from(stream, Some(peer.ip())).await {
                                 error!(%peer, error = %error, "客户端连接异常结束");
                             }
                         }

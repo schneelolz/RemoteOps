@@ -121,6 +121,10 @@ mod tests {
         let mut value = serde_json::to_value(ClientHello::Agent(AgentHello {
             protocol_version: PROTOCOL_VERSION,
             agent_instance_id: AgentInstanceId::new(),
+            boot_id: remoteops_domain::AgentBootId::new(),
+            target_context: None,
+            pairing_mode: crate::PairingMode::AutoPerBoot,
+            managed_enrollment: None,
             resume_token: None,
             hostname: "legacy-agent".to_owned(),
             operating_system: "Windows".to_owned(),
@@ -132,6 +136,28 @@ mod tests {
             supports_agent_shutdown: false,
         }))
         .expect("Agent Hello 应可序列化");
+        let mut legacy = value.clone();
+        let object = legacy.as_object_mut().unwrap();
+        object.insert(
+            "protocol_version".to_owned(),
+            crate::LEGACY_PROTOCOL_VERSION.into(),
+        );
+        for key in ["target_context", "pairing_mode", "managed_enrollment"] {
+            object.remove(key);
+        }
+        let ClientHello::Agent(legacy) =
+            serde_json::from_value(legacy).expect("协议17 Hello应保留旧模式")
+        else {
+            panic!("应为Agent")
+        };
+        assert_eq!(legacy.pairing_mode, crate::PairingMode::AutoPerBoot);
+        assert!(legacy.target_context.is_none() && legacy.managed_enrollment.is_none());
+        let mut missing_boot_id = value.clone();
+        missing_boot_id.as_object_mut().unwrap().remove("boot_id");
+        assert!(
+            serde_json::from_value::<ClientHello>(missing_boot_id).is_err(),
+            "缺少启动标识时必须拒绝握手"
+        );
         value
             .as_object_mut()
             .expect("Agent Hello 应为对象")

@@ -346,7 +346,7 @@ async fn main() -> anyhow::Result<()> {
         .pointer("/details/operation")
         .cloned()
         .context("命令审批申请没有返回完整 operation")?;
-    let pending_command = call(
+    let pending_command = call_approval_rejected(
         &client,
         "run_command",
         json!({
@@ -372,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let tampered_command = format!("{approval_command}; 'REMOTEOPS_MCP_TAMPERED'");
-    let tampered_result = call(
+    let tampered_result = call_approval_rejected(
         &client,
         "run_command",
         json!({
@@ -465,7 +465,7 @@ async fn main() -> anyhow::Result<()> {
         bail!("持久 PowerShell 状态未保留：{persistent_state}");
     }
 
-    let reused_command_approval = call(
+    let reused_command_approval = call_approval_rejected(
         &client,
         "run_command",
         json!({
@@ -574,7 +574,12 @@ async fn main() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    if unapproved_upload.get("status").and_then(Value::as_str) == Some("completed") {
+    if unapproved_upload.get("status").and_then(Value::as_str) != Some("failed")
+        || !unapproved_upload
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|summary| summary.contains("[approval_not_granted]"))
+    {
         bail!("尚未由独立 Human Controller 批准的审批被错误执行：{unapproved_upload}");
     }
 
@@ -613,7 +618,12 @@ async fn main() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    if reused_approval.get("status").and_then(Value::as_str) == Some("completed") {
+    if reused_approval.get("status").and_then(Value::as_str) != Some("failed")
+        || !reused_approval
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|summary| summary.contains("[approval_not_granted]"))
+    {
         bail!("同一 approval_id 被重复消费：{reused_approval}");
     }
 
@@ -998,11 +1008,13 @@ fn assert_remoteops_discovery_guidance(
         .context("MCP initialize 未返回 RemoteOps 使用说明")?;
     for required in [
         "必须先调用 pair_connection",
-        "配对后默认逐项确认",
+        "全新配置默认逐项确认",
+        "配对后先查询有效模式",
+        "只有用户明确要求完全控制时才调用一次 set_control_mode",
         "Codex 对该工具的授权就是唯一确认",
-        "Agent 端没有逐项确认或完全控制按钮",
-        "按 session_id 独立保存在 MCP 内存",
-        "禁止改用 Computer Use",
+        "用返回的不可变 session_id 调用 get_target_info 和其他工具",
+        "不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连",
+        "必须视为操作未执行并停止",
         "检查、分析、判断等请求默认只读",
         "禁止声称已操作远端",
     ] {
@@ -1100,6 +1112,26 @@ async fn call(
     result
         .structured_content
         .context("MCP 工具未返回 structuredContent")
+}
+
+// 审批拒绝是 MCP 工具错误；要求明确错误码，避免把其他失败当作授权校验通过。
+async fn call_approval_rejected(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    arguments: Value,
+) -> anyhow::Result<Value> {
+    let arguments: Map<String, Value> = arguments
+        .as_object()
+        .cloned()
+        .context("工具参数必须是 JSON 对象")?;
+    let result = client
+        .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments))
+        .await?;
+    let encoded = serde_json::to_string(&result)?;
+    if result.is_error != Some(true) || !encoded.contains("[approval_not_granted]") {
+        bail!("MCP 工具 {name} 未明确拒绝无效审批");
+    }
+    Ok(json!({"status": "rejected", "error_code": "approval_not_granted"}))
 }
 
 async fn call_expect_error(

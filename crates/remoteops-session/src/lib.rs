@@ -207,6 +207,7 @@ mod tests {
 
     fn connection(session_id: SessionId) -> ConnectionDescriptor {
         ConnectionDescriptor {
+            target_context: None,
             session_id,
             agent_instance_id: AgentInstanceId::new(),
             display_index: 0,

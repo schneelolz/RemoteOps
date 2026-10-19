@@ -1,4 +1,9 @@
 //! 真实 Agent、真实 MCP 与本地 TLS Relay 的授权生命周期验收。
+mod managed_portal_live;
+mod pair_result_proxy;
+mod process_lifecycle;
+mod target_context_live;
+
 use anyhow::{Context, Result, bail, ensure};
 use remoteops_agent::{
     AgentConfig, AgentEvent, AgentPermissionControl, run_agent_with_permission_control,
@@ -248,7 +253,7 @@ async fn scenarios(
     control: &AgentPermissionControl,
     default_full: bool,
     disconnect: &watch::Sender<u64>,
-) -> Result<()> {
+) -> Result<(String, String)> {
     let code = pairing_code(events).await?;
     let paired = call(client, "pair_connection", json!({"pairing_code":code})).await?;
     let session = paired["session_id"]
@@ -335,10 +340,13 @@ async fn scenarios(
         let revoked = agent_state(events, ControllerControlMode::StepByStep, None).await?;
         while events.try_recv().is_ok() {}
         disconnect.send_modify(|generation| *generation += 1);
+        let resumed_code = pairing_code(events).await?;
+        ensure!(resumed_code == code, "同次运行 TLS 断线恢复不应更换控制码");
         let restored = agent_state(events, ControllerControlMode::StepByStep, None).await?;
         ensure!(
-            restored.agent_generation > revoked.agent_generation,
-            "必须实际重建 TLS 连接"
+            restored.agent_generation > revoked.agent_generation
+                && restored.session_id.to_string() == session,
+            "同次运行必须实际重建 TLS 连接并保留会话"
         );
         sleep(Duration::from_millis(300)).await;
         assert_mcp_mode(client, session, "step_by_step", None).await?;
@@ -389,7 +397,7 @@ async fn scenarios(
     );
     ensure!(!denied.exists(), "先前拒绝的命令不得延迟执行");
     println!("通过：现场显式重新授权后允许写操作，先前被拒命令仍未执行");
-    Ok(())
+    Ok((code, session.to_owned()))
 }
 
 #[tokio::main]
@@ -416,6 +424,15 @@ async fn main() -> Result<()> {
         std::fs::create_dir(&root)?;
         run_case(&root, &address, &cert, default_full).await?;
     }
+    let process_root = workspace.0.join("process-lifecycle");
+    std::fs::create_dir(&process_root)?;
+    process_lifecycle::run(&process_root, &address, &cert).await?;
+    let context_root = workspace.0.join("target-context");
+    std::fs::create_dir(&context_root)?;
+    target_context_live::run(&context_root, &address, &cert).await?;
+    let managed_root = workspace.0.join("managed-portal");
+    std::fs::create_dir(&managed_root)?;
+    managed_portal_live::run(&managed_root, &address, &cert).await?;
     println!("真实 MCP + Agent 控制授权端到端验收通过");
     Ok(())
 }
@@ -436,21 +453,90 @@ async fn run_case(root: &Path, address: &str, cert: &Path, default_full: bool) -
     let (events_sender, events) = mpsc::channel();
     let (stop, stopped) = watch::channel(false);
     let agent = tokio::spawn(run_agent_with_permission_control(
-        config,
+        config.clone(),
         Some(events_sender),
         stopped,
         control.clone(),
     ));
+    let mut agent = Some(agent);
+    let mut stop = stop;
     let result = async {
         let client = start_mcp(root, address, cert).await?;
-        let result = scenarios(&client, root, &events, &control, default_full, &disconnect).await;
+        let result = async {
+            let (old_code, old_session) =
+                scenarios(&client, root, &events, &control, default_full, &disconnect).await?;
+            let before: Value = serde_json::from_slice(&std::fs::read(&config.state_file)?)?;
+            stop_agent(&stop, &mut agent).await?;
+            let next_control = AgentPermissionControl::from_config(&config);
+            let (next_events_sender, next_events) = mpsc::channel();
+            let (next_stop, next_stopped) = watch::channel(false);
+            stop = next_stop;
+            agent = Some(tokio::spawn(run_agent_with_permission_control(
+                config.clone(),
+                Some(next_events_sender),
+                next_stopped,
+                next_control,
+            )));
+            let new_code = pairing_code(&next_events).await?;
+            ensure!(new_code != old_code, "Agent 运行重启必须更换控制码");
+            let after: Value = serde_json::from_slice(&std::fs::read(&config.state_file)?)?;
+            ensure!(
+                before["agent_instance_id"] == after["agent_instance_id"],
+                "重启验收必须沿用同一持久 Agent 身份"
+            );
+            let old_pair = raw_call(&client, "pair_connection", json!({"pairing_code":old_code})).await?;
+            ensure!(old_pair.is_error == Some(true), "重启后旧控制码仍可配对");
+            let old_write = raw_call(
+                &client,
+                "run_command",
+                mkdir_args(&old_session, &root.join("old-session-must-not-exist"))?,
+            )
+            .await?;
+            ensure!(
+                old_write.is_error == Some(true) && !root.join("old-session-must-not-exist").exists(),
+                "旧会话或现场临时授权跨启动执行了写操作"
+            );
+            let new_pair = call(&client, "pair_connection", json!({"pairing_code":new_code})).await?;
+            let new_session = new_pair["session_id"].as_str().context("新配对缺少会话")?;
+            ensure!(new_session != old_session, "同一持久身份重启必须建立新会话");
+            if default_full {
+                let _ = agent_state(
+                    &next_events,
+                    ControllerControlMode::FullAccess,
+                    Some(ControlSource::LocalDefault),
+                )
+                .await?;
+                assert_mcp_mode(&client, new_session, "full_access", Some("local_default")).await?;
+            } else {
+                let _ = agent_state(&next_events, ControllerControlMode::StepByStep, None).await?;
+                assert_mcp_mode(&client, new_session, "step_by_step", None).await?;
+            }
+            println!("通过：真实 Agent 复用状态文件重新启动换码换会话，旧码与旧会话拒绝，新授权遵循默认偏好");
+            Ok(())
+        }
+        .await;
         let _ = client.cancel().await;
         result
     }
     .await;
+    let shutdown_result = stop_agent(&stop, &mut agent).await;
+    proxy.abort();
+    let _ = proxy.await;
+    drop(disconnect);
+    result?;
+    shutdown_result?;
+    Ok(())
+}
+
+async fn stop_agent(
+    stop: &watch::Sender<bool>,
+    agent: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    let Some(mut agent) = agent.take() else {
+        return Ok(());
+    };
     let _ = stop.send(true);
-    let mut agent = agent;
-    let shutdown_result = if let Ok(joined) = timeout(Duration::from_secs(10), &mut agent).await {
+    if let Ok(joined) = timeout(Duration::from_secs(10), &mut agent).await {
         joined
             .context("真实 Agent 任务异常终止")
             .and_then(|result| result)
@@ -458,13 +544,7 @@ async fn run_case(root: &Path, address: &str, cert: &Path, default_full: bool) -
         agent.abort();
         let _ = agent.await;
         Err(anyhow::anyhow!("真实 Agent 未在期限内停止"))
-    };
-    proxy.abort();
-    let _ = proxy.await;
-    drop(disconnect);
-    result?;
-    shutdown_result?;
-    Ok(())
+    }
 }
 
 // A loopback byte proxy forces a real TLS transport break while the Agent process lives.

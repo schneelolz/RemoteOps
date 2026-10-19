@@ -137,7 +137,7 @@ mod tests {
         );
         assert_eq!(
             remoteops_agent_gui::build_info(&profile()).protocol_version,
-            16
+            18
         );
         assert!(options().icon_png.unwrap().starts_with(b"\x89PNG"));
     }

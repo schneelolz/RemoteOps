@@ -2126,6 +2126,7 @@ fn demo_connections() -> Vec<ConnectionDescriptor> {
 
 fn demo_connection(index: u32, alias: &str, hostname: &str) -> ConnectionDescriptor {
     ConnectionDescriptor {
+        target_context: None,
         session_id: SessionId::new(),
         agent_instance_id: AgentInstanceId::new(),
         display_index: index,

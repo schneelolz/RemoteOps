@@ -1,6 +1,6 @@
 # RemoteOps MCP Windows x64 安装说明
 
-- 版本：`0.2.0-preview.14`
+- 版本：`0.2.0-preview.15`
 - 适用系统：Windows x64
 - Codex MCP 名称：`remoteops`
 - 许可证：`AGPL-3.0-only`
@@ -112,7 +112,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.p
 安装内容：
 
 ```text
-%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.14.exe
+%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.15.exe
 %USERPROFILE%\.codex\remoteops\remoteops-credential-prompt.exe
 %USERPROFILE%\.codex\remoteops\controller-config.json
 %USERPROFILE%\.codex\remoteops\setup-state.json  # 仅一次性设置模式
@@ -147,6 +147,32 @@ codex mcp list
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-RemoteOpsMcp.ps1 -CredentialPromptSmokeTest
 ```
+
+### 旁路安装检查
+
+标准安装仍使用上面的默认命令。若维护者将完整 MCP 包放在
+`<CodexHome>/remoteops/candidates/<构建目录>`，可显式选择该目录，并提供维护者已核验的
+MCP 和凭据输入程序 SHA-256。两项哈希必须来自可信构建记录；不能仅对当前待检查文件
+临时计算哈希，就把它当作可信来源。
+
+```powershell
+$codexHome = Join-Path $env:USERPROFILE '.codex'
+$candidate = Join-Path $codexHome 'remoteops\candidates\approved-build'
+# 将目录和下面两项占位值替换为维护者提供的实际值。
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-RemoteOpsMcp.ps1 `
+  -CodexHome $codexHome -CandidateDirectory $candidate `
+  -ExpectedMcpSha256 '<可信构建记录中的 MCP SHA-256>' `
+  -ExpectedCredentialPromptSha256 '<可信构建记录中的凭据输入程序 SHA-256>'
+```
+
+目录必须是 `candidates` 的直接子目录，不能通过符号链接或目录联接跳转；Codex 配置
+也必须准确指向该目录的 `remoteops-controller-mcp.exe`。两个程序的哈希验证成功后才会
+执行检查，并从同目录检查 `remoteops-credential-prompt.exe`。连接配置仍使用
+`<CodexHome>/remoteops/controller-config.json`，不会复制或修改凭据、配置或运行中的进程。
+`CodexHome` 和候选目录应使用一致的路径别名；系统自有的 Codex 用户目录联接不受影响。
+
+该功能只检查本地安装及固定包版本，不查询或下载最新发布版本；缺少候选目录或任一
+可信哈希时不能通过旁路检查。`-SkipNetwork` 只跳过 TCP 探测，不跳过路径、哈希和版本校验。
 
 安装检查会根据 `credential_id` 读取安全存储中的凭据，不把凭据返回到脚本；旧模式仍
 检查用户环境变量。网络检查只证明 TCP 可达，不等同于重新认证；首次安装认证自检

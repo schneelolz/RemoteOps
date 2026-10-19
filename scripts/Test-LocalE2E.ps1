@@ -133,6 +133,89 @@ function Invoke-NativeCapture {
     @($output | ForEach-Object { $_.ToString() })
 }
 
+
+# 同一次交互进程保留同一个Controller绑定；独立CLI退出会正确撤销其持久资源。
+function Read-InteractivePrompt {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [System.Text.StringBuilder]$Transcript
+    )
+    $received = [System.Text.StringBuilder]::new()
+    $buffer = [char[]]::new(1024)
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    while ($true) {
+        $remaining = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($remaining -le 0) { throw '等待持久CLI提示符超时，请检查隔离诊断文件' }
+        $read = $Process.StandardOutput.ReadAsync($buffer, 0, $buffer.Length)
+        if (-not $read.Wait($remaining)) { throw '读取持久CLI响应超时，请检查隔离诊断文件' }
+        $count = $read.GetAwaiter().GetResult()
+        if ($count -eq 0) { throw '持久CLI提前退出，请检查隔离诊断文件' }
+        [void]$received.Append($buffer, 0, $count)
+        [void]$Transcript.Append($buffer, 0, $count)
+        $text = $received.ToString()
+        if ($text.EndsWith('remoteops> ', [StringComparison]::Ordinal)) {
+            return $text.Substring(0, $text.Length - 'remoteops> '.Length)
+        }
+    }
+}
+
+function Test-PersistentCliShell {
+    param([string]$Executable, [string[]]$CliArguments, [string]$DiagnosticRoot)
+    $start = [System.Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $Executable
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $start.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $start.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+    foreach ($argument in $CliArguments) { $start.ArgumentList.Add($argument) }
+    $start.ArgumentList.Add('interactive')
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $transcript = [System.Text.StringBuilder]::new()
+    $errorRead = $null
+    try {
+        if (-not $process.Start()) { throw '无法启动隔离的交互CLI' }
+        # 异步排空事件日志，避免stderr管道阻塞命令完成。
+        $errorRead = $process.StandardError.ReadToEndAsync()
+        $null = Read-InteractivePrompt -Process $process -Transcript $transcript
+        $process.StandardInput.WriteLine('shell-open 本机测试 cmd')
+        $process.StandardInput.Flush()
+        $opened = Read-InteractivePrompt -Process $process -Transcript $transcript
+        $match = [regex]::Match($opened, '"shell_id"\s*:\s*"([0-9a-f-]{36})"')
+        if (-not $match.Success) { throw '交互CLI未返回持久Shell标识' }
+        $persistentShellId = $match.Groups[1].Value
+        $process.StandardInput.WriteLine("shell-run 本机测试 $persistentShellId cmd set REMOTEOPS_PERSIST_E2E=alpha")
+        $process.StandardInput.Flush()
+        $null = Read-InteractivePrompt -Process $process -Transcript $transcript
+        $process.StandardInput.WriteLine("shell-run 本机测试 $persistentShellId cmd echo %REMOTEOPS_PERSIST_E2E%")
+        $process.StandardInput.Flush()
+        $readBack = Read-InteractivePrompt -Process $process -Transcript $transcript
+        if ($readBack -notmatch 'alpha') { throw '同一CLI绑定内持久Shell未保留变量状态' }
+        $process.StandardInput.WriteLine("shell-close 本机测试 $persistentShellId")
+        $process.StandardInput.Flush()
+        $null = Read-InteractivePrompt -Process $process -Transcript $transcript
+        $process.StandardInput.WriteLine('quit')
+        $process.StandardInput.Flush()
+        $process.StandardInput.Close()
+        if (-not $process.WaitForExit(10000)) { throw '交互CLI未在10秒内退出' }
+        if ($process.ExitCode -ne 0) { throw '交互CLI持久Shell验收失败，请检查隔离诊断文件' }
+    }
+    finally {
+        # 只结束本函数创建的进程；异常、超时也不遗留Controller或子Shell。
+        Stop-OwnedProcess -Process $process
+        [IO.File]::WriteAllText((Join-Path $DiagnosticRoot 'persistent-cli.out'), $transcript.ToString(), [Text.UTF8Encoding]::new($false))
+        if ($null -ne $errorRead) {
+            $stderr = $errorRead.GetAwaiter().GetResult()
+            [IO.File]::WriteAllText((Join-Path $DiagnosticRoot 'persistent-cli.err'), $stderr, [Text.UTF8Encoding]::new($false))
+        }
+    }
+}
+
 try {
     New-Item -ItemType Directory -Path $resolvedTestRoot -Force | Out-Null
     Push-Location $workspaceRoot
@@ -262,6 +345,8 @@ try {
         throw "读取初始连接 JSON 失败：$($initialListJson -join "`n")"
     }
     $initialConnections = @(($initialListJson -join "`n") | ConvertFrom-Json)
+    $initialAgentIdentity = (Get-Content -LiteralPath $agentState -Raw | ConvertFrom-Json).agent_instance_id
+    if (-not $initialAgentIdentity) { throw '初始 Agent 状态缺少长期身份' }
     $initialSessionId = $initialConnections[0].session_id
     if (-not $initialSessionId) {
         throw '初始连接没有 session_id'
@@ -291,42 +376,7 @@ try {
         throw "Windows PowerShell 测试失败：$($powerShellOutput -join "`n")"
     }
 
-    $shellOpenJson = Invoke-NativeCapture $cliExe @baseArguments --json shell-open `
-        '本机测试' `
-        '--shell' 'cmd'
-    if ($LASTEXITCODE -ne 0) {
-        throw "持久 Shell 打开失败：$($shellOpenJson -join "`n")"
-    }
-    $shellOpen = ($shellOpenJson -join "`n") | ConvertFrom-Json
-    $persistentShellId = $shellOpen.details.shell_id
-    if (-not $persistentShellId) {
-        throw '持久 Shell 未返回 shell_id'
-    }
-    $shellSetOutput = Invoke-NativeCapture $cliExe @baseArguments shell-run `
-        '本机测试' `
-        $persistentShellId `
-        '--shell' 'cmd' `
-        'set REMOTEOPS_PERSIST_E2E=alpha'
-    if ($LASTEXITCODE -ne 0) {
-        throw "持久 Shell 状态写入失败：$($shellSetOutput -join "`n")"
-    }
-    $shellReadOutput = Invoke-NativeCapture $cliExe @baseArguments shell-run `
-        '本机测试' `
-        $persistentShellId `
-        '--shell' 'cmd' `
-        'echo %REMOTEOPS_PERSIST_E2E%'
-    if (
-        $LASTEXITCODE -ne 0 -or
-        (($shellReadOutput -join "`n") -notmatch 'alpha')
-    ) {
-        throw "持久 Shell 状态读取失败：$($shellReadOutput -join "`n")"
-    }
-    $shellCloseOutput = Invoke-NativeCapture $cliExe @baseArguments shell-close `
-        '本机测试' `
-        $persistentShellId
-    if ($LASTEXITCODE -ne 0) {
-        throw "持久 Shell 关闭失败：$($shellCloseOutput -join "`n")"
-    }
+    Test-PersistentCliShell -Executable $cliExe -CliArguments $baseArguments -DiagnosticRoot $resolvedTestRoot
 
     $portOutput = Invoke-NativeCapture $cliExe @baseArguments test-port `
         '本机测试' `
@@ -535,7 +585,8 @@ try {
         -WindowStyle Hidden `
         -PassThru
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
-    $expiredIdentityRecovered = $false
+    $newBootCodeRotated = $false
+    $newBootPairingCode = $null
     do {
         Start-Sleep -Milliseconds 250
         $agentResumeText = Get-Content `
@@ -549,28 +600,40 @@ try {
             $agentResumeText,
             '([0-9]{3}-[0-9]{3}-[0-9]{3})'
         )
-        $expiredIdentityRecovered = (
-            $resumedPairingMatch.Success -and
-            $resumedPairingMatch.Groups[1].Value -eq $pairingCode
-        )
-    } while (-not $expiredIdentityRecovered -and [DateTime]::UtcNow -lt $deadline)
-    if (-not $expiredIdentityRecovered) {
-        $agentResumeErrors = if (Test-Path -LiteralPath $agentResumeErr) {
-            Get-Content -LiteralPath $agentResumeErr -Raw
+        if ($resumedPairingMatch.Success) {
+            $newBootPairingCode = $resumedPairingMatch.Groups[1].Value
+            $newBootCodeRotated = $newBootPairingCode -ne $pairingCode
         }
-        else {
-            ''
-        }
-        throw "离线租约过期后 Agent 未恢复原控制码：$agentResumeErrors"
+    } while (-not $newBootCodeRotated -and [DateTime]::UtcNow -lt $deadline)
+    if (-not $newBootCodeRotated) {
+        throw '新 Agent 进程没有生成新控制码，请检查隔离诊断文件'
     }
 
-    $expiredRecoveryJson = Invoke-NativeCapture $cliExe @baseArguments --json list
-    if ($LASTEXITCODE -ne 0) {
-        throw "离线租约过期恢复后旧控制码无法重新绑定：$($expiredRecoveryJson -join "`n")"
+    $oldCodeAfterBootOutput = Invoke-NativeCapture $cliExe @baseArguments --json list
+    $newBootOldCodeRejected = (
+        $LASTEXITCODE -ne 0 -and
+        (($oldCodeAfterBootOutput -join "`n") -match
+            '(pairing_failed|控制码不存在或已经过期|控制码租约已经过期)')
+    )
+    if (-not $newBootOldCodeRejected) { throw '新 Agent 进程启动后旧控制码未被拒绝' }
+
+    $newBootArguments = @(
+        '--relay', $relayEndpoint,
+        '--server-name', '127.0.0.1',
+        '--ca-cert', $cert,
+        '--audit-log', $auditLog,
+        '--pair', "$newBootPairingCode=本机测试"
+    )
+    $newBootListJson = Invoke-NativeCapture $cliExe @newBootArguments --json list
+    if ($LASTEXITCODE -ne 0) { throw '新 Agent 进程的新控制码无法配对' }
+    $newBootConnections = @(($newBootListJson -join "`n") | ConvertFrom-Json)
+    if (-not $newBootConnections[0].session_id -or
+        $newBootConnections[0].session_id -eq $initialSessionId) {
+        throw '新 Agent 进程没有创建新会话'
     }
-    $expiredRecoveryConnections = @(($expiredRecoveryJson -join "`n") | ConvertFrom-Json)
-    if ($expiredRecoveryConnections[0].session_id -ne $initialSessionId) {
-        throw '离线租约过期恢复后 session_id 发生变化'
+    $newBootAgentIdentity = (Get-Content -LiteralPath $agentState -Raw | ConvertFrom-Json).agent_instance_id
+    if ($newBootAgentIdentity -ne $initialAgentIdentity) {
+        throw 'Agent 进程重启改变了长期设备身份'
     }
 
     $healthClient = [System.Net.Sockets.TcpClient]::new()
@@ -589,9 +652,9 @@ try {
         ConnectionList = $listOutput -join "`n"
         Cmd = $cmdOutput -join "`n"
         WindowsPowerShell = $powerShellOutput -join "`n"
-        PersistentShellOpen = $shellOpenJson -join "`n"
-        PersistentShellState = $shellReadOutput -join "`n"
-        PersistentShellClose = $shellCloseOutput -join "`n"
+        PersistentShellOpen = '通过'
+        PersistentShellState = '通过'
+        PersistentShellClose = '通过'
         PortProbe = $portOutput -join "`n"
         Upload = $uploadOutput -join "`n"
         Download = $downloadOutput -join "`n"
@@ -605,8 +668,10 @@ try {
         RelayRestartPreservedPairingCode = $true
         RelayHealthyAfterRestart = $relayHealthyAfterRestart
         ExpiredPairingCodeRejected = $expiredCodeRejected
-        ExpiredIdentityRecovered = $expiredIdentityRecovered
-        ExpiredRecoveryPreservedSession = $true
+        NewBootCodeRotated = $newBootCodeRotated
+        NewBootOldCodeRejected = $newBootOldCodeRejected
+        NewBootCreatedNewSession = $true
+        NewBootPreservedDeviceIdentity = $true
         RelayHealthyAfterLeaseExpiry = $true
     } | ConvertTo-Json -Depth 4
 }

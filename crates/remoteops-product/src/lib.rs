@@ -33,6 +33,41 @@ impl EndpointPolicy {
     }
 }
 
+/// 产品编译时确定的能力上限；配置、权限授权与宿主参数只能进一步收紧。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AgentCapabilityPolicy {
+    // 禁止所有内建图形操作及真实 Provider 生命周期。
+    visual_disabled: bool,
+    // 仅允许由公共策略重新计算为只读的操作。
+    read_only: bool,
+}
+impl AgentCapabilityPolicy {
+    /// 创建强制无图形产品上限。
+    #[must_use]
+    pub const fn headless() -> Self {
+        Self {
+            visual_disabled: true,
+            read_only: false,
+        }
+    }
+    /// 进一步限制为只读产品。
+    #[must_use]
+    pub const fn with_read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+    /// 产品是否允许图形操作。
+    #[must_use]
+    pub const fn visual_allowed(self) -> bool {
+        !self.visual_disabled
+    }
+    /// 产品是否仅允许只读操作。
+    #[must_use]
+    pub const fn read_only(self) -> bool {
+        self.read_only
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProductProfile {
     pub id: String,

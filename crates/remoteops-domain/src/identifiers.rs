@@ -57,8 +57,12 @@ macro_rules! uuid_identifier {
 }
 
 uuid_identifier!(
-    /// Agent 进程生命周期内保持不变的实例标识。
+    /// Agent 安装实例的持久身份，跨进程启动保持不变。
     AgentInstanceId
+);
+uuid_identifier!(
+    /// Agent 本次运行的随机标识，仅在进程内保留并供断线重连复用。
+    AgentBootId
 );
 uuid_identifier!(
     /// 控制端进程实例标识。

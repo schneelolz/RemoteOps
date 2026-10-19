@@ -1,0 +1,6 @@
+{
+  "state_file": "C:\\ProgramData\\ExampleServiceAgent\\Agent\\agent-state.json",
+  "transfer_root": "C:\\ProgramData\\ExampleServiceAgent\\Agent\\transfer",
+  "managed_enrollment_file": "enrollment.json",
+  "default_full_control": false
+}

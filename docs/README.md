@@ -53,7 +53,7 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 - Token、密码、私钥、控制码、恢复令牌和客户信息不得进入源码、文档、日志或安装包。
 - Agent 只主动出站连接 Relay，不监听客户公网端口。
 - 同一 Agent Session 只允许一个 `ControllerOwnerId`；Human 和 AI 可以作为同一 Owner 的不同角色协作，不能形成两个互相独立的控制者。
-- MCP 使用本地 STDIO；全新 Agent 默认逐项确认。协议 16 配套部署支持现场临时授权和持久默认模式，详见[控制权限与默认模式](control-permissions.md)。MCP 授权保留一小时空闲 TTL；只读、外部审批及宿主独立授权仍然有效。
+- MCP 使用本地 STDIO；全新 Agent 默认逐项确认。当前配套协议为 18，现场临时授权和持久默认模式见[控制权限与默认模式](control-permissions.md)。MCP 授权保留一小时空闲 TTL；只读、外部审批及宿主独立授权仍然有效。
 - 所有目标操作绑定不可变 `session_id`，不能根据主机名或别名猜测目标。
 - 发布包由 CI 从源码构建，并附带 SHA-256；`artifacts` 只是本地临时目录。
 - `target`、运行状态文件、审计日志、控制码、恢复令牌、TLS 私钥和任何本地 Token 都不属于公开发布内容。
@@ -65,3 +65,4 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 Agent GUI 现提供公共库入口；产品配置与构建资源分别位于 `remoteops-product` 和 `remoteops-build`。RemoteOps 默认入口与独立中性示例复用同一宿主。职责、实际接口、固定依赖版本、外部构建验证及迁移步骤见 [薄产品接入与迁移](product-integration.md)。
 
 - [公共底座与产品定制分离交付记录](product-refactor-delivery.md)：实际接口、完整文件清单、验证结果与待完成验收。
+- [定制服务 Agent 公共接口与兼容矩阵](integrations/custom-service-agent.md)、[门户 API v1](integrations/portal-api-v1.md)、[本轮验收记录](integrations/custom-service-delivery.md)。
