@@ -123,7 +123,9 @@ Agent GUI 在窗口初始化前安装本地 panic 记录器。Windows 事件查�
 
 每次运行会生成 `agent-gui-runtime-*.log`，记录版本、UTC 时间、进程 ID 和不含凭据的初始化阶段。原生窗口初始化返回错误时，日志还会记录 `error_display` 和 `error_debug`；连接失败时记录 `network_error`，用于区分 TLS、网络和协议错误。Rust panic 另生成 `agent-gui-crash-*.log`，包含 panic 位置和回溯。程序目录不可写时依次回退到 `%LOCALAPPDATA%\RemoteOps\logs` 和 `%TEMP%\RemoteOps\logs`。这些日志不记录 Token、控制码或恢复令牌。
 
-Windows 默认使用 WGPU 的 DirectX 12 后端和低延迟单帧交换链，避免基础显示驱动在悬停重绘时积压帧；复制按钮不再创建额外悬停浮层。日志会记录 `renderer`、`wgpu_backend`、`wgpu_device_type`、适配器和驱动。只有兼容性诊断时才使用 `--renderer glow`；它要求 OpenGL 2.0，不适用于仅提供系统 OpenGL 1.1 的 Windows Server、RDP 和云主机。窗口初始化失败时程序会显示系统错误对话框，并在日志中保留完整错误。
+Windows 默认使用 WGPU 的 DirectX 12 后端和低延迟单帧交换链，避免基础显示驱动在悬停重绘时积压帧；复制按钮不再创建额外悬停浮层。日志会记录 `renderer`、`wgpu_backend`、`wgpu_device_type`、适配器和驱动。默认 WGPU 若在应用创建前返回图形初始化错误，原 UI 线程退出后会用同一 EXE 自动尝试一次 Glow；没有 DX12 但具备 OpenGL 2.0 的环境可使用该兼容路径。显式 `--renderer wgpu`、`--renderer glow` 或产品的 `*_RENDERER` 环境变量会固定选择，不自动回退。Glow 仍要求 OpenGL 2.0，只有系统 OpenGL 1.1 或完全没有可用驱动的环境不保证可用。
+
+兼容模式包含一个等待中的父进程和一个真正运行 GUI/Agent 的子进程；父进程不会建立 Agent 连接。已经进入应用创建回调后的错误或运行期错误不重启产品，也不重放操作。父日志保留原 DX12 错误和子进程 PID、退出状态；子进程独立记录 Glow 结果，失败时只显示子进程错误对话框。诊断时请保留这两个进程对应的日志。
 
 如果只有 Windows 事件 `0xc000041d` 而没有 `agent-gui-crash-*.log`，该异常可能发生在 Rust panic 捕获范围之外。请在管理员 PowerShell 中启用 Windows Error Reporting 完整转储：
 
