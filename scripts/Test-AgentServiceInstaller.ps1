@@ -152,3 +152,6 @@ Invoke-Case -Name 'description-failure' -ThrowDescription $true -ExpectedError '
 Invoke-Case -Name 'recovery-failure' -ScCode 1072 -ExpectedError '1072'
 $global:RemoteOpsInstallerTestState.Results | ConvertTo-Json
 Write-Output ('Passed: ' + $global:RemoteOpsInstallerTestState.Results.Count + '; fixture=' + $fixtureRoot)
+
+# 最后一个用例模拟原生失败；断言均通过后清零，避免 CI 将预期失败作为整套退出码。
+$global:LASTEXITCODE = 0
