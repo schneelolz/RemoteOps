@@ -1260,6 +1260,17 @@ pub async fn run_agent_with_options(
     let environment = detect_environment_profile(device.as_ref()).await;
     let (boundary, visual_provider, capabilities) =
         runtime::prepare(&options, &environment, runtime::native_facts()).await?;
+    if let Some(diagnostic) = boundary.visual_diagnostic() {
+        emit_agent_event(
+            event_sender.as_ref(),
+            AgentEvent::OperationLog(AgentOperationLog {
+                request_id: None,
+                occurred_at: Utc::now(),
+                level: AgentLogLevel::Info,
+                message: format!("图形探测：{diagnostic}"),
+            }),
+        );
+    }
     let boundary = Arc::new(boundary);
     let host_identity = remoteops_host_identity::collect();
     let hostname = host_identity.hostname;
@@ -1412,7 +1423,7 @@ where
         protocol_version: PROTOCOL_VERSION,
         agent_instance_id,
         boot_id,
-        target_context: Some((*boundary.context).clone()),
+        target_context: Some(boundary.snapshot()),
         pairing_mode,
         managed_enrollment,
         resume_token,
@@ -1804,7 +1815,7 @@ where
                         continue;
                     }
                 };
-                if let Err(error) = boundary.check_current(&request.operation) {
+                if let Err(error) = boundary.check_for_dispatch(&request.operation) {
                     let code = error
                         .downcast_ref::<runtime::RuntimeDenied>()
                         .map_or("product_policy_disabled", |denied| denied.code.as_str());
@@ -2416,6 +2427,19 @@ async fn execute_request(
     }
     match result {
         Ok(mut response) => {
+            if matches!(request.operation, RemoteOperation::GetTargetContext)
+                && response.summary.starts_with("图形探测：")
+            {
+                send_event(
+                    sender,
+                    sequence,
+                    &request,
+                    EventPayload::OutputChunk {
+                        stderr: false,
+                        text: response.summary.clone(),
+                    },
+                );
+            }
             if let Some(details) = &response.details {
                 send_event(
                     sender,
@@ -2488,6 +2512,13 @@ async fn execute_operation(
     sender: &mpsc::UnboundedSender<WireMessage>,
     sequence: &Arc<AtomicU64>,
 ) -> anyhow::Result<RemoteResponse> {
+    // 只有已认证的只读观察请求能重试临时失败；输入和控件操作仍先拒绝。
+    if matches!(request.operation, RemoteOperation::VisualObserve { .. }) {
+        runtime_state
+            .boundary
+            .refresh_visual(runtime_state.visual_provider.as_ref())
+            .await;
+    }
     runtime_state.boundary.check_current(&request.operation)?;
     let shell_sessions = &runtime_state.shell_sessions;
     let serial_sessions = &runtime_state.serial_sessions;
@@ -2504,8 +2535,12 @@ async fn execute_operation(
     };
     match &request.operation {
         RemoteOperation::GetTargetContext => {
-            "目标产品与运行上下文".clone_into(&mut response.summary);
-            response.details = Some(serde_json::to_value(runtime_state.boundary.snapshot())?);
+            let context = runtime_state.boundary.snapshot();
+            response.summary = runtime_state.boundary.visual_diagnostic().map_or_else(
+                || "目标产品与运行上下文".to_owned(),
+                |diagnostic| format!("图形探测：{diagnostic}"),
+            );
+            response.details = Some(serde_json::to_value(context)?);
         }
         RemoteOperation::OpenShell { shell } => {
             let session = device.open_interactive_shell(*shell).await?;

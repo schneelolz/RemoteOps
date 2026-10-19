@@ -916,6 +916,9 @@ impl RemoteOpsAgentApp {
                 }
             }
             AgentEvent::OperationLog(log) => {
+                if let Some(diagnostic) = log.message.strip_prefix("图形探测：") {
+                    self.diagnostics.record_detail("visual_probe", diagnostic);
+                }
                 store_operation_log(
                     &mut self.operation_logs,
                     log,
@@ -4003,6 +4006,29 @@ mod tests {
             layout_is_setup: None,
             window_centering: WindowCenteringState::default(),
         }
+    }
+
+    #[test]
+    fn visual_probe_diagnostic_is_persisted_without_credentials() {
+        let path = std::env::temp_dir().join(format!(
+            "remoteops-visual-diagnostic-{}.log",
+            RequestId::new()
+        ));
+        std::fs::write(&path, "").unwrap();
+        let mut app = test_app();
+        app.diagnostics = StartupDiagnostics {
+            path: Some(path.clone()),
+        };
+        app.apply_event(AgentEvent::OperationLog(AgentOperationLog {
+            request_id: None,
+            occurred_at: Utc::now(),
+            level: AgentLogLevel::Info,
+            message: "图形探测：code=visual_probe_timeout elapsed_ms=35000 Authorization: Bearer diagnostic-test-secret".into(),
+        }));
+        let log = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(log.contains("visual_probe: code=visual_probe_timeout elapsed_ms=35000"));
+        assert!(!log.contains("diagnostic-test-secret"));
     }
 
     #[test]

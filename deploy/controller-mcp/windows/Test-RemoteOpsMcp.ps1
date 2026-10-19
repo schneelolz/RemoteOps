@@ -1,6 +1,9 @@
 ﻿[CmdletBinding()]
 param(
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
+    [string]$CandidateDirectory,
+    [ValidatePattern('^[a-fA-F0-9]{64}$')][string]$ExpectedMcpSha256,
+    [ValidatePattern('^[a-fA-F0-9]{64}$')][string]$ExpectedCredentialPromptSha256,
     [switch]$SkipNetwork,
     [switch]$CredentialPromptSmokeTest
 )
@@ -8,12 +11,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$expectedMcpVersion = '0.2.0-preview.14'
+$expectedMcpVersion = '0.2.0-preview.15'
 $expectedCredentialPromptVersion = '0.2.0-preview.5'
 $expectedToolTimeoutSec = 360
 $configPath = Join-Path $CodexHome 'config.toml'
 $installDirectory = Join-Path $CodexHome 'remoteops'
 $installedExecutable = $null
+$candidateExecutable = $null
 $connectionConfigPath = Join-Path $installDirectory 'controller-config.json'
 $credentialPromptPath = Join-Path $installDirectory 'remoteops-credential-prompt.exe'
 $defaultCodexHome = Join-Path $env:USERPROFILE '.codex'
@@ -28,21 +32,23 @@ else {
 $compatSkillPath = Join-Path $CodexHome 'skills\remoteops\SKILL.md'
 $failures = [System.Collections.Generic.List[string]]::new()
 
-function Read-CodexInspection {
+function Invoke-CheckExecutable {
     param(
         [Parameter(Mandatory)][string]$Executable,
-        [Parameter(Mandatory)][string]$CodexConfig
+        [Parameter(Mandatory)][string[]]$Arguments
     )
 
     # Rust always emits UTF-8. A native PowerShell pipeline instead uses the
     # console output code page, corrupting non-ASCII installation paths.
-    $quotedPath = '"' + ([regex]::Replace(
-        [regex]::Replace($CodexConfig, '(\\*)"', '$1$1\"'),
-        '(\\+)$', '$1$1'
-    )) + '"'
+    $quotedArguments = foreach ($argument in $Arguments) {
+        '"' + ([regex]::Replace(
+            [regex]::Replace($argument, '(\\*)"', '$1$1\"'),
+            '(\\+)$', '$1$1'
+        )) + '"'
+    }
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Executable
-    $startInfo.Arguments = '--inspect-codex ' + $quotedPath
+    $startInfo.Arguments = $quotedArguments -join ' '
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
@@ -54,17 +60,17 @@ function Read-CodexInspection {
     $processStarted = $false
     try {
         $processStarted = $process.Start()
-        if (-not $processStarted) { throw '无法启动 Codex 配置检查。' }
+        if (-not $processStarted) { throw '无法启动安装检查子进程。' }
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit(30000)) {
             $process.Kill()
             $process.WaitForExit()
-            throw 'Codex 配置检查超时。'
+            throw '安装检查子进程超时。'
         }
         $outputText = $stdout.GetAwaiter().GetResult()
         $null = $stderr.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) { throw 'Codex remoteops 配置解析失败。' }
+        if ($process.ExitCode -ne 0) { throw '安装检查子进程失败；未回显输出。' }
         return $outputText
     }
     finally {
@@ -78,18 +84,54 @@ function Read-CodexInspection {
     }
 }
 
+$candidateRequested = -not [string]::IsNullOrWhiteSpace($CandidateDirectory) -or
+    -not [string]::IsNullOrWhiteSpace($ExpectedMcpSha256) -or
+    -not [string]::IsNullOrWhiteSpace($ExpectedCredentialPromptSha256)
+if ($candidateRequested) {
+    if ([string]::IsNullOrWhiteSpace($CandidateDirectory) -or
+        [string]::IsNullOrWhiteSpace($ExpectedMcpSha256) -or
+        [string]::IsNullOrWhiteSpace($ExpectedCredentialPromptSha256)) {
+        throw '旁路检查必须同时提供 CandidateDirectory 和两个可信来源的 SHA-256。'
+    }
+    $candidateRoot = [IO.Path]::GetFullPath((Join-Path $installDirectory 'candidates')).TrimEnd('\')
+    $selectedDirectory = [IO.Path]::GetFullPath($CandidateDirectory).TrimEnd('\')
+    if ([IO.Path]::GetDirectoryName($selectedDirectory) -ine $candidateRoot) {
+        throw '旁路目录必须是当前 Codex 安装 candidates 目录的直接子目录。'
+    }
+    $candidateExecutable = Join-Path $selectedDirectory 'remoteops-controller-mcp.exe'
+    $credentialPromptPath = Join-Path $selectedDirectory 'remoteops-credential-prompt.exe'
+    # 仅检查明确选择的一层目录，不能通过联接或符号链接跳到其他安装。
+    foreach ($directory in @($installDirectory, $candidateRoot, $selectedDirectory)) {
+        if (-not (Test-Path -LiteralPath $directory -PathType Container) -or
+            ((Get-Item -LiteralPath $directory -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw '旁路安装目录缺失或包含重解析点。'
+        }
+    }
+    foreach ($entry in @(@($candidateExecutable, $ExpectedMcpSha256), @($credentialPromptPath, $ExpectedCredentialPromptSha256))) {
+        if (-not (Test-Path -LiteralPath $entry[0] -PathType Leaf) -or
+            ((Get-Item -LiteralPath $entry[0] -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw '旁路程序缺失或是重解析点。'
+        }
+        if ((Get-FileHash -LiteralPath $entry[0] -Algorithm SHA256).Hash -ine $entry[1]) {
+            throw '旁路程序 SHA-256 与受信任构建不一致；未执行程序。'
+        }
+    }
+    Write-Host '[通过] 旁路目录边界与两个程序的 SHA-256 已验证。'
+}
+
 if (-not (Test-Path -LiteralPath $credentialPromptPath -PathType Leaf)) {
     $failures.Add("未找到 SSH 密码安全输入程序：$credentialPromptPath")
 }
 else {
     Write-Host '[通过] SSH 密码安全输入程序已安装。'
-    $promptVersionOutput = (& $credentialPromptPath --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $promptVersionOutput -notmatch [regex]::Escape($expectedCredentialPromptVersion)) {
-        $failures.Add("SSH 密码安全输入程序版本不正确：$promptVersionOutput")
+    try {
+        $promptVersionOutput = (Invoke-CheckExecutable -Executable $credentialPromptPath -Arguments @('--version')).Trim()
+        if ($promptVersionOutput -notmatch ('^remoteops-credential-prompt\s+' + [regex]::Escape($expectedCredentialPromptVersion) + '$')) {
+            $failures.Add('SSH 密码安全输入程序版本不正确。')
+        }
+        else { Write-Host "[通过] SSH 密码安全输入程序版本：$promptVersionOutput" }
     }
-    else {
-        Write-Host "[通过] SSH 密码安全输入程序版本：$promptVersionOutput"
-    }
+    catch { $failures.Add('无法安全检查 SSH 密码输入程序版本。') }
 }
 
 foreach ($skillPath in @($standardSkillPath, $compatSkillPath) | Select-Object -Unique) {
@@ -149,6 +191,7 @@ else {
     # Inspect using only a known package/installation path. Never execute a path
     # taken from Codex config before constraining it to this installation.
     $inspectionExecutable = Join-Path $PSScriptRoot 'remoteops-controller-mcp.exe'
+    if ($candidateRequested) { $inspectionExecutable = $candidateExecutable }
     if (-not (Test-Path -LiteralPath $inspectionExecutable -PathType Leaf)) {
         $inspectionExecutable = Join-Path $installDirectory "remoteops-controller-mcp-$expectedMcpVersion.exe"
     }
@@ -157,13 +200,15 @@ else {
     }
     else {
         try {
-            $inspectionText = Read-CodexInspection -Executable $inspectionExecutable -CodexConfig $configPath
+            $inspectionText = Invoke-CheckExecutable -Executable $inspectionExecutable -Arguments @('--inspect-codex', $configPath)
             $inspection = $inspectionText | ConvertFrom-Json
             $candidate = [IO.Path]::GetFullPath([string]$inspection.command)
             $expectedDirectory = [IO.Path]::GetFullPath($installDirectory).TrimEnd('\')
-            if ([IO.Path]::GetDirectoryName($candidate).TrimEnd('\') -ne $expectedDirectory -or
-                [IO.Path]::GetFileName($candidate) -notmatch
-                "^remoteops-controller-mcp-$([regex]::Escape($expectedMcpVersion))(?:-[0-9a-f]{12})?\.exe$") {
+            $standardCommand = [IO.Path]::GetDirectoryName($candidate).TrimEnd('\') -ieq $expectedDirectory -and
+                [IO.Path]::GetFileName($candidate) -match
+                "^remoteops-controller-mcp-$([regex]::Escape($expectedMcpVersion))(?:-[0-9a-f]{12})?\.exe$"
+            $selectedCommand = $candidateRequested -and $candidate -ieq $candidateExecutable
+            if (($candidateRequested -and -not $selectedCommand) -or (-not $candidateRequested -and -not $standardCommand)) {
                 $failures.Add('Codex remoteops 命令不属于当前安装目录；不会执行未知命令。')
             }
             else {
@@ -199,30 +244,26 @@ if ([string]::IsNullOrWhiteSpace($installedExecutable)) {
 elseif (-not (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
     $failures.Add("未找到 MCP 程序：$installedExecutable")
 }
-elseif (
-    (Split-Path -Leaf $installedExecutable) -notmatch
-        "^remoteops-controller-mcp-$([regex]::Escape($expectedMcpVersion))(?:-[0-9a-f]{12})?\.exe$"
-) {
-    $failures.Add('RemoteOps MCP 配置没有指向当前版本程序。')
-}
 else {
-    $versionOutput = (& $installedExecutable --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($expectedMcpVersion)) {
-        $failures.Add("MCP 版本不正确：$versionOutput")
+    try {
+        $versionOutput = (Invoke-CheckExecutable -Executable $installedExecutable -Arguments @('--version')).Trim()
+        if ($versionOutput -notmatch ('^remoteops-controller-mcp\s+' + [regex]::Escape($expectedMcpVersion) + '$')) {
+            $failures.Add('MCP 版本不正确。')
+            $installedExecutable = $null
+        }
+        else { Write-Host "[通过] MCP 版本：$versionOutput" }
     }
-    else {
-        Write-Host "[通过] MCP 版本：$versionOutput"
-    }
+    catch { $failures.Add('无法安全检查 MCP 版本。'); $installedExecutable = $null }
 }
 
 if ($usesCredentialStore) {
     if ($installedExecutable -and (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
-        & $installedExecutable --check-credential --config $connectionConfigPath | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            $failures.Add('无法读取此安装的 Windows Credential Manager 凭据；请保留设置状态并重新运行安装器。')
-        }
-        else {
+        try {
+            $null = Invoke-CheckExecutable -Executable $installedExecutable -Arguments @('--check-credential', '--config', $connectionConfigPath)
             Write-Host '[通过] 独立 Controller 凭据存在于 Windows Credential Manager（未读取到脚本）。'
+        }
+        catch {
+            $failures.Add('无法读取此安装的 Windows Credential Manager 凭据；请保留设置状态并重新运行安装器。')
         }
     }
     $parsedOwner = [guid]::Empty

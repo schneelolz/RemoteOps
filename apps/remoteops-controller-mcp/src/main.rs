@@ -2190,37 +2190,12 @@ impl RemoteOpsMcp {
         Parameters(input): Parameters<TargetInput>,
     ) -> Result<Json<ActionOutput>, String> {
         let session_id = parse_session_id(&input.session_id)?;
-        let connection = self
-            .client
-            .list_connections()
-            .await
-            .into_iter()
-            .find(|connection| connection.session_id == session_id)
-            .ok_or_else(|| "未找到 session_id".to_owned())?;
-        if !supports_target_context(&connection) {
-            return Ok(Json(visual_unavailable_output(
-                session_id,
-                "host_context_unknown",
-            )));
-        }
-        if let Some(reason) = connection
-            .target_context
-            .as_ref()
-            .and_then(remoteops_domain::TargetContext::visual_disabled_reason)
-        {
-            return Ok(Json(visual_unavailable_output(session_id, reason)));
-        }
         let mut output = self
-            .execute_simple(
-                input.session_id,
-                RemoteOperation::VisualObserve {
-                    include_screenshot: true,
-                    include_ui_tree: true,
-                },
-                None,
-                None,
-            )
+            .observe_with_refreshed_context(session_id, true, true)
             .await?;
+        if output.0.status != "completed" {
+            return Ok(output);
+        }
         if let Some(mut observation) = output.0.details.take() {
             let uia_available = visual_uia_available(&observation);
             let interactive_desktop = observation
@@ -2312,14 +2287,10 @@ impl RemoteOpsMcp {
         &self,
         Parameters(input): Parameters<VisualObserveInput>,
     ) -> Result<Json<ActionOutput>, String> {
-        self.execute_simple(
-            input.session_id,
-            RemoteOperation::VisualObserve {
-                include_screenshot: input.include_screenshot.unwrap_or(true),
-                include_ui_tree: input.include_ui_tree.unwrap_or(true),
-            },
-            None,
-            None,
+        self.observe_with_refreshed_context(
+            parse_session_id(&input.session_id)?,
+            input.include_screenshot.unwrap_or(true),
+            input.include_ui_tree.unwrap_or(true),
         )
         .await
     }
@@ -3459,6 +3430,59 @@ impl RemoteOpsMcp {
         Ok(Json(action_output(session_id, result)))
     }
 
+    /// 显式只读观察前后刷新同一目标，避免恢复后的能力继续停留在旧缓存。
+    async fn observe_with_refreshed_context(
+        &self,
+        session_id: SessionId,
+        include_screenshot: bool,
+        include_ui_tree: bool,
+    ) -> Result<Json<ActionOutput>, String> {
+        let connection = self
+            .client
+            .list_connections()
+            .await
+            .into_iter()
+            .find(|connection| connection.session_id == session_id)
+            .ok_or_else(|| "未找到 session_id".to_owned())?;
+        if !supports_target_context(&connection) {
+            return Ok(Json(visual_unavailable_output(
+                session_id,
+                "host_context_unknown",
+            )));
+        }
+        // 只依赖本次精确会话的事实，刷新失败不能沿用缓存中的可用状态。
+        let fresh_context = self.client.refresh_target_context(session_id).await.ok();
+        if let Err(reason) = desktop_probe_context(fresh_context.as_ref()) {
+            return Ok(Json(visual_unavailable_output(session_id, reason)));
+        }
+        let output = self
+            .execute_simple(
+                session_id.to_string(),
+                RemoteOperation::VisualObserve {
+                    include_screenshot,
+                    include_ui_tree,
+                },
+                None,
+                None,
+            )
+            .await?;
+        // 观察可能恢复或撤销图形能力；完成后仍以同一目标的当前事实为准。
+        let latest_context = self.client.refresh_target_context(session_id).await.ok();
+        let unavailable_reason = desktop_probe_context(latest_context.as_ref())
+            .err()
+            .or_else(|| {
+                latest_context
+                    .as_ref()
+                    .and_then(remoteops_domain::TargetContext::visual_disabled_reason)
+            });
+        if let Some(reason) = unavailable_reason {
+            let mut unavailable = visual_unavailable_output(session_id, reason);
+            unavailable.request_id = output.0.request_id;
+            return Ok(Json(unavailable));
+        }
+        Ok(output)
+    }
+
     async fn execute_simple(
         &self,
         session_id: String,
@@ -4181,6 +4205,19 @@ fn supports_target_context(connection: &remoteops_domain::ConnectionDescriptor) 
             .is_some_and(|context| context.validate().is_ok())
 }
 
+/// 仅本次成功刷新的事实可触发只读探测；缓存和未知状态不授予恢复机会。
+fn desktop_probe_context(context: Option<&remoteops_domain::TargetContext>) -> Result<(), &str> {
+    let Some(context) = context else {
+        return Err("host_context_unknown");
+    };
+    if context.visual_probe_allowed() {
+        return Ok(());
+    }
+    Err(context
+        .visual_disabled_reason()
+        .unwrap_or("host_context_unknown"))
+}
+
 fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> ConnectionOutput {
     let reported = supports_target_context(&connection);
     let visual_allowed = reported
@@ -4228,8 +4265,9 @@ fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> Conn
         capabilities: connection
             .capabilities
             .iter()
-            .filter(|capability| **capability != Capability::Visual || visual_allowed)
+            .filter(|capability| **capability != Capability::Visual)
             .map(|capability| format!("{capability:?}").to_lowercase())
+            .chain(visual_allowed.then(|| "visual".to_owned()))
             .collect(),
     }
 }
@@ -4330,9 +4368,87 @@ mod tests {
         assert!(details["observation"].is_null());
     }
 
+    fn graphics_test_context() -> remoteops_domain::TargetContext {
+        remoteops_domain::TargetContext {
+            product_id: "customer-gui".into(),
+            run_mode: remoteops_domain::AgentRunMode::Interactive,
+            facts: remoteops_domain::TargetRuntimeFacts {
+                interactive_desktop: remoteops_domain::CapabilityAvailability::Available,
+                observed_at: chrono::Utc::now(),
+                source: "host_runtime".into(),
+                ..remoteops_domain::TargetRuntimeFacts::default()
+            },
+            capabilities: vec![remoteops_domain::TargetCapabilityStatus {
+                capability: "visual".into(),
+                status: remoteops_domain::CapabilityAvailability::Available,
+                reasons: vec![],
+            }],
+            ..remoteops_domain::TargetContext::default()
+        }
+    }
+
     #[test]
-    fn target_context_outputs_are_session_scoped_and_missing_context_is_unknown() {
-        let make = |id: &str| remoteops_domain::ConnectionDescriptor {
+    fn desktop_probe_uses_fresh_facts_and_preserves_transient_failures() {
+        let mut context = graphics_test_context();
+        context.capabilities[0].status = remoteops_domain::CapabilityAvailability::Unavailable;
+        for reason in [
+            "visual_probe_failed",
+            "visual_probe_timeout",
+            "visual_probe_error",
+            "visual_windows_unavailable",
+        ] {
+            context.capabilities[0].reasons = vec![reason.into()];
+            assert_eq!(super::desktop_probe_context(Some(&context)), Ok(()));
+            assert_eq!(context.visual_disabled_reason(), Some(reason));
+        }
+        // 失败只允许显式观察重新验证；恢复后的事实才能显示图形能力可用。
+        context.capabilities[0].status = remoteops_domain::CapabilityAvailability::Available;
+        context.capabilities[0].reasons.clear();
+        assert_eq!(super::desktop_probe_context(Some(&context)), Ok(()));
+        assert!(context.visual_allowed());
+        // 刷新失败不接受此前成功的 context 作为替代证据。
+        assert_eq!(
+            super::desktop_probe_context(None),
+            Err("host_context_unknown")
+        );
+    }
+
+    #[test]
+    fn desktop_probe_never_borrows_gui_permission_for_service_or_unknown_target() {
+        let gui = graphics_test_context();
+        let mut service = gui.clone();
+        service.product_id = "opscenter-agent".into();
+        service.run_mode = remoteops_domain::AgentRunMode::WindowsService;
+        assert_eq!(
+            super::desktop_probe_context(Some(&service)),
+            Err("product_policy_disabled")
+        );
+        assert_eq!(super::desktop_probe_context(Some(&gui)), Ok(()));
+        let mut unknown = gui.clone();
+        unknown.run_mode = remoteops_domain::AgentRunMode::Unknown;
+        assert_eq!(
+            super::desktop_probe_context(Some(&unknown)),
+            Err("host_context_unknown")
+        );
+        let mut failed = gui;
+        failed.capabilities[0].status = remoteops_domain::CapabilityAvailability::Unavailable;
+        failed.capabilities[0].reasons = vec!["future_reason".into()];
+        assert_eq!(
+            super::desktop_probe_context(Some(&failed)),
+            Err("future_reason")
+        );
+        failed.capabilities[0].reasons = vec![
+            "product_policy_disabled".into(),
+            "visual_probe_timeout".into(),
+        ];
+        assert_eq!(
+            super::desktop_probe_context(Some(&failed)),
+            Err("product_policy_disabled")
+        );
+    }
+
+    fn graphics_test_connection(id: &str) -> remoteops_domain::ConnectionDescriptor {
+        remoteops_domain::ConnectionDescriptor {
             session_id: remoteops_domain::SessionId::new(),
             agent_instance_id: remoteops_domain::AgentInstanceId::new(),
             display_index: 1,
@@ -4355,8 +4471,12 @@ mod tests {
             updated_at: chrono::Utc::now(),
             mac_address: None,
             target_context: None,
-        };
-        let mut legacy_with_metadata = make("legacy-with-metadata");
+        }
+    }
+
+    #[test]
+    fn target_context_outputs_are_session_scoped_and_missing_context_is_unknown() {
+        let mut legacy_with_metadata = graphics_test_connection("legacy-with-metadata");
         legacy_with_metadata.environment.protocol_version = 17;
         legacy_with_metadata.target_context = Some(remoteops_domain::TargetContext::default());
         assert!(!super::supports_target_context(&legacy_with_metadata));
@@ -4364,14 +4484,14 @@ mod tests {
             super::connection_output(legacy_with_metadata).target_context_status,
             "unknown"
         );
-        let mut service = make("service");
+        let mut service = graphics_test_connection("service");
         service.target_context = Some(remoteops_domain::TargetContext {
             product_id: "opscenter-agent".into(),
             run_mode: remoteops_domain::AgentRunMode::WindowsService,
             ..remoteops_domain::TargetContext::default()
         });
         let service = super::connection_output(service);
-        let legacy = super::connection_output(make("legacy-gui"));
+        let legacy = super::connection_output(graphics_test_connection("legacy-gui"));
         assert_ne!(service.session_id, legacy.session_id);
         assert_eq!(service.target_context["product_id"], "opscenter-agent");
         assert_eq!(legacy.target_context["product_id"], "unknown");
@@ -4379,6 +4499,83 @@ mod tests {
         assert!(!legacy.capabilities.iter().any(|cap| cap == "visual"));
         assert!(!service.capabilities.iter().any(|cap| cap == "visual"));
         assert!(service.guidance_is_advisory && legacy.guidance_is_advisory);
+    }
+
+    #[test]
+    fn target_output_restores_visual_only_from_its_own_current_context() {
+        use remoteops_domain::{AgentRunMode, Capability, CapabilityAvailability, CapabilitySet};
+        let mut gui = graphics_test_connection("recovering-gui");
+        gui.capabilities = CapabilitySet::new([Capability::Cmd, Capability::PowerShell]);
+        let mut context = graphics_test_context();
+        context.capabilities[0].status = CapabilityAvailability::Unavailable;
+        context.capabilities[0].reasons = vec!["visual_probe_timeout".into()];
+        gui.target_context = Some(context.clone());
+        let before = super::connection_output(gui.clone());
+        assert!(
+            !before
+                .capabilities
+                .iter()
+                .any(|capability| capability == "visual")
+        );
+        assert!(
+            before
+                .capabilities
+                .iter()
+                .any(|capability| capability == "cmd")
+        );
+        assert!(
+            before
+                .capabilities
+                .iter()
+                .any(|capability| capability == "powershell")
+        );
+
+        context.capabilities[0].status = CapabilityAvailability::Available;
+        context.capabilities[0].reasons.clear();
+        gui.target_context = Some(context);
+        let after = super::connection_output(gui.clone());
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(
+            after
+                .capabilities
+                .iter()
+                .filter(|capability| *capability == "visual")
+                .count(),
+            1
+        );
+        assert_eq!(after.capabilities.len(), before.capabilities.len() + 1);
+        let mut service = graphics_test_connection("service");
+        service.target_context = gui.target_context.clone();
+        service.target_context.as_mut().unwrap().run_mode = AgentRunMode::WindowsService;
+        let service = super::connection_output(service);
+        assert_ne!(service.session_id, after.session_id);
+        assert!(
+            !service
+                .capabilities
+                .iter()
+                .any(|capability| capability == "visual")
+        );
+        assert!(
+            after
+                .capabilities
+                .iter()
+                .any(|capability| capability == "visual")
+        );
+        gui.target_context = None;
+        gui.capabilities = CapabilitySet::new([Capability::Cmd, Capability::Visual]);
+        let unknown = super::connection_output(gui);
+        assert!(
+            !unknown
+                .capabilities
+                .iter()
+                .any(|capability| capability == "visual")
+        );
+        assert!(
+            unknown
+                .capabilities
+                .iter()
+                .any(|capability| capability == "cmd")
+        );
     }
 
     #[test]

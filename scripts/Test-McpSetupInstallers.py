@@ -10,6 +10,7 @@ proxies Codex editing to the real MCP binary. Only network/credentials are fake.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -64,10 +65,15 @@ fn main() {
             std::process::exit(88);
         }
     }
+    if let Ok(marker) = env::var("INSTALLER_TEST_EXECUTION_MARKER") {
+        fs::write(marker, "fixture executable started").unwrap();
+    }
     if args.iter().any(|a| a == "--version") {
         if args[0].contains("credential-prompt") {
-            println!("remoteops-credential-prompt 0.2.0-preview.5");
-        } else { println!("remoteops-controller-mcp @MCP_VERSION@"); }
+            println!("remoteops-credential-prompt {}", env::var("INSTALLER_TEST_PROMPT_VERSION")
+                .unwrap_or_else(|_| "0.2.0-preview.5".to_owned()));
+        } else { println!("remoteops-controller-mcp {}", env::var("INSTALLER_TEST_MCP_VERSION")
+            .unwrap_or_else(|_| "@MCP_VERSION@".to_owned())); }
         return;
     }
     let mut log = fs::OpenOptions::new().create(true).append(true)
@@ -417,16 +423,22 @@ class InstallerTests(unittest.TestCase):
     def test_hidden_setup_prompt(self):
         self.assert_success(self.run_installer(code=True, input_content=SETUP + "\n"))
 
-    def run_verifier(self, *, output_encoding=None):
+    def run_verifier(self, *, output_encoding=None, extra=()):
         if self.target == "windows":
             command = [self.powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
                        str(self.package / "Test-RemoteOpsMcp.ps1"), "-SkipNetwork"]
             if output_encoding is not None:
                 self.env["INSTALLER_TEST_VERIFIER"] = str(self.package / "Test-RemoteOpsMcp.ps1")
+                self.env["INSTALLER_TEST_VERIFIER_ARGUMENTS"] = json.dumps(list(extra))
                 wrapper = ("$ErrorActionPreference = 'Stop'; "
                            "[Console]::OutputEncoding = [Text.Encoding]::GetEncoding(" + str(output_encoding) + "); "
-                           "& $env:INSTALLER_TEST_VERIFIER -SkipNetwork")
-                command = [self.powershell, "-NoProfile", "-NonInteractive", "-Command", wrapper]
+                           "$values = ConvertFrom-Json $env:INSTALLER_TEST_VERIFIER_ARGUMENTS; "
+                           "$extraArguments = @{}; for ($i = 0; $i -lt $values.Count; $i += 2) { "
+                           "$extraArguments[$values[$i].TrimStart('-')] = $values[$i + 1] }; "
+                           "& $env:INSTALLER_TEST_VERIFIER -SkipNetwork @extraArguments")
+                command = [self.powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", wrapper]
+            else:
+                command += list(extra)
         else:
             command = ["bash", str(self.package / "test-remoteops-mcp.sh"), "--skip-network"]
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env, timeout=30)
@@ -442,6 +454,143 @@ class InstallerTests(unittest.TestCase):
     def test_installed_verifier_uses_native_credential_helper(self):
         self.assert_success(self.run_installer())
         self.assert_verifier_success()
+
+    def configure_verifier_command(self, executable):
+        subprocess.run([str(self.real_helper), "--configure-codex", str(self.config),
+                        "--mcp-command", str(executable),
+                        "--mcp-config", str(self.codex / "remoteops/controller-config.json"),
+                        "--mcp-mode", "agent-controlled"],
+                       capture_output=True, check=True, env=self.env)
+
+    def prepare_windows_candidate(self):
+        if self.target != "windows":
+            self.skipTest("Windows side-by-side installation verifier")
+        self.assert_success(self.run_installer())
+        directory = self.codex / "remoteops/candidates/候選 spaces & protocol18"
+        directory.mkdir(parents=True)
+        for name in ["remoteops-controller-mcp.exe", "remoteops-credential-prompt.exe"]:
+            shutil.copy2(self.binary, directory / name)
+        self.configure_verifier_command(directory / "remoteops-controller-mcp.exe")
+        return directory
+
+    def candidate_arguments(self, directory):
+        return ["-CandidateDirectory", str(directory),
+                "-ExpectedMcpSha256", hashlib.sha256((directory / "remoteops-controller-mcp.exe").read_bytes()).hexdigest(),
+                "-ExpectedCredentialPromptSha256", hashlib.sha256((directory / "remoteops-credential-prompt.exe").read_bytes()).hexdigest()]
+
+    def forbid_fixture_execution(self, executable=None):
+        marker = self.root / "unexpected-candidate-execution"
+        if executable is None:
+            self.env["INSTALLER_TEST_EXECUTION_MARKER"] = str(marker)
+        else:
+            self.env["INSTALLER_TEST_FORBIDDEN_EXECUTABLE"] = str(executable)
+            self.env["INSTALLER_TEST_FORBIDDEN_MARKER"] = str(marker)
+        return marker
+
+    def assert_candidate_rejected_without_execution(self, arguments, marker):
+        previous = self.config.read_bytes()
+        result = self.run_verifier(extra=arguments)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), "Verifier executed an untrusted fixture program")
+        self.assertEqual(self.config.read_bytes(), previous)
+
+    def test_windows_candidate_verifier_accepts_unicode_and_uses_selected_helper(self):
+        directory = self.prepare_windows_candidate()
+        marker = self.forbid_fixture_execution(self.codex / "remoteops/remoteops-credential-prompt.exe")
+        for encoding in [None, 437, 1252]:
+            with self.subTest(console_encoding=encoding):
+                result = self.run_verifier(extra=self.candidate_arguments(directory), output_encoding=encoding)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(marker.exists(), "Candidate verification used the old installation's helper")
+
+    def test_windows_candidate_verifier_requires_all_three_trust_parameters(self):
+        directory = self.prepare_windows_candidate()
+        arguments = self.candidate_arguments(directory)
+        marker = self.forbid_fixture_execution(directory / "remoteops-controller-mcp.exe")
+        for partial in [[], arguments[:2], arguments[:4], arguments[2:]]:
+            with self.subTest(arguments=partial):
+                self.assert_candidate_rejected_without_execution(partial, marker)
+
+    def test_windows_candidate_verifier_rejects_outside_and_nested_directories(self):
+        directory = self.prepare_windows_candidate()
+        arguments = self.candidate_arguments(directory)
+        marker = self.forbid_fixture_execution()
+        for selected in [self.root / "outside", directory / "nested"]:
+            with self.subTest(directory=selected):
+                shutil.copytree(directory, selected, ignore=shutil.ignore_patterns("nested"))
+                self.configure_verifier_command(selected / "remoteops-controller-mcp.exe")
+                self.assert_candidate_rejected_without_execution(
+                    ["-CandidateDirectory", str(selected)] + arguments[2:], marker)
+
+    def test_windows_candidate_verifier_checks_both_hashes_before_execution(self):
+        directory = self.prepare_windows_candidate()
+        arguments = self.candidate_arguments(directory)
+        marker = self.forbid_fixture_execution()
+        for position, value in [(3, "0" * 64), (5, "0" * 64), (3, "invalid-sha256")]:
+            with self.subTest(parameter=arguments[position - 1], value=value):
+                invalid = arguments.copy()
+                invalid[position] = value
+                self.assert_candidate_rejected_without_execution(invalid, marker)
+
+    def test_windows_candidate_verifier_requires_exact_mcp_and_helper_versions(self):
+        directory = self.prepare_windows_candidate()
+        for variable, version in [("INSTALLER_TEST_MCP_VERSION", VERSION + "0"),
+                                  ("INSTALLER_TEST_PROMPT_VERSION", "0.2.0-preview.50")]:
+            with self.subTest(program=variable):
+                self.env[variable] = version
+                try:
+                    result = self.run_verifier(extra=self.candidate_arguments(directory))
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                finally:
+                    self.env.pop(variable)
+
+    def test_windows_candidate_verifier_rejects_missing_helper_before_execution(self):
+        directory = self.prepare_windows_candidate()
+        arguments = self.candidate_arguments(directory)
+        (directory / "remoteops-credential-prompt.exe").unlink()
+        marker = self.forbid_fixture_execution()
+        self.assert_candidate_rejected_without_execution(arguments, marker)
+
+    def test_windows_candidate_verifier_rejects_different_configured_command(self):
+        directory = self.prepare_windows_candidate()
+        outside = self.root / "remoteops-controller-mcp.exe"
+        shutil.copy2(self.binary, outside)
+        self.configure_verifier_command(outside)
+        marker = self.forbid_fixture_execution(outside)
+        self.assert_candidate_rejected_without_execution(self.candidate_arguments(directory), marker)
+
+    def test_windows_candidate_verifier_rejects_reparse_directory_before_execution(self):
+        directory = self.prepare_windows_candidate()
+        arguments = self.candidate_arguments(directory)
+        alias = directory.parent / "directory alias"
+        if os.name == "nt":
+            subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(alias), str(directory)],
+                           capture_output=True, check=True)
+        else:
+            alias.symlink_to(directory, target_is_directory=True)
+        marker = self.forbid_fixture_execution()
+        self.assert_candidate_rejected_without_execution(
+            ["-CandidateDirectory", str(alias)] + arguments[2:], marker)
+
+    def test_windows_candidate_verifier_rejects_reparse_executables_before_execution(self):
+        directory = self.prepare_windows_candidate()
+        arguments = self.candidate_arguments(directory)
+        marker = self.forbid_fixture_execution()
+        for name in ["remoteops-controller-mcp.exe", "remoteops-credential-prompt.exe"]:
+            with self.subTest(executable=name):
+                executable = directory / name
+                executable.unlink()
+                try:
+                    executable.symlink_to(self.binary)
+                except OSError as error:
+                    if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                        self.skipTest("File symlinks require Windows Developer Mode or symlink privilege")
+                    raise
+                try:
+                    self.assert_candidate_rejected_without_execution(arguments, marker)
+                finally:
+                    executable.unlink()
+                    shutil.copy2(self.binary, executable)
 
     def test_windows_installation_alias_preserves_active_executable(self):
         if self.target != "windows":

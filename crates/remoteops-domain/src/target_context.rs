@@ -229,6 +229,56 @@ impl TargetContext {
         self.visual_disabled_reason().is_none()
     }
 
+    /// 判断是否允许显式只读观察触发暂态图形故障恢复；不放行图形写操作。
+    ///
+    /// 产品、宿主和桌面事实必须明确；未识别、空白或混合的禁用原因均不重试。
+    #[must_use]
+    pub fn visual_probe_allowed(&self) -> bool {
+        if self.validate().is_err()
+            || self.product_id.is_empty()
+            || self.product_id == "unknown"
+            || !matches!(
+                self.run_mode,
+                AgentRunMode::Interactive | AgentRunMode::Console
+            )
+            || self.facts.interactive_desktop != CapabilityAvailability::Available
+            || self.facts.observed_at <= DateTime::<Utc>::UNIX_EPOCH
+            || self.facts.source.is_empty()
+            || self.facts.source == "unknown"
+        {
+            return false;
+        }
+        let Some(status) = self
+            .capabilities
+            .iter()
+            .find(|status| status.capability == "visual")
+        else {
+            return false;
+        };
+        match status.status {
+            CapabilityAvailability::Available => status.reasons.is_empty(),
+            CapabilityAvailability::Unavailable => {
+                !status.reasons.is_empty()
+                    && status.reasons.iter().all(|reason| {
+                        matches!(
+                            reason.as_str(),
+                            "no_interactive_desktop"
+                                | "visual_probe_pending"
+                                | "visual_probe_failed"
+                                | "visual_probe_timeout"
+                                | "visual_provider_unavailable"
+                                | "visual_probe_rejected"
+                                | "visual_probe_error"
+                                | "visual_desktop_not_ready"
+                                | "visual_windows_unavailable"
+                                | "visual_foreground_unavailable"
+                        )
+                    })
+            }
+            CapabilityAvailability::Unknown => false,
+        }
+    }
+
     /// 返回阻止图形操作的稳定原因；未知上下文不触发探测。
     #[must_use]
     pub fn visual_disabled_reason(&self) -> Option<&str> {
@@ -298,6 +348,105 @@ mod tests {
         );
         assert!(!context.visual_allowed());
     }
+    fn interactive_probe_context() -> TargetContext {
+        TargetContext {
+            product_id: "test-gui".into(),
+            run_mode: AgentRunMode::Interactive,
+            facts: TargetRuntimeFacts {
+                interactive_desktop: CapabilityAvailability::Available,
+                observed_at: Utc::now(),
+                source: "host_runtime".into(),
+                ..TargetRuntimeFacts::default()
+            },
+            capabilities: vec![TargetCapabilityStatus {
+                capability: "visual".into(),
+                status: CapabilityAvailability::Unavailable,
+                reasons: vec!["visual_probe_timeout".into()],
+            }],
+            ..TargetContext::default()
+        }
+    }
+
+    #[test]
+    fn visual_probe_recovery_requires_all_reasons_to_be_known_and_transient() {
+        let mut context = interactive_probe_context();
+        for reason in [
+            "no_interactive_desktop",
+            "visual_probe_pending",
+            "visual_probe_failed",
+            "visual_probe_timeout",
+            "visual_provider_unavailable",
+            "visual_probe_rejected",
+            "visual_probe_error",
+            "visual_desktop_not_ready",
+            "visual_windows_unavailable",
+            "visual_foreground_unavailable",
+        ] {
+            context.capabilities[0].reasons = vec![reason.into()];
+            assert!(context.visual_probe_allowed(), "{reason}");
+            assert!(!context.visual_allowed(), "暂态恢复不代表一般图形权限");
+        }
+        for reasons in [
+            vec![],
+            vec!["future_reason"],
+            vec!["product_policy_disabled"],
+            vec!["visual_probe_timeout", "product_policy_disabled"],
+            vec!["visual_probe_timeout", "future_reason"],
+        ] {
+            context.capabilities[0].reasons = reasons.into_iter().map(str::to_owned).collect();
+            assert!(!context.visual_probe_allowed());
+        }
+        context.capabilities[0].status = CapabilityAvailability::Available;
+        context.capabilities[0].reasons.clear();
+        assert!(context.visual_probe_allowed());
+        context.capabilities[0]
+            .reasons
+            .push("product_policy_disabled".into());
+        assert!(!context.visual_probe_allowed());
+    }
+
+    #[test]
+    fn visual_probe_recovery_rejects_unknown_or_service_facts() {
+        let context = interactive_probe_context();
+        let mut cases = vec![];
+        for mode in [AgentRunMode::WindowsService, AgentRunMode::Unknown] {
+            let mut denied = context.clone();
+            denied.run_mode = mode;
+            cases.push(denied);
+        }
+        for desktop in [
+            CapabilityAvailability::Unknown,
+            CapabilityAvailability::Unavailable,
+        ] {
+            let mut denied = context.clone();
+            denied.facts.interactive_desktop = desktop;
+            cases.push(denied);
+        }
+        let mut denied = context.clone();
+        denied.capabilities[0].status = CapabilityAvailability::Unknown;
+        cases.push(denied);
+        for identity in ["", "unknown"] {
+            let mut denied = context.clone();
+            denied.product_id = identity.into();
+            cases.push(denied);
+            let mut denied = context.clone();
+            denied.facts.source = identity.into();
+            cases.push(denied);
+        }
+        let mut denied = context.clone();
+        denied.facts.observed_at = DateTime::<Utc>::UNIX_EPOCH;
+        cases.push(denied);
+        let mut denied = context.clone();
+        denied.schema_version = 0;
+        cases.push(denied);
+        let mut denied = context.clone();
+        denied.capabilities.push(denied.capabilities[0].clone());
+        cases.push(denied);
+        for denied in cases {
+            assert!(!denied.visual_probe_allowed());
+        }
+    }
+
     #[test]
     fn context_limits_and_duplicate_capabilities_are_rejected() {
         let mut context = TargetContext::default();

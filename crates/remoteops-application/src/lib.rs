@@ -180,6 +180,22 @@ impl ControllerCore {
         if operation.is_visual() {
             let reason = if connection.environment.protocol_version < 18 {
                 Some("host_context_unknown")
+            } else if matches!(operation, RemoteOperation::VisualObserve { .. }) {
+                // 显式只读观察可恢复已识别的暂态故障，Agent 仍在执行前重新校验能力。
+                connection
+                    .target_context
+                    .as_ref()
+                    .map_or(Some("host_context_unknown"), |context| {
+                        if context.visual_probe_allowed() {
+                            None
+                        } else {
+                            Some(
+                                context
+                                    .visual_disabled_reason()
+                                    .unwrap_or("host_context_unknown"),
+                            )
+                        }
+                    })
             } else {
                 connection.target_context.as_ref().map_or(
                     Some("host_context_unknown"),
@@ -2505,6 +2521,79 @@ mod tests {
         assert!(
             matches!(core.prepare_request(session_id, EventSource::Ai, RemoteOperation::VisualStop, None),
             Err(ApplicationError::Remote { code, .. }) if code == "product_policy_disabled")
+        );
+    }
+
+    #[test]
+    fn explicit_visual_observation_recovers_only_known_interactive_failures() {
+        use remoteops_domain::{
+            AgentRunMode, CapabilityAvailability, TargetCapabilityStatus, TargetRuntimeFacts,
+        };
+        let (mut core, session_id) = core_with_connection();
+        let mut connection = core.get_connection(session_id).unwrap().clone();
+        connection.environment.protocol_version = 18;
+        let context = TargetContext {
+            product_id: "test-gui".into(),
+            run_mode: AgentRunMode::Interactive,
+            facts: TargetRuntimeFacts {
+                interactive_desktop: CapabilityAvailability::Available,
+                source: "host_runtime".into(),
+                observed_at: Utc::now(),
+                ..TargetRuntimeFacts::default()
+            },
+            capabilities: vec![TargetCapabilityStatus {
+                capability: "visual".into(),
+                status: CapabilityAvailability::Unavailable,
+                reasons: vec!["visual_probe_timeout".into()],
+            }],
+            ..TargetContext::default()
+        };
+        connection.target_context = Some(context.clone());
+        core.upsert_connection(connection.clone());
+        let observe = RemoteOperation::VisualObserve {
+            include_screenshot: false,
+            include_ui_tree: false,
+        };
+        assert!(
+            core.prepare_request(session_id, EventSource::Ai, observe.clone(), None)
+                .is_ok()
+        );
+        assert!(
+            matches!(core.prepare_request(session_id, EventSource::Ai, RemoteOperation::VisualStop, None),
+            Err(ApplicationError::Remote { code, .. }) if code == "visual_probe_timeout")
+        );
+
+        for reasons in [
+            vec!["product_policy_disabled"],
+            vec!["future_reason"],
+            vec!["visual_probe_timeout", "product_policy_disabled"],
+            vec![],
+        ] {
+            let mut denied = context.clone();
+            denied.capabilities[0].reasons = reasons.into_iter().map(str::to_owned).collect();
+            connection.target_context = Some(denied);
+            core.upsert_connection(connection.clone());
+            assert!(matches!(
+                core.prepare_request(session_id, EventSource::Ai, observe.clone(), None),
+                Err(ApplicationError::Remote { .. })
+            ));
+        }
+        for mode in [AgentRunMode::WindowsService, AgentRunMode::Unknown] {
+            let mut denied = context.clone();
+            denied.run_mode = mode;
+            connection.target_context = Some(denied);
+            core.upsert_connection(connection.clone());
+            assert!(matches!(
+                core.prepare_request(session_id, EventSource::Ai, observe.clone(), None),
+                Err(ApplicationError::Remote { .. })
+            ));
+        }
+        connection.target_context = Some(context);
+        connection.environment.protocol_version = 17;
+        core.upsert_connection(connection);
+        assert!(
+            matches!(core.prepare_request(session_id, EventSource::Ai, observe, None),
+            Err(ApplicationError::Remote { code, .. }) if code == "host_context_unknown")
         );
     }
 
