@@ -474,7 +474,7 @@ mod tests {
             error: None,
         }));
         assert!(!state.connected);
-        assert!(state.bindings.is_empty());
+        assert_eq!(state.bindings, Vec::<SessionControlState>::new());
         assert!(state.pending.is_empty());
         state.command("full", &control);
         assert!(state.pending.is_empty());
