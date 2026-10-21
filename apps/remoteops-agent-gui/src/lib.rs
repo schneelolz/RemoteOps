@@ -7,6 +7,7 @@ pub use extension::{
     GuiExtension, GuiLayout, GuiOptions, GuiSnapshot,
 };
 pub mod activity;
+mod console_startup;
 mod renderer_startup;
 use renderer_startup::GuiOutcome;
 static DIAGNOSTIC_PRODUCT: std::sync::OnceLock<ProductProfile> = std::sync::OnceLock::new();
@@ -197,6 +198,9 @@ struct Args {
     /// 界面语言；优先级低于已保存的 GUI 设置。
     #[arg(long, env = "REMOTEOPS_LANG")]
     lang: Option<Language>,
+    /// 在控制台运行同一产品，禁用窗口、截图和桌面输入。
+    #[arg(long, conflicts_with = "demo")]
+    cli: bool,
     /// 显式固定图形渲染器；Windows 默认先尝试 DirectX 12，启动失败时回退 Glow。
     #[arg(long, env = "REMOTEOPS_RENDERER", default_value_t = default_renderer())]
     renderer: eframe::Renderer,
@@ -3383,17 +3387,17 @@ pub fn run_default() -> std::process::ExitCode {
     };
     run(profile, GuiOptions::remoteops())
 }
-/// Launch one product GUI in this process.
+/// 按启动参数运行同一产品的 GUI 或无图形控制台。
 #[must_use]
 pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCode {
-    if let Err(error) = profile.validate() {
-        eprintln!("{error}");
+    if console_startup::console_requested(std::env::args_os())
+        && let Err(error) = remoteops_native_host::ensure_console()
+    {
+        eprintln!("无法初始化控制台：{error}");
         return std::process::ExitCode::FAILURE;
     }
-    if let Some(icon) = options.icon_png
-        && eframe::icon_data::from_png_bytes(icon).is_err()
-    {
-        eprintln!("Invalid product PNG icon");
+    if let Err(error) = profile.validate() {
+        eprintln!("{error}");
         return std::process::ExitCode::FAILURE;
     }
     let _ = DIAGNOSTIC_PRODUCT.set(profile.clone());
@@ -3414,6 +3418,16 @@ pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCo
         }
     };
     diagnostics.record("arguments_parsed");
+    if args.cli {
+        diagnostics.record("console_mode_selected");
+        return console_startup::run(&args, profile);
+    }
+    if let Some(icon) = options.icon_png
+        && eframe::icon_data::from_png_bytes(icon).is_err()
+    {
+        eprintln!("Invalid product PNG icon");
+        return std::process::ExitCode::FAILURE;
+    }
     launch_gui(args, &diagnostics, profile, options)
 }
 

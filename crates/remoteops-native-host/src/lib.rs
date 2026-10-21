@@ -1,4 +1,8 @@
-//! 最小只读宿主事实封装；不加载图形 Provider、不枚举窗口、不截图、不注入输入。
+//! 最小宿主事实与控制台封装；不加载图形 Provider、不枚举窗口、不截图、不注入输入。
+
+mod console;
+
+pub use console::ensure_console;
 
 /// 当前进程交互桌面的系统证据。
 #[derive(Clone, Debug, Eq, PartialEq)]

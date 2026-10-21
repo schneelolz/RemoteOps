@@ -14,7 +14,7 @@
 |---|---|
 | `remoteops-product::ProductProfile`、`EndpointPolicy` | 产品标识、默认值、固定端点、路径及环境变量命名 |
 | `AgentConfig::load_file_with_profile`、`resolve_product`、`save_for_product` | 一次解析缺字段与显式布尔值、输入合并后的策略检查、端点信任隔离、原子写入与便携回退 |
-| `remoteops_agent_gui::run`、`run_default`、`resolve_config` | 同一个默认与外部产品宿主；无窗口、无网络的配置检查入口 |
+| `remoteops_agent_gui::run`、`run_default`、`resolve_config` | 同一个默认与外部产品宿主；通过 `--cli` 使用同产品控制台；无窗口、无网络的配置检查入口 |
 | `GuiOptions`、`GuiLayout`、`GuiExtension`、`GuiEvent`、`GuiSnapshot`、`GuiAction` | 布局模板、可选活动组件、Logo、外观、双语文案及受控呈现扩展 |
 | `remoteops_agent_service::run`、`ServiceOptions` | 公共 SCM 与前台宿主、机器级配置、状态、停止和受管模式入口 |
 | `AgentRuntimeOptions`、`AgentCapabilityPolicy`、`run_agent_with_options` | 可信宿主能力上限、延迟图形初始化和目标上下文 |
@@ -94,6 +94,18 @@ remoteops-build = { git = "https://github.com/schneelolz/RemoteOps.git", rev = "
 启动时 `ProductProfile.version` 由产品包 `env!("CARGO_PKG_VERSION")` 提供。库内同名宏表示底座包版本，不能用作产品版本。公共 GUI 在首次启动和运行中切换语言时统一生成窗口标题：`<当前语言的产品名称> v<ProductProfile.version>`。通用版传入自身 GUI 包版本，外部产品传入自己的产品包版本；版本为空或只有空白时仅显示名称，不回填底座版本。产品文案只提供名称，不应自行再拼接版本。编译时在产品 `build.rs` 调用资源工具，图标路径从**产品自身** `CARGO_MANIFEST_DIR` 构造，设置 `binary_name` 与产品资源信息。工具只链接到指定二进制，不向依赖者传递底座的图标资源。不得复制仓库资源脚本。
 
 库依赖不会交付 CLI、服务、SSH 密码窗口、凭据窗口等伴随程序。由独立发布步骤从同一个审核 rev 构建所需程序，或取得明确记录源码提交和协议版本的兼容发布产物，并验 SHA-256。构建清单应读取实际依赖 `build_info`/Cargo metadata 和实际产物版本，不能手填陈旧协议号。源码归档无法确定 Git 来源时明确报告 `unknown`，不可伪造提交。未提交源码会标记 dirty，不能当作可固定的发布 rev。
+
+## 同一产品的 GUI 与 CLI
+
+薄产品继续调用 `remoteops_agent_gui::run(profile, options)`，无需复制 CLI 入口或新增伴随 EXE。默认 GUI；传入 `--cli` 后，公共宿主在原生窗口和图形渲染器创建前分流到控制台。产品名称和版本来自同一 `ProductProfile`，配置合并、固定 Relay 策略、TLS 信任、端点隔离的身份与目录均沿用 GUI 的产品配置规则；与独立的通用 CLI 兼容入口不同，该分流不会退回 RemoteOps 默认产品。
+
+控制台以 headless 运行时上限禁用内建图形 Provider，不提供截图、桌面输入或窗口交互；现有 Shell、文件、系统等非图形能力仍受产品配置、Agent 能力和 Relay 权限约束。控制台显示控制码、连接与权限状态、操作摘要，使用 `help`、`status`、`full`、`confirm`、`quit` 交互，`Ctrl+C` 停止。`full` 为当前唯一已绑定且具权威权限快照的会话申请临时授权；`confirm` 撤销并恢复逐项确认，不保存产品默认值。标准输入 EOF 保持连接，不因此静默退出。
+
+CLI 不弹出配置或证书确认窗口。缺少有效配置时明确报错；自签名 Relay 必须由管理员预置已经独立核验的 CA 或叶证书指纹。切换 CLI 不增加信任、不授予权限；GUI 图形启动失败也不会自动进入 CLI。
+
+Windows 产品通常使用 GUI 子系统，CMD 直接启动可能提前显示下一行提示符；建议 `start "" /wait "产品.exe" --cli`。PowerShell 可用 `& .\产品.exe --cli | Out-Host` 或 `Start-Process -FilePath .\产品.exe -ArgumentList '--cli' -Wait`。控制台输出支持重定向，帮助和版本使用 `--cli --help`、`--cli --version`。产品入口在调用公共 `run` 前不要初始化图形 Provider 或图形上下文，才能保留无图形启动路径。
+
+可对产品构建产物运行 `scripts/Test-AgentGuiConsole.ps1 -Executable <产品EXE>`；脚本只运行帮助、版本和无效临时配置，检查输出与诊断阶段，绝不连接产品真实 Relay。实际配对、非图形命令和无厂商显卡驱动的 Server 2016 仍需端到端现场验收。
 
 ## Windows GUI 渲染兼容
 

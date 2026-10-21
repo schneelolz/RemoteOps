@@ -22,6 +22,48 @@ GUI 默认将配置保存为与 EXE 同级的 `agent-config.json`；程序目录
 
 Agent 首次连接不需要入网码、部署级 Agent Token 或 Controller Token。首次登记后，当前及后续进程使用受保护的身份状态文件和恢复令牌重连；重新生成或删除 Agent 身份状态时，再次启动也只需 Relay 地址。
 
+## 无图形控制台模式
+
+同一个 GUI EXE 默认打开窗口，追加 `--cli` 则在创建窗口和渲染器之前进入控制台模式。没有可用显卡驱动、OpenGL 2.0 或 DX12 的服务器可以使用此模式；它不初始化内建图形 Provider，不提供截图、桌面输入和窗口交互，保留 CMD、PowerShell、文件及系统诊断等非图形能力。
+
+在 CMD 中建议等待程序结束，避免提示符与控制台输出抢行：
+
+```cmd
+start "" /wait "remoteops-agent-gui.exe" --cli
+```
+
+定制版使用自己的 EXE 名称，例如：
+
+```cmd
+start "" /wait "精灵AI-Agent-Release.exe" --cli
+```
+
+PowerShell 中可使用：
+
+```powershell
+& .\remoteops-agent-gui.exe --cli | Out-Host
+# 或由独立控制台运行，并等待结束：
+Start-Process -FilePath .\remoteops-agent-gui.exe -ArgumentList '--cli' -Wait
+```
+
+Windows GUI 子系统程序直接从 CMD 运行时，CMD 可能立即返回提示符；这不代表程序已经退出。以上等待方式可使操作更清晰。`--cli --help` 和 `--cli --version` 也可通过相同方式查看。
+
+CLI 沿用同一产品的 Relay、TLS 信任、配置、身份状态与权限偏好，不会因切换模式变成通用 RemoteOps 身份，也不会自动授予完全控制。配置未就绪或无效时在控制台明确报错并退出，不打开首次设置页；请先使用 GUI 保存配置，或由管理员通过 `--config` 等既有方式预置。未知自签名证书不会在控制台跳过验证；管理员须预置经过独立核验的 CA 或证书指纹。
+
+连接成功后，控制台显示控制码、连接状态、权限及操作摘要。输入以下命令并按回车：
+
+| 命令 | 行为 |
+|---|---|
+| `help` | 显示交互命令 |
+| `status` | 显示当前连接和权限状态 |
+| `full` | 为唯一的已绑定活跃会话申请现场临时完全控制，等待 Relay 确认 |
+| `confirm` | 撤销临时授权，恢复逐项确认；不保存或修改产品默认偏好 |
+| `quit` | 停止本次 Agent 和连接 |
+
+`full` 是明确授权命令，不会再增加一次 yes/no 提示；没有唯一且已确认状态的活跃会话时拒绝操作。`Ctrl+C` 也可停止程序。标准输入结束不会自动停止连接，便于重定向输出场景运行；无人交互时仍建议使用专用 Service。工程师继续通过原有 MCP 配对并调用非图形能力，权限边界保持原规则。
+
+此模式为显式选择；GUI 图形初始化失败后不会自动切换 CLI。Server 2016 无核显驱动现场仍需验证实际控制码获取、工程师配对、CMD/PowerShell 执行及停止行为。
+
 ## 二、TLS 证书确认
 
 - 公网 CA：自动使用 Windows 系统可信根，不需要 PEM；
@@ -149,7 +191,10 @@ Windows 默认使用 WGPU 的 DirectX 12 后端和低延迟单帧交换链，避
 cargo test -p remoteops-agent -p remoteops-agent-gui --locked
 cargo clippy -p remoteops-agent -p remoteops-agent-gui --all-targets --locked -- -D warnings
 .\scripts\Build-Windows.ps1
+.\scripts\Test-AgentGuiConsole.ps1 -Executable .\target\release\remoteops-agent-gui.exe
 .\scripts\Test-AgentGuiCodexMcp.ps1
 ```
 
 `Test-AgentGuiCodexMcp.ps1` 默认从剪贴板读取 GUI 复制的控制码，也可以通过 `-PairingCode` 显式提供。脚本仅在子进程内传递控制码，最终结果不会输出控制码、Token、`session_id` 或审批标识。
+
+无图形启动检查 `Test-AgentGuiConsole.ps1` 在独立目录复制指定 EXE，以帮助、版本和无效临时配置验证控制台输出、快速失败及诊断阶段没有进入窗口初始化。脚本不连接 Relay，不代替配对、Shell 执行或 Server 2016 现场验收。

@@ -3789,7 +3789,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.31"
+version = "0.2.0-preview.32"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3801,6 +3801,7 @@ dependencies = [
  "remoteops-device",
  "remoteops-domain",
  "remoteops-i18n",
+ "remoteops-native-host",
  "remoteops-product",
  "remoteops-protocol",
  "remoteops-visual",
@@ -3808,6 +3809,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "winit",
  "winresource",
