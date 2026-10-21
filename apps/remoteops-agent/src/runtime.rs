@@ -61,6 +61,17 @@ impl AgentRuntimeOptions {
             ..Self::interactive(product)
         }
     }
+
+    /// 创建强制禁用图形能力的产品控制台宿主配置。
+    #[must_use]
+    pub fn console(product: ProductProfile) -> Self {
+        Self {
+            run_mode: AgentRunMode::Console,
+            capability_policy: AgentCapabilityPolicy::headless(),
+            visual_enabled: false,
+            ..Self::interactive(product)
+        }
+    }
 }
 
 /// 产品或宿主能力拒绝，稳定错误码透传至协议响应。

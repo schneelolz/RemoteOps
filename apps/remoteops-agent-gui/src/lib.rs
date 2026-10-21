@@ -7,6 +7,9 @@ pub use extension::{
     GuiExtension, GuiLayout, GuiOptions, GuiSnapshot,
 };
 pub mod activity;
+mod console_startup;
+mod renderer_startup;
+use renderer_startup::GuiOutcome;
 static DIAGNOSTIC_PRODUCT: std::sync::OnceLock<ProductProfile> = std::sync::OnceLock::new();
 
 use std::{
@@ -195,9 +198,15 @@ struct Args {
     /// 界面语言；优先级低于已保存的 GUI 设置。
     #[arg(long, env = "REMOTEOPS_LANG")]
     lang: Option<Language>,
-    /// 图形渲染器；Windows 默认使用 DirectX 12，glow 仅用于兼容性诊断。
+    /// 在控制台运行同一产品，禁用窗口、截图和桌面输入。
+    #[arg(long, conflicts_with = "demo")]
+    cli: bool,
+    /// 显式固定图形渲染器；Windows 默认先尝试 DirectX 12，启动失败时回退 Glow。
     #[arg(long, env = "REMOTEOPS_RENDERER", default_value_t = default_renderer())]
     renderer: eframe::Renderer,
+    /// 仅默认选择允许自动回退，显式命令行或产品环境变量保持原意。
+    #[arg(skip)]
+    automatic_renderer: bool,
 }
 
 #[derive(Default)]
@@ -254,9 +263,11 @@ impl Args {
                 arg.env(format!("{}_{}", profile.env_prefix, suffix))
             });
         }
-        Ok(Self::from_arg_matches(
-            &command.try_get_matches_from(input)?,
-        )?)
+        let matches = command.try_get_matches_from(input)?;
+        let mut args = Self::from_arg_matches(&matches)?;
+        args.automatic_renderer = cfg!(target_os = "windows")
+            && matches.value_source("renderer") == Some(clap::parser::ValueSource::DefaultValue);
+        Ok(args)
     }
     fn merge(&self, profile: &ProductProfile) -> anyhow::Result<AgentConfig> {
         let mut config = AgentConfig::load_file_with_profile(self.config.as_deref(), profile)?
@@ -3057,7 +3068,7 @@ impl StartupDiagnostics {
     }
 }
 
-/// Windows 保留无需 OpenGL 2.0 的 WGPU，其他平台使用 Glow。
+/// Windows 优先尝试 DirectX 12；仅默认启动失败时另启 Glow 兼容进程。
 fn default_renderer() -> eframe::Renderer {
     if cfg!(target_os = "windows") {
         eframe::Renderer::Wgpu
@@ -3194,9 +3205,11 @@ fn run_gui(
     diagnostics: &StartupDiagnostics,
     profile: ProductProfile,
     options: GuiOptions,
-) -> std::process::ExitCode {
+) -> GuiOutcome {
     diagnostics.record("ui_thread_started");
     let renderer = args.renderer;
+    let automatic_renderer = args.automatic_renderer;
+    diagnostics.record_detail("renderer_automatic", automatic_renderer);
     let requested_language = args.lang;
     // 显式演示配置使用独立偏好文件，不读取或覆盖日常 Agent 的界面设置。
     let demo_persistence = args
@@ -3241,10 +3254,14 @@ fn run_gui(
     let title = agent_window_title(&translator, &profile);
     let app_diagnostics = diagnostics.clone();
     diagnostics.record("starting_native_window");
+    let app_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let creation_started = app_started.clone();
     let result = eframe::run_native(
         &title,
         native_options,
         Box::new(move |cc| {
+            // 回调一旦进入就不能重启产品，避免重复连接或恢复运行中的操作。
+            creation_started.store(true, std::sync::atomic::Ordering::SeqCst);
             app_diagnostics.record("app_creator_started");
             if let Some(render_state) = &cc.wgpu_render_state {
                 let adapter = render_state.adapter.get_info();
@@ -3270,11 +3287,55 @@ fn run_gui(
     match result {
         Ok(()) => {
             diagnostics.record("native_window_closed");
-            std::process::ExitCode::SUCCESS
+            GuiOutcome::Finished(std::process::ExitCode::SUCCESS)
         }
+        Err(error) => native_window_failure(
+            renderer,
+            automatic_renderer,
+            app_started.load(std::sync::atomic::Ordering::SeqCst),
+            &error,
+            diagnostics,
+        ),
+    }
+}
+
+/// 在应用创建前的默认 WGPU 错误中请求回退，其余错误保持原退出流程。
+fn native_window_failure(
+    renderer: eframe::Renderer,
+    automatic: bool,
+    app_started: bool,
+    error: &eframe::Error,
+    diagnostics: &StartupDiagnostics,
+) -> GuiOutcome {
+    diagnostics.record_native_window_error(error);
+    if renderer_startup::should_fallback(automatic, renderer, app_started, error) {
+        diagnostics.record("renderer_fallback_requested");
+        return GuiOutcome::RetryWithGlow;
+    }
+    show_native_startup_error(renderer, error, diagnostics);
+    GuiOutcome::Finished(std::process::ExitCode::FAILURE)
+}
+
+/// UI 线程已退出后才启动兼容进程，不在旧事件循环中再次创建窗口。
+fn finish_gui(outcome: GuiOutcome, diagnostics: &StartupDiagnostics) -> std::process::ExitCode {
+    let result = renderer_startup::finish_with(outcome, || {
+        diagnostics.record("renderer_fallback_starting");
+        let executable = std::env::current_exe()?;
+        let mut child =
+            renderer_startup::fallback_command(&executable, std::env::args_os().skip(1)).spawn()?;
+        diagnostics.record_detail("renderer_fallback_child_pid", child.id());
+        let status = child.wait()?;
+        diagnostics.record_detail("renderer_fallback_exit", status);
+        Ok(status)
+    });
+    match result {
+        Ok(code) => code,
         Err(error) => {
-            diagnostics.record_native_window_error(&error);
-            show_native_startup_error(renderer, &error, diagnostics);
+            diagnostics.record_detail("renderer_fallback_process_error", &error);
+            let error = eframe::Error::AppCreation(Box::new(std::io::Error::other(format!(
+                "兼容渲染器进程启动或等待失败：{error}"
+            ))));
+            show_native_startup_error(eframe::Renderer::Glow, &error, diagnostics);
             std::process::ExitCode::FAILURE
         }
     }
@@ -3296,9 +3357,9 @@ fn launch_gui(
         diagnostics.record("ui_thread_spawn_failed");
         return std::process::ExitCode::FAILURE;
     };
-    if let Ok(exit_code) = gui_thread.join() {
+    if let Ok(outcome) = gui_thread.join() {
         diagnostics.record("ui_thread_joined");
-        exit_code
+        finish_gui(outcome, diagnostics)
     } else {
         diagnostics.record("ui_thread_panicked");
         std::process::ExitCode::FAILURE
@@ -3313,7 +3374,8 @@ fn launch_gui(
     profile: ProductProfile,
     options: GuiOptions,
 ) -> std::process::ExitCode {
-    run_gui(args, diagnostics, profile, options)
+    let outcome = run_gui(args, diagnostics, profile, options);
+    finish_gui(outcome, diagnostics)
 }
 
 /// Launch the default product through the same public host.
@@ -3325,17 +3387,17 @@ pub fn run_default() -> std::process::ExitCode {
     };
     run(profile, GuiOptions::remoteops())
 }
-/// Launch one product GUI in this process.
+/// 按启动参数运行同一产品的 GUI 或无图形控制台。
 #[must_use]
 pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCode {
-    if let Err(error) = profile.validate() {
-        eprintln!("{error}");
+    if console_startup::console_requested(std::env::args_os())
+        && let Err(error) = remoteops_native_host::ensure_console()
+    {
+        eprintln!("无法初始化控制台：{error}");
         return std::process::ExitCode::FAILURE;
     }
-    if let Some(icon) = options.icon_png
-        && eframe::icon_data::from_png_bytes(icon).is_err()
-    {
-        eprintln!("Invalid product PNG icon");
+    if let Err(error) = profile.validate() {
+        eprintln!("{error}");
         return std::process::ExitCode::FAILURE;
     }
     let _ = DIAGNOSTIC_PRODUCT.set(profile.clone());
@@ -3356,6 +3418,16 @@ pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCo
         }
     };
     diagnostics.record("arguments_parsed");
+    if args.cli {
+        diagnostics.record("console_mode_selected");
+        return console_startup::run(&args, profile);
+    }
+    if let Some(icon) = options.icon_png
+        && eframe::icon_data::from_png_bytes(icon).is_err()
+    {
+        eprintln!("Invalid product PNG icon");
+        return std::process::ExitCode::FAILURE;
+    }
     launch_gui(args, &diagnostics, profile, options)
 }
 
@@ -3588,6 +3660,64 @@ mod tests {
             centered_window_position(monitor, outer),
             egui::pos2(952.0, 470.5)
         );
+    }
+
+    #[test]
+    fn default_and_explicit_renderer_sources_preserve_user_choice() {
+        let profile = ProductProfile {
+            env_prefix: format!("RENDERER_PARSE_{}", std::process::id()),
+            ..ProductProfile::default()
+        };
+        let default = Args::parse_for(&profile, ["agent"]).expect("默认参数");
+        assert_eq!(default.renderer, default_renderer());
+        assert_eq!(default.automatic_renderer, cfg!(target_os = "windows"));
+        for renderer in ["wgpu", "glow"] {
+            let explicit =
+                Args::parse_for(&profile, ["agent", "--renderer", renderer]).expect("显式参数");
+            assert!(!explicit.automatic_renderer);
+        }
+        let command = renderer_startup::fallback_command(Path::new("agent"), std::iter::empty());
+        let args = std::iter::once(std::ffi::OsString::from("agent"))
+            .chain(command.get_args().map(std::ffi::OsStr::to_os_string));
+        let child = Args::parse_for(&profile, args).expect("兼容子进程参数");
+        assert_eq!(child.renderer, eframe::Renderer::Glow);
+        assert!(!child.automatic_renderer);
+    }
+
+    #[test]
+    fn renderer_environment_source_disables_auto_fallback() {
+        for renderer in ["wgpu", "glow"] {
+            let result = std::process::Command::new(std::env::current_exe().expect("测试程序"))
+                .args([
+                    "--exact",
+                    "tests::renderer_environment_source_child",
+                    "--nocapture",
+                ])
+                .env("REMOTEOPS_RENDERER_SOURCE_CHILD", renderer)
+                .env("RENDERER_SOURCE_TEST_RENDERER", renderer)
+                .output()
+                .expect("隔离测试产品环境变量");
+            assert!(result.status.success());
+            assert!(
+                String::from_utf8_lossy(&result.stdout)
+                    .contains(&format!("renderer_selection_verified:{renderer}"))
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_environment_source_child() {
+        let Ok(renderer) = std::env::var("REMOTEOPS_RENDERER_SOURCE_CHILD") else {
+            return;
+        };
+        let profile = ProductProfile {
+            env_prefix: "RENDERER_SOURCE_TEST".into(),
+            ..ProductProfile::default()
+        };
+        let args = Args::parse_for(&profile, ["agent"]).expect("产品环境渲染器");
+        assert_eq!(args.renderer.to_string(), renderer);
+        assert!(!args.automatic_renderer);
+        println!("renderer_selection_verified:{renderer}");
     }
 
     #[test]

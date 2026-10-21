@@ -14,9 +14,11 @@ pub fn redact_diagnostic(text: &str) -> String {
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+mod console;
 mod operation_log;
 mod product;
 mod runtime;
+pub use console::run_product_console;
 pub use remoteops_domain::AgentRunMode;
 pub use remoteops_product::{EndpointPolicy, ProductProfile};
 pub use runtime::{AgentCapabilityPolicy, AgentRuntimeOptions, VisualProviderFactory};
