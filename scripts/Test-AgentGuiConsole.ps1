@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$Executable,
@@ -38,6 +38,11 @@ $results = foreach ($case in $cases) {
     $info.RedirectStandardError = $true
     $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
     $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    # 定制产品把诊断写到用户目录；同时隔离其配置和日志，避免使用现场资料。
+    foreach ($name in @($info.EnvironmentVariables.Keys)) {
+        if ($name -match '^(REMOTEOPS|JLAI)_') { $info.EnvironmentVariables.Remove($name) }
+    }
+    $info.EnvironmentVariables['LOCALAPPDATA'] = Join-Path $runDirectory 'localappdata'
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $info
     try {
@@ -60,7 +65,7 @@ $results = foreach ($case in $cases) {
         $process.Dispose()
     }
 }
-$runtimeLogs = @(Get-ChildItem -LiteralPath (Join-Path $runDirectory 'logs') -Filter 'agent-gui-runtime-*.log' -ErrorAction SilentlyContinue)
+$runtimeLogs = @(Get-ChildItem -LiteralPath $runDirectory -Recurse -Filter 'agent-gui-runtime-*.log' -ErrorAction SilentlyContinue)
 $diagnostics = ($runtimeLogs | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join "`n"
 $consoleSelected = $diagnostics -match 'stage: console_mode_selected(?:\r?\n|$)'
 $windowStarted = $diagnostics -match 'stage: (starting_native_window|ui_thread_started)(?:\r?\n|$)'
