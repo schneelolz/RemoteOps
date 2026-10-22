@@ -77,8 +77,13 @@ struct Args {
     /// 人工 Controller 使用的独立认证令牌。
     #[arg(long, env = "REMOTEOPS_HUMAN_CONTROLLER_TOKEN", hide_env_values = true)]
     human_controller_token: String,
-    /// AI Controller 使用的独立认证令牌。
-    #[arg(long, env = "REMOTEOPS_AI_CONTROLLER_TOKEN", hide_env_values = true)]
+    /// 旧 MCP 共享认证令牌；是否允许接入由后台开关控制，新安装请使用设置码或文件。
+    #[arg(
+        long,
+        env = "REMOTEOPS_AI_CONTROLLER_TOKEN",
+        default_value = "",
+        hide_env_values = true
+    )]
     ai_controller_token: String,
     /// 此 Relay 部署允许接入的唯一 Controller Owner。
     #[arg(long, env = "REMOTEOPS_CONTROLLER_OWNER_ID")]
@@ -109,6 +114,11 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_controller_tokens(&args.human_controller_token, &args.ai_controller_token)?;
+    if !args.ai_controller_token.is_empty() {
+        eprintln!(
+            "已配置旧 AI Token；接入由后台“允许旧 Token 客户端接入”开关控制，新安装请使用设置码或设置文件。"
+        );
+    }
     if args.controller_owner_id.as_uuid().is_nil() {
         anyhow::bail!("Controller Owner ID 不能使用全零 UUID");
     }
@@ -262,13 +272,16 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-fn validate_controller_tokens(human: &str, ai: &str) -> anyhow::Result<()> {
+fn validate_controller_tokens(human: &str, legacy_ai: &str) -> anyhow::Result<()> {
     const MINIMUM_TOKEN_BYTES: usize = 32;
-    if human.len() < MINIMUM_TOKEN_BYTES || ai.len() < MINIMUM_TOKEN_BYTES {
-        anyhow::bail!("Controller 认证令牌必须至少包含 {MINIMUM_TOKEN_BYTES} 个字节");
+    if human.len() < MINIMUM_TOKEN_BYTES {
+        anyhow::bail!("人工 Controller 认证令牌必须至少包含 {MINIMUM_TOKEN_BYTES} 个字节");
     }
-    if human == ai {
-        anyhow::bail!("人工和 AI Controller 必须配置不同的认证令牌");
+    if !legacy_ai.is_empty() && legacy_ai.len() < MINIMUM_TOKEN_BYTES {
+        anyhow::bail!("旧 AI Token 必须至少包含 {MINIMUM_TOKEN_BYTES} 个字节，或留空禁用该凭据");
+    }
+    if human == legacy_ai {
+        anyhow::bail!("人工 Controller 令牌不得与旧 AI Token 相同，请轮换人工令牌");
     }
     Ok(())
 }
@@ -332,16 +345,15 @@ mod tests {
     use super::validate_controller_tokens;
 
     #[test]
-    fn controller_tokens_must_be_long_and_independent() {
-        assert!(validate_controller_tokens("short", "also-short").is_err());
-        let shared = "shared-controller-token-at-least-32-bytes";
-        assert!(validate_controller_tokens(shared, shared).is_err());
+    fn human_controller_token_must_remain_strong() {
+        assert!(validate_controller_tokens("short", "").is_err());
+        let human = "human-controller-token-at-least-32-bytes";
+        assert!(validate_controller_tokens(human, human).is_err());
+        assert!(validate_controller_tokens(human, "").is_ok());
+        assert!(validate_controller_tokens(human, "short").is_err());
         assert!(
-            validate_controller_tokens(
-                "human-controller-token-at-least-32-bytes",
-                "ai-controller-token-value-at-least-32-bytes",
-            )
-            .is_ok()
+            validate_controller_tokens(human, "legacy-ai-controller-token-at-least-32-bytes")
+                .is_ok()
         );
     }
 }

@@ -1,5 +1,7 @@
 # RemoteOps MCP 使用手册
 
+> 当前安装规则：新版安装器只支持设置码/设置文件，不再支持 Token 安装。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](mcp-one-time-setup.md)。
+
 > 文档状态：当前 Codex 操作手册。底层配置原理见[Codex MCP 接入说明](CodexMCP接入说明.md)，不要从历史验收报告复制安装参数。
 
 - 更新日期：2026-10-18
@@ -17,7 +19,7 @@ Windows x64 安装包：
 artifacts\release\0.2.0-preview.5\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.5.zip
 ```
 
-解压后运行 `Install-RemoteOpsMcp.ps1`。安装后的默认程序和配置位置为：
+请先从管理员取得设置文件，解压后运行 `Install-RemoteOpsMcp.ps1 -SetupFile <设置文件路径>`；只有设置码时使用 `-SetupCode` 隐藏输入。安装后的默认程序和配置位置为：
 
 ```text
 %USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.12.exe
@@ -25,7 +27,7 @@ artifacts\release\0.2.0-preview.5\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.5.
 %USERPROFILE%\.codex\config.toml
 ```
 
-安装时必须提供自行部署或组织批准的自托管 Relay 地址和该 Relay 配置的统一 Owner UUID。MCP 不内置、不依赖共享中继服务；公网 CA 使用 Windows 系统可信根，不需要 `relay-cert.pem`。配置名称为 `remoteops`，AI Controller Token 与统一 Owner 分别由 Windows 当前用户环境变量 `REMOTEOPS_CONTROLLER_TOKEN`、`REMOTEOPS_CONTROLLER_OWNER_ID` 提供，不会明文写入 `config.toml` 或 JSON 配置。
+管理员签发的设置包含自托管 Relay、HTTPS 登记地址、Owner 关联及公开信任配置。MCP 不内置、不依赖共享中继服务。配置名称为 `remoteops`，每台安装兑换独立凭据并保存到系统凭据库，JSON 只保存连接信息与凭据引用，Codex 配置不转发旧 Token 环境变量。现有旧安装仍受中继「允许旧 Token 客户端接入」开关控制，默认允许。
 
 安装脚本只替换 RemoteOps MCP 配置；已有 `config.toml` 会先备份为：
 
@@ -33,7 +35,7 @@ artifacts\release\0.2.0-preview.5\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.5.
 %USERPROFILE%\.codex\config.toml.remoteops-backup-<时间戳>
 ```
 
-Apple Silicon Mac 使用 `RemoteOps-MCP-macOS-arm64-0.2.0-preview.5.tar.gz`。安装器把 Token 保存到 macOS Keychain，不写入 Codex 配置；安装、检测和卸载命令见 [macOS MCP 接入说明](macOSMCP接入说明.md)。Windows 或 Mac 上运行的 MCP 都可以通过 Relay 控制现有 Windows Agent。
+Apple Silicon Mac 使用对应 macOS 安装包，通过设置码/文件兑换独立凭据并保存到 macOS Keychain，不写入 Codex 配置；安装、检测和卸载命令见 [macOS MCP 接入说明](macOSMCP接入说明.md)。Windows 或 Mac 上运行的 MCP 都可以通过 Relay 控制现有 Windows Agent。
 
 ## 二、为什么当前任务还看不到 MCP
 

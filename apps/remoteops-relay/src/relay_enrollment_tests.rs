@@ -262,19 +262,58 @@ async fn revoke_closes_actual_controller_stream_without_another_incoming_frame()
 }
 
 #[test]
-fn legacy_token_with_installation_prefix_remains_compatible() {
-    let relay = Relay::new(
+fn installation_prefix_cannot_restore_shared_ai_token_authentication() {
+    let mut relay = Relay::new(
         Duration::minutes(10),
         15,
         test_owner_id(),
         "roc1.legacy-human-token-with-at-least-32-bytes".to_owned(),
         "roc1.legacy-ai-token-with-at-least-32-bytes".to_owned(),
     );
+    let store = EnrollmentStore::in_memory(test_owner_id()).unwrap();
+    store.set_allow_legacy_token(false).unwrap();
+    relay.enrollment_store = Some(Arc::new(store));
     let mut hello = installation_hello("roc1.legacy-ai-token-with-at-least-32-bytes".to_owned());
-    assert_eq!(relay.authenticate_controller(&hello).unwrap(), None);
+    assert!(relay.authenticate_controller(&hello).is_err());
     hello.kind = ControllerKind::Human;
     hello.auth_token = "roc1.legacy-human-token-with-at-least-32-bytes".to_owned();
     assert_eq!(relay.authenticate_controller(&hello).unwrap(), None);
+}
+
+#[tokio::test]
+async fn shared_ai_token_is_rejected_before_stream_registration() {
+    let (relay, _, _) = enrolled_relay();
+    relay.set_allow_legacy_token(false).await.unwrap();
+    let relay = Arc::new(relay);
+    let (mut client, server) = tokio::io::duplex(4096);
+    let serving_relay = relay.clone();
+    let serving = tokio::spawn(async move { serving_relay.handle_client(server).await });
+    write_frame(
+        &mut client,
+        &WireMessage::Hello(ClientHello::Controller(installation_hello(
+            AI_TOKEN.to_owned(),
+        ))),
+    )
+    .await
+    .unwrap();
+    let error = time::timeout(time::Duration::from_secs(1), serving)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("旧 AI Token 接入已禁用"));
+    assert!(!error.to_string().contains(AI_TOKEN));
+    assert!(relay.state.lock().await.controllers.is_empty());
+    assert!(
+        time::timeout(
+            time::Duration::from_secs(1),
+            read_frame::<WireMessage, _>(&mut client),
+        )
+        .await
+        .unwrap()
+        .is_err(),
+        "旧 Token 不能收到连接欢迎帧"
+    );
 }
 
 #[test]
@@ -316,5 +355,269 @@ fn sqlite_suffix_in_legacy_json_filename_keeps_enrollment_database_distinct() {
     assert_eq!(
         original, restored,
         "legacy JSON must remain readable and unchanged on restart"
+    );
+}
+
+#[tokio::test]
+async fn legacy_token_policy_defaults_to_allow_and_survives_relay_restart() {
+    let files = TestStateFile::new("legacy-policy");
+    let hello = installation_hello(AI_TOKEN.to_owned());
+    {
+        let relay = persisted_relay(&files.path, Duration::minutes(10)).unwrap();
+        assert!(relay.allow_legacy_token().unwrap());
+        assert_eq!(relay.authenticate_controller(&hello).unwrap(), None);
+        relay.set_allow_legacy_token(false).await.unwrap();
+    }
+    let relay = persisted_relay(&files.path, Duration::minutes(10)).unwrap();
+    assert!(!relay.allow_legacy_token().unwrap());
+    assert!(relay.authenticate_controller(&hello).is_err());
+    assert!(!relay.admin_snapshot().await.identity.allow_legacy_token);
+    relay.set_allow_legacy_token(true).await.unwrap();
+    assert_eq!(relay.authenticate_controller(&hello).unwrap(), None);
+}
+
+#[tokio::test]
+async fn disable_legacy_token_cleans_only_legacy_ai_connections_and_their_authority() {
+    let (relay, _, token) = enrolled_relay();
+    let (agent, mut agent_receiver, session_id) =
+        ready_agent(&relay, AgentInstanceId::new(), None).await;
+    let old = installation_hello(AI_TOKEN.to_owned());
+    let (sender, _old_receiver, closed) = outbound_channel();
+    let generation = relay
+        .authenticate_and_register_controller(&old, sender)
+        .await
+        .unwrap();
+    let second = installation_hello(AI_TOKEN.to_owned());
+    let (sender, _second_receiver, closed_two) = outbound_channel();
+    relay
+        .authenticate_and_register_controller(&second, sender)
+        .await
+        .unwrap();
+    let independent = installation_hello(token.clone());
+    let (sender, _independent_receiver, independent_closed) = outbound_channel();
+    relay
+        .authenticate_and_register_controller(&independent, sender)
+        .await
+        .unwrap();
+    let (human, _, _human_receiver) = register_controller(&relay, ControllerKind::Human).await;
+    let paired = relay
+        .pair_controller(
+            old.controller_instance_id,
+            generation,
+            PairRequest {
+                connection_resume_token: None,
+                expected_session_id: None,
+                request_id: RequestId::new(),
+                pairing_code: agent.welcome.pairing_code,
+                permission_mode: PermissionMode::ApprovalRequired,
+            },
+        )
+        .await;
+    assert!(paired.connection.is_some());
+    while agent_receiver.try_recv().is_ok() {}
+    let approval = relay
+        .request_approval(
+            old.controller_instance_id,
+            generation,
+            ApprovalRequest {
+                request_id: RequestId::new(),
+                session_id,
+                operation: run_command("Remove-Item C:\\temp\\a.txt", false),
+            },
+        )
+        .await;
+    assert_eq!(approval.state, ApprovalState::Pending);
+    relay.set_allow_legacy_token(false).await.unwrap();
+    time::timeout(time::Duration::from_secs(1), closed.notified())
+        .await
+        .unwrap();
+    time::timeout(time::Duration::from_secs(1), closed_two.notified())
+        .await
+        .unwrap();
+    assert!(
+        matches!(agent_receiver.try_recv(), Ok(WireMessage::ControllerBindingRevoked { session_id: id, .. }) if id == session_id)
+    );
+    {
+        let state = relay.state.lock().await;
+        assert!(!state.controllers.contains_key(&old.controller_instance_id));
+        assert!(
+            !state
+                .controllers
+                .contains_key(&second.controller_instance_id)
+        );
+        assert!(
+            state
+                .controllers
+                .contains_key(&independent.controller_instance_id)
+        );
+        assert!(state.controllers.contains_key(&human));
+        assert!(!state.session_bindings.contains_key(&session_id));
+        assert!(state.approvals.is_empty());
+    }
+    assert!(
+        time::timeout(
+            time::Duration::from_millis(1),
+            independent_closed.notified()
+        )
+        .await
+        .is_err()
+    );
+    assert!(relay.authenticate_controller(&old).is_err());
+    assert!(
+        relay
+            .authenticate_controller(&installation_hello(token))
+            .is_ok()
+    );
+    let mut human_hello = installation_hello(HUMAN_TOKEN.to_owned());
+    human_hello.kind = ControllerKind::Human;
+    assert!(relay.authenticate_controller(&human_hello).is_ok());
+    assert_legacy_reconnect_has_no_authority(&relay, &old).await;
+}
+
+async fn assert_legacy_reconnect_has_no_authority(relay: &Relay, hello: &ControllerHello) {
+    relay.set_allow_legacy_token(true).await.unwrap();
+    let (sender, _receiver) = test_channel();
+    relay
+        .authenticate_and_register_controller(hello, sender)
+        .await
+        .unwrap();
+    let state = relay.state.lock().await;
+    assert!(
+        state.controllers[&hello.controller_instance_id]
+            .sessions
+            .is_empty()
+    );
+    assert!(state.session_bindings.is_empty());
+    assert!(state.approvals.is_empty());
+}
+
+#[tokio::test]
+async fn disabling_legacy_token_serializes_with_registration_already_authenticated() {
+    let (relay, _, _) = enrolled_relay();
+    let relay = Arc::new(relay);
+    let state = relay.state.lock().await;
+    let registering_relay = relay.clone();
+    let registering = tokio::spawn(async move {
+        let hello = installation_hello(AI_TOKEN.to_owned());
+        let (sender, receiver, closed) = outbound_channel();
+        let result = registering_relay
+            .authenticate_and_register_controller(&hello, sender)
+            .await;
+        (hello.controller_instance_id, result, receiver, closed)
+    });
+    while relay.enrollment_gate.try_lock().is_ok() {
+        tokio::task::yield_now().await;
+    }
+    let disabling_relay = relay.clone();
+    let disabling =
+        tokio::spawn(async move { disabling_relay.set_allow_legacy_token(false).await });
+    tokio::task::yield_now().await;
+    assert!(!disabling.is_finished());
+    drop(state);
+    let (id, result, _receiver, closed) = registering.await.unwrap();
+    assert!(result.is_ok());
+    disabling.await.unwrap().unwrap();
+    assert!(!relay.state.lock().await.controllers.contains_key(&id));
+    time::timeout(time::Duration::from_secs(1), closed.notified())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn legacy_registration_waiting_after_disable_cannot_resurrect_connection() {
+    let (relay, _, _) = enrolled_relay();
+    let relay = Arc::new(relay);
+    let gate = relay.enrollment_gate.lock().await;
+    let disabling_relay = relay.clone();
+    let disabling =
+        tokio::spawn(async move { disabling_relay.set_allow_legacy_token(false).await });
+    tokio::task::yield_now().await;
+    let registering_relay = relay.clone();
+    let registering = tokio::spawn(async move {
+        let (sender, _receiver) = test_channel();
+        registering_relay
+            .authenticate_and_register_controller(&installation_hello(AI_TOKEN.to_owned()), sender)
+            .await
+    });
+    tokio::task::yield_now().await;
+    drop(gate);
+    disabling.await.unwrap().unwrap();
+    assert!(registering.await.unwrap().is_err());
+    assert!(relay.state.lock().await.controllers.is_empty());
+}
+
+#[tokio::test]
+async fn disabling_legacy_token_closes_actual_stream_without_an_incoming_frame() {
+    let (relay, _, _) = enrolled_relay();
+    let relay = Arc::new(relay);
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let serving_relay = relay.clone();
+    let serving = tokio::spawn(async move { serving_relay.handle_client(server).await });
+    write_frame(
+        &mut client,
+        &WireMessage::Hello(ClientHello::Controller(installation_hello(
+            AI_TOKEN.to_owned(),
+        ))),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<WireMessage, _>(&mut client).await.unwrap(),
+        WireMessage::ControllerWelcome { .. }
+    ));
+    relay.set_allow_legacy_token(false).await.unwrap();
+    assert!(
+        time::timeout(
+            time::Duration::from_secs(1),
+            read_frame::<WireMessage, _>(&mut client)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn policy_storage_failure_does_not_disconnect_or_change_authentication() {
+    let relay = relay(Duration::minutes(10));
+    let hello = installation_hello(AI_TOKEN.to_owned());
+    let (sender, _receiver, closed) = outbound_channel();
+    relay
+        .authenticate_and_register_controller(&hello, sender)
+        .await
+        .unwrap();
+    assert!(relay.set_allow_legacy_token(false).await.is_err());
+    assert!(relay.allow_legacy_token().unwrap());
+    assert!(relay.authenticate_controller(&hello).is_ok());
+    assert!(
+        relay
+            .state
+            .lock()
+            .await
+            .controllers
+            .contains_key(&hello.controller_instance_id)
+    );
+    assert!(
+        time::timeout(time::Duration::from_millis(1), closed.notified())
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn enabled_legacy_policy_does_not_allow_an_unconfigured_or_incorrect_token() {
+    let mut relay = relay(Duration::minutes(10));
+    relay.ai_controller_token.clear();
+    assert!(relay.allow_legacy_token().unwrap());
+    assert!(
+        relay
+            .authenticate_controller(&installation_hello(String::new()))
+            .is_err()
+    );
+    assert!(
+        relay
+            .authenticate_controller(&installation_hello(AI_TOKEN.to_owned()))
+            .is_err()
     );
 }

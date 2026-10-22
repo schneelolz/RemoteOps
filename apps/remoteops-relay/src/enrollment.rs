@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use chrono::Utc;
 use remoteops_enrollment::{
@@ -19,6 +19,7 @@ use remoteops_enrollment::{
     MAX_SETUP_BYTES, RedeemRequest, RedeemResponse,
 };
 use remoteops_enrollment_store::StoreError;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::admin::{AdminState, ErrorResponse, authorize};
@@ -87,12 +88,21 @@ pub(crate) fn router() -> Router<AdminState> {
             "/api/admin/mcp/settings",
             get(settings).put(update_settings),
         )
+        .route(
+            "/api/admin/mcp/access-policy",
+            get(access_policy).put(update_access_policy),
+        )
         .route("/api/admin/mcp/setups", get(setups).post(create_setup))
         .route(
             "/api/admin/mcp/setups/{grant_id}/revoke",
             post(revoke_setup),
         )
+        .route("/api/admin/mcp/setups/{grant_id}/name", put(rename_setup))
         .route("/api/admin/mcp/clients", get(clients))
+        .route(
+            "/api/admin/mcp/clients/{installation_id}/name",
+            put(rename_client),
+        )
         .route(
             "/api/admin/mcp/clients/{installation_id}/revoke",
             post(revoke_client),
@@ -145,6 +155,37 @@ async fn update_settings(
     let Json(request) = request.map_err(invalid_json)?;
     let store = state.relay.enrollment_store().map_err(store_error)?;
     store.set_settings(request.clone()).map_err(store_error)?;
+    Ok(Json(request))
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct McpAccessPolicy {
+    allow_legacy_token: bool,
+}
+
+async fn access_policy(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> ApiResult<McpAccessPolicy> {
+    authorize(&state, &headers).await?;
+    Ok(Json(McpAccessPolicy {
+        allow_legacy_token: state.relay.allow_legacy_token().map_err(store_error)?,
+    }))
+}
+
+async fn update_access_policy(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    request: Result<Json<McpAccessPolicy>, JsonRejection>,
+) -> ApiResult<McpAccessPolicy> {
+    authorize(&state, &headers).await?;
+    let Json(request) = request.map_err(invalid_json)?;
+    state
+        .relay
+        .set_allow_legacy_token(request.allow_legacy_token)
+        .await
+        .map_err(store_error)?;
     Ok(Json(request))
 }
 
@@ -202,6 +243,51 @@ async fn revoke_setup(
     Ok(Json(
         serde_json::json!({"success": true, "changed": changed}),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameRequest {
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    client_name: Option<String>,
+}
+
+async fn rename_setup(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    request: Result<Json<RenameRequest>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    authorize(&state, &headers).await?;
+    let id = parse_id(&id)?;
+    let Json(request) = request.map_err(invalid_json)?;
+    let store = state.relay.enrollment_store().map_err(store_error)?;
+    if !store
+        .rename_grant(id, request.client_name.as_deref())
+        .map_err(store_error)?
+    {
+        return Err(error(StatusCode::NOT_FOUND, "Setup grant not found"));
+    }
+    Ok(Json(serde_json::json!({"success": true})))
+}
+
+async fn rename_client(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    request: Result<Json<RenameRequest>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    authorize(&state, &headers).await?;
+    let id = parse_id(&id)?;
+    let Json(request) = request.map_err(invalid_json)?;
+    let store = state.relay.enrollment_store().map_err(store_error)?;
+    if !store
+        .rename_client(id, request.client_name.as_deref())
+        .map_err(store_error)?
+    {
+        return Err(error(StatusCode::NOT_FOUND, "MCP client not found"));
+    }
+    Ok(Json(serde_json::json!({"success": true})))
 }
 
 async fn clients(

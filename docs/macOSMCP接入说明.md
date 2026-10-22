@@ -1,5 +1,7 @@
 # macOS MCP 接入说明
 
+> 当前安装规则：新版安装器只支持设置码/设置文件，不再支持 Token 安装。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](mcp-one-time-setup.md)。
+
 RemoteOps 首个公开预览支持在 Apple Silicon Mac 上运行 Codex STDIO MCP，并通过自托管 Relay 控制现有 Windows Agent。这里的 macOS 支持是控制端 MCP，不是 macOS 被控端 Agent。
 
 ## 支持范围
@@ -17,10 +19,8 @@ Intel Mac、Universal Binary、Developer ID 签名和 Apple Notarization 尚未�
 你需要：
 
 1. `RemoteOps-MCP-macOS-arm64-0.2.0-preview.5.tar.gz`；
-2. Relay 地址，例如 `relay.example.com:7443`；
-3. AI Controller Token，长度至少 32 个字符；
-4. Relay 配置的统一 Controller Owner UUID；
-5. 私有 CA 环境中的 CA PEM，或已经通过独立可信渠道核对的 Relay 叶证书 SHA-256 指纹。
+2. 管理员签发的设置文件或设置码；
+3. 通过可信渠道核对设置中的 Relay、HTTPS 登记地址和公开信任证书。
 
 ## 安装
 
@@ -28,31 +28,23 @@ Intel Mac、Universal Binary、Developer ID 签名和 Apple Notarization 尚未�
 tar -xzf RemoteOps-MCP-macOS-arm64-0.2.0-preview.5.tar.gz
 cd RemoteOps-MCP-macOS-arm64-0.2.0-preview.5
 chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.sh
-./install-remoteops-mcp.sh \
-  --relay relay.example.com:7443 \
-  --owner-id '<controller-owner-uuid>'
+./install-remoteops-mcp.sh --setup-file "$HOME/Downloads/client.remoteops-setup"
 ```
 
-公网 CA 证书使用 macOS 系统可信根。私有 CA 增加：
+只有设置码时，使用隐藏输入提示：
 
 ```bash
---ca-cert ./relay-ca.pem
+./install-remoteops-mcp.sh --setup-code
 ```
 
-没有 CA PEM、但已经独立核对叶证书指纹时使用：
-
-```bash
---tls-fingerprint '<64 位 SHA-256 指纹>'
-```
-
-两种信任方式只能选择一种。安装器会隐藏读取 Controller Token，并保存到当前用户的 macOS Keychain，服务名为 `RemoteOps Controller Token`。Codex 配置只指向本地启动脚本，不包含 Token。
+安装器预览设置中的非秘密地址及信任配置，确认后兑换独立凭据，保存到当前用户的 macOS Keychain。Codex 配置直接启动 MCP，JSON 仅保存凭据引用，不包含秘密。公网 CA 使用系统可信根；私有 CA 由管理员放入设置文件，不再接收手工 Token、Relay、Owner 或证书参数。
 
 默认安装位置：
 
 ```text
 ~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.12
-~/.codex/remoteops/launch-remoteops-controller-mcp.sh
 ~/.codex/remoteops/controller-config.json
+~/.codex/remoteops/setup-state.json
 ~/.codex/config.toml
 ~/.agents/skills/remoteops/SKILL.md
 ~/.codex/skills/remoteops/SKILL.md

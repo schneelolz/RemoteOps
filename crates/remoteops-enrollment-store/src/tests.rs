@@ -740,3 +740,291 @@ fn database_symlinks_are_rejected() {
         Err(StoreError::Storage(_))
     ));
 }
+
+#[test]
+fn renamed_grants_and_clients_survive_restart_and_keep_credentials() {
+    let database = TestDatabase::new();
+    let owner = ControllerOwnerId::new();
+    let now = Utc::now();
+    let (grant_id, request, expected_response) = {
+        let store = EnrollmentStore::open(database.path(), owner).unwrap();
+        store.set_settings(endpoints()).unwrap();
+        let grant = create(&store, now);
+        assert!(
+            store
+                .rename_grant(grant.setup.grant_id, Some("  Before install  "))
+                .unwrap()
+        );
+        assert_eq!(
+            store.list_grants(now).unwrap()[0].client_name.as_deref(),
+            Some("Before install")
+        );
+        let request = request(&grant);
+        let response = store.redeem(request.clone(), now).unwrap();
+        assert_eq!(
+            store.list_clients().unwrap()[0].client_name.as_deref(),
+            Some("Before install")
+        );
+        assert!(
+            store
+                .rename_grant(grant.setup.grant_id, Some("After install"))
+                .unwrap()
+        );
+        assert_eq!(
+            store.list_clients().unwrap()[0].client_name.as_deref(),
+            Some("After install")
+        );
+        assert!(
+            store
+                .rename_client(request.installation_id, Some("  Final name  "))
+                .unwrap()
+        );
+        assert_eq!(
+            store.list_grants(now).unwrap()[0].client_name.as_deref(),
+            Some("Final name")
+        );
+        (
+            grant.setup.grant_id,
+            request,
+            serde_json::to_value(response).unwrap(),
+        )
+    };
+    let store = EnrollmentStore::open(database.path(), owner).unwrap();
+    assert_eq!(store.list_grants(now).unwrap()[0].grant_id, grant_id);
+    assert_eq!(
+        store.list_grants(now).unwrap()[0].client_name.as_deref(),
+        Some("Final name")
+    );
+    assert_eq!(
+        store.list_clients().unwrap()[0].client_name.as_deref(),
+        Some("Final name")
+    );
+    assert!(store.authenticate_token(&token(&request), now).is_ok());
+    assert_eq!(
+        serde_json::to_value(store.redeem(request, now).unwrap()).unwrap(),
+        expected_response
+    );
+}
+
+#[test]
+fn renaming_revoked_records_does_not_restore_access_or_change_protected_fields() {
+    let store = store();
+    let now = Utc::now();
+    let grant = create(&store, now);
+    let request = request(&grant);
+    store.redeem(request.clone(), now).unwrap();
+    store.revoke_grant(grant.setup.grant_id).unwrap();
+    store.revoke_client(request.installation_id).unwrap();
+    let protected_fields = || {
+        let connection = store.connection().unwrap();
+        let grant: (Vec<u8>, String, String, bool, String, String) = connection.query_row(
+            "SELECT secret_hash, created_at, expires_at, revoked, endpoints_json, response_json FROM enrollment_grants",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).unwrap();
+        let client: (Vec<u8>, String, Option<String>, bool) = connection
+            .query_row(
+                "SELECT secret_hash, created_at, last_seen, revoked FROM enrollment_clients",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        (grant, client)
+    };
+    let before = protected_fields();
+    assert!(
+        store
+            .rename_grant(grant.setup.grant_id, Some("Revoked setup"))
+            .unwrap()
+    );
+    assert!(
+        store
+            .rename_client(request.installation_id, Some("Revoked client"))
+            .unwrap()
+    );
+    assert_eq!(protected_fields(), before);
+    assert_eq!(store.list_grants(now).unwrap()[0].state, "revoked");
+    assert!(store.list_clients().unwrap()[0].revoked);
+    assert!(matches!(
+        store.authenticate_token(&token(&request), now),
+        Err(StoreError::Revoked)
+    ));
+    assert!(matches!(
+        store.redeem(request, now),
+        Err(StoreError::Revoked)
+    ));
+}
+
+#[test]
+fn rename_normalizes_blank_names_and_validates_untrimmed_control_characters() {
+    let store = store();
+    let now = Utc::now();
+    let grant = create(&store, now);
+    let request = request(&grant);
+    store.redeem(request.clone(), now).unwrap();
+    for name in [None, Some(""), Some("   "), Some("\u{2003} \u{2003}")] {
+        assert!(store.rename_grant(grant.setup.grant_id, name).unwrap());
+        assert!(store.list_grants(now).unwrap()[0].client_name.is_none());
+        assert!(store.list_clients().unwrap()[0].client_name.is_none());
+        assert!(
+            store
+                .rename_client(request.installation_id, Some("Temporary"))
+                .unwrap()
+        );
+        assert!(store.rename_client(request.installation_id, name).unwrap());
+        assert!(store.list_grants(now).unwrap()[0].client_name.is_none());
+    }
+    let maximum = "a".repeat(256);
+    assert!(
+        store
+            .rename_client(request.installation_id, Some(&format!("  {maximum}  ")))
+            .unwrap()
+    );
+    for name in [
+        "a".repeat(257),
+        "中".repeat(86),
+        "\t".into(),
+        "\n Name ".into(),
+        "Name\r".into(),
+        "a\0b".into(),
+    ] {
+        assert!(matches!(
+            store.rename_grant(grant.setup.grant_id, Some(&name)),
+            Err(StoreError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            store.rename_client(request.installation_id, Some(&name)),
+            Err(StoreError::InvalidInput(_))
+        ));
+        assert_eq!(
+            store.list_grants(now).unwrap()[0].client_name.as_deref(),
+            Some(maximum.as_str())
+        );
+    }
+}
+
+#[test]
+fn renaming_unknown_records_does_not_create_them() {
+    let store = store();
+    assert!(!store.rename_grant(Uuid::new_v4(), Some("Unknown")).unwrap());
+    assert!(
+        !store
+            .rename_client(Uuid::new_v4(), Some("Unknown"))
+            .unwrap()
+    );
+    assert!(store.list_grants(Utc::now()).unwrap().is_empty());
+    assert!(store.list_clients().unwrap().is_empty());
+}
+
+#[test]
+fn rename_rolls_back_both_names_when_bound_client_update_fails() {
+    let store = store();
+    let now = Utc::now();
+    let grant = create(&store, now);
+    let request = request(&grant);
+    store.redeem(request.clone(), now).unwrap();
+    store
+        .connection()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_client_rename BEFORE UPDATE OF client_name ON enrollment_clients
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+    assert!(matches!(
+        store.rename_grant(grant.setup.grant_id, Some("Changed")),
+        Err(StoreError::Storage(_))
+    ));
+    assert!(matches!(
+        store.rename_client(request.installation_id, Some("Changed")),
+        Err(StoreError::Storage(_))
+    ));
+    assert_eq!(
+        store.list_grants(now).unwrap()[0].client_name.as_deref(),
+        Some("My workstation")
+    );
+    assert_eq!(
+        store.list_clients().unwrap()[0].client_name.as_deref(),
+        Some("My workstation")
+    );
+    assert!(store.authenticate_token(&token(&request), now).is_ok());
+}
+
+#[test]
+fn legacy_token_policy_defaults_to_compatible_and_survives_restart() {
+    let database = TestDatabase::new();
+    let owner = ControllerOwnerId::new();
+    {
+        let store = EnrollmentStore::open(database.path(), owner).unwrap();
+        assert!(store.allow_legacy_token().unwrap());
+        store.set_allow_legacy_token(false).unwrap();
+    }
+    {
+        let store = EnrollmentStore::open(database.path(), owner).unwrap();
+        assert!(!store.allow_legacy_token().unwrap());
+        store.set_allow_legacy_token(true).unwrap();
+    }
+    assert!(
+        EnrollmentStore::open(database.path(), owner)
+            .unwrap()
+            .allow_legacy_token()
+            .unwrap()
+    );
+}
+
+#[test]
+fn malformed_legacy_token_policy_fails_closed_and_prevents_restart() {
+    for value in ["", "1", "TRUE", " false ", "null"] {
+        let database = TestDatabase::new();
+        let owner = ControllerOwnerId::new();
+        {
+            let store = EnrollmentStore::open(database.path(), owner).unwrap();
+            store
+                .connection()
+                .unwrap()
+                .execute(
+                    "INSERT INTO enrollment_meta (key, value) VALUES ('allow_legacy_token', ?1)",
+                    [value],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.allow_legacy_token(),
+                Err(StoreError::Storage(_))
+            ));
+        }
+        assert!(matches!(
+            EnrollmentStore::open(database.path(), owner),
+            Err(StoreError::Storage(_))
+        ));
+    }
+}
+
+#[test]
+fn failed_policy_writes_preserve_the_previous_value() {
+    let store = store();
+    store
+        .connection()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER deny_policy_insert BEFORE INSERT ON enrollment_meta
+         BEGIN SELECT RAISE(ABORT, 'injected policy failure'); END;",
+        )
+        .unwrap();
+    assert!(store.set_allow_legacy_token(false).is_err());
+    assert!(store.allow_legacy_token().unwrap());
+    store
+        .connection()
+        .unwrap()
+        .execute_batch("DROP TRIGGER deny_policy_insert;")
+        .unwrap();
+    store.set_allow_legacy_token(false).unwrap();
+    store
+        .connection()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER deny_policy_update BEFORE UPDATE ON enrollment_meta
+         BEGIN SELECT RAISE(ABORT, 'injected policy failure'); END;",
+        )
+        .unwrap();
+    assert!(store.set_allow_legacy_token(true).is_err());
+    assert!(!store.allow_legacy_token().unwrap());
+}

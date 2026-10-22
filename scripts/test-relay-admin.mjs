@@ -238,6 +238,8 @@ function seedMcp(h) {
     state.isLoggedIn = true;
     state.currentTab = 'mcp';
     state.mcp.loaded = true;
+    state.mcp.accessPolicy = {allow_legacy_token:true};
+    state.mcp.policyLoaded = true;
     state.mcp.settings = ${JSON.stringify(mcpSettings)};
     state.mcp.settingsDraft = mcpSettingsDraft(state.mcp.settings);
     globalThis.setupResponse = ${JSON.stringify({ setup: setupFixture, setup_code: codeFixture })};
@@ -245,6 +247,7 @@ function seedMcp(h) {
     globalThis.listClients = [];
     apiFetch = async (url, options = {}) => {
       requests.push({ url, ...options });
+      if (url === '/api/admin/mcp/access-policy') return {allow_legacy_token:true};
       if (url === '/api/admin/mcp/settings') return ${JSON.stringify(mcpSettings)};
       if (url === '/api/admin/mcp/setups' && options.method === 'POST') return setupResponse;
       if (url === '/api/admin/mcp/setups') return listSetups;
@@ -442,7 +445,7 @@ test('MCP 旧列表请求不会覆盖导航返回后的新数据', async () => {
   const old = h.run('refreshMcpData()');
   h.run(`navigateTo('overview'); apiFetch = regularApi; listSetups = [{grant_id:'new', state:'redeemed', grant_secret:'MUST-NOT-RETAIN'}]; navigateTo('mcp');`);
   await h.run('Promise.resolve()');
-  h.run('oldResolvers[0](null); oldResolvers[1]([{grant_id:"old",state:"pending"}]); oldResolvers[2]([]);');
+  h.run('oldResolvers[0](null); oldResolvers[1]([{grant_id:"old",state:"pending"}]); oldResolvers[2]([]); oldResolvers[3]({allow_legacy_token:true});');
   await old;
   assert.equal(h.run('state.mcp.setups[0].grant_id'), 'new');
   assert.equal(h.run('state.mcp.setups[0].grant_secret'), undefined);
@@ -581,4 +584,244 @@ test('MCP 生成未完成时离开再返回，迟到结果只刷新元数据且�
   assert.equal(h.run('state.activeModal'),null);
   assert.equal(h.run('state.mcp.loading'),false);
   assert.match(h.run('renderMcpView()'), /id="mcp-new-setup"/);
+});
+
+
+test('MCP 名称使用 UTF-8 字节上限，拒绝控制字符并支持清空', () => {
+  const h = harness();
+  for (const name of ['a'.repeat(256), '中'.repeat(85), '😀'.repeat(64)]) {
+    assert.equal(h.run(`normalizeMcpClientName(${JSON.stringify(name)})`), name);
+  }
+  for (const name of ['a'.repeat(257), '中'.repeat(86), '😀'.repeat(65), ' 名称\n', '\t名称', '名\u0085称']) {
+    assert.throws(() => h.run(`normalizeMcpClientName(${JSON.stringify(name)})`));
+  }
+  assert.equal(h.run('normalizeMcpClientName("   ")'), null);
+  assert.equal(h.run('normalizeMcpClientName("  客户端  ")'), '客户端');
+});
+
+test('MCP 待使用、已兑换和已撤销记录均可改名，弹窗转义输入', () => {
+  const h = harness();
+  seedMcp(h);
+  const name = `"><img src=x onerror=alert(1)>`;
+  h.run(`state.mcp.setups = ['pending','redeemed','expired','revoked'].map(state => ({grant_id:state, state, client_name:${JSON.stringify(name)}})); state.mcp.clients = [{installation_id:'revoked-client', revoked:true}];`);
+  for (const id of ['pending','redeemed','expired','revoked']) {
+    h.run(`openMcpRename('setups', '${id}')`);
+    assert.equal(h.run('state.activeModal'), 'mcpRename');
+    assert.match(h.run('renderMcpModal()'), /&lt;img/);
+    assert.doesNotMatch(h.run('renderMcpModal()'), /<img/);
+    h.run('closeModal()');
+  }
+  h.run("openMcpRename('clients', 'revoked-client')");
+  assert.equal(h.run('state.activeModal'), 'mcpRename');
+  assert.equal((h.run('renderMcpView()').match(/>修改名称<\/button>/g) || []).length, 5);
+});
+
+test('MCP 改名阻止重复提交，提交规范化名称并刷新关联设置与客户端', async () => {
+  for (const kind of ['setups', 'clients']) {
+    const h = harness();
+    seedMcp(h);
+    h.run(`listSetups = [{grant_id:'fixture-grant', installation_id:'fixture-client', state:'redeemed', client_name:'新名字'}]; listClients = [{installation_id:'fixture-client', revoked:false, client_name:'新名字'}]; state.mcp.setups = [{grant_id:'fixture-grant', state:'redeemed'}]; state.mcp.clients = [{installation_id:'fixture-client', revoked:false}];
+      const regularApi = apiFetch;
+      apiFetch = async (url, options = {}) => { if (url.endsWith('/name')) { requests.push({url, ...options}); return new Promise(resolve => globalThis.releaseRename = resolve); } return regularApi(url, options); };
+      openMcpRename('${kind}', '${kind === 'setups' ? 'fixture-grant' : 'fixture-client'}'); state.modalTargetData.name = '  新名字  ';`);
+    const request = h.run('renameMcpClient()');
+    await h.run('renameMcpClient()');
+    assert.equal(h.run('requests.length'), 1);
+    assert.equal(h.run('requests[0].method'), 'PUT');
+    assert.match(h.run('requests[0].url'), new RegExp(`/mcp/${kind}/fixture-.*?/name$`));
+    assert.deepEqual(h.data('JSON.parse(requests[0].body)'), {client_name:'新名字'});
+    assert.match(h.run('renderMcpModal()'), /正在保存/);
+    h.run('releaseRename({success:true})');
+    await request;
+    assert.equal(h.run('state.activeModal'), null);
+    assert.equal(h.run('state.mcp.setups[0].client_name'), '新名字');
+    assert.equal(h.run('state.mcp.clients[0].client_name'), '新名字');
+    assert.equal(h.run('state.mcp.renaming.size'), 0);
+  }
+});
+
+test('MCP 清空名称提交 null，非法名称不发送请求且错误不回显响应内容', async () => {
+  const h = harness();
+  seedMcp(h);
+  h.run("state.mcp.setups = [{grant_id:'fixture-grant', state:'pending'}]; openMcpRename('setups','fixture-grant'); state.modalTargetData.name = '中'.repeat(86);");
+  await h.run('renameMcpClient()');
+  assert.equal(h.run('requests.length'), 0);
+  assert.match(h.run('state.mcp.modalError'), /256/);
+  h.run(`state.modalTargetData.name = '  '; apiFetch = async (url, options) => { requests.push({url,...options}); throw new Error('NONFUNCTIONAL-SECRET-ERROR'); };`);
+  await h.run('renameMcpClient()');
+  assert.deepEqual(h.data('JSON.parse(requests[0].body)'), {client_name:null});
+  assert.equal(h.run('state.activeModal'), 'mcpRename');
+  assert.equal(h.run('state.mcp.renaming.size'), 0);
+  assert.doesNotMatch(h.run('renderMcpModal()'), /NONFUNCTIONAL-SECRET-ERROR/);
+});
+
+test('MCP 关闭、导航或退出后的改名响应不会直接采纳响应字段或关闭新弹窗', async () => {
+  for (const action of ['closeModal(); openMcpRevoke("setups", "fixture-grant")', 'navigateTo("identity")', 'logout()']) {
+    const h = harness();
+    seedMcp(h);
+    h.run(`state.mcp.setups = [{grant_id:'fixture-grant', client_name:'旧名称', state:'pending'}]; apiFetch = async (url, options = {}) => url.endsWith('/name') ? new Promise(resolve => globalThis.releaseRename = resolve) : {}; openMcpRename('setups','fixture-grant'); state.modalTargetData.name = '新名称';`);
+    const request = h.run('renameMcpClient()');
+    h.run(action);
+    const modal = h.run('state.activeModal');
+    h.run('releaseRename({success:true})');
+    await request;
+    assert.equal(h.run('state.activeModal'), modal);
+    assert.equal(h.run('state.mcp.renaming.size'), 0);
+    assert.equal(h.run('toasts.some(item => item.type === "success")'), false);
+    assert.notEqual(h.run('state.mcp.setups[0]?.client_name'), '新名称');
+  }
+});
+
+test('MCP 演示模式不允许改名，身份页跟随旧 Token 接入策略', async () => {
+  const h = harness();
+  seedMcp(h);
+  h.run("state.demoMode = true; state.mcp.clients = [{installation_id:'fixture-client'}]; openMcpRename('clients','fixture-client');");
+  assert.equal(h.run('state.activeModal'), null);
+  await h.run('renameMcpClient()');
+  assert.equal(h.run('requests.length'), 0);
+  h.run('relayInfo.aiTokenConfigured = true; relayInfo.allowLegacyToken = false;');
+  const html = h.run('renderIdentityView()');
+  assert.match(html, /已禁止旧 Token 接入/);
+  assert.match(html, /检测到历史 Token 配置，是否可用取决于接入策略/);
+  assert.match(html, /Human Controller Token/);
+  assert.match(h.run('renderMcpView()'), /新版安装器仅支持设置码或设置文件/);
+});
+
+
+test('MCP 关闭改名弹窗后成功响应通过 GET 同步元数据，并保留新弹窗输入', async () => {
+  const h = harness();
+  seedMcp(h);
+  h.run(`state.mcp.setups = [{grant_id:'fixture-grant', client_name:'旧名称', state:'redeemed'}, {grant_id:'another-grant', client_name:'另一客户端', state:'pending'}];
+    listSetups = [{grant_id:'fixture-grant', client_name:'保存后的名字', state:'redeemed'}, {grant_id:'another-grant', client_name:'另一客户端', state:'pending'}];
+    listClients = [{installation_id:'fixture-client', client_name:'保存后的名字', revoked:false}];
+    const regularApi = apiFetch;
+    apiFetch = async (url, options = {}) => url.endsWith('/name') ? new Promise(resolve => globalThis.releaseRename = resolve) : regularApi(url, options);
+    openMcpRename('setups','fixture-grant'); state.modalTargetData.name = '保存后的名字';`);
+  const request = h.run('renameMcpClient()');
+  h.run(`closeModal(); openMcpRename('setups','another-grant'); state.modalTargetData.name = '新弹窗中未保存的名字'; releaseRename({success:true, client_name:'不可直接采用的响应字段'});`);
+  await request;
+  assert.equal(h.run('state.activeModal'), 'mcpRename');
+  assert.equal(h.run('state.modalTargetData.name'), '新弹窗中未保存的名字');
+  assert.equal(h.run('state.mcp.setups[0].client_name'), '保存后的名字');
+  assert.equal(h.run('state.mcp.clients[0].client_name'), '保存后的名字');
+  assert.equal(h.run('requests.some(item => item.url === "/api/admin/mcp/setups")'), true);
+  assert.equal(h.run('toasts.some(item => item.type === "success")'), false);
+});
+
+
+test('MCP 兼容策略严格读取布尔值，false 不会被默认开启或误提交', async () => {
+  const h = harness();
+  seedMcp(h);
+  h.run(`state.mcp.accessPolicy = null; state.mcp.policyLoaded = false; apiFetch = async () => ({allow_legacy_token:false});`);
+  h.run('requestMcpAccessPolicy(true)');
+  assert.equal(h.run('state.mcp.policySaving'), false);
+  assert.match(h.run('renderMcpView()'), /id="mcp-allow-legacy"[^>]*disabled/);
+  assert.equal(await h.run('refreshMcpAccessPolicy()'), true);
+  assert.equal(h.run('state.mcp.accessPolicy.allow_legacy_token'), false);
+  assert.equal(h.run('relayInfo.allowLegacyToken'), false);
+  assert.doesNotMatch(h.run('renderMcpView()'), /id="mcp-allow-legacy"[^>]*\schecked(?:\s|>)/);
+  for (const value of [{}, {allow_legacy_token:'false'}, {allow_legacy_token:null}]) {
+    assert.throws(() => h.run(`parseMcpAccessPolicy(${JSON.stringify(value)})`));
+  }
+});
+
+test('MCP 关闭旧 Token 前必须确认，重复提交只保存一次，开启可直接保存', async () => {
+  const h = harness();
+  seedMcp(h);
+  h.run(`apiFetch = async (url, options = {}) => {requests.push({url,...options}); return new Promise(resolve => globalThis.releasePolicy = resolve);}; requestMcpAccessPolicy(false);`);
+  assert.equal(h.run('state.activeModal'), 'mcpLegacyDisable');
+  assert.equal(h.run('requests.length'), 0);
+  assert.match(h.run('renderMcpModal()'), /现有旧 Token MCP 连接会断开/);
+  const closing = h.run('saveMcpAccessPolicy(false)');
+  await h.run('saveMcpAccessPolicy(false)');
+  assert.equal(h.run('requests.length'), 1);
+  assert.equal(h.run('requests[0].method'), 'PUT');
+  assert.deepEqual(h.data('JSON.parse(requests[0].body)'), {allow_legacy_token:false});
+  h.run('releasePolicy({allow_legacy_token:false})');
+  await closing;
+  assert.equal(h.run('state.mcp.accessPolicy.allow_legacy_token'), false);
+  assert.equal(h.run('state.activeModal'), null);
+  const opening = h.run('saveMcpAccessPolicy(true)');
+  h.run('releasePolicy({allow_legacy_token:true})');
+  await opening;
+  assert.equal(h.run('state.mcp.accessPolicy.allow_legacy_token'), true);
+  assert.equal(h.run('requests.length'), 2);
+});
+
+test('MCP 策略读取失败禁止修改，PUT 失败回读实际状态且不误报成功', async () => {
+  const h = harness();
+  seedMcp(h);
+  h.run(`apiFetch = async () => {throw new Error('NONFUNCTIONAL-SECRET-ERROR');};`);
+  assert.equal(await h.run('refreshMcpAccessPolicy()'), false);
+  assert.equal(h.run('state.mcp.policyLoaded'), false);
+  h.run('requestMcpAccessPolicy(false)');
+  assert.equal(h.run('state.activeModal'), null);
+  assert.match(h.run('state.mcp.policyError'), /读取失败/);
+  assert.doesNotMatch(h.run('renderMcpView()'), /NONFUNCTIONAL-SECRET-ERROR/);
+  h.run(`state.mcp.policyLoaded = true; apiFetch = async (url, options = {}) => {requests.push({url,...options}); if (options.method === 'PUT') throw new Error('NONFUNCTIONAL-SECRET-ERROR'); return {allow_legacy_token:false};}; requestMcpAccessPolicy(false);`);
+  await h.run('saveMcpAccessPolicy(false)');
+  assert.equal(h.run('requests.length'), 2);
+  assert.equal(h.run('requests[1].method'), undefined);
+  assert.equal(h.run('state.mcp.accessPolicy.allow_legacy_token'), false);
+  assert.equal(h.run('state.mcp.policySaving'), false);
+  assert.equal(h.run('state.mcp.policyLoaded'), true);
+  assert.match(h.run('state.mcp.policyError'), /保存结果尚未确认/);
+  assert.equal(h.run('toasts.length'), 0);
+});
+
+test('MCP 策略 PUT 与回读均失败时保持开关禁用，错误响应不得伪装保存成功', async () => {
+  const h = harness();
+  seedMcp(h);
+  h.run(`apiFetch = async (url, options = {}) => { if (options.method === 'PUT') return {success:true}; throw new Error('offline'); }; requestMcpAccessPolicy(false);`);
+  await h.run('saveMcpAccessPolicy(false)');
+  assert.equal(h.run('state.mcp.policyLoaded'), false);
+  assert.equal(h.run('state.mcp.policySaving'), false);
+  assert.equal(h.run('toasts.length'), 0);
+  assert.match(h.run('renderMcpView()'), /id="mcp-allow-legacy"[^>]*disabled/);
+});
+
+test('MCP 导航和退出后迟到策略响应不更新当前视图或显示成功', async () => {
+  for (const action of ['navigateTo("identity")', 'logout()']) {
+    for (const operation of ['read', 'write']) {
+      const h = harness();
+      seedMcp(h);
+      h.run(`apiFetch = async (url) => url === '/api/admin/mcp/access-policy' ? new Promise(resolve => globalThis.releasePolicy = resolve) : {}; requestMcpAccessPolicy(false);`);
+      const pending = h.run(operation === 'read' ? 'refreshMcpAccessPolicy()' : 'saveMcpAccessPolicy(false)');
+      h.run(action);
+      h.run('releasePolicy({allow_legacy_token:false})');
+      await pending;
+      assert.notEqual(h.run('state.mcp.accessPolicy?.allow_legacy_token'), false);
+      assert.equal(h.run('toasts.some(item => item.type === "success")'), false);
+      assert.equal(h.run('state.mcp.policySaving'), false);
+    }
+  }
+});
+
+test('MCP 策略保存时关闭确认弹窗，不关闭之后打开的改名弹窗', async () => {
+  const h = harness();
+  seedMcp(h);
+  h.run(`state.mcp.clients = [{installation_id:'client',client_name:'旧名称'}]; apiFetch = async (url) => url === '/api/admin/mcp/access-policy' ? new Promise(resolve => globalThis.releasePolicy = resolve) : {}; requestMcpAccessPolicy(false);`);
+  const pending = h.run('saveMcpAccessPolicy(false)');
+  h.run(`closeModal(); openMcpRename('clients','client'); state.modalTargetData.name='未保存的新名称'; releasePolicy({allow_legacy_token:false});`);
+  await pending;
+  assert.equal(h.run('state.activeModal'), 'mcpRename');
+  assert.equal(h.run('state.modalTargetData.name'), '未保存的新名称');
+  assert.equal(h.run('state.mcp.accessPolicy.allow_legacy_token'), false);
+  assert.equal(h.run('toasts.length'), 0);
+});
+
+
+test('MCP 离开返回后的新策略不会被旧 GET 覆盖，身份接口保留 false 值', async () => {
+  const h = harness();
+  seedMcp(h);
+  h.run(`globalThis.regularApi = apiFetch; apiFetch = async () => new Promise(resolve => globalThis.releasePolicy = resolve);`);
+  const pending = h.run('refreshMcpAccessPolicy()');
+  h.run(`navigateTo('identity'); apiFetch = regularApi; navigateTo('mcp');`);
+  await h.run('Promise.resolve()');
+  await h.run('Promise.resolve()');
+  h.run('releasePolicy({allow_legacy_token:false})');
+  await pending;
+  assert.equal(h.run('state.mcp.accessPolicy.allow_legacy_token'), true);
+  h.run('applyApiData({}, {allow_legacy_token:false}, [], [], [])');
+  assert.equal(h.run('relayInfo.allowLegacyToken'), false);
 });

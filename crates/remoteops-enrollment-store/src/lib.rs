@@ -205,6 +205,30 @@ impl EnrollmentStore {
         Ok(())
     }
 
+    /// 返回是否允许旧共享 Token 接入；历史数据库缺省允许。
+    ///
+    /// # Errors
+    /// 策略值无效或存储不可用时返回错误，调用方应拒绝旧 Token 接入。
+    pub fn allow_legacy_token(&self) -> Result<bool, StoreError> {
+        read_allow_legacy_token(&*self.connection()?)
+    }
+
+    /// 持久化旧共享 Token 接入策略，不修改独立客户端凭据。
+    ///
+    /// # Errors
+    /// 存储不可用时返回错误，事务失败不改变原策略。
+    pub fn set_allow_legacy_token(&self, allow: bool) -> Result<(), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO enrollment_meta (key, value) VALUES ('allow_legacy_token', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [if allow { "true" } else { "false" }],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Generates a 256-bit one-time grant and returns its secret once.
     /// # Errors
     /// Rejects unsupported lifetimes/names, missing settings, or storage errors.
@@ -320,6 +344,55 @@ impl EnrollmentStore {
             "UPDATE enrollment_clients SET revoked = 1 WHERE installation_id = ?1 AND revoked = 0",
             installation_id,
         )
+    }
+
+    /// 修改设置名称，并同步已绑定的客户端；返回 false 表示设置不存在。
+    ///
+    /// # Errors
+    /// 名称无效、绑定关系异常或存储不可用时返回错误，所有更改一起回滚。
+    pub fn rename_grant(
+        &self,
+        grant_id: Uuid,
+        client_name: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let client_name = normalize_client_name(client_name)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(grant) = read_grant(&transaction, grant_id)? else {
+            return Ok(false);
+        };
+        rename_bound_grant(&transaction, &grant, client_name)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// 修改客户端名称，并同步其设置记录；返回 false 表示客户端不存在。
+    ///
+    /// # Errors
+    /// 名称无效、绑定关系异常或存储不可用时返回错误，所有更改一起回滚。
+    pub fn rename_client(
+        &self,
+        installation_id: Uuid,
+        client_name: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let client_name = normalize_client_name(client_name)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_client(&transaction, installation_id)?.is_none() {
+            return Ok(false);
+        }
+        let grant_id: String = transaction.query_row(
+            "SELECT grant_id FROM enrollment_grants WHERE installation_id = ?1",
+            [installation_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let grant_id =
+            Uuid::parse_str(&grant_id).map_err(|_| corrupt("stored grant identity is invalid"))?;
+        let grant = read_grant(&transaction, grant_id)?
+            .ok_or_else(|| corrupt("installation grant binding is missing"))?;
+        rename_bound_grant(&transaction, &grant, client_name)?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     fn revoke(&self, sql: &str, id: Uuid) -> Result<bool, StoreError> {
@@ -555,6 +628,39 @@ fn stored_bool(value: i64) -> Result<bool, StoreError> {
     }
 }
 
+fn rename_bound_grant(
+    connection: &Connection,
+    grant: &ValidatedGrant,
+    client_name: Option<&str>,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "UPDATE enrollment_grants SET client_name = ?1 WHERE grant_id = ?2",
+        params![client_name, grant.grant_id.to_string()],
+    )?;
+    if let Some(installation_id) = grant.installation_id {
+        let changed = connection.execute(
+            "UPDATE enrollment_clients SET client_name = ?1 WHERE installation_id = ?2",
+            params![client_name, installation_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(corrupt("grant client is missing"));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_client_name(name: Option<&str>) -> Result<Option<&str>, StoreError> {
+    // 先检查原始输入，避免 trim 隐藏边缘的换行或制表符。
+    if name.is_some_and(|value| value.chars().any(char::is_control)) {
+        return Err(StoreError::InvalidInput(
+            "client name must not contain control characters".into(),
+        ));
+    }
+    let name = name.map(str::trim).filter(|value| !value.is_empty());
+    validate_client_name(name)?;
+    Ok(name)
+}
+
 fn validate_client_name(name: Option<&str>) -> Result<(), StoreError> {
     if name.is_some_and(|value| {
         value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control)
@@ -778,8 +884,24 @@ fn read_client(connection: &Connection, id: Uuid) -> Result<Option<ValidatedClie
         .transpose()
 }
 
+fn read_allow_legacy_token(connection: &Connection) -> Result<bool, StoreError> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM enrollment_meta WHERE key = 'allow_legacy_token'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match value.as_deref() {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(corrupt("stored legacy token policy is invalid")),
+    }
+}
+
 fn verify_contents(connection: &Connection, owner_id: ControllerOwnerId) -> Result<(), StoreError> {
     read_settings(connection)?;
+    read_allow_legacy_token(connection)?;
     let mut grants = connection.prepare(GRANT_SELECT)?;
     for row in grants.query_map([], GrantRecord::from_row)? {
         let grant = row?.validate()?;

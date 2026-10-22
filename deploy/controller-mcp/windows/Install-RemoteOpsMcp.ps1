@@ -24,24 +24,17 @@ $setupSourceCount = [int](-not [string]::IsNullOrWhiteSpace($SetupFile)) + [int]
 if ($setupSourceCount -gt 1) {
     throw 'SetupFile、SetupStdin 和 SetupCode 只能选择一种。'
 }
-if ($setupMode) {
-    foreach ($manualParameter in @('RelayAddress', 'OwnerId', 'ServerName', 'CaCert', 'TlsFingerprint', 'SkipTokenPrompt')) {
-        if ($PSBoundParameters.ContainsKey($manualParameter)) {
-            throw '一次性设置不能与手工 Relay、Owner、证书或 Token 参数混用。'
-        }
+foreach ($manualParameter in @('RelayAddress', 'OwnerId', 'ServerName', 'CaCert', 'TlsFingerprint', 'SkipTokenPrompt')) {
+    if ($PSBoundParameters.ContainsKey($manualParameter)) {
+        throw '已停用 Token 手工安装；请使用 SetupFile、SetupCode 或 SetupStdin。'
     }
 }
-elseif ($ConfirmEnrollment) {
-    throw 'ConfirmEnrollment 只能用于一次性设置。'
-}
-elseif ([string]::IsNullOrWhiteSpace($RelayAddress) -or $OwnerId -eq [guid]::Empty) {
-    throw '手工安装必须提供 RelayAddress 和非全零 OwnerId；推荐改用 SetupFile 或 SetupCode。'
+if (-not $setupMode) {
+    throw '安装必须提供 SetupFile、SetupCode 或 SetupStdin；不再支持 Token 安装。'
 }
 
-$mcpVersion = '0.2.0-preview.15'
+$mcpVersion = '0.2.0-preview.16'
 $credentialPromptVersion = '0.2.0-preview.5'
-$tokenVariable = 'REMOTEOPS_CONTROLLER_TOKEN'
-$ownerVariable = 'REMOTEOPS_CONTROLLER_OWNER_ID'
 $sourceExecutable = Join-Path $PSScriptRoot 'remoteops-controller-mcp.exe'
 $sourceCredentialPrompt = Join-Path $PSScriptRoot 'remoteops-credential-prompt.exe'
 $sourceSkill = Join-Path $PSScriptRoot 'skills\remoteops'
@@ -49,46 +42,10 @@ $defaultCodexHome = Join-Path $env:USERPROFILE '.codex'
 $isDefaultCodexHome = [IO.Path]::GetFullPath($CodexHome).TrimEnd('\') -eq
     [IO.Path]::GetFullPath($defaultCodexHome).TrimEnd('\')
 
-if (-not $setupMode) {
-    if ([string]::IsNullOrWhiteSpace($ServerName)) {
-        if ($RelayAddress -match '^\[(?<host>[^\]]+)\]:(?<port>\d+)$') {
-            $ServerName = $Matches.host
-        }
-        elseif ($RelayAddress -match '^(?<host>[^:]+):(?<port>\d+)$') {
-            $ServerName = $Matches.host
-        }
-        else {
-            throw 'RelayAddress 必须使用 host:port 格式。'
-        }
-    }
-
-    if (
-        -not [string]::IsNullOrWhiteSpace($CaCert) -and
-        -not [string]::IsNullOrWhiteSpace($TlsFingerprint)
-    ) {
-        throw 'CaCert 和 TlsFingerprint 只能选择一种信任方式。'
-    }
-    $normalizedTlsFingerprint = $null
-    if (-not [string]::IsNullOrWhiteSpace($TlsFingerprint)) {
-        $compactFingerprint = $TlsFingerprint.Trim() -replace '^(?i:sha256:)', ''
-        $compactFingerprint = $compactFingerprint -replace '[:\-\s]', ''
-        if ($compactFingerprint -notmatch '^[0-9A-Fa-f]{64}$') {
-            throw 'TlsFingerprint 必须是 64 位 SHA-256 十六进制值。'
-        }
-        $normalizedTlsFingerprint = (
-            0..31 |
-                ForEach-Object {
-                    $compactFingerprint.Substring($_ * 2, 2).ToUpperInvariant()
-                }
-        ) -join ':'
-    }
-
-}
-
 # Use a managed worker for the complete transfer: .NET Framework's FlushAsync
 # may synchronously flush its buffer before returning a Task. No PowerShell
 # scriptblock runs on this worker, and setup material is never a process argument.
-if ($setupMode -and -not ('RemoteOps.SetupPipeTransfer' -as [type])) {
+if (-not ('RemoteOps.SetupPipeTransfer' -as [type])) {
     Add-Type -TypeDefinition @'
 using System.IO;
 using System.Threading.Tasks;
@@ -203,15 +160,6 @@ function Invoke-SetupHelper {
     }
 }
 
-function Write-Utf8NoBom {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Content
-    )
-
-    [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
-}
-
 if (-not [Environment]::Is64BitOperatingSystem) {
     throw '此安装包仅支持 Windows x64。'
 }
@@ -238,42 +186,6 @@ $configPath = Join-Path $CodexHome 'config.toml'
 # Validate before changing any installation files or credentials.
 & $sourceExecutable --validate-codex $configPath | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'Codex 配置校验失败；尚未更改安装或凭据。' }
-
-if (-not $setupMode) {
-    $userToken = [Environment]::GetEnvironmentVariable($tokenVariable, 'User')
-    if ([string]::IsNullOrWhiteSpace($userToken)) {
-        $processToken = [Environment]::GetEnvironmentVariable($tokenVariable, 'Process')
-        if (-not [string]::IsNullOrWhiteSpace($processToken)) {
-            if ($processToken.Length -lt 32) {
-                throw "$tokenVariable 至少需要 32 个字符。"
-            }
-            [Environment]::SetEnvironmentVariable($tokenVariable, $processToken, 'User')
-            $userToken = $processToken
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($userToken)) {
-        if ($SkipTokenPrompt) {
-            throw "未找到当前用户环境变量 $tokenVariable。请先安全设置 Token，或不带 -SkipTokenPrompt 重新运行安装脚本。"
-        }
-        $secureToken = Read-Host '请输入 AI Controller Token（输入内容不会显示）' -AsSecureString
-        $tokenPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
-        try {
-            $plainToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer)
-            if ([string]::IsNullOrWhiteSpace($plainToken) -or $plainToken.Length -lt 32) {
-                throw 'AI Controller Token 至少需要 32 个字符。'
-            }
-            [Environment]::SetEnvironmentVariable($tokenVariable, $plainToken, 'User')
-        }
-        finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)
-            Remove-Variable plainToken -ErrorAction SilentlyContinue
-        }
-    }
-
-    $ownerValue = $OwnerId.ToString('D')
-    [Environment]::SetEnvironmentVariable($ownerVariable, $ownerValue, 'User')
-
-}
 
 $installDirectory = Join-Path $CodexHome 'remoteops'
 $installedExecutable = Join-Path $installDirectory "remoteops-controller-mcp-$mcpVersion.exe"
@@ -311,73 +223,55 @@ catch {
     Write-Warning '当前版本 MCP 正被 Codex 使用，已按构建哈希旁路安装；重启 Codex 后切换到新程序。'
 }
 
-$installedCaCert = $null
-if ($setupMode) {
-    $setupInput = $null
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($SetupFile)) {
-            $setupInput = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $SetupFile).Path)
-        }
-        elseif ($SetupStdin) {
-            # Read redirected setup as UTF-8 independently of the Windows OEM
-            # console code page. The source is consumed only once.
-            $setupReader = [IO.StreamReader]::new(
-                [Console]::OpenStandardInput(), [Text.UTF8Encoding]::new($false, $true), $true
-            )
-            try { $setupInput = $setupReader.ReadToEnd() }
-            finally { $setupReader.Dispose() }
-        }
-        else {
-            $secureSetup = Read-Host '请粘贴一次性设置码（输入内容不会显示）' -AsSecureString
-            $setupPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureSetup)
-            try {
-                $setupInput = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($setupPointer)
-            }
-            finally {
-                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($setupPointer)
-                $secureSetup.Dispose()
-            }
-        }
-        # Preview and redemption use the same in-memory snapshot.
-        $preview = Invoke-SetupHelper -Executable $installedExecutable `
-            -Arguments @('--setup-stdin', '--setup-preview') -InputContent $setupInput
-        Write-Host '请核对登记目标（以下不包含设置密钥）：'
-        Write-Host $preview
-        if (-not $ConfirmEnrollment) {
-            if ($SetupStdin) {
-                throw 'SetupStdin 需要 ConfirmEnrollment；请先核对管理员提供的登记目标。'
-            }
-            $confirmation = Read-Host '确认连接此登记地址并保存本机凭据？输入 yes 继续'
-            if ($confirmation -cne 'yes') { throw '已取消，未进行登记。' }
-        }
-        $summary = Invoke-SetupHelper -Executable $installedExecutable -Arguments @(
-            '--setup-stdin', '--setup-enroll',
-            '--setup-state', (Join-Path $installDirectory 'setup-state.json'),
-            '--setup-output', $connectionConfigPath
-        ) -InputContent $setupInput
-        if (-not (Test-Path -LiteralPath $connectionConfigPath -PathType Leaf)) {
-            throw '登记程序未生成连接配置。'
-        }
-        Write-Host $summary
+$setupInput = $null
+try {
+    if (-not [string]::IsNullOrWhiteSpace($SetupFile)) {
+        $setupInput = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $SetupFile).Path)
     }
-    finally {
-        Remove-Variable setupInput -ErrorAction SilentlyContinue
+    elseif ($SetupStdin) {
+        # Read redirected setup as UTF-8 independently of the Windows OEM
+        # console code page. The source is consumed only once.
+        $setupReader = [IO.StreamReader]::new(
+            [Console]::OpenStandardInput(), [Text.UTF8Encoding]::new($false, $true), $true
+        )
+        try { $setupInput = $setupReader.ReadToEnd() }
+        finally { $setupReader.Dispose() }
     }
+    else {
+        $secureSetup = Read-Host '请粘贴一次性设置码（输入内容不会显示）' -AsSecureString
+        $setupPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureSetup)
+        try {
+            $setupInput = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($setupPointer)
+        }
+        finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($setupPointer)
+            $secureSetup.Dispose()
+        }
+    }
+    # Preview and redemption use the same in-memory snapshot.
+    $preview = Invoke-SetupHelper -Executable $installedExecutable `
+        -Arguments @('--setup-stdin', '--setup-preview') -InputContent $setupInput
+    Write-Host '请核对登记目标（以下不包含设置密钥）：'
+    Write-Host $preview
+    if (-not $ConfirmEnrollment) {
+        if ($SetupStdin) {
+            throw 'SetupStdin 需要 ConfirmEnrollment；请先核对管理员提供的登记目标。'
+        }
+        $confirmation = Read-Host '确认连接此登记地址并保存本机凭据？输入 yes 继续'
+        if ($confirmation -cne 'yes') { throw '已取消，未进行登记。' }
+    }
+    $summary = Invoke-SetupHelper -Executable $installedExecutable -Arguments @(
+        '--setup-stdin', '--setup-enroll',
+        '--setup-state', (Join-Path $installDirectory 'setup-state.json'),
+        '--setup-output', $connectionConfigPath
+    ) -InputContent $setupInput
+    if (-not (Test-Path -LiteralPath $connectionConfigPath -PathType Leaf)) {
+        throw '登记程序未生成连接配置。'
+    }
+    Write-Host $summary
 }
-else {
-    if (-not [string]::IsNullOrWhiteSpace($CaCert)) {
-        $resolvedCaCert = (Resolve-Path -LiteralPath $CaCert).Path
-        $installedCaCert = Join-Path $installDirectory 'relay-ca.pem'
-        Copy-Item -LiteralPath $resolvedCaCert -Destination $installedCaCert -Force
-    }
-    $connectionConfig = [ordered]@{
-        relay = $RelayAddress
-        server_name = $ServerName
-        ca_cert = $installedCaCert
-        tls_fingerprint = $normalizedTlsFingerprint
-        reconnect_seconds = 2
-    } | ConvertTo-Json
-    Write-Utf8NoBom -Path $connectionConfigPath -Content ($connectionConfig + "`r`n")
+finally {
+    Remove-Variable setupInput -ErrorAction SilentlyContinue
 }
 
 foreach ($skillDirectory in @($standardSkillDirectory, $compatSkillDirectory) | Select-Object -Unique) {
@@ -399,7 +293,6 @@ $configurationArguments = @(
     '--mcp-config', $connectionConfigPath,
     '--mcp-mode', $CommandMode
 )
-if (-not $setupMode) { $configurationArguments += '--legacy-env' }
 & $installedExecutable @configurationArguments | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'Codex MCP 配置未完成；请保留设置状态并重试。' }
 
@@ -419,10 +312,7 @@ Get-ChildItem -LiteralPath $installDirectory -Filter 'remoteops-controller-mcp-*
         }
     }
 $legacyCertificate = Join-Path $installDirectory 'relay-cert.pem'
-if (
-    (Test-Path -LiteralPath $legacyCertificate -PathType Leaf) -and
-    $legacyCertificate -ne $installedCaCert
-) {
+if (Test-Path -LiteralPath $legacyCertificate -PathType Leaf) {
     try {
         Remove-Item -LiteralPath $legacyCertificate -Force
     }
@@ -441,11 +331,6 @@ if ($compatSkillDirectory -ne $standardSkillDirectory) {
     Write-Host "RemoteOps skill（兼容目录）：$compatSkillDirectory"
 }
 Write-Host "命令模式：$CommandMode"
-if ($setupMode) {
-    Write-Host '独立 Controller 凭据已保存到 Windows Credential Manager；登记与 Relay 身份自检通过。'
-}
-else {
-    Write-Host '统一 Controller Owner 已保存到当前 Windows 用户环境变量（不会显示其值）。'
-}
+Write-Host '独立 Controller 凭据已保存到 Windows Credential Manager；登记与 Relay 身份自检通过。'
 Write-Host '请完全退出并重新打开 Codex，然后输入 /mcp 检查 remoteops。'
 Write-Host '安装脚本未输出、未写入 config.toml，也未打包 Controller Token。'

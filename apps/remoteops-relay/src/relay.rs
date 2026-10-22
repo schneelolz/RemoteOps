@@ -590,6 +590,7 @@ impl Relay {
             owner_id: self.controller_owner_id,
             human_token_configured: !self.human_controller_token.is_empty(),
             ai_token_configured: !self.ai_controller_token.is_empty(),
+            allow_legacy_token: self.allow_legacy_token().unwrap_or(false),
             ai_token_fingerprint: token_fingerprint(&self.ai_controller_token),
         };
         let overview = AdminOverview {
@@ -1646,20 +1647,30 @@ impl Relay {
         if hello.owner_id != self.controller_owner_id {
             bail!("Controller Owner 身份不匹配");
         }
-        let expected = match hello.kind {
-            ControllerKind::Human => &self.human_controller_token,
-            ControllerKind::Ai => &self.ai_controller_token,
-        };
-        // Preserve arbitrary configured legacy token values, including a coincidental roc1 prefix.
-        if !expected.is_empty()
-            && constant_time_eq(hello.auth_token.as_bytes(), expected.as_bytes())
+        if hello.kind == ControllerKind::Human {
+            // 人工控制端的凭据与旧 MCP 接入策略相互独立。
+            if !self.human_controller_token.is_empty()
+                && constant_time_eq(
+                    hello.auth_token.as_bytes(),
+                    self.human_controller_token.as_bytes(),
+                )
+            {
+                return Ok(None);
+            }
+            bail!("Controller 认证失败");
+        }
+        if !self.ai_controller_token.is_empty()
+            && constant_time_eq(
+                hello.auth_token.as_bytes(),
+                self.ai_controller_token.as_bytes(),
+            )
         {
-            return Ok(None);
+            if self.allow_legacy_token()? {
+                return Ok(None);
+            }
+            bail!("旧 AI Token 接入已禁用，请使用设置码或设置文件重新配置 MCP");
         }
         if hello.auth_token.starts_with("roc1.") {
-            if hello.kind != ControllerKind::Ai {
-                bail!("MCP 安装凭据仅允许 AI Controller 角色");
-            }
             let identity = self
                 .enrollment_store()?
                 .authenticate_token(&hello.auth_token, Utc::now())?;
@@ -1702,6 +1713,44 @@ impl Relay {
             },
         )
         .await
+    }
+
+    /// 返回旧共享 Token 接入策略；无持久化存储的嵌入模式兼容历史行为。
+    pub(crate) fn allow_legacy_token(&self) -> Result<bool, StoreError> {
+        self.enrollment_store
+            .as_ref()
+            .map_or(Ok(true), |store| store.allow_legacy_token())
+    }
+
+    /// 保存策略后，在同一认证门锁内移除全部旧 AI 连接及其绑定、审批。
+    pub(crate) async fn set_allow_legacy_token(&self, allow: bool) -> Result<(), StoreError> {
+        let _gate = self.enrollment_gate.lock().await;
+        let mut state = self.state.lock().await;
+        // 提交后到清理完成之间不 await，避免请求取消留下已经禁止的连接。
+        self.enrollment_store()?.set_allow_legacy_token(allow)?;
+        if allow {
+            return Ok(());
+        }
+        let connections = state
+            .controllers
+            .iter()
+            .filter(|(_, controller)| {
+                controller.kind == ControllerKind::Ai && controller.installation_id.is_none()
+            })
+            .map(|(id, controller)| (*id, controller.connection_generation))
+            .collect::<Vec<_>>();
+        let mut revocations = Vec::new();
+        for (id, generation) in connections {
+            revocations.extend(remove_controller_locked(&mut state, id, generation, None));
+        }
+        drop(state);
+        for (sender, session_id, binding_token) in revocations {
+            let _ = sender.send(WireMessage::ControllerBindingRevoked {
+                session_id,
+                binding_token,
+            });
+        }
+        Ok(())
     }
 
     /// Include recent activity of live connections without writing `SQLite` on every heartbeat.
@@ -5418,9 +5467,10 @@ mod tests {
         assert!(agent.ready);
     }
 
-    #[test]
-    fn controller_authentication_requires_role_specific_token() {
-        let relay = relay(Duration::minutes(10));
+    #[tokio::test]
+    async fn controller_authentication_preserves_human_token_and_rejects_shared_ai_token() {
+        let (relay, _, _) = enrolled_relay();
+        relay.set_allow_legacy_token(false).await.unwrap();
         let controller_id = ControllerInstanceId::new();
         assert!(
             relay
@@ -5472,7 +5522,7 @@ mod tests {
                     hostname: None,
                     mac_address: None,
                 })
-                .is_ok()
+                .is_err()
         );
         assert!(
             relay
@@ -6544,7 +6594,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stale_controller_partial_frame_is_closed_without_reusing_transport() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let relay = Arc::new(relay(Duration::minutes(10)));
+        let (relay, _, token) = enrolled_relay();
+        let relay = Arc::new(relay);
         let (stream, mut peer) = tokio::io::duplex(4096);
         let controller_id = ControllerInstanceId::new();
         write_frame(
@@ -6554,7 +6605,7 @@ mod tests {
                 controller_instance_id: controller_id,
                 owner_id: test_owner_id(),
                 kind: ControllerKind::Ai,
-                auth_token: AI_TOKEN.to_owned(),
+                auth_token: token,
                 hostname: None,
                 mac_address: None,
             })),
