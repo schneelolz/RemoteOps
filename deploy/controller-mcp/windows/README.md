@@ -1,13 +1,15 @@
 # RemoteOps MCP Windows x64 安装说明
 
-- 版本：`0.2.0-preview.15`
+> 当前安装规则：新版安装器只支持设置码/设置文件，不再支持 Token 安装。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](../../../docs/mcp-one-time-setup.md)。
+
+- 版本：`0.2.0-preview.16`
 - 适用系统：Windows x64
 - Codex MCP 名称：`remoteops`
 - 许可证：`AGPL-3.0-only`
 
 本安装包把 Codex 接入你自行部署或获准使用的 RemoteOps Relay。安装包不包含默认 Relay、Token、服务器密码、控制码、私钥或证书。
 
-## 推荐：一次性设置
+## 使用一次性设置安装
 
 请管理员在 Relay 管理界面签发短时、单次使用的 MCP 设置文件或设置码。文件包含
 Relay 地址、登记 URL、TLS 服务名、必要的 CA 信任和一次性登记密钥；它不是通用
@@ -53,69 +55,15 @@ Credential Manager 条目和原设置文件，再运行相同安装命令。此�
 过期或被撤销的设置不能新登记，请管理员重新签发。成功后妥善删除下载的设置文件；
 不要把它放进安装包或 Git。`-CodexHome` 和 `CODEX_HOME` 可指定其他安装目录。
 
-## 兼容：手工安装前准备
-
-你需要：
-
-1. Relay 地址，例如 `relay.example.com:7443`；
-2. Relay TLS 服务名，通常与地址中的主机名相同；
-3. AI Controller Token，长度至少 32 个字符；
-4. Relay 配置的统一 Controller Owner UUID，Human 与 AI 必须使用同一个值；
-5. 私有 CA 可准备 CA PEM；没有 PEM 时，必须由管理员通过独立可信渠道核对 Relay 叶证书 SHA-256 指纹。
-
-公网 CA 颁发的证书使用 Windows 系统可信根，不需要 `relay-cert.pem`。
-
-## 兼容：手工安装
-
-在解压目录打开 PowerShell：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.ps1 `
-  -RelayAddress 'relay.example.com:7443' `
-  -OwnerId '<controller-owner-uuid>'
-```
-
-如果证书服务名与 Relay 主机名不同：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.ps1 `
-  -RelayAddress '203.0.113.10:7443' `
-  -ServerName 'relay.example.com' `
-  -OwnerId '<controller-owner-uuid>'
-```
-
-私有 CA 环境额外提供：
-
-```powershell
--CaCert '.\my-relay-ca.pem'
-```
-
-没有 PEM、但已独立核对自签名证书指纹时，可以改用：
-
-```powershell
--TlsFingerprint '<64 位 SHA-256 证书指纹>'
-```
-
-`-CaCert` 和 `-TlsFingerprint` 只能选择一种。MCP 不显示确认窗口，也不会自动信任未知证书。
-
-脚本会隐藏提示输入 Token，并把 Token 和统一 Owner 分别保存为当前 Windows 用户环境变量 `REMOTEOPS_CONTROLLER_TOKEN`、`REMOTEOPS_CONTROLLER_OWNER_ID`。Token 和 Owner 不会写入 Codex `config.toml` 或 RemoteOps JSON 配置。
-
-已由管理员安全设置 Token 时，可使用：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.ps1 `
-  -RelayAddress 'relay.example.com:7443' `
-  -OwnerId '<controller-owner-uuid>' `
-  -SkipTokenPrompt
-```
+## 安装位置
 
 安装内容：
 
 ```text
-%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.15.exe
+%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.16.exe
 %USERPROFILE%\.codex\remoteops\remoteops-credential-prompt.exe
 %USERPROFILE%\.codex\remoteops\controller-config.json
-%USERPROFILE%\.codex\remoteops\setup-state.json  # 仅一次性设置模式
+%USERPROFILE%\.codex\remoteops\setup-state.json
 %USERPROFILE%\.codex\config.toml
 %USERPROFILE%\.agents\skills\remoteops\SKILL.md
 %USERPROFILE%\.codex\skills\remoteops\SKILL.md
@@ -191,7 +139,7 @@ Codex 应自动通过 RemoteOps 配对并使用远程工具。若当前任务没
 
 `-CommandMode agent-controlled` 是推荐默认模式：未获有效授权时逐项确认。MCP 可通过 `set_control_mode` 授权，也可由现场在 Agent“控制权限”中授权；Relay 确认后无需重复 RemoteOps 审批。MCP 授权空闲一小时到期，现场授权到连接结束或撤销失效。Agent 默认 `default_full_control=false`；默认完全控制为新绑定自动授权，现场切回逐项确认会抑制本次运行的自动授权。`readonly`、`approval` 仍是权限上限，协议 16 的 `full-access` 不会自动授权。详见[控制权限说明](../../../docs/control-permissions.md)。
 
-全新 Agent 首次运行只需填写 Relay 地址并等待九位控制码，不需要让 Codex 生成入网码，也不需要部署级 Agent 注册 Token。MCP 只在工程师本机使用 AI Controller Token 完成自身认证和后续配对。
+全新 Agent 首次运行只需填写 Relay 地址并等待九位控制码，不需要让 Codex 生成入网码，也不需要部署级 Agent 注册 Token。新版 MCP 使用设置兑换的独立凭据完成自身认证，再使用 Agent 控制码配对。
 
 ## 第一次只读测试
 

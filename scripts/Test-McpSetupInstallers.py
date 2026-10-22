@@ -267,7 +267,8 @@ class InstallerTests(unittest.TestCase):
             commands.mkdir()
             # Never touch the runner's Keychain, including uninstall's legacy cleanup.
             security = commands / "security"
-            security.write_text('#!/bin/sh\n[ "$1" = delete-generic-password ]\n')
+            self.env["INSTALLER_TEST_SECURITY_CALLS"] = str(self.root / "security-calls")
+            security.write_text('#!/bin/sh\necho "$1" >> "$INSTALLER_TEST_SECURITY_CALLS"\n[ "$1" = delete-generic-password ]\n')
             security.chmod(0o755)
             if platform.system() != "Darwin":
                 uname = commands / "uname"
@@ -278,12 +279,13 @@ class InstallerTests(unittest.TestCase):
                 plutil.chmod(0o755)
             self.env["PATH"] = str(commands) + os.pathsep + self.env["PATH"]
 
-    def run_installer(self, *, stdin=False, code=False, confirm=True, input_content=None, extra=(), console_encoding=None):
+    def run_installer(self, *, stdin=False, code=False, confirm=True, input_content=None, extra=(), console_encoding=None, setup=True):
         if self.target == "windows":
             command = [self.powershell, "-NoProfile", "-NonInteractive" if confirm else "-NoLogo",
                        "-ExecutionPolicy", "Bypass", "-File", str(self.package / "Install-RemoteOpsMcp.ps1")]
-            command += ["-SetupStdin"] if stdin else ["-SetupFile", str(self.setup_file)]
-            if confirm:
+            if setup:
+                command += ["-SetupStdin"] if stdin else ["-SetupFile", str(self.setup_file)]
+            if confirm and setup:
                 command.append("-ConfirmEnrollment")
             if code:
                 # Secure Read-Host needs a real terminal on Windows. This scope
@@ -295,7 +297,7 @@ class InstallerTests(unittest.TestCase):
                            "foreach ($character in ([IO.File]::ReadAllText($env:INSTALLER_TEST_EXPECTED)).ToCharArray()) { $secure.AppendChar($character) }; "
                            "$secure.MakeReadOnly(); return $secure }; "
                            "& $env:INSTALLER_TEST_SCRIPT -SetupCode -ConfirmEnrollment")
-                command = [self.powershell, "-NoProfile", "-NonInteractive", "-Command", wrapper]
+                command = [self.powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", wrapper]
             if console_encoding is not None:
                 self.env["INSTALLER_TEST_SCRIPT"] = str(self.package / "Install-RemoteOpsMcp.ps1")
                 self.env["INSTALLER_TEST_SETUP_FILE"] = str(self.setup_file)
@@ -307,11 +309,12 @@ class InstallerTests(unittest.TestCase):
                            "if ([Console]::InputEncoding.CodePage -ne $before.CodePage -or "
                            "[Console]::InputEncoding.GetPreamble().Length -ne $before.GetPreamble().Length) { "
                            "throw 'Installer changed host console encoding' }")
-                command = [self.powershell, "-NoProfile", "-NonInteractive", "-Command", wrapper]
+                command = [self.powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", wrapper]
         else:
             command = ["bash", str(self.package / "install-remoteops-mcp.sh")]
-            command += ["--setup-code"] if code else (["--setup-stdin"] if stdin else ["--setup-file", str(self.setup_file)])
-            if confirm:
+            if setup:
+                command += ["--setup-code"] if code else (["--setup-stdin"] if stdin else ["--setup-file", str(self.setup_file)])
+            if confirm and setup:
                 command.append("--confirm-enrollment")
         result = subprocess.run(command + list(extra), input=input_content if input_content is not None else (SETUP if stdin else ""),
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env, timeout=30)
@@ -331,6 +334,8 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(config.count("[mcp_servers.remoteops]"), 1)
         self.assertNotIn("env_vars", config)
         self.assertNotIn("launch-remoteops", config)
+        self.assertNotIn("--legacy-env", self.calls.read_text())
+        self.assertFalse((self.root / "security-calls").exists())
         connection = json.loads((self.codex / "remoteops/controller-config.json").read_text())
         self.assertEqual(connection["helper_marker"], "preserve-generated-config")
         self.assertIn("credential_id", connection)
@@ -792,6 +797,46 @@ class InstallerTests(unittest.TestCase):
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(self.config.read_bytes().startswith(original))
+
+    def assert_rejected_before_installation(self, extra=()):
+        before = {path.relative_to(self.codex): path.read_bytes()
+                  for path in self.codex.rglob("*") if path.is_file()}
+        result = self.run_installer(setup=False, extra=extra)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Token", result.stdout + result.stderr)
+        self.assertNotIn("legacy-dummy-token-must-remain-untouched", result.stdout + result.stderr)
+        self.assertFalse(self.calls.exists(), "Rejected installation executed the setup helper")
+        self.assertFalse((self.root / "security-calls").exists(), "Rejected installation accessed Keychain")
+        after = {path.relative_to(self.codex): path.read_bytes()
+                 for path in self.codex.rglob("*") if path.is_file()}
+        self.assertEqual(after, before)
+        self.assertFalse((self.home / ".agents").exists())
+        self.assertFalse((self.codex / "skills").exists())
+        self.assertFalse((self.codex / "remoteops").exists())
+
+    def test_missing_setup_rejected_with_existing_legacy_environment(self):
+        self.assert_rejected_before_installation()
+
+    def test_legacy_manual_installation_rejected_before_changes(self):
+        if self.target == "windows":
+            arguments = ["-RelayAddress", "relay.example.com:7443", "-OwnerId",
+                         "33333333-3333-4333-8333-333333333333", "-SkipTokenPrompt"]
+        else:
+            arguments = ["--relay", "relay.example.com:7443", "--owner-id",
+                         "33333333-3333-4333-8333-333333333333", "--skip-token-prompt"]
+        self.assert_rejected_before_installation(arguments)
+
+    def test_each_legacy_parameter_rejected_before_changes(self):
+        if self.target == "windows":
+            arguments = [["-RelayAddress", "relay.example.com:7443"], ["-OwnerId", "33333333-3333-4333-8333-333333333333"],
+                         ["-ServerName", "relay.example.com"], ["-CaCert", "missing-ca.pem"],
+                         ["-TlsFingerprint", "0" * 64], ["-SkipTokenPrompt"]]
+        else:
+            arguments = [["--relay", ""], ["--owner-id", ""], ["--server-name", ""],
+                         ["--ca-cert", ""], ["--tls-fingerprint", ""], ["--skip-token-prompt"]]
+        for argument in arguments:
+            with self.subTest(argument=argument[0]):
+                self.assert_rejected_before_installation(argument)
 
     def test_manual_and_setup_parameters_cannot_mix(self):
         extra = ["-RelayAddress", "relay.example.com:7443"] if self.target == "windows" else ["--relay", "relay.example.com:7443"]

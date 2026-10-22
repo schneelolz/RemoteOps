@@ -1,5 +1,7 @@
 # Codex MCP 接入说明
 
+> 当前安装规则：新版安装器只支持设置码/设置文件，不再支持 Token 安装。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](mcp-one-time-setup.md)。
+
 > 文档状态：当前安装和配置说明。普通使用者优先阅读[RemoteOps MCP 使用手册](RemoteOpsMCP使用手册.md)。
 
 本机已安装环境的日常使用、自然语言示例和现场实测结果见
@@ -48,7 +50,7 @@ Windows x64 优先使用：
 artifacts\release\0.2.0-preview.5\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.5.zip
 ```
 
-安装包内的 `README.md` 可直接交给安装者或安装者的 Codex 阅读。`Install-RemoteOpsMcp.ps1` 会保留其他 Codex 配置、创建备份，并安全配置 Token 与统一 Owner 环境变量转发。
+安装包内的 `README.md` 可直接交给安装者或安装者的 Codex 阅读。`Install-RemoteOpsMcp.ps1 -SetupFile <路径>` 或 `-SetupCode` 会兑换独立凭据、保留其他 Codex 配置并创建备份；不再提供手工 Token 安装。
 
 Apple Silicon Mac 使用：
 
@@ -56,7 +58,7 @@ Apple Silicon Mac 使用：
 RemoteOps-MCP-macOS-arm64-0.2.0-preview.5.tar.gz
 ```
 
-macOS 安装器把 Token 保存到当前用户 Keychain，由 `~/.codex/remoteops/launch-remoteops-controller-mcp.sh` 在启动 MCP 时读取。非敏感的 Owner UUID 写入 `controller-config.json`，因此从 Finder 启动 Codex 时不依赖 shell 环境变量继承。完整步骤见 [macOS MCP 接入说明](macOSMCP接入说明.md)。
+macOS 安装器通过设置码/文件兑换独立凭据，保存到当前用户 Keychain。非敏感的 Owner UUID 和凭据引用写入 `controller-config.json`，运行时由 MCP 直接读取凭据，因此从 Finder 启动 Codex 时不依赖 shell 环境变量继承。完整步骤见 [macOS MCP 接入说明](macOSMCP接入说明.md)。
 
 安装器会生成不含 Token 的 `controller-config.json`。MCP 不内置共享中继服务，安装时必须提供自行部署或组织批准的自托管 Relay 地址：
 
@@ -66,7 +68,6 @@ approval_policy = { granular = { sandbox_approval = true, rules = true, mcp_elic
 [mcp_servers.remoteops]
 command = 'C:\Users\<用户名>\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.12.exe'
 args = ['--config', 'C:\Users\<用户名>\.codex\remoteops\controller-config.json', '--command-mode', 'agent-controlled']
-env_vars = ['REMOTEOPS_CONTROLLER_TOKEN', 'REMOTEOPS_CONTROLLER_OWNER_ID']
 startup_timeout_sec = 15
 tool_timeout_sec = 180
 enabled = true
@@ -79,13 +80,11 @@ approval_mode = 'prompt'
 
 连接参数的优先级是命令行、环境变量、JSON 配置。公网环境默认使用 Windows 系统可信根。自签名或私有 CA Relay 可以设置 `ca_cert`；没有 PEM 时，只能填写已通过独立可信渠道核对的 `tls_fingerprint`。MCP 是无界面 STDIO 服务，不显示证书确认窗口，也不会自动信任未知证书。
 
-Windows 安装包把 AI Controller Token 和统一 Owner UUID 分别写入当前用户环境变量 `REMOTEOPS_CONTROLLER_TOKEN`、`REMOTEOPS_CONTROLLER_OWNER_ID`。macOS 安装包使用 Keychain 保存 Token，并把非敏感 Owner 写入本地 JSON。Human 与 AI Controller 必须使用同一个 Owner。不要把 Token 写入 `args`、仓库、文档或聊天。安装后需要完全退出并重新启动 Codex。
-
-Windows 配置使用 STDIO MCP 的 `env_vars` 转发已有用户环境变量，避免把 Token 明文复制到 `config.toml`。macOS 不依赖 Finder 是否继承终端环境变量，而是通过 Keychain 启动脚本只向 MCP 子进程提供 Token。
+新安装的凭据保存到 Windows Credential Manager 或 macOS Keychain，MCP 运行时使用 JSON 中的 `credential_id` 直接读取，不转发或改写旧 Token/Owner 环境变量。已有旧 Token 安装不受新版安装器自动改动；中继后台的兼容开关默认开启，可继续使用原 Token，关闭后被拒绝。不要把凭据写入 `args`、仓库、文档或聊天。安装后需要完全退出并重新启动 Codex。
 
 不建议把临时配对码长期写在 `args` 中。MCP 启动后调用 `pair_connection` 即可新增连接，不需要修改配置并重启 Codex。
 
-全新 Agent 首次运行只需填写 Relay 地址并等待九位控制码，不需要在 MCP 中申请入网码，也不需要部署级 Agent 注册 Token。MCP 仍必须使用已认证的 AI Controller Token；Agent 控制码只用于把当前 Agent 会话绑定到该 Controller。
+全新 Agent 首次运行只需填写 Relay 地址并等待九位控制码，不需要在 MCP 中申请入网码，也不需要部署级 Agent 注册 Token。MCP 必须先通过有效凭据认证；Agent 控制码只用于把当前 Agent 会话绑定到该 Controller。
 
 安装包同时将 `remoteops` skill 安装到当前 Codex 使用的标准目录 `~/.agents/skills/remoteops`，并同步写入兼容目录 `~/.codex/skills/remoteops`。它负责把“RemoteOps 控制码 + 诊断目标”这样的自然语言请求路由到 MCP，并在当前任务未加载 RemoteOps 工具时明确要求刷新，而不是误用远程桌面或本机命令。安装或更新后必须完全退出并重新打开 Codex，再新建任务使 MCP 工具和 skill 同时生效。
 

@@ -45,6 +45,16 @@ async function main() {
     browser = await chromium.launch(launchOptions);
     const context = await browser.newContext({ viewport: {width:1440,height:1150}, acceptDownloads:true, colorScheme:'light', serviceWorkers:'block' });
     await context.addInitScript(() => {
+      const nativeSetTimeout = window.setTimeout.bind(window);
+      window.__remoteopsHoldModalTimers = false;
+      window.__remoteopsModalTimers = [];
+      window.setTimeout = (callback, delay, ...args) => {
+        if (window.__remoteopsHoldModalTimers && delay === 10) {
+          window.__remoteopsModalTimers.push(() => callback(...args));
+          return -window.__remoteopsModalTimers.length;
+        }
+        return nativeSetTimeout(callback, delay, ...args);
+      };
       Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
         writeText: async text => { window.__remoteopsTestClipboard = String(text); },
         readText: async () => window.__remoteopsTestClipboard || '',
@@ -52,10 +62,14 @@ async function main() {
     });
     const page = await context.newPage();
     let settings = null;
+    let accessPolicy = {allow_legacy_token:true};
+    let policyPutCount = 0;
     let setups = [];
     let clients = [];
     let createCount = 0;
     let revokeCount = 0;
+    let renameCount = 0;
+    const renamedInputs = [];
     const issuedExpiryHours = [];
     let holdNextCreate = null;
     let delayNextSetupList = null;
@@ -73,8 +87,16 @@ async function main() {
       }
       if (pathname === '/api/admin/session') return json(route,{authenticated:true,username:'local-test-admin'});
       if (pathname === '/api/admin/overview') return json(route,{version:'local-fixture',owner_id:'fixture-owner',uptime_seconds:100});
-      if (pathname === '/api/admin/identity') return json(route,{owner_id:'fixture-owner'});
+      if (pathname === '/api/admin/identity') return json(route,{owner_id:'fixture-owner',allow_legacy_token:accessPolicy.allow_legacy_token});
       if (['/api/admin/agents','/api/admin/sessions','/api/admin/audit'].includes(pathname)) return json(route,[]);
+      if (pathname === '/api/admin/mcp/access-policy') {
+        if (request.method() === 'PUT') {
+          policyPutCount++;
+          accessPolicy = request.postDataJSON();
+          await new Promise(resolve=>setTimeout(resolve,120));
+        }
+        return json(route,accessPolicy);
+      }
       if (pathname === '/api/admin/mcp/settings') { if (request.method() === 'PUT') settings = request.postDataJSON(); return json(route,settings); }
       if (pathname === '/api/admin/mcp/setups') {
         if (request.method() === 'POST') {
@@ -106,6 +128,18 @@ async function main() {
         return json(route,snapshot);
       }
       if (pathname === '/api/admin/mcp/clients') return json(route,clients);
+      if (pathname.endsWith('/name') && request.method() === 'PUT') {
+        renameCount++;
+        const id = decodeURIComponent(pathname.split('/').at(-2));
+        const name = request.postDataJSON().client_name;
+        renamedInputs.push({id,name});
+        const setup = pathname.includes('/setups/') ? setups.find(x => x.grant_id === id) : setups.find(x => x.installation_id === id);
+        const client = clients.find(x => x.installation_id === (setup?.installation_id || id));
+        if (setup) setup.client_name = name;
+        if (client) client.client_name = name;
+        await new Promise(resolve => setTimeout(resolve,120));
+        return json(route,{success:true});
+      }
       if (pathname.endsWith('/revoke')) {
         revokeCount++;
         const id = decodeURIComponent(pathname.split('/').at(-2));
@@ -120,6 +154,36 @@ async function main() {
     });
     await page.goto(`${origin}/#tab=mcp`);
     await page.getByRole('heading',{name:/MCP 客户端接入.*One-time Setup/}).waitFor();
+    await page.locator('#mcp-allow-legacy:not(:disabled)').waitFor();
+    assert.equal(await page.locator('#mcp-allow-legacy').isChecked(),true);
+    await page.locator('#mcp-allow-legacy').click();
+    await page.getByRole('heading',{name:'关闭旧 Token 客户端接入？',exact:true}).waitFor();
+    assert.equal(policyPutCount,0);
+    await page.locator('#modal-backdrop.open').waitFor();
+    await page.locator('#modal-backdrop .modal').evaluate(async dialog => {
+      await Promise.all(dialog.getAnimations().map(animation => animation.finished));
+      await Promise.all(dialog.parentElement.getAnimations().map(animation => animation.finished));
+    });
+    await page.screenshot({path:artifact('legacy-policy-confirm-light.png')});
+    await page.getByRole('button',{name:'取消',exact:true}).click();
+    assert.equal(await page.locator('#mcp-allow-legacy').isChecked(),true);
+    await page.locator('#mcp-allow-legacy').click();
+    await page.getByRole('button',{name:'确认关闭旧 Token 接入',exact:true}).evaluate(button=>{button.click();button.click();});
+    await page.locator('#modal-backdrop').waitFor({state:'detached'});
+    await page.waitForFunction(() => !state.mcp.policySaving);
+    assert.equal(policyPutCount,1);
+    assert.equal(await page.locator('#mcp-allow-legacy').isChecked(),false);
+    await page.waitForFunction(() => document.querySelectorAll('#toast-container .toast').length === 0);
+    await page.screenshot({path:artifact('legacy-policy-disabled-light.png'),fullPage:true});
+    await page.getByRole('button',{name:'Relay 身份凭据',exact:true}).click();
+    await page.getByText('已禁止旧 Token 接入',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'MCP 客户端接入',exact:true}).click();
+    await page.locator('#mcp-allow-legacy:not(:disabled)').waitFor();
+    assert.equal(await page.locator('#mcp-allow-legacy').isChecked(),false);
+    await page.locator('#mcp-allow-legacy').click();
+    await page.waitForFunction(() => !state.mcp.policySaving && state.mcp.accessPolicy.allow_legacy_token === true);
+    assert.equal(policyPutCount,2);
+    assert.equal(await page.locator('#modal-backdrop').count(),0);
     await page.locator('#mcp-relay:not(:disabled)').waitFor();
     assert.equal(await page.locator('#mcp-relay').inputValue(),'');
     assert.equal(await page.locator('#mcp-new-setup').isDisabled(),true);
@@ -154,16 +218,79 @@ async function main() {
     setups = ['pending','redeemed','expired','revoked'].map((state,i)=>({grant_id:`metadata-${i}`,client_name:`状态示例 · ${state}`,created_at:now,expires_at:later,state,installation_id:state==='redeemed'?'client-used':null}));
     clients = [{installation_id:'client-used',client_name:'已注册工作站',created_at:now,last_seen:now,revoked:false},{installation_id:'client-revoked',client_name:'已撤销工作站',created_at:now,last_seen:null,revoked:true}];
     await page.evaluate(()=>refreshMcpData());
+    // 可控触发真实延迟回调，验证输入清空和弹窗替换都不会被旧焦点任务干扰。
+    await page.evaluate(() => {
+      window.__remoteopsHoldModalTimers = true;
+      window.__remoteopsModalTimers = [];
+      openMcpRename('clients','client-revoked');
+      const input = document.getElementById('mcp-client-name');
+      input.focus();
+      input.value = '';
+      input.dispatchEvent(new Event('input',{bubbles:true}));
+      window.__remoteopsModalTimers.shift()();
+      window.__remoteopsFocusAfterClear = document.activeElement === input && state.modalTargetData.name === '';
+      window.__remoteopsOpenAfterClear = document.getElementById('modal-backdrop').classList.contains('open');
+      closeModal();
+      openMcpRename('clients','client-used');
+      const oldCallback = window.__remoteopsModalTimers.shift();
+      openMcpRename('clients','client-revoked');
+      const newCallback = window.__remoteopsModalTimers.shift();
+      document.body.tabIndex = -1;
+      document.body.focus();
+      oldCallback();
+      window.__remoteopsOldFocusDiscarded = document.activeElement === document.body && !document.getElementById('modal-backdrop').classList.contains('open');
+      newCallback();
+      window.__remoteopsDefaultNameFocus = document.activeElement === document.getElementById('mcp-client-name');
+      renderModal();
+      const cancel = document.querySelector('#modal-backdrop button[type="button"]');
+      cancel.focus();
+      window.__remoteopsModalTimers.shift()();
+      window.__remoteopsUserButtonFocus = document.activeElement === cancel;
+      closeModal();
+      window.__remoteopsHoldModalTimers = false;
+    });
+    assert.equal(await page.evaluate(() => window.__remoteopsFocusAfterClear),true);
+    assert.equal(await page.evaluate(() => window.__remoteopsOpenAfterClear),true);
+    assert.equal(await page.evaluate(() => window.__remoteopsOldFocusDiscarded),true);
+    assert.equal(await page.evaluate(() => window.__remoteopsDefaultNameFocus),true);
+    assert.equal(await page.evaluate(() => window.__remoteopsUserButtonFocus),true);
     for (const state of ['Pending','Redeemed','Expired','Revoked']) assert.ok((await page.locator('main').innerText()).includes(state));
     assert.equal(await page.locator('main img').count(),0);
     await page.screenshot({path:artifact('page-light.png'),fullPage:true});
     await page.locator('.theme-select').selectOption('dark');
     await page.screenshot({path:artifact('page-dark.png'),fullPage:true});
-    await page.getByRole('row').filter({hasText:'已注册工作站'}).getByRole('button',{name:'撤销客户端',exact:true}).click();
+    // Renaming either registration metadata path updates both linked rows; revoked records remain editable.
+    await page.getByRole('row').filter({hasText:'metadata-1'}).getByRole('button',{name:'修改名称',exact:true}).click();
+    await page.locator('#mcp-client-name').fill('  同步后的客户端  ');
+    await page.waitForFunction(() => document.querySelectorAll('#toast-container .toast').length === 0);
+    await page.screenshot({path:artifact('rename-dark.png')});
+    await page.getByRole('button',{name:'保存名称',exact:true}).evaluate(button=>{button.click();button.click();});
+    await page.locator('#modal-backdrop').waitFor({state:'detached'});
+    await page.waitForFunction(() => !state.mcp.loading && state.mcp.renaming.size === 0);
+    assert.equal(renameCount,1);
+    assert.equal(await page.getByRole('row').filter({hasText:'同步后的客户端'}).count(),2);
+    await page.getByRole('row').filter({hasText:'client-used'}).filter({has:page.getByRole('button',{name:'撤销客户端',exact:true})}).getByRole('button',{name:'修改名称',exact:true}).click();
+    await page.locator('#mcp-client-name').fill('已注册工作站');
+    await page.getByRole('button',{name:'保存名称',exact:true}).click();
+    await page.locator('#modal-backdrop').waitFor({state:'detached'});
+    await page.waitForFunction(() => !state.mcp.loading && state.mcp.renaming.size === 0);
+    assert.equal(renameCount,2);
+    await page.getByRole('row').filter({hasText:'client-revoked'}).getByRole('button',{name:'修改名称',exact:true}).click();
+    await page.locator('#mcp-client-name').fill('');
+    assert.equal(await page.locator('#mcp-client-name').inputValue(),'');
+    assert.equal(await page.evaluate(()=>state.modalTargetData.name),'');
+    await page.getByRole('button',{name:'保存名称',exact:true}).click();
+    await page.locator('#modal-backdrop').waitFor({state:'detached'});
+    await page.waitForFunction(() => !state.mcp.loading && state.mcp.renaming.size === 0);
+    assert.equal(renameCount,3);
+    assert.deepEqual(renamedInputs,[{id:'metadata-1',name:'同步后的客户端'},{id:'client-used',name:'已注册工作站'},{id:'client-revoked',name:null}]);
+    assert.equal(clients.find(x=>x.installation_id === 'client-revoked').client_name,null);
+    assert.match(await page.getByRole('row').filter({hasText:'client-revoked'}).innerText(),/未命名客户端/);
+    await page.getByRole('row').filter({hasText:'client-used'}).filter({has:page.getByRole('button',{name:'撤销客户端',exact:true})}).getByRole('button',{name:'撤销客户端',exact:true}).click();
     await page.getByRole('button',{name:'确认撤销',exact:true}).evaluate(button=>{button.click();button.click();});
     await page.locator('#modal-backdrop').waitFor({state:'detached'});
     assert.equal(revokeCount,1);
-    assert.equal(await page.getByRole('row').filter({hasText:'已注册工作站'}).getByRole('button',{name:'撤销客户端',exact:true}).isDisabled(),true);
+    assert.equal(await page.getByRole('row').filter({hasText:'client-used'}).filter({has:page.getByRole('button',{name:'撤销客户端',exact:true})}).getByRole('button',{name:'撤销客户端',exact:true}).isDisabled(),true);
     await page.waitForFunction(() => !state.mcp.loading && state.mcp.revoking.size === 0);
     await page.getByRole('row').filter({hasText:'metadata-0'}).getByRole('button',{name:'撤销设置',exact:true}).click();
     await page.getByRole('button',{name:'确认撤销',exact:true}).evaluate(button=>{button.click();button.click();});
@@ -201,6 +328,7 @@ async function main() {
     assert.ok(await page.getByRole('cell',{name:/新页面记录.*latest-metadata/}).count());
     assert.equal(await page.evaluate(() => state.mcp.freshSetup),null);
     await page.setViewportSize({width:390,height:844});
+    await page.waitForFunction(() => document.querySelectorAll('#toast-container .toast').length === 0);
     await page.screenshot({path:artifact('mobile-dark.png'),fullPage:true});
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth > window.innerWidth),false);
     // A new fresh response clears immediately on logout even if its modal is open.
@@ -212,7 +340,7 @@ async function main() {
     assert.deepEqual(errors,[]);
     assert.deepEqual(unexpectedRequests,[]);
     assert.deepEqual(issuedExpiryHours,[1,168,24]);
-    console.log('PASS: isolated Chromium onboarding smoke; endpoint save, 1/24/168-hour controls, copy/download equality, four states, setup/client revoke, duplicate submit/revoke, delayed navigation/list refresh, logout clearing, desktop light/dark and 390px layout. No page errors.');
+    console.log('PASS: isolated Chromium onboarding smoke; controlled modal focus callbacks, legacy policy default/read/confirm/cancel/disable/enable and identity status, endpoint save, 1/24/168-hour controls, copy/download equality, four states, linked setup/client rename, cleared revoked-client name, setup/client revoke, duplicate submit/rename/revoke, delayed navigation/list refresh, logout clearing, desktop light/dark and 390px layout. No page errors.');
     console.log(`Synthetic screenshots and download: ${artifacts}`);
   } finally {
     if (browser) await browser.close();

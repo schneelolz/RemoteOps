@@ -1,12 +1,14 @@
 # RemoteOps MCP macOS Apple Silicon 安装说明
 
-- 版本：`0.2.0-preview.15`
+> 当前安装规则：新版安装器只支持设置码/设置文件，不再支持 Token 安装。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](../../../docs/mcp-one-time-setup.md)。
+
+- 版本：`0.2.0-preview.16`
 - 适用系统：macOS 13 或更高版本，Apple Silicon（arm64）
 - Codex MCP 名称：`remoteops`
 
 本安装包只安装工程师本机使用的 STDIO MCP。它可以通过 Relay 控制现有 Windows Agent；不要求现场电脑是 Mac，也不代表 macOS Agent 已经完成。
 
-## 推荐：一次性设置
+## 使用一次性设置安装
 
 请管理员在 Relay 管理界面签发短时、单次使用的 MCP 设置文件或设置码。文件包含
 Relay 地址、登记 URL、TLS 服务名、必要的 CA 信任和一次性登记密钥；它不是通用
@@ -50,27 +52,15 @@ Keychain，不使用旧 Token 启动脚本，也不改写旧 Token。登记成�
 不要先删凭据或复制检查点到另一台机器。已由其他安装使用、过期或被撤销的设置
 不能新登记，请管理员重新签发。成功后妥善删除下载的设置文件；不要把它放进安装包或 Git。
 
-## 兼容：手工安装
-
-打开 Terminal，进入解压目录：
-
-```bash
-chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.sh
-./install-remoteops-mcp.sh \
-  --relay relay.example.com:7443 \
-  --owner-id '<controller-owner-uuid>'
-```
-
-安装器会以隐藏输入方式读取 AI Controller Token，并保存到当前用户的 macOS Keychain。Token 不写入 `config.toml`、RemoteOps JSON、日志或安装包。公网 CA 使用 macOS 系统可信根；私有 CA 使用 `--ca-cert`，已独立核对的证书指纹使用 `--tls-fingerprint`，两者只能选择一种。
+## 安装位置
 
 安装位置：
 
 ```text
-~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.15
+~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.16
 ~/.codex/remoteops/remoteops-credential-prompt
-~/.codex/remoteops/launch-remoteops-controller-mcp.sh  # 仅手工 Token 模式
 ~/.codex/remoteops/controller-config.json
-~/.codex/remoteops/setup-state.json                 # 仅一次性设置模式
+~/.codex/remoteops/setup-state.json
 ~/.codex/config.toml
 ~/.agents/skills/remoteops/SKILL.md
 ~/.codex/skills/remoteops/SKILL.md

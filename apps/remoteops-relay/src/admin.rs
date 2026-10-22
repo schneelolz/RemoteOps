@@ -75,6 +75,7 @@ pub(crate) struct AdminIdentity {
     pub owner_id: ControllerOwnerId,
     pub human_token_configured: bool,
     pub ai_token_configured: bool,
+    pub allow_legacy_token: bool,
     pub ai_token_fingerprint: Option<String>,
 }
 
@@ -884,6 +885,16 @@ mod tests {
             ("GET", "/api/admin/mcp/setups"),
             ("POST", "/api/admin/mcp/setups"),
             ("GET", "/api/admin/mcp/clients"),
+            ("GET", "/api/admin/mcp/access-policy"),
+            ("PUT", "/api/admin/mcp/access-policy"),
+            (
+                "PUT",
+                "/api/admin/mcp/setups/00000000-0000-0000-0000-000000000001/name",
+            ),
+            (
+                "PUT",
+                "/api/admin/mcp/clients/00000000-0000-0000-0000-000000000001/name",
+            ),
             (
                 "POST",
                 "/api/admin/mcp/setups/00000000-0000-0000-0000-000000000001/revoke",
@@ -969,6 +980,153 @@ mod tests {
             assert!(!body.contains(secret));
             assert!(!body.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"));
             assert!(!body.contains("secret_hash"));
+        }
+    }
+
+    #[tokio::test]
+    async fn enrollment_http_access_policy_is_strict_and_persists_changes() {
+        let fixture = EnrollmentFixture::new();
+        let path = "/api/admin/mcp/access-policy";
+        let response = fixture.request("GET", path, "", true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_response(response).await,
+            serde_json::json!({"allow_legacy_token": true})
+        );
+        for body in [
+            "{}",
+            r#"{"allow_legacy_token":null}"#,
+            r#"{"allow_legacy_token":"false"}"#,
+            r#"{"allow_legacy_token":false,"extra":true}"#,
+            "false",
+        ] {
+            let response = fixture.request("PUT", path, body, true).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(json_response(response).await["error"].is_string());
+            assert!(fixture.state.relay.allow_legacy_token().unwrap());
+        }
+        for allow in [false, true] {
+            let expected = serde_json::json!({"allow_legacy_token": allow});
+            let response = fixture
+                .request("PUT", path, &expected.to_string(), true)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_response(response).await, expected);
+            let response = fixture.request("GET", path, "", true).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_response(response).await, expected);
+            assert_eq!(
+                fixture
+                    .state
+                    .relay
+                    .admin_snapshot()
+                    .await
+                    .identity
+                    .allow_legacy_token,
+                allow
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn enrollment_http_rename_validates_input_and_synchronizes_names() {
+        let fixture = EnrollmentFixture::new();
+        let now = chrono::Utc::now();
+        let store = fixture.state.relay.enrollment_store().unwrap();
+        store
+            .set_settings(remoteops_enrollment::AdvertisedEndpoints {
+                enrollment_url: "https://relay.example.test/api/mcp/enroll".into(),
+                relay: "relay.example.test:7443".into(),
+                server_name: "relay.example.test".into(),
+                relay_ca_pem: None,
+                enrollment_ca_pem: None,
+            })
+            .unwrap();
+        let grant = store
+            .create_grant(
+                remoteops_enrollment::CreateGrantRequest {
+                    client_name: Some("Initial".into()),
+                    expires_in_hours: Some(24),
+                },
+                now,
+            )
+            .unwrap();
+        let setup_path = format!("/api/admin/mcp/setups/{}/name", grant.setup.grant_id);
+        let response = fixture
+            .request(
+                "PUT",
+                &setup_path,
+                r#"{"client_name":"  Before install  "}"#,
+                true,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        json_response(response).await;
+        let installation_id = Uuid::new_v4();
+        store
+            .redeem(
+                remoteops_enrollment::RedeemRequest {
+                    grant_id: grant.setup.grant_id,
+                    grant_secret: grant.setup.grant_secret,
+                    installation_id,
+                    installation_secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE".into(),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            store.list_clients().unwrap()[0].client_name.as_deref(),
+            Some("Before install")
+        );
+        let client_path = format!("/api/admin/mcp/clients/{installation_id}/name");
+        for path in [&setup_path, &client_path] {
+            let response = fixture
+                .request("PUT", path, r#"{"client_name":"  Renamed  "}"#, true)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                json_response(response).await,
+                serde_json::json!({"success": true})
+            );
+            assert_eq!(
+                store.list_clients().unwrap()[0].client_name.as_deref(),
+                Some("Renamed")
+            );
+            assert_eq!(
+                store.list_grants(now).unwrap()[0].client_name.as_deref(),
+                Some("Renamed")
+            );
+            for body in [
+                "{}".to_owned(),
+                r#"{"client_name":42}"#.to_owned(),
+                r#"{"client_name":"name","unknown":true}"#.to_owned(),
+                serde_json::json!({"client_name": "a".repeat(257)}).to_string(),
+                serde_json::json!({"client_name": "\nname"}).to_string(),
+            ] {
+                let response = fixture.request("PUT", path, &body, true).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}: {body}");
+                assert!(json_response(response).await["error"].is_string());
+            }
+            for body in [r#"{"client_name":null}"#, r#"{"client_name":"   "}"#] {
+                let response = fixture.request("PUT", path, body, true).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                json_response(response).await;
+                assert!(store.list_clients().unwrap()[0].client_name.is_none());
+                assert!(store.list_grants(now).unwrap()[0].client_name.is_none());
+            }
+        }
+        for kind in ["setups", "clients"] {
+            for (id, expected) in [
+                (Uuid::new_v4().to_string(), StatusCode::NOT_FOUND),
+                ("invalid".into(), StatusCode::BAD_REQUEST),
+            ] {
+                let path = format!("/api/admin/mcp/{kind}/{id}/name");
+                let response = fixture
+                    .request("PUT", &path, r#"{"client_name":"Unknown"}"#, true)
+                    .await;
+                assert_eq!(response.status(), expected);
+                assert!(json_response(response).await["error"].is_string());
+            }
         }
     }
 

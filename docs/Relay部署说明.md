@@ -20,11 +20,10 @@ Relay 是现场 Agent 与工程师本机 MCP 之间的中转服务。首版官�
 
 部署需要：
 
-1. Human Controller Token；
-2. AI Controller Token；
-3. Human 与 AI 共用的非全零 Controller Owner UUID。
+1. Human Controller Token，长度至少 32 字节；
+2. Human 与 AI 共用的非全零 Controller Owner UUID。
 
-两个 Controller Token 必须互不相同，且长度至少 32 字节。Agent 首次连接不需要入网码或部署级注册 Token。Token、Owner UUID、TLS 私钥和控制码不得写入 Git、聊天、截图或普通日志。
+新版 MCP 安装器只接受由管理页签发的设置码/设置文件。需要保留旧 Token 安装时，保留原 `REMOTEOPS_AI_CONTROLLER_TOKEN`（至少 32 字节，且与 Human 不同），并保持后台「允许旧 Token 客户端接入」开启；该开关默认开启，关闭后旧凭据不能使用。没有旧安装时可省略 AI Token 配置。Agent 首次连接不需要入网码或部署级注册 Token。Token、Owner UUID、TLS 私钥和控制码不得写入 Git、聊天、截图或普通日志。
 
 正式部署应使用受信任 CA 证书，证书 SAN 必须包含 Agent 和 Controller 实际连接时使用的域名或 IP。首次实验如果没有证书，Relay 会在 Docker 数据卷中自动生成自签名证书；这种方式只适合封闭实验，Agent 和 MCP 必须通过 PEM 或人工核对的 SHA-256 指纹显式信任它。
 
@@ -57,7 +56,6 @@ REMOTEOPS_ADMIN_USERNAME=<管理页面用户名>
 REMOTEOPS_ADMIN_PASSWORD=<至少 12 个字符的随机管理密码>
 REMOTEOPS_ADMIN_PASSWORD_FORCE_RESET=false
 REMOTEOPS_HUMAN_CONTROLLER_TOKEN=<至少 32 字节的随机值>
-REMOTEOPS_AI_CONTROLLER_TOKEN=<另一组至少 32 字节的随机值>
 REMOTEOPS_CONTROLLER_OWNER_ID=<非全零 UUID>
 ```
 
@@ -103,7 +101,7 @@ Agent 的 Relay 地址、Agent 的 TLS 服务名和 MCP 的 Relay 地址必须�
 
 Relay 部署完成后：
 
-1. 在工程师本机安装 Windows x64 MCP，配置相同的 Relay 地址和 Owner UUID；
+1. 在管理页「MCP 接入」配置真实对外 TLS 与 HTTPS 登记地址，为工程师本机签发设置码/设置文件，再按[一次性安装配置](mcp-one-time-setup.md)安装 MCP；
 2. 在现场 Windows 电脑运行 `remoteops-agent-gui.exe`，首次只填写 Relay 地址并读取临时控制码；
 3. 先完成一次只读配对和目标核对；
 4. 修改操作默认由当前 Codex 逐项确认，或通过 MCP/Agent 现场入口授予当前连接完全控制。当前协议 18 要求 Agent、MCP、Relay 配套升级；协议 17 的迁移范围见[兼容矩阵](integrations/custom-service-agent.md)。默认偏好、撤销与重连规则见[控制权限说明](control-permissions.md)。
@@ -146,7 +144,7 @@ Relay 状态保存在 `/data/relay-state.json`，TLS 文件保存在 `/data/tls`
 
 ### Token 或 Owner 错误
 
-Human 与 AI Controller Token 必须互不相同，且使用同一个 Owner UUID。Token 长度不足、Owner 使用全零 UUID 或 MCP 使用了另一组 Owner，都会导致认证或配对失败。Agent 端不读取 Controller Token，也不需要 Agent 注册 Token。
+Human Controller Token 长度至少 32 字节，Owner 必须为非全零 UUID。MCP 的独立安装凭据由当前 Relay 签发，Owner 从设置中取得；凭据已撤销、系统凭据缺失或安装配置属于其他 Relay，都会导致认证失败。旧 Token 安装还需核对原 AI Token 配置是否保留，以及后台「允许旧 Token 客户端接入」是否开启。Agent 端不读取 Controller Token，也不需要 Agent 注册 Token。
 
 ### 容器反复重启
 
@@ -203,4 +201,8 @@ docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml l
 
 ## MCP 一次性安装配置
 
-管理页新增「MCP 接入」：管理员显式设置对外 TLS 地址、HTTPS 登记地址和可选公开 CA 后，可签发默认 24 小时的一次性安装码/文件，并查看状态或撤销独立客户端。登记只配置 Codex MCP，不配对 Agent 或授予完全控制。登记 SQLite 与原 JSON 状态需要一致备份；完整部署、重试和撤销边界见 [MCP 一次性安装配置](mcp-one-time-setup.md)。
+管理页新增「MCP 接入」：管理员显式设置对外 TLS 地址、HTTPS 登记地址和可选公开 CA 后，可签发默认 24 小时的一次性安装码/文件，并查看状态、修改关联名称或撤销独立客户端。改名不改变凭据，无需重新生成安装码/文件。登记只配置 Codex MCP，不配对 Agent 或授予完全控制。
+
+后台「允许旧 Token 客户端接入」默认开启，保留原 AI Token 配置即可兼容现有旧安装；关闭会立即断开旧 AI Token 连接并拒绝重连，重新开启后可重新连接。策略保存在登记 SQLite 中，重启后保留；独立安装凭据和 Human Controller Token 不受影响。新版 Windows/macOS 安装器已移除 Token 入口，只支持设置码/文件；但兼容开关不能区分安装日期，历史安装包或手工复用同一旧 Token 的客户端也可能连接。
+
+登记 SQLite 与原 JSON 状态需要一致备份；完整部署、重试、改名和撤销边界见 [MCP 一次性安装配置](mcp-one-time-setup.md)。

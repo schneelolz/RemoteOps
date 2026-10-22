@@ -55,9 +55,9 @@ python3 -m http.server 8080
 - **双列响应式布局**：宽屏下并排展示，窄屏 (`<= 1024px`) 自动折叠为单列。
 - **Owner 身份标识**：展示完整的 Owner UUID 与复制按钮，附带脱敏摘要与地址说明。
 - **Controller 凭据状态**：
-  - **AI Controller Token (MCP)**：展示配置状态与 SHA-256 指纹（支持自动换行与一键复制）。
+  - **AI MCP 认证**：独立安装凭据始终可按各自状态接入；旧共享 AI Token 由「MCP 客户端接入」中的兼容开关控制，默认允许。
   - **Human Controller Token**：以紧凑信息行形式展示配置状态。
-  - **安全说明**：明确 Controller 认证令牌由服务端启动配置维护，控制台提供只读状态与指纹核验。
+  - **安全说明**：Human Controller Token 仍由服务端启动配置维护；MCP 独立凭据在「MCP 客户端接入」中管理。
 
 ### 6. 安全设置 (`/settings`)
 - **修改管理密码**：调用 `POST /api/admin/password` 修改管理员密码（密码长度至少 12 字符，服务端以加盐哈希保存）。修改后自动登出并提示重新登录。
@@ -87,11 +87,15 @@ python3 -m http.server 8080
 
 1. 首次配置客户端实际可访问的 Relay TLS `host:port`、证书 `server_name` 和完整 HTTPS `enrollment_url`。可分别填写 Relay TLS 与注册 HTTPS 服务的公开 PEM 信任证书；公共 CA 部署可留空。地址不会从管理页面地址或 `0.0.0.0` 等监听地址推导。
 2. 为一台客户端生成一次性设置，可选名称与首次兑换有效期（1 小时、24 小时默认、7 天）。新生成弹窗可复制设置代码或下载 `.remoteops-setup` JSON 文件；两种格式描述同一份设置。代码与文件含一次性凭据，须通过安全渠道提供给目标使用者。关闭、导航、离开页面或退出登录后，页面会清除内存及 DOM 中的代码；列表接口不能重新获取它，也不会将它写入 URL、日志或 localStorage。复制后的剪贴板与已下载文件由使用者自行保管、清理。
-3. 查看设置的 pending / redeemed / expired / revoked 状态与已注册客户端、注册时间、最后在线时间，分别撤销设置或客户端凭据。撤销设置阻止兑换及重试；已注册客户端凭据需要单独撤销。
+3. 查看设置的 pending / redeemed / expired / revoked 状态与已注册客户端、注册时间、最后在线时间，分别撤销设置或客户端凭据。撤销设置阻止兑换及重试；已注册客户端凭据需要单独撤销。设置和客户端可修改或清空名称（最多 256 个 UTF-8 字节，不允许控制字符），关联记录同步改名并持久保存；已撤销记录也可改名，无需重新发码/文件或重新安装。
+
+「允许旧 Token 客户端接入」默认开启，保留已安装旧 MCP 的使用能力；关闭会断开全部旧 AI Token 连接并拒绝重连，重新开启允许其重新连接，但不恢复配对或完全控制授权。策略持久保存到 SQLite，读取/写入使用 `GET/PUT /api/admin/mcp/access-policy`，JSON 为 `{"allow_legacy_token":true}` 或 `false`。Human Controller Token 和独立安装凭据不受影响。
+
+新版安装器只接受设置码/设置文件，不再提供 Token 安装入口。兼容开关不能识别安装日期，开启时历史安装包或手工复用旧 Token 的客户端也可能连接；旧安装不自动迁移，也不补录记录。
 
 有效期只约束**首次兑换**：已兑换的同一安装实例在过期后仍可重试或续接，但不能借同一设置注册第二个客户端。该流程只安装与配置 Codex MCP，不执行 Agent 配对，不授予 FullAccess。
 
-前端使用 `/api/admin/mcp/settings`、`/api/admin/mcp/setups`、`/api/admin/mcp/clients` 及相应的 `/revoke` 管理接口。演示模式只展示结构，不请求这些 API，不签发模拟凭据。生成及撤销采用提交锁；请求完成前关闭、导航或退出登录时，迟到响应不能重新打开弹窗或覆盖新页面。生成响应失败且结果不明确时，必须关闭弹窗并核对列表，不能直接重复签发。
+前端使用 `/api/admin/mcp/settings`、`/api/admin/mcp/setups`、`/api/admin/mcp/clients` 及相应的 `/revoke` 管理接口。改名使用 `PUT /api/admin/mcp/setups/{grant_id}/name` 或 `PUT /api/admin/mcp/clients/{installation_id}/name`，请求为 `{"client_name":"名称"}`（`null` 或空字符串清空），响应为 `{"success":true}`。演示模式只展示结构，不请求这些 API，不签发模拟凭据。生成及撤销采用提交锁；请求完成前关闭、导航或退出登录时，迟到响应不能重新打开弹窗或覆盖新页面。生成响应失败且结果不明确时，必须关闭弹窗并核对列表，不能直接重复签发。
 
 验证：`node --test scripts/test-relay-admin.mjs`。测试全部使用不可用的本地合成数据，覆盖有效期与设置校验、HTML 转义、代码/文件一致、凭据清理、重复点击和过期异步响应。
 
