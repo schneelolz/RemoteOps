@@ -2,15 +2,20 @@
 use crate::admin::{AdminState, authorize};
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State, rejection::JsonRejection},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Path, Query, Request, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::Response,
     routing::{delete, get, post},
 };
 use remoteops_portal::{
-    ConnectionSummary, CreateAssetRequest, CreatePrincipalRequest, CreatedAsset, CreatedPrincipal,
-    InvitationSummary, IssueInvitationRequest, IssuedInvitation, PortalError,
+    AdminAuditEvent as PortalAdminAuditEvent, AdminOperation, Asset, ConnectionSummary,
+    CreateAssetRequest, CreatePrincipalRequest, CreatedAsset, CreatedPrincipal, InvitationSummary,
+    IssueInvitationRequest, IssuedInvitation, PortalError, Principal, TransferAssetRequest,
+    UpdatePrincipalAssetsRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,14 +41,38 @@ struct CloseRequest {
     expected_revision: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortalAuditQuery {
+    limit: Option<usize>,
+}
+
 pub(crate) fn router() -> Router<AdminState> {
     Router::new()
         .route("/api/admin/portal/principals", post(create_principal))
+        .route(
+            "/api/admin/portal/principals/{principal_id}",
+            get(admin_principal),
+        )
+        .route(
+            "/api/admin/portal/principals/{principal_id}/assets",
+            post(update_principal_assets),
+        )
         .route(
             "/api/admin/portal/principals/{principal_id}/revoke",
             post(revoke_principal),
         )
         .route("/api/admin/portal/assets", post(create_asset))
+        .route("/api/admin/portal/assets/{target_id}", get(admin_asset))
+        .route(
+            "/api/admin/portal/assets/{target_id}/transfer",
+            post(transfer_asset),
+        )
+        .route(
+            "/api/admin/portal/operations/{operation_id}",
+            get(admin_operation),
+        )
+        .route("/api/admin/portal/audit", get(admin_audit))
         .route(
             "/api/portal/v1/assets/{asset_id}/remote-access",
             get(status),
@@ -148,6 +177,140 @@ async fn create_principal(
     state
         .relay
         .portal_create_principal(request)
+        .await
+        .map(Json)
+        .map_err(error)
+}
+
+async fn admin_principal(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Principal> {
+    require_admin(&state, &headers).await?;
+    rate_limit(peer.ip())?;
+    state
+        .relay
+        .portal_get_principal(id)
+        .await
+        .map(Json)
+        .map_err(error)
+}
+
+async fn admin_asset(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(target_id): Path<String>,
+) -> ApiResult<Asset> {
+    require_admin(&state, &headers).await?;
+    rate_limit(peer.ip())?;
+    state
+        .relay
+        .portal_get_asset(&target_id)
+        .await
+        .map(Json)
+        .map_err(error)
+}
+
+async fn update_principal_assets(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    request: Result<Json<UpdatePrincipalAssetsRequest>, JsonRejection>,
+) -> ApiResult<AdminOperation> {
+    require_admin(&state, &headers).await?;
+    rate_limit(peer.ip())?;
+    // 只记录已验证的管理身份类型及实际 TCP peer，不接受正文自报操作者。
+    let actor = format!("relay_admin@{}", peer.ip());
+    let request = admin_payload(
+        &state,
+        &actor,
+        "update_principal_assets",
+        &id.to_string(),
+        request,
+    )
+    .await?;
+    state
+        .relay
+        .portal_update_principal_assets(id, request, &actor)
+        .await
+        .map(Json)
+        .map_err(error)
+}
+
+async fn transfer_asset(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(target_id): Path<String>,
+    request: Result<Json<TransferAssetRequest>, JsonRejection>,
+) -> ApiResult<AdminOperation> {
+    require_admin(&state, &headers).await?;
+    rate_limit(peer.ip())?;
+    let actor = format!("relay_admin@{}", peer.ip());
+    let request = admin_payload(&state, &actor, "transfer_asset", &target_id, request).await?;
+    state
+        .relay
+        .portal_transfer_asset(&target_id, request, &actor)
+        .await
+        .map(Json)
+        .map_err(error)
+}
+
+async fn admin_payload<T>(
+    state: &AdminState,
+    actor: &str,
+    kind: &str,
+    resource: &str,
+    request: Result<Json<T>, JsonRejection>,
+) -> Result<T, (StatusCode, Json<ErrorBody>)> {
+    match request {
+        Ok(Json(value)) => Ok(value),
+        Err(rejection) => {
+            let _ = state
+                .relay
+                .portal_record_admin_failure(actor, kind, resource, &PortalError::InvalidInput)
+                .await;
+            Err(invalid_json(rejection))
+        }
+    }
+}
+
+async fn admin_operation(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<AdminOperation> {
+    require_admin(&state, &headers).await?;
+    rate_limit(peer.ip())?;
+    state
+        .relay
+        .portal_admin_operation(id)
+        .await
+        .map(Json)
+        .map_err(error)
+}
+
+async fn admin_audit(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    query: Result<Query<PortalAuditQuery>, QueryRejection>,
+) -> ApiResult<Vec<PortalAdminAuditEvent>> {
+    require_admin(&state, &headers).await?;
+    rate_limit(peer.ip())?;
+    let Query(query) = query.map_err(|_| error(PortalError::InvalidInput))?;
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(error(PortalError::InvalidInput));
+    }
+    state
+        .relay
+        .portal_admin_audit(limit)
         .await
         .map(Json)
         .map_err(error)
@@ -287,6 +450,10 @@ fn error(value: PortalError) -> (StatusCode, Json<ErrorBody>) {
         PortalError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
         PortalError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
         PortalError::Conflict => (StatusCode::CONFLICT, "conflict"),
+        PortalError::RevisionConflict => (StatusCode::CONFLICT, "revision_conflict"),
+        PortalError::OwnershipConflict => (StatusCode::CONFLICT, "ownership_conflict"),
+        PortalError::IdempotencyConflict => (StatusCode::CONFLICT, "idempotency_conflict"),
+        PortalError::NameConflict => (StatusCode::CONFLICT, "name_conflict"),
         PortalError::Expired => (StatusCode::GONE, "expired"),
         PortalError::Revoked => (StatusCode::GONE, "revoked"),
         PortalError::TargetMismatch => (StatusCode::CONFLICT, "target_mismatch"),
@@ -308,6 +475,8 @@ mod tests {
     use remoteops_domain::ControllerOwnerId;
     use std::{path::PathBuf, sync::Arc};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    include!("portal_admin_tests.rs");
 
     struct HttpFixture {
         address: SocketAddr,

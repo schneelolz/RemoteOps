@@ -1156,7 +1156,6 @@ impl Relay {
         let mut restored = RelayState::default();
         load_persisted_state(&state_path, &mut restored)?;
         save_persisted_state(&state_path, &restored)?;
-        relay.state = Arc::new(Mutex::new(restored));
         relay.enrollment_store = Some(Arc::new(EnrollmentStore::open(
             enrollment_database_path(&state_path),
             controller_owner_id,
@@ -1165,6 +1164,8 @@ impl Relay {
             portal_access::portal_database_path(&state_path),
             controller_owner_id,
         )?));
+        relay.reconcile_portal_admin_operations(&mut restored)?;
+        relay.state = Arc::new(Mutex::new(restored));
         Ok(relay)
     }
 

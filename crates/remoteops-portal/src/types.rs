@@ -23,6 +23,18 @@ pub enum PortalError {
     /// 门户资源状态或修订号冲突。
     #[error("门户资源状态或修订号冲突")]
     Conflict,
+    /// 管理操作的资源修订号冲突。
+    #[error("资源修订号冲突")]
+    RevisionConflict,
+    /// 管理操作预期的资产归属不匹配。
+    #[error("资产归属冲突")]
+    OwnershipConflict,
+    /// 管理操作幂等键被用于不同请求。
+    #[error("管理操作幂等键冲突")]
+    IdempotencyConflict,
+    /// 目标主体已存在同名资产。
+    #[error("目标主体资产名称冲突")]
+    NameConflict,
     /// 邀请已经过期。
     #[error("邀请已经过期")]
     Expired,
@@ -53,6 +65,9 @@ pub struct Principal {
     pub owner_id: ControllerOwnerId,
     /// 允许该集成主体访问的资产键白名单。
     pub allowed_assets: Vec<String>,
+    /// 主体权限修订号，旧数据库记录默认从一开始。
+    #[serde(default = "initial_revision")]
+    pub revision: u64,
     /// 主体是否已被管理员撤销。
     pub revoked: bool,
 }
@@ -222,4 +237,94 @@ pub struct AssetStatus {
     pub invitation: Option<InvitationSummary>,
     /// 单目标授权连接的非机密状态。
     pub connection: Option<ConnectionSummary>,
+}
+
+fn initial_revision() -> u64 {
+    1
+}
+
+/// 管理员按修订号增删现有主体白名单，不更换主体凭据。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePrincipalAssetsRequest {
+    /// 当前主体权限修订号。
+    pub expected_revision: u64,
+    /// 本次操作唯一幂等键，重试必须保持。
+    pub idempotency_key: Uuid,
+    /// 要新增的资产键。
+    pub add: Vec<String>,
+    /// 要移除的资产键，允许移除最后一项。
+    pub remove: Vec<String>,
+}
+
+/// 管理员在同一个 Relay 所有者下迁移准确资产。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferAssetRequest {
+    /// 必须匹配资产当前归属的主体。
+    pub expected_principal_id: Uuid,
+    /// 迁移后的目标主体，必须有效并允许该资产键。
+    pub destination_principal_id: Uuid,
+    /// 当前资产修订号。
+    pub expected_revision: u64,
+    /// 本次操作唯一幂等键，重试必须保持。
+    pub idempotency_key: Uuid,
+}
+
+/// 管理变更的持久结果；资源字段是原操作快照，当前状态请另行查询。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AdminOperation {
+    /// 服务端生成的唯一操作标识。
+    pub operation_id: Uuid,
+    /// 管理变更类型。
+    pub kind: String,
+    /// pending 表示仍需同步 Relay 运行态，completed 表示同步已完成。
+    pub state: String,
+    /// 必须精确同步运行态的目标集合。
+    pub affected_target_ids: Vec<String>,
+    /// 白名单变更前的主体快照。
+    pub previous_principal: Option<Principal>,
+    /// 白名单变更当时的主体快照。
+    pub principal: Option<Principal>,
+    /// 迁移前的资产快照。
+    pub previous_asset: Option<Asset>,
+    /// 迁移当时的资产快照。
+    pub asset: Option<Asset>,
+    /// 持久变更提交时间。
+    pub created_at: DateTime<Utc>,
+    /// Relay 完成运行态同步的时间。
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// 不包含任何凭据的管理操作审计。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AdminAuditEvent {
+    /// 每次成功或失败尝试的审计标识。
+    pub event_id: Uuid,
+    /// 对应的持久管理操作；失败尝试没有已提交操作。
+    pub operation_id: Option<Uuid>,
+    /// 操作的非机密主体或目标标识。
+    pub resource: String,
+    /// 失败时的脱敏错误分类。
+    pub error_code: Option<String>,
+    /// 管理认证上下文提供的操作来源，不能使用正文自报身份。
+    pub actor: String,
+    /// 管理变更类型。
+    pub kind: String,
+    /// 当前运行态同步结果。
+    pub state: String,
+    /// 受影响的准确目标集合。
+    pub affected_target_ids: Vec<String>,
+    /// 白名单变更前的主体快照。
+    pub previous_principal: Option<Principal>,
+    /// 白名单变更后的主体快照。
+    pub principal: Option<Principal>,
+    /// 迁移前的资产快照。
+    pub previous_asset: Option<Asset>,
+    /// 迁移后的资产快照。
+    pub asset: Option<Asset>,
+    /// 持久变更提交时间。
+    pub created_at: DateTime<Utc>,
+    /// Relay 完成运行态同步的时间。
+    pub completed_at: Option<DateTime<Utc>>,
 }

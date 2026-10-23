@@ -6,9 +6,10 @@ use super::{
     RequestId, SessionId, Utc, Uuid, WireMessage, active_controller, bail, end_session, time,
 };
 use remoteops_portal::{
-    ConnectionSummary, ConsumerIdentity, CreateAssetRequest, CreatePrincipalRequest, CreatedAsset,
-    CreatedPrincipal, InvitationSummary, IssueInvitationRequest, IssuedInvitation, PortalError,
-    PortalResult, TargetSnapshot,
+    AdminAuditEvent as PortalAdminAuditEvent, AdminOperation, Asset, ConnectionSummary,
+    ConsumerIdentity, CreateAssetRequest, CreatePrincipalRequest, CreatedAsset, CreatedPrincipal,
+    InvitationSummary, IssueInvitationRequest, IssuedInvitation, PortalError, PortalResult,
+    Principal, TargetSnapshot, TransferAssetRequest, UpdatePrincipalAssetsRequest,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -124,6 +125,135 @@ fn portal_pair_error(error: PortalError) -> (PairingErrorCode, String) {
 }
 
 impl Relay {
+    // 重启不恢复 Controller 绑定，但仍须将未完成的管理操作同步并持久化。
+    pub(super) fn reconcile_portal_admin_operations(
+        &self,
+        state: &mut RelayState,
+    ) -> PortalResult<()> {
+        for operation in self.portal_store()?.pending_admin_operations()? {
+            self.synchronize_portal_admin_operation(state, operation)?;
+        }
+        Ok(())
+    }
+
+    fn synchronize_portal_admin_operation(
+        &self,
+        state: &mut RelayState,
+        operation: AdminOperation,
+    ) -> PortalResult<AdminOperation> {
+        if operation.state == "completed" {
+            return Ok(operation);
+        }
+        // pending 期间存储层拒绝该目标的新授权，重试可按准确 target 清理。
+        let targets = state
+            .agents
+            .iter()
+            .filter(|(_, agent)| {
+                agent
+                    .managed_target_id
+                    .as_ref()
+                    .is_some_and(|target| operation.affected_target_ids.contains(target))
+            })
+            .map(|(id, agent)| (*id, agent.session_id))
+            .collect::<Vec<_>>();
+        for (agent_id, session) in targets {
+            end_managed_session(state, session);
+            if let Some(agent) = state.agents.get_mut(&agent_id) {
+                agent.session_id = SessionId::new();
+            }
+        }
+        self.persist_state_locked(state)
+            .map_err(|_| PortalError::Storage)?;
+        self.portal_store()?
+            .complete_admin_operation(operation.operation_id)
+    }
+
+    /// 管理员读取主体的当前白名单、修订号和撤销状态。
+    pub(crate) async fn portal_get_principal(&self, id: Uuid) -> PortalResult<Principal> {
+        let _state = self.state.lock().await;
+        self.portal_store()?.get_principal(id)
+    }
+
+    /// 管理员按准确目标读取资产，不返回登记凭据。
+    pub(crate) async fn portal_get_asset(&self, target_id: &str) -> PortalResult<Asset> {
+        let _state = self.state.lock().await;
+        self.portal_store()?.get_asset(target_id)
+    }
+
+    /// 原子增删白名单，再完成相应目标的运行态撤权。
+    pub(crate) async fn portal_update_principal_assets(
+        &self,
+        id: Uuid,
+        request: UpdatePrincipalAssetsRequest,
+        actor: &str,
+    ) -> PortalResult<AdminOperation> {
+        let mut state = self.state.lock().await;
+        let operation = self
+            .portal_store()?
+            .update_principal_assets(id, request, actor)?;
+        let result = self.synchronize_portal_admin_operation(&mut state, operation);
+        if let Err(error) = &result {
+            let _ = self.portal_store()?.record_admin_failure(
+                actor,
+                "update_principal_assets",
+                &id.to_string(),
+                error,
+            );
+        }
+        result
+    }
+
+    /// 迁移准确目标的归属并清理旧控制会话，保持 Agent 传输身份。
+    pub(crate) async fn portal_transfer_asset(
+        &self,
+        target_id: &str,
+        request: TransferAssetRequest,
+        actor: &str,
+    ) -> PortalResult<AdminOperation> {
+        let mut state = self.state.lock().await;
+        let operation = self
+            .portal_store()?
+            .transfer_asset(target_id, request, actor)?;
+        let result = self.synchronize_portal_admin_operation(&mut state, operation);
+        if let Err(error) = &result {
+            let _ = self.portal_store()?.record_admin_failure(
+                actor,
+                "transfer_asset",
+                target_id,
+                error,
+            );
+        }
+        result
+    }
+
+    /// 查询原管理操作的同步状态和前后快照。
+    pub(crate) async fn portal_admin_operation(&self, id: Uuid) -> PortalResult<AdminOperation> {
+        let _state = self.state.lock().await;
+        self.portal_store()?.admin_operation(id)
+    }
+
+    /// 读取脱敏的门户管理员审计记录。
+    pub(crate) async fn portal_admin_audit(
+        &self,
+        limit: usize,
+    ) -> PortalResult<Vec<PortalAdminAuditEvent>> {
+        let _state = self.state.lock().await;
+        self.portal_store()?.admin_audit(limit)
+    }
+
+    /// 为已认证管理入口记录未通过请求校验的脱敏失败事件。
+    pub(crate) async fn portal_record_admin_failure(
+        &self,
+        actor: &str,
+        kind: &str,
+        resource: &str,
+        error: &PortalError,
+    ) -> PortalResult<()> {
+        let _state = self.state.lock().await;
+        self.portal_store()?
+            .record_admin_failure(actor, kind, resource, error)
+    }
+
     // 新启动登记若曾在跨存储边界中断，同启动重试仍须收敛旧门户状态。
     pub(super) fn reconcile_managed_boot(
         &self,
@@ -134,7 +264,8 @@ impl Relay {
         let asset = store
             .asset_for_agent(agent_id)?
             .context("受管资产登记不存在")?;
-        let status = store.status(asset.principal_id, &asset.asset_id, Utc::now())?;
+        // Agent 身份恢复不依赖门户 ACL；撤权后仍需清理旧 boot 的控制授权。
+        let status = store.target_status(&asset.target_id, Utc::now())?;
         let stale = status
             .connection
             .is_some_and(|connection| connection.target.boot_id != boot_id)

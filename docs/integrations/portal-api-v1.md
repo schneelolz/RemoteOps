@@ -24,7 +24,58 @@
 
 集成凭据返回后保存在 OpsCenter 后端受保护的凭据库。不要保存到网页 localStorage、URL、前端配置、普通日志或源码中。资产登记文件使用 `{"target_id":"<受控返回的 target_id>","token":"<enrollment_token>"}`，通过 Agent 的 `managed_enrollment_file` 路径加载；普通配置仅保存文件路径，不包含凭据正文。
 
-## 门户业务接口
+## 管理员授权变更与资产迁移
+
+Relay `0.2.0-preview.10` 新增以下管理能力。只接受既有 Relay 管理认证；门户 `ropp1` 凭据、MCP 安装凭据和 Controller 凭据不能调用这些入口。沿用 32 KiB 正文限制、实际 TCP peer 限流、拒绝未知 JSON 字段以及 `no-store` 响应头。
+
+| 方法与路径 | 请求或结果 |
+|---|---|
+| `GET /api/admin/portal/principals/{principal_id}` | 返回主体、当前 `revision`、白名单和撤销状态，不返回凭据；已撤销主体仍可由管理员核验 |
+| `GET /api/admin/portal/assets/{target_id}` | 按准确目标返回当前归属、Agent 和资产修订号，不返回登记证明 |
+| `POST /api/admin/portal/principals/{principal_id}/assets` | `idempotency_key`、主体 `expected_revision`、`add` 与 `remove` 字符串数组；返回管理操作记录 |
+| `POST /api/admin/portal/assets/{target_id}/transfer` | `idempotency_key`、`expected_principal_id`、`destination_principal_id`、资产 `expected_revision`；返回管理操作记录 |
+| `GET /api/admin/portal/operations/{operation_id}` | 返回原操作的 `pending`/`completed` 状态、前后快照和准确受影响目标，不代表这些资源此刻仍停留在原快照 |
+| `GET /api/admin/portal/audit?limit=50` | 返回最近审计事件数组，`limit` 为 1–100；含操作来源、资源、结果和前后快照，不含凭据或控制码 |
+
+白名单采用增量修改，不替换未提及资产。允许移除最后一项，结果可为空；同一次请求不能对同一资产同时增删。纯追加不撤销现有连接。移除只关闭该主体当前拥有的相应目标，撤销其未用邀请及控制连接，后续重新加入也不会恢复旧码或旧恢复能力。已绑定 Agent 的稳定身份保持，不能退回自动签码模式；首次登记仍需有效主体和白名单。
+
+主体 ACL 修订号、资产修订号、连接修订号相互独立。管理员必须先读取对应资源，使用准确修订号。主体已撤销、归属不符、目标主体白名单不包含该资产、同名冲突、跨 Owner 或并发状态变化均拒绝。迁移不要求目标当前在线，也不要求重新登记：保留 `target_id`、`asset_id`、`agent_id`、登记证明摘要及 Agent 传输恢复身份；只改变资产归属及修订。旧主体的其他资产与权限保持。
+
+迁移请求示例（UUID 均为虚构标识）：
+
+```json
+{
+  "idempotency_key": "2a590f4e-9a0f-4c96-85de-d02c8c70ca0e",
+  "expected_principal_id": "c76a9b13-304d-496f-ad45-e5c313d014ee",
+  "destination_principal_id": "0544c9cf-76d5-4752-bc35-e2c847a88923",
+  "expected_revision": 2
+}
+```
+
+白名单修改请求示例：
+
+```json
+{
+  "idempotency_key": "6e7e5df1-afc7-4ac7-bcfb-9ec5858da505",
+  "expected_revision": 1,
+  "add": ["linux-service-01"],
+  "remove": []
+}
+```
+
+两个请求是独立事务：先给目标主体追加白名单，再迁移；追加本身不会取得其他主体的资产归属。两个操作分别使用各自的幂等键和修订号，不隐式迁移或共享资产。
+
+管理幂等键全局唯一，绑定操作类型、准确资源及规范化参数。参数完全相同的重试返回同一操作，不能改键掩盖失败；复用同键但改变参数返回 409 `idempotency_conflict`。并发修订错误为 409 `revision_conflict`，原归属错误为 409 `ownership_conflict`，目标同名为 409 `name_conflict`。门户业务已有错误契约保持。
+
+归属/ACL、邀请和连接撤销、操作及成功审计在同一个 SQLite 事务内提交。操作先为 `pending`，对应目标暂时拒绝新签码、兑换、恢复和请求转发；Relay 精确清理旧目标会话并保存 JSON 后，才将操作标为 `completed` 并返回成功。不会关闭承载其他资产的整个 Controller 传输连接。纯追加的受影响目标为空。
+
+若返回 503，数据库可能已提交，不能按“完全未变更”处理。使用同键同参数重试，或按已知 `operation_id` 查询；重试会完成待同步工作。重启会在接受连接前恢复未完成操作，恢复失败则拒绝启动。已经完成的原请求重试只返回原结果，不再次清理后来新建的会话。审计的 `actor` 来自已通过认证的 Relay 管理入口与实际 TCP peer；共享管理 Token 不能证明具体自然人身份。
+
+成功表示 Relay 持久授权和运行态清理完成。Agent 解绑通过现有通知执行，没有同步停止回执；已经完成的操作副作用不回滚，不能把成功解释为 Agent 上所有任务均已确认停止。迁移不解除无图形、只读、系统账号或产品能力上限。
+
+门户数据库从 schema v1 事务升级到 v2，保留原主体凭据摘要、登记证明、绑定和密钥。升级前一致备份 JSON、SQLite 及 WAL；旧 Relay 不识别 v2，回滚需要按既有恢复流程处理数据库，不能只替换旧二进制。REST `schema_version: 1`、线协议 18 均保持，本次只需更新 Relay；已兼容受管配对的 Agent/MCP 无需更新。
+
+## 门户业务调用
 
 每次请求携带 `Authorization: Bearer <portal-token>`。此身份由 Relay 解析；接口不接受客户端自报主体替代认证。所有响应设置 `Cache-Control: no-store`，不得被反向代理、浏览器或服务端响应缓存保存。
 
