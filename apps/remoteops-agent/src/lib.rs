@@ -15,13 +15,18 @@ pub fn redact_diagnostic(text: &str) -> String {
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod console;
+mod observation;
 mod operation_log;
+pub use observation::{BoundedAgentEventReceiver, BoundedAgentEventSender, bounded_agent_events};
 mod product;
 mod runtime;
-pub use console::run_product_console;
+mod ssh_trust_cli;
+pub use console::{run_product_console, run_product_console_with_tools};
+pub use remoteops_device::{BundledToolPaths, BundledTools, EmbeddedTool};
 pub use remoteops_domain::AgentRunMode;
 pub use remoteops_product::{EndpointPolicy, ProductProfile};
 pub use runtime::{AgentCapabilityPolicy, AgentRuntimeOptions, VisualProviderFactory};
+pub use ssh_trust_cli::handle_ssh_trust_cli;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -211,10 +216,11 @@ impl AgentConfig {
         profile: &ProductProfile,
     ) -> anyhow::Result<Self> {
         let mut defaults = Self::for_product(profile);
+        let path = std::path::absolute(path).context("无法解析服务配置绝对路径")?;
         let directory = path.parent().context("服务配置路径缺少父目录")?;
         defaults.state_file = directory.join(&profile.state_file_name);
         defaults.transfer_root = directory.join("transfer");
-        Self::load_file_with_defaults(Some(path), profile, defaults)
+        Self::load_file_with_defaults(Some(&path), profile, defaults)
     }
 
     fn load_file_with_defaults(
@@ -223,8 +229,10 @@ impl AgentConfig {
         defaults: Self,
     ) -> anyhow::Result<Self> {
         profile.validate()?;
-        let path =
-            config_path.map_or_else(|| Self::product_config_path(profile), Path::to_path_buf);
+        let path = std::path::absolute(
+            config_path.map_or_else(|| Self::product_config_path(profile), Path::to_path_buf),
+        )
+        .context("无法解析 Agent 配置绝对路径")?;
         if !path.exists() {
             if config_path.is_some() {
                 bail!("Agent 配置文件不存在：{}", path.display());
@@ -474,8 +482,32 @@ pub enum AgentEvent {
         /// 当前活动 Controller 绑定快照。
         bindings: Vec<AgentControllerBinding>,
     },
+    /// 已授权操作的本地来源与资源信息，不含认证载荷。
+    OperationContext {
+        /// 对应的远程请求。
+        request_id: RequestId,
+        /// 操作类型。
+        kind: AgentOperationKind,
+        /// 控制端来源。
+        source: remoteops_domain::EventSource,
+        /// 可选的持久 Shell 或串口资源标识。
+        resource_id: Option<String>,
+        /// 已解析的真实命令解释器；SSH、串口及未知资源不借用命令正文猜测。
+        shell: Option<ShellKind>,
+    },
     /// 远程操作的本地展示日志。
     OperationLog(AgentOperationLog),
+    /// 面向只读终端的结构化、已脱敏展示；不进入远程线协议。
+    OperationPresentation {
+        /// 完整请求标识，供并发任务关联。
+        request_id: RequestId,
+        /// 命令、输出或结果的语义颜色角色。
+        role: AgentPresentationRole,
+        /// 已经过现有完整行与凭据脱敏策略的正文。
+        text: String,
+        /// 本条是否为显示终态；标准错误输出为 false。
+        terminal: bool,
+    },
     /// 远程请求的真实执行阶段发生变化，独立于输出日志级别。
     OperationStateChanged {
         /// 对应远程请求，便于区分并发操作。
@@ -512,6 +544,34 @@ pub enum AgentOperationState {
     Succeeded,
     /// 操作执行失败、被拒绝或被中断。
     Failed,
+}
+
+/// 本地只读观察窗的操作来源类型。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentOperationKind {
+    /// 本机一次性或持久 Shell。
+    Shell,
+    /// 远端 SSH 命令。
+    Ssh,
+    /// 串口读取、写入或查询。
+    Serial,
+    /// 其他诊断操作。
+    Other,
+}
+
+/// GUI 中显示的远程操作日志级别。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentPresentationRole {
+    /// 实际命令或明确的操作说明。
+    Command,
+    /// 普通返回内容，不根据正文词语推断成败。
+    Output,
+    /// 已确认成功的结果。
+    Success,
+    /// 标准错误或失败结果，不据此推断任务终态。
+    Error,
+    /// 简短的过程说明。
+    Info,
 }
 
 /// GUI 中显示的远程操作日志级别。
@@ -707,9 +767,27 @@ impl LocalPermissionPolicy {
 /// Agent 生命周期事件发送端。
 pub type AgentEventSender = std_mpsc::Sender<AgentEvent>;
 
-fn emit_agent_event(sender: Option<&AgentEventSender>, event: AgentEvent) {
+#[derive(Clone)]
+pub(crate) enum AgentEventSink {
+    Legacy(AgentEventSender),
+    Bounded(BoundedAgentEventSender),
+}
+impl AgentEventSink {
+    fn send(&self, event: AgentEvent) {
+        match self {
+            Self::Legacy(sender) => {
+                let _ = sender.send(event);
+            }
+            Self::Bounded(sender) => sender.send(event),
+        }
+    }
+    fn bounded(&self) -> bool {
+        matches!(self, Self::Bounded(_))
+    }
+}
+fn emit_agent_event(sender: Option<&AgentEventSink>, event: AgentEvent) {
     if let Some(sender) = sender {
-        let _ = sender.send(event);
+        sender.send(event);
     }
 }
 
@@ -862,10 +940,14 @@ struct FileUploadRuntime {
     session_id: SessionId,
     /// Agent 端受控临时上传会话。
     upload: SystemFileUploadSession,
+    /// 创建会话时已由 Device 验证的目标相对路径，完成回执不能依赖 Controller 猜测。
+    remote_path: String,
 }
 
 #[derive(Clone)]
 struct RequestRuntimeState {
+    // 本地观察器不参与协议和授权。
+    log_observer: Option<Arc<std::sync::Mutex<operation_log::LogObserver>>>,
     /// 本次文件操作的取消与不可逆提交点。
     file_commit: FileCommitControl,
     /// 持久 Shell 会话。
@@ -1097,7 +1179,21 @@ pub async fn run_cli() -> anyhow::Result<()> {
         }
     });
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-    let mut task = tokio::spawn(run_agent(config, Some(event_sender), shutdown_receiver));
+    let permission_control = AgentPermissionControl::from_config(&config);
+    let visual_enabled = cfg!(windows)
+        && env::var("REMOTEOPS_VISUAL_PROVIDER_ENABLED")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let mut options =
+        AgentRuntimeOptions::interactive(ProductProfile::default()).with_ssh_trust_cli();
+    options.run_mode = AgentRunMode::Console;
+    options.visual_enabled = visual_enabled;
+    let mut task = tokio::spawn(run_agent_with_options(
+        config,
+        Some(event_sender),
+        shutdown_receiver,
+        permission_control,
+        options,
+    ));
     let result = tokio::select! {
         result = &mut task => result.context("Agent 运行任务异常结束")?,
         signal = shutdown_signal() => {
@@ -1222,6 +1318,49 @@ pub async fn run_agent_with_visual_provider(
 pub async fn run_agent_with_options(
     config: AgentConfig,
     event_sender: Option<AgentEventSender>,
+    shutdown: watch::Receiver<bool>,
+    permission_control: AgentPermissionControl,
+    options: AgentRuntimeOptions,
+) -> anyhow::Result<()> {
+    run_agent_with_event_sink(
+        config,
+        event_sender.map(AgentEventSink::Legacy),
+        shutdown,
+        permission_control,
+        options,
+    )
+    .await
+}
+
+/// 使用有界、按连接代次隔离的本地观察订阅运行 Agent。
+///
+/// # Errors
+/// 当配置、设备或 Relay 生命周期失败时返回错误；宿主取消时应先关闭观察订阅。
+pub async fn run_agent_with_bounded_scoped_options(
+    config: AgentConfig,
+    event_sender: BoundedAgentEventSender,
+    shutdown: watch::Receiver<bool>,
+    permission_control: AgentPermissionControl,
+    options: AgentRuntimeOptions,
+) -> anyhow::Result<()> {
+    permission_control
+        .scoped_events
+        .store(true, Ordering::SeqCst);
+    event_sender.attach_shutdown(shutdown.clone());
+    run_agent_with_event_sink(
+        config,
+        Some(AgentEventSink::Bounded(event_sender)),
+        shutdown,
+        permission_control,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_agent_with_event_sink(
+    config: AgentConfig,
+    event_sender: Option<AgentEventSink>,
     mut shutdown: watch::Receiver<bool>,
     permission_control: AgentPermissionControl,
     options: AgentRuntimeOptions,
@@ -1252,13 +1391,17 @@ pub async fn run_agent_with_options(
     // 启动标识只属于这次运行，网络重连复用，下一次运行重新生成。
     let boot_id = AgentBootId::new();
     let device = Arc::new(
-        SystemDevice::with_transfer_root(&config.transfer_root).with_context(|| {
-            format!(
-                "无法初始化 Agent 文件交换目录 {}",
-                config.transfer_root.display()
-            )
-        })?,
+        SystemDevice::with_transfer_root(&config.transfer_root)
+            .with_context(|| {
+                format!(
+                    "无法初始化 Agent 文件交换目录 {}",
+                    config.transfer_root.display()
+                )
+            })?
+            .with_bundled_tools(options.bundled_tools.clone()),
     );
+    // 同一运行只使用 Device 创建并规范化后的根，后续展示不能重新按 CWD 推导。
+    config.transfer_root = device.transfer_root().to_path_buf();
     let environment = detect_environment_profile(device.as_ref()).await;
     let (boundary, visual_provider, capabilities) =
         runtime::prepare(&options, &environment, runtime::native_facts()).await?;
@@ -1296,7 +1439,9 @@ pub async fn run_agent_with_options(
         AgentEvent::Started {
             agent_instance_id,
             relay: config.relay.clone(),
-            transfer_root: device.transfer_root().to_path_buf(),
+            transfer_root: PathBuf::from(remoteops_device::path_for_child_process(
+                device.transfer_root(),
+            )),
             capabilities: capabilities.clone(),
         },
     );
@@ -1412,7 +1557,7 @@ async fn run_connection<S>(
     local_permission_policy: Arc<LocalPermissionPolicy>,
     credential_encryption: Arc<CredentialEncryptionKeyPair>,
     mut permission_mode_updates: watch::Receiver<PermissionMode>,
-    event_sender: Option<&AgentEventSender>,
+    event_sender: Option<&AgentEventSink>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()>
 where
@@ -1425,7 +1570,7 @@ where
         protocol_version: PROTOCOL_VERSION,
         agent_instance_id,
         boot_id,
-        target_context: Some(boundary.snapshot()),
+        target_context: Some(runtime_target_context(&boundary, device.as_ref())),
         pairing_mode,
         managed_enrollment,
         resume_token,
@@ -1501,7 +1646,7 @@ where
         },
     ));
     let log_observer = Arc::new(std::sync::Mutex::new(
-        operation_log::LogObserver::new(event_sender.cloned()).with_epoch(epoch),
+        operation_log::LogObserver::with_sink(event_sender.cloned()).with_epoch(epoch),
     ));
     let writer_logs = log_observer.clone();
     let writer_task = tokio::spawn(async move {
@@ -1828,7 +1973,11 @@ where
                     });
                     continue;
                 }
-                operation_log::record_request(event_sender, &request, epoch);
+                // 先释放异步资源锁，再进入同步观察器，避免让展示订阅持锁等待运行时。
+                let shell = observed_request_shell(&request, &shell_sessions).await;
+                if let Ok(mut observer) = log_observer.lock() {
+                    observer.record_request(&request, shell);
+                }
                 if let RemoteOperation::CancelRequest {
                     request_id: target_request_id,
                 } = &request.operation
@@ -1954,6 +2103,7 @@ where
                 )
                 .then(FileCommitControl::default);
                 let runtime_state = RequestRuntimeState {
+                    log_observer: Some(log_observer.clone()),
                     file_commit: file_commit.clone().unwrap_or_default(),
                     shell_sessions: shell_sessions.clone(),
                     serial_sessions: serial_sessions.clone(),
@@ -2264,7 +2414,7 @@ fn verify_authorized_request(
 }
 
 fn emit_controller_bindings(
-    event_sender: Option<&AgentEventSender>,
+    event_sender: Option<&AgentEventSink>,
     bindings: &BTreeMap<ControllerInstanceId, ControllerBinding>,
     local_permission_policy: &LocalPermissionPolicy,
 ) {
@@ -2443,20 +2593,24 @@ async fn execute_request(
                 );
             }
             if let Some(details) = &response.details {
-                send_event(
+                send_response_event(
                     sender,
                     sequence,
+                    runtime_state,
                     &request,
+                    &response,
                     EventPayload::OutputChunk {
                         stderr: false,
                         text: details.to_string(),
                     },
                 );
             }
-            send_event(
+            send_response_event(
                 sender,
                 sequence,
+                runtime_state,
                 &request,
+                &response,
                 EventPayload::OperationCompleted {
                     exit_code: response.exit_code,
                     summary: response.summary.clone(),
@@ -2467,40 +2621,82 @@ async fn execute_request(
             let _ = sender.send(WireMessage::RemoteResponse(response));
         }
         Err(error) => {
-            let message = error.to_string();
-            let error_code = error
-                .downcast_ref::<runtime::RuntimeDenied>()
-                .map_or("agent_operation_failed", |denied| denied.code.as_str())
-                .to_owned();
-            let details = error.downcast_ref::<ShellOperationError>().map(|error| {
-                serde_json::json!({
-                    "shell_id": error.shell_id.to_string(),
-                    "shell": format!("{:?}", error.shell),
-                    "shell_closed": error.shell_closed,
-                })
-            });
-            send_event(
+            let response = operation_error_response(&request, &error);
+            send_response_event(
                 sender,
                 sequence,
+                runtime_state,
                 &request,
+                &response,
                 EventPayload::OperationFailed {
-                    code: error_code.clone(),
-                    message: message.clone(),
+                    code: response.error_code.clone().expect("错误响应必须包含错误码"),
+                    message: response.summary.clone(),
                 },
             );
-            let _ = sender.send(WireMessage::RemoteResponse(RemoteResponse {
-                request_id: request.request_id,
-                session_id: request.session_id,
-                exit_code: None,
-                summary: message,
-                error_code: Some(error_code),
-                payload_base64: None,
-                sha256: None,
-                details,
-            }));
+            let _ = sender.send(WireMessage::RemoteResponse(response));
         }
     }
     final_terminal
+}
+
+fn operation_error_response(request: &RemoteRequest, error: &anyhow::Error) -> RemoteResponse {
+    let error_code = error
+        .downcast_ref::<runtime::RuntimeDenied>()
+        .map_or("agent_operation_failed", |denied| denied.code.as_str())
+        .to_owned();
+    let details = error.downcast_ref::<ShellOperationError>().map(|error| {
+        serde_json::json!({
+            "shell_id": error.shell_id.to_string(),
+            "shell": format!("{:?}", error.shell),
+            "shell_closed": error.shell_closed,
+        })
+    });
+    RemoteResponse {
+        request_id: request.request_id,
+        session_id: request.session_id,
+        exit_code: None,
+        summary: error.to_string(),
+        error_code: Some(error_code),
+        payload_base64: None,
+        sha256: None,
+        details,
+    }
+}
+
+// 本地表现层只转换这里明确产生的响应元数据；wire消息与真正stdout保持原样。
+fn send_response_event(
+    sender: &mpsc::UnboundedSender<WireMessage>,
+    sequence: &Arc<AtomicU64>,
+    runtime_state: &RequestRuntimeState,
+    request: &RemoteRequest,
+    response: &RemoteResponse,
+    payload: EventPayload,
+) {
+    let event = RemoteEvent {
+        sequence: sequence.fetch_add(1, Ordering::Relaxed),
+        session_id: request.session_id,
+        request_id: Some(request.request_id),
+        source: request.source,
+        approval: if request.approval_id.is_some() {
+            ApprovalState::Approved
+        } else {
+            ApprovalState::NotRequired
+        },
+        payload,
+        occurred_at: Utc::now(),
+    };
+    if let Some(observer) = runtime_state.log_observer.as_ref()
+        && let Ok(mut observer) = observer.lock()
+    {
+        observer.annotate_response_event(request, response, &event);
+    }
+    // 不跨发送保留观察器锁；失败时清掉该请求尚未消费的标注。
+    if sender.send(WireMessage::RemoteEvent(event)).is_err()
+        && let Some(observer) = runtime_state.log_observer.as_ref()
+        && let Ok(mut observer) = observer.lock()
+    {
+        observer.discard_response_events(request.session_id, request.request_id);
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2537,7 +2733,7 @@ async fn execute_operation(
     };
     match &request.operation {
         RemoteOperation::GetTargetContext => {
-            let context = runtime_state.boundary.snapshot();
+            let context = runtime_target_context(runtime_state.boundary.as_ref(), device);
             response.summary = runtime_state.boundary.visual_diagnostic().map_or_else(
                 || "目标产品与运行上下文".to_owned(),
                 |diagnostic| format!("图形探测：{diagnostic}"),
@@ -2568,6 +2764,11 @@ async fn execute_operation(
                 },
             );
             drop(sessions);
+            if let Some(observer) = runtime_state.log_observer.as_ref()
+                && let Ok(observer) = observer.lock()
+            {
+                observer.open_shell(request, shell_id, *shell);
+            }
             response.summary = format!("持久 Shell {shell_id} 已打开");
             response.details = Some(serde_json::json!({
                 "shell_id": shell_id.to_string(),
@@ -2695,6 +2896,12 @@ async fn execute_operation(
                 )
                 .await?;
             response.summary = format!("已写入 {} 字节", bytes.len());
+            response.details = Some(upload_receipt(
+                device,
+                remote_path,
+                bytes.len() as u64,
+                &actual_hash,
+            )?);
             response.sha256 = Some(actual_hash);
         }
         RemoteOperation::BeginUploadFile {
@@ -2739,6 +2946,7 @@ async fn execute_operation(
                 FileUploadRuntime {
                     session_id: request.session_id,
                     upload,
+                    remote_path: remote_path.clone(),
                 },
             );
             response.summary = format!("已开始接收 {size} 字节文件");
@@ -2804,6 +3012,12 @@ async fn execute_operation(
                 .await?;
             file_uploads.lock().await.remove(transfer_id);
             response.summary = format!("已完成 {} 字节文件上传", runtime.upload.written());
+            response.details = Some(upload_receipt(
+                device,
+                &runtime.remote_path,
+                runtime.upload.written(),
+                &actual_hash,
+            )?);
             response.sha256 = Some(actual_hash);
         }
         RemoteOperation::AbortUploadFile { transfer_id } => {
@@ -2999,8 +3213,20 @@ async fn execute_operation(
                 command,
             )
             .await?;
+            if let Some(observer) = &runtime_state.log_observer
+                && let Ok(observer) = observer.lock()
+            {
+                observer.ssh_connecting(request.request_id);
+            }
+            let (output_sender, output_receiver) = mpsc::unbounded_channel();
+            let output_task = spawn_command_output_forwarder(
+                output_receiver,
+                sender.clone(),
+                sequence.clone(),
+                request.clone(),
+            );
             let result = ssh_provider
-                .run_command(
+                .run_command_streaming(
                     host,
                     *port,
                     username,
@@ -3009,8 +3235,11 @@ async fn execute_operation(
                     known_hosts_file.as_deref(),
                     command,
                     120,
+                    output_sender,
                 )
-                .await?;
+                .await;
+            let _ = output_task.await;
+            let result = result?;
             response.exit_code = result.exit_code;
             let stdout = remoteops_serial::redact_serial_text(&result.stdout);
             let stderr = remoteops_serial::redact_serial_text(&result.stderr);
@@ -3046,7 +3275,18 @@ async fn execute_operation(
             if ensure_serial_capacity(sessions.len(), session_count).is_err() {
                 bail!("串口会话达到安全上限");
             }
+            if let Some(observer) = &runtime_state.log_observer
+                && let Ok(mut observer) = observer.lock()
+            {
+                observer.open_serial(
+                    request.session_id,
+                    serial_session_id,
+                    request.request_id,
+                    request.source,
+                );
+            }
             let reader_task = spawn_serial_reader(
+                runtime_state.log_observer.clone(),
                 serial_session_id,
                 request.session_id,
                 request.request_id,
@@ -3117,7 +3357,17 @@ async fn execute_operation(
             if runtime.cancelled.load(Ordering::Acquire) {
                 bail!("串口会话已关闭");
             }
+            if let Some(observer) = &runtime_state.log_observer
+                && let Ok(mut observer) = observer.lock()
+            {
+                observer.prepare_serial_write(request, &bytes);
+            }
             let written = runtime.port.write(bytes.clone()).await?;
+            if let Some(observer) = &runtime_state.log_observer
+                && let Ok(observer) = observer.lock()
+            {
+                observer.serial_write(request, &bytes);
+            }
             runtime
                 .transcript
                 .lock()
@@ -3173,12 +3423,26 @@ async fn execute_operation(
                 "串口查询完成：{:?}，接收 {} 字节，自动翻页 {} 次",
                 result.completion, result.received_bytes, result.pages
             );
+            let redacted_text = runtime_state
+                .log_observer
+                .as_ref()
+                .and_then(|observer| observer.lock().ok())
+                .map_or_else(
+                    || remoteops_serial::redact_serial_text(&result.redacted_text),
+                    |observer| {
+                        observer.serial_result(
+                            request.session_id,
+                            serial_session_id,
+                            &result.redacted_text,
+                        )
+                    },
+                );
             response.details = Some(serde_json::json!({
                 "completion": result.completion,
                 "received_bytes": result.received_bytes,
                 "pages": result.pages,
                 "elapsed_millis": result.elapsed_millis,
-                "redacted_text": result.redacted_text
+                "redacted_text": redacted_text
             }));
         }
         RemoteOperation::CloseSerial { serial_session_id } => {
@@ -3351,6 +3615,35 @@ fn set_structured_inventory_response(
     Ok(())
 }
 
+/// 运行事实来自本次 Device，旧宿主或未启用 CLI 的进程不推断能力。
+fn runtime_target_context(
+    boundary: &runtime::RuntimeBoundary,
+    device: &SystemDevice,
+) -> remoteops_domain::TargetContext {
+    let mut context = boundary.snapshot();
+    context.transfer_root = Some(remoteops_device::path_for_child_process(
+        device.transfer_root(),
+    ));
+    context
+}
+
+fn upload_receipt(
+    device: &SystemDevice,
+    remote_path: &str,
+    size: u64,
+    sha256: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let absolute = device.resolved_transfer_file(remote_path)?;
+    let relative = absolute
+        .strip_prefix(device.transfer_root())
+        .context("上传目标不属于本次 Agent 文件交换目录")?;
+    Ok(serde_json::json!({
+        "agent_transfer_root": remoteops_device::path_for_child_process(device.transfer_root()),
+        "remote_path": relative.to_string_lossy().replace('\\', "/"),
+        "remote_absolute_path": remoteops_device::path_for_child_process(&absolute), "size": size, "sha256": sha256,
+    }))
+}
+
 fn command_summary(stdout: &str, stderr: &str) -> String {
     if stderr.trim().is_empty() {
         stdout.to_owned()
@@ -3361,6 +3654,10 @@ fn command_summary(stdout: &str, stderr: &str) -> String {
     }
 }
 
+// 合并微小输出片段，限制帧频率；不扩大 Relay 队列或改变授权、终态顺序。
+const OUTPUT_COALESCE_BYTES: usize = 16 * 1024;
+const OUTPUT_COALESCE_DELAY: Duration = Duration::from_millis(8);
+
 fn spawn_command_output_forwarder(
     mut receiver: mpsc::UnboundedReceiver<CommandOutputChunk>,
     sender: mpsc::UnboundedSender<WireMessage>,
@@ -3368,7 +3665,7 @@ fn spawn_command_output_forwarder(
     request: RemoteRequest,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(chunk) = receiver.recv().await {
+        let publish = |chunk: CommandOutputChunk| {
             send_event(
                 &sender,
                 &sequence,
@@ -3378,6 +3675,60 @@ fn spawn_command_output_forwarder(
                     text: chunk.text,
                 },
             );
+        };
+        let flush = |pending: &mut Option<CommandOutputChunk>| {
+            if let Some(chunk) = pending.take() {
+                publish(chunk);
+            }
+        };
+        let mut pending: Option<CommandOutputChunk> = None;
+        let mut flush_at = tokio::time::Instant::now();
+        loop {
+            // 已到截止时间时先交付，避免持续可读的微片让定时分支饥饿。
+            if pending.is_some() && tokio::time::Instant::now() >= flush_at {
+                flush(&mut pending);
+            }
+            let chunk = if pending.is_some() {
+                if let Ok(chunk) = tokio::time::timeout_at(flush_at, receiver.recv()).await {
+                    chunk
+                } else {
+                    flush(&mut pending);
+                    continue;
+                }
+            } else {
+                receiver.recv().await
+            };
+            let Some(chunk) = chunk else {
+                flush(&mut pending);
+                break;
+            };
+            if chunk.text.is_empty() {
+                continue;
+            }
+            if pending.as_ref().is_some_and(|current| {
+                current.stderr != chunk.stderr
+                    || tokio::time::Instant::now() >= flush_at
+                    || current.text.len().saturating_add(chunk.text.len()) > OUTPUT_COALESCE_BYTES
+            }) {
+                flush(&mut pending);
+            }
+            if chunk.text.len() > OUTPUT_COALESCE_BYTES {
+                // 原有超大片段直接转移所有权，不再次复制或按字节切断 UTF-8。
+                publish(chunk);
+                continue;
+            }
+            if let Some(current) = pending.as_mut() {
+                current.text.push_str(&chunk.text);
+            } else {
+                flush_at = tokio::time::Instant::now() + OUTPUT_COALESCE_DELAY;
+                pending = Some(chunk);
+            }
+            if pending
+                .as_ref()
+                .is_some_and(|current| current.text.len() == OUTPUT_COALESCE_BYTES)
+            {
+                flush(&mut pending);
+            }
         }
     })
 }
@@ -3605,6 +3956,28 @@ fn ensure_shell_capacity(total: usize, session: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 展示分类复用真实资源表；其容量、会话边界和回收与执行路径保持一致。
+async fn observed_request_shell(
+    request: &RemoteRequest,
+    shell_sessions: &Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
+) -> Option<ShellKind> {
+    match &request.operation {
+        RemoteOperation::RunCommand { shell, .. } | RemoteOperation::OpenShell { shell } => {
+            Some(operation_log::normalize_observed_shell(*shell))
+        }
+        RemoteOperation::RunShellCommand { shell_id, .. }
+        | RemoteOperation::CloseShell { shell_id } => shell_sessions
+            .lock()
+            .await
+            .get(shell_id)
+            .filter(|runtime| {
+                runtime.session_id == request.session_id && !runtime.session.is_closed()
+            })
+            .map(|runtime| operation_log::normalize_observed_shell(runtime.shell)),
+        _ => None,
+    }
+}
+
 async fn prune_closed_shells(shell_sessions: &Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>) {
     shell_sessions
         .lock()
@@ -3671,6 +4044,7 @@ fn send_event(
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_serial_reader(
+    log_observer: Option<Arc<std::sync::Mutex<operation_log::LogObserver>>>,
     serial_session_id: SerialSessionId,
     session_id: SessionId,
     request_id: RequestId,
@@ -3702,7 +4076,21 @@ fn spawn_serial_reader(
                         .await
                         .push(SerialDirection::Receive, bytes.clone());
                     activity.notify_waiters();
-                    let text = serial_output_for_remote_event(&bytes);
+                    let text = if let Some(observer) = &log_observer {
+                        observer.lock().map_or_else(
+                            |_| "[串口观察器不可用，内容已隐藏]".to_owned(),
+                            |mut observer| {
+                                observer
+                                    .serial_output(session_id, serial_session_id, &bytes)
+                                    .join("\n")
+                            },
+                        )
+                    } else {
+                        serial_output_for_remote_event(&bytes)
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
                     if sender
                         .send(WireMessage::RemoteEvent(RemoteEvent {
                             sequence: sequence.fetch_add(1, Ordering::Relaxed),
@@ -3712,7 +4100,7 @@ fn spawn_serial_reader(
                             approval: ApprovalState::NotRequired,
                             payload: EventPayload::OutputChunk {
                                 stderr: false,
-                                text: format!("[serial:{serial_session_id}] {text}"),
+                                text: format!("[serial:{serial_session_id}] {text}\n"),
                             },
                             occurred_at: Utc::now(),
                         }))
@@ -3741,6 +4129,26 @@ fn spawn_serial_reader(
         cancelled.store(true, Ordering::Release);
         activity.notify_waiters();
         remove_serial_runtime(&serial_sessions, serial_session_id, &cancelled).await;
+        if let Some(observer) = &log_observer {
+            let tail = observer.lock().map_or_else(
+                |_| Vec::new(),
+                |mut observer| observer.close_serial(session_id, serial_session_id),
+            );
+            if !tail.is_empty() {
+                let _ = sender.send(WireMessage::RemoteEvent(RemoteEvent {
+                    sequence: sequence.fetch_add(1, Ordering::Relaxed),
+                    session_id,
+                    request_id: Some(request_id),
+                    source,
+                    approval: ApprovalState::NotRequired,
+                    payload: EventPayload::OutputChunk {
+                        stderr: false,
+                        text: format!("[serial:{serial_session_id}] {}\n", tail.join("\n")),
+                    },
+                    occurred_at: Utc::now(),
+                }));
+            }
+        }
     })
 }
 
@@ -3810,6 +4218,11 @@ async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile
     .collect();
     let ssh_executable = if cfg!(windows) { "ssh.exe" } else { "ssh" };
     let ssh_available = command_exists(ssh_executable);
+    let keyscan_available = command_exists(if cfg!(windows) {
+        "ssh-keyscan.exe"
+    } else {
+        "ssh-keyscan"
+    });
 
     EnvironmentProfile {
         schema_version: remoteops_domain::ENVIRONMENT_PROFILE_SCHEMA_VERSION,
@@ -3824,11 +4237,12 @@ async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile
         shells,
         tools: {
             #[allow(unused_mut)]
-            let mut tools = vec![ToolProfile {
-                name: "ssh".to_owned(),
-                available: ssh_available,
-                version: ssh_available.then(ssh_version).flatten(),
-            }];
+            let mut tools = ssh_tool_profiles(
+                ssh_available,
+                ssh_available.then(ssh_version).flatten(),
+                cfg!(windows) && device.has_bundled_ssh(),
+                keyscan_available,
+            );
             #[cfg(target_os = "linux")]
             for name in ["systemctl", "journalctl", "apt-get", "dnf"] {
                 tools.push(ToolProfile {
@@ -3841,6 +4255,38 @@ async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile
             tools
         },
     }
+}
+
+fn ssh_tool_profiles(
+    system_available: bool,
+    system_version: Option<String>,
+    bundled_plink: bool,
+    keyscan_available: bool,
+) -> Vec<ToolProfile> {
+    let mut tools = vec![
+        ToolProfile {
+            name: "ssh".into(),
+            available: system_available,
+            version: if system_available {
+                system_version
+            } else {
+                None
+            },
+        },
+        ToolProfile {
+            name: "ssh-keyscan".into(),
+            available: keyscan_available,
+            version: None,
+        },
+    ];
+    if bundled_plink {
+        tools.push(ToolProfile {
+            name: "plink".into(),
+            available: true,
+            version: None,
+        });
+    }
+    tools
 }
 
 fn capabilities_from_environment(
@@ -3864,7 +4310,7 @@ fn capabilities_from_environment(
     if environment
         .tools
         .iter()
-        .any(|tool| tool.name == "ssh" && tool.available)
+        .any(|tool| matches!(tool.name.as_str(), "ssh" | "plink") && tool.available)
     {
         capabilities.push(Capability::Ssh);
     }
@@ -4463,7 +4909,10 @@ fn print_agent_event(event: &AgentEvent) {
                 );
             }
         }
-        AgentEvent::ConnectionEpoch(_) | AgentEvent::OperationStateChanged { .. } => {}
+        AgentEvent::ConnectionEpoch(_)
+        | AgentEvent::OperationStateChanged { .. }
+        | AgentEvent::OperationPresentation { .. }
+        | AgentEvent::OperationContext { .. } => {}
         AgentEvent::ScopedOperation { event, .. } => print_agent_event(event),
         AgentEvent::ControlStatePending(_) => println!("正在同步现场控制权限"),
         AgentEvent::ControlStateResult(result) => println!(
@@ -4485,6 +4934,41 @@ fn print_agent_event(event: &AgentEvent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embedded_plink_reports_ssh_capability_without_inventing_openssh_presence() {
+        let mut environment = remoteops_domain::EnvironmentProfile::empty();
+        environment.tools =
+            super::ssh_tool_profiles(false, Some("must-not-report".into()), true, false);
+        let openssh = environment
+            .tools
+            .iter()
+            .find(|tool| tool.name == "ssh")
+            .unwrap();
+        assert!(!openssh.available);
+        assert_eq!(openssh.version, None);
+        assert!(
+            environment
+                .tools
+                .iter()
+                .any(|tool| tool.name == "plink" && tool.available)
+        );
+        assert!(
+            !environment
+                .tools
+                .iter()
+                .any(|tool| tool.name == "ssh-keyscan" && tool.available)
+        );
+        assert!(
+            super::capabilities_from_environment(&environment, false)
+                .contains(remoteops_domain::Capability::Ssh)
+        );
+        environment.tools = super::ssh_tool_profiles(false, None, false, false);
+        assert!(
+            !super::capabilities_from_environment(&environment, false)
+                .contains(remoteops_domain::Capability::Ssh)
+        );
+    }
+
     #[test]
     fn visual_capability_requires_successful_provider_initialization() {
         let environment = remoteops_domain::EnvironmentProfile::empty();
@@ -4543,6 +5027,7 @@ mod tests {
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let runtime_state = RequestRuntimeState {
+            log_observer: None,
             file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -5072,7 +5557,7 @@ mod tests {
                 }),
                 Arc::new(CredentialEncryptionKeyPair::generate()),
                 watch::channel(PermissionMode::FullAccess).1,
-                Some(&log_sender),
+                Some(&AgentEventSink::Legacy(log_sender)),
                 shutdown_receiver,
             )
             .await
@@ -5343,6 +5828,7 @@ mod tests {
         };
 
         let runtime_state = RequestRuntimeState {
+            log_observer: None,
             file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -5372,6 +5858,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // 分块、提交和回执属于同一完整传输回归。
     async fn executes_chunked_file_transfer_with_session_binding_and_hashes() {
         let transfer_root = test_state_file("chunked-transfer").with_extension("dir");
         let device = SystemDevice::with_transfer_root(&transfer_root).expect("应创建交换目录");
@@ -5435,6 +5922,20 @@ mod tests {
         .await
         .expect("应完成上传");
         assert_eq!(complete.sha256.as_deref(), Some(hash.as_str()));
+        let receipt = complete.details.as_ref().unwrap();
+        assert_eq!(
+            receipt["agent_transfer_root"],
+            remoteops_device::path_for_child_process(device.transfer_root())
+        );
+        assert_eq!(receipt["remote_path"], "nested/result.bin");
+        assert_eq!(
+            receipt["remote_absolute_path"],
+            remoteops_device::path_for_child_process(
+                &device.resolved_transfer_file("nested/result.bin").unwrap()
+            )
+        );
+        assert_eq!(receipt["size"], contents.len() as u64);
+        assert_eq!(receipt["sha256"], hash);
         assert!(uploads.lock().await.is_empty());
 
         let download = execute_test_file_operation(
@@ -5947,7 +6448,11 @@ mod tests {
         ] {
             current.controller_control_mode = mode;
             bindings.insert(controller_id, current.clone());
-            emit_controller_bindings(Some(&sender), &bindings, &local_policy);
+            emit_controller_bindings(
+                Some(&AgentEventSink::Legacy(sender.clone())),
+                &bindings,
+                &local_policy,
+            );
             let AgentEvent::ControllerBindingsChanged { bindings } = receiver.try_recv().unwrap()
             else {
                 panic!("应发送绑定事件");
@@ -5961,7 +6466,11 @@ mod tests {
             assert!(!bindings[0].full_access_authorized_locally);
         }
         bindings.clear();
-        emit_controller_bindings(Some(&sender), &bindings, &local_policy);
+        emit_controller_bindings(
+            Some(&AgentEventSink::Legacy(sender.clone())),
+            &bindings,
+            &local_policy,
+        );
         assert!(matches!(
             receiver.try_recv().unwrap(),
             AgentEvent::ControllerBindingsChanged { bindings } if bindings.is_empty()
@@ -6322,6 +6831,7 @@ mod tests {
         shell_sessions: Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
     ) -> RequestRuntimeState {
         RequestRuntimeState {
+            log_observer: None,
             file_commit: FileCommitControl::default(),
             shell_sessions,
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -6373,6 +6883,260 @@ mod tests {
         } else {
             ShellKind::System
         }
+    }
+
+    async fn observed_shell_exchange(
+        state: &RequestRuntimeState,
+        sequence: &Arc<AtomicU64>,
+        session: SessionId,
+        operation: RemoteOperation,
+    ) -> (RemoteResponse, Vec<WireMessage>) {
+        let request = metadata_shell_request(session, operation);
+        let shell = observed_request_shell(&request, &state.shell_sessions).await;
+        state
+            .log_observer
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .record_request(&request, shell);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        execute_request(
+            &SystemDevice::new(),
+            &sender,
+            sequence,
+            state,
+            AgentInstanceId::new(),
+            &CredentialEncryptionKeyPair::generate(),
+            request,
+            &AtomicTaskTerminal::running(),
+        )
+        .await;
+        let messages: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        for message in &messages {
+            state
+                .log_observer
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .observe(message);
+        }
+        let response = messages
+            .iter()
+            .find_map(|message| match message {
+                WireMessage::RemoteResponse(response) => Some(response.clone()),
+                _ => None,
+            })
+            .unwrap();
+        (response, messages)
+    }
+
+    #[tokio::test]
+    async fn shell_response_projection_preserves_wire_contract_and_genuine_json_output() {
+        let mut state = shell_test_state(Arc::new(Mutex::new(BTreeMap::new())));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        state.log_observer = Some(Arc::new(std::sync::Mutex::new(
+            operation_log::LogObserver::new(Some(sender)),
+        )));
+        let sequence = Arc::new(AtomicU64::new(1));
+        let owner = SessionId::new();
+        let shell = lifecycle_test_shell();
+        let (opened, _) = observed_shell_exchange(
+            &state,
+            &sequence,
+            owner,
+            RemoteOperation::OpenShell { shell },
+        )
+        .await;
+        let resource = opened.details.as_ref().unwrap()["shell_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let shell_id: ShellId = resource.parse().unwrap();
+        let literal = r#"{"shell_id":"user-output","shell_closed":false}"#;
+        let command = if cfg!(windows) {
+            // CMD首次输出前存在无换行提示符，先结束该行，让JSON成为独立完整行。
+            format!("echo. & echo {literal}")
+        } else {
+            format!("printf '%s' '{literal}'")
+        };
+        let (ran, wire) = observed_shell_exchange(
+            &state,
+            &sequence,
+            owner,
+            RemoteOperation::RunShellCommand {
+                shell_id,
+                shell,
+                command,
+                readonly: true,
+            },
+        )
+        .await;
+        let (closed, _) = observed_shell_exchange(
+            &state,
+            &sequence,
+            owner,
+            RemoteOperation::CloseShell { shell_id },
+        )
+        .await;
+        close_agent_resources(&state.shell_sessions, &state.serial_sessions).await;
+        assert_eq!(ran.exit_code, Some(0));
+        assert_eq!(ran.details.as_ref().unwrap()["shell_id"], resource);
+        assert_eq!(ran.details.as_ref().unwrap()["shell_closed"], false);
+        assert!(wire.iter().any(
+            |message| matches!(message, WireMessage::RemoteEvent(RemoteEvent {
+            payload: EventPayload::OutputChunk { text, stderr: false }, ..
+        }) if serde_json::from_str::<serde_json::Value>(text).ok().as_ref() == ran.details.as_ref())
+        ));
+        assert!(closed.summary.contains(&resource));
+        let rows: Vec<_> = receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                AgentEvent::OperationPresentation { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(rows.iter().any(|text| text.contains("持久终端已打开")));
+        assert!(
+            rows.iter().any(|text| text == literal),
+            "synthetic stdout={:?}; presentation={:?}",
+            ran.summary.replace(&resource, "[test-resource]"),
+            rows.iter()
+                .map(|text| text.replace(&resource, "[test-resource]"))
+                .collect::<Vec<_>>()
+        );
+        assert!(rows.iter().any(|text| text == "持久终端已关闭"));
+        assert!(rows.iter().all(|text| !text.contains(&resource)));
+    }
+
+    fn metadata_shell_request(session_id: SessionId, operation: RemoteOperation) -> RemoteRequest {
+        RemoteRequest {
+            control_proof: None,
+            request_id: RequestId::new(),
+            session_id,
+            source: EventSource::Human,
+            operation,
+            approval_id: None,
+            payload_base64: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_shell_kind_uses_live_resources_and_cleans_session_and_closed_handles() {
+        let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let state = shell_test_state(sessions.clone());
+        let owner = SessionId::new();
+        let other_owner = SessionId::new();
+        let shell = lifecycle_test_shell();
+        let (_, first) =
+            execute_test_shell_request(&state, owner, RemoteOperation::OpenShell { shell }).await;
+        assert!(first.error_code.is_none());
+        let first_id: ShellId = first.details.unwrap()["shell_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let lookup = metadata_shell_request(
+            owner,
+            RemoteOperation::RunShellCommand {
+                shell_id: first_id,
+                shell: ShellKind::PowerShell,
+                command: "echo metadata only; no execution".into(),
+                readonly: true,
+            },
+        );
+        assert_eq!(
+            observed_request_shell(&lookup, &sessions).await,
+            Some(operation_log::normalize_observed_shell(shell))
+        );
+        let cross_session = metadata_shell_request(
+            other_owner,
+            RemoteOperation::CloseShell { shell_id: first_id },
+        );
+        assert_eq!(
+            observed_request_shell(&cross_session, &sessions).await,
+            None
+        );
+        let unknown = metadata_shell_request(
+            owner,
+            RemoteOperation::CloseShell {
+                shell_id: ShellId::new(),
+            },
+        );
+        assert_eq!(observed_request_shell(&unknown, &sessions).await, None);
+        let other_shell = if cfg!(windows) {
+            ShellKind::WindowsPowerShell
+        } else {
+            ShellKind::System
+        };
+        let (_, second) = execute_test_shell_request(
+            &state,
+            other_owner,
+            RemoteOperation::OpenShell { shell: other_shell },
+        )
+        .await;
+        assert!(second.error_code.is_none());
+        let second_id: ShellId = second.details.unwrap()["shell_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let second_lookup = metadata_shell_request(
+            other_owner,
+            RemoteOperation::CloseShell {
+                shell_id: second_id,
+            },
+        );
+        assert_eq!(
+            observed_request_shell(&second_lookup, &sessions).await,
+            Some(operation_log::normalize_observed_shell(other_shell))
+        );
+        close_session_resources(&sessions, &state.serial_sessions, owner).await;
+        assert_eq!(observed_request_shell(&lookup, &sessions).await, None);
+        assert_eq!(
+            observed_request_shell(&second_lookup, &sessions).await,
+            Some(operation_log::normalize_observed_shell(other_shell))
+        );
+        // 已关闭但尚未被表清理的句柄也不再声称能执行该 Shell。
+        let closing = sessions
+            .lock()
+            .await
+            .get(&second_id)
+            .unwrap()
+            .session
+            .clone();
+        closing.close().await.unwrap();
+        assert_eq!(
+            observed_request_shell(&second_lookup, &sessions).await,
+            None
+        );
+        close_agent_resources(&sessions, &state.serial_sessions).await;
+        assert!(sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_shell_open_publishes_actual_resource_context_only_after_creation() {
+        let mut state = shell_test_state(Arc::new(Mutex::new(BTreeMap::new())));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        state.log_observer = Some(Arc::new(std::sync::Mutex::new(
+            operation_log::LogObserver::new(Some(sender)),
+        )));
+        let shell = lifecycle_test_shell();
+        let (_, response) = execute_test_shell_request(
+            &state,
+            SessionId::new(),
+            RemoteOperation::OpenShell { shell },
+        )
+        .await;
+        let resource = response.details.as_ref().unwrap()["shell_id"]
+            .as_str()
+            .unwrap();
+        assert!(receiver.try_iter().any(|event| matches!(event,
+            AgentEvent::OperationContext { request_id, resource_id: Some(id), shell: Some(actual), .. }
+                if request_id == response.request_id && id == resource && actual == operation_log::normalize_observed_shell(shell)
+        )));
+        close_agent_resources(&state.shell_sessions, &state.serial_sessions).await;
     }
 
     #[tokio::test]
@@ -6525,6 +7289,7 @@ mod tests {
         let activity = Arc::new(Notify::new());
         let mut sessions = serial_sessions.lock().await;
         let reader = spawn_serial_reader(
+            None,
             serial_session_id,
             session_id,
             RequestId::new(),
@@ -6729,6 +7494,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // 同一场景核对授权边界与新增流式转发，不拆散共享凭据与策略。
     async fn agent_ssh_gate_uses_relay_verified_permission_and_approval() {
         let policy = DefaultPolicy::default();
         let session_id = SessionId::new();
@@ -6780,6 +7546,7 @@ mod tests {
         let device = SystemDevice::with_transfer_root(&transfer_root).expect("应创建交换目录");
         let ssh_provider = RecordingSshProvider::default();
         let runtime_state = RequestRuntimeState {
+            log_observer: None,
             file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -6788,7 +7555,7 @@ mod tests {
             visual_provider: default_visual_provider(),
             boundary: Arc::new(runtime::RuntimeBoundary::default()),
         };
-        let (sender, _receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
         let credential_encryption = CredentialEncryptionKeyPair::generate();
         execute_operation(
             &device,
@@ -6802,6 +7569,10 @@ mod tests {
         )
         .await
         .expect("Relay 已批准的 SSH 修改命令应到达设备适配器");
+        let streamed = receiver.try_recv().expect("SSH 输出应经过共同流式转发器");
+        assert!(
+            matches!(streamed, WireMessage::RemoteEvent(RemoteEvent { payload: EventPayload::OutputChunk { stderr: false, text }, .. }) if text == "ok")
+        );
         assert_eq!(
             ssh_provider
                 .commands
@@ -6878,6 +7649,7 @@ mod tests {
             ),
         };
         let runtime_state = RequestRuntimeState {
+            log_observer: None,
             file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -6926,5 +7698,419 @@ mod tests {
             "同一加密载荷不得再次消费"
         );
         let _ = fs::remove_dir_all(transfer_root);
+    }
+    struct EarlyEchoSerialPort {
+        input: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+        echo: mpsc::UnboundedSender<Vec<u8>>,
+        release_write: Arc<Notify>,
+        fail_write: bool,
+    }
+    #[async_trait]
+    impl AgentSerialPort for EarlyEchoSerialPort {
+        async fn read(&self, _: usize) -> Result<Vec<u8>, remoteops_device::DeviceError> {
+            match timeout(Duration::from_millis(20), self.input.lock().await.recv()).await {
+                Ok(Some(bytes)) => Ok(bytes),
+                Ok(None) => Err(remoteops_device::DeviceError::Operation(
+                    "模拟串口已关闭".into(),
+                )),
+                Err(_) => Ok(Vec::new()),
+            }
+        }
+        async fn write(&self, bytes: Vec<u8>) -> Result<usize, remoteops_device::DeviceError> {
+            self.echo.send(bytes.clone()).expect("模拟 reader 必须存活");
+            self.release_write.notified().await;
+            if self.fail_write {
+                Err(remoteops_device::DeviceError::Operation(
+                    "模拟部分写入后失败".into(),
+                ))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+    }
+    fn assert_serial_logs_hide_secret(
+        receiver: &crate::BoundedAgentEventReceiver,
+        secret: &str,
+    ) -> bool {
+        let mut summary = false;
+        while let Ok(event) = receiver.try_recv() {
+            let event = match event {
+                AgentEvent::ScopedOperation { event, .. } => *event,
+                event => event,
+            };
+            if let AgentEvent::OperationLog(log) = event {
+                assert!(!log.message.contains(secret));
+                summary |= log.message.contains("使用结构化串口查询展示命令")
+                    || log.message.contains("串口已发送");
+            }
+        }
+        summary
+    }
+    async fn early_serial_echo(receiver: &mut mpsc::UnboundedReceiver<WireMessage>) -> String {
+        let event = timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            WireMessage::RemoteEvent(RemoteEvent {
+                payload: EventPayload::OutputChunk { text, .. },
+                ..
+            }) => text,
+            other => panic!("预期 reader 实际输出，得到 {other:?}"),
+        }
+    }
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // 同时覆盖真实 reader 与阻塞 write 的成功/部分失败时序，不能拆成预先脱敏的假事件。
+    async fn serial_write_hides_echo_before_io_completes_and_after_partial_failure() {
+        for fail_write in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let device = Arc::new(SystemDevice::with_transfer_root(directory.path()).unwrap());
+            let (local_sender, local_receiver) = bounded_agent_events(128);
+            let observer = Arc::new(std::sync::Mutex::new(
+                operation_log::LogObserver::with_sink(Some(AgentEventSink::Bounded(local_sender))),
+            ));
+            let session_id = SessionId::new();
+            let serial_id = SerialSessionId::new();
+            let request_id = RequestId::new();
+            observer.lock().unwrap().open_serial(
+                session_id,
+                serial_id,
+                request_id,
+                EventSource::Human,
+            );
+            let (echo, input) = mpsc::unbounded_channel();
+            let release_write = Arc::new(Notify::new());
+            let port: Arc<dyn AgentSerialPort> = Arc::new(EarlyEchoSerialPort {
+                input: Mutex::new(input),
+                echo: echo.clone(),
+                release_write: release_write.clone(),
+                fail_write,
+            });
+            let serial_sessions = Arc::new(Mutex::new(BTreeMap::new()));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let transcript = Arc::new(Mutex::new(SerialTranscript::default()));
+            let activity = Arc::new(Notify::new());
+            let (sender, mut wire) = mpsc::unbounded_channel();
+            let sequence = Arc::new(AtomicU64::new(1));
+            let reader = spawn_serial_reader(
+                Some(observer.clone()),
+                serial_id,
+                session_id,
+                request_id,
+                EventSource::Human,
+                port.clone(),
+                transcript.clone(),
+                activity.clone(),
+                cancelled.clone(),
+                serial_sessions.clone(),
+                sender.clone(),
+                sequence.clone(),
+            );
+            let runtime = SerialRuntime {
+                session_id,
+                port_name: "early-echo-mock".into(),
+                writable: true,
+                port,
+                transcript,
+                activity,
+                operation_lock: Arc::new(Mutex::new(())),
+                cancelled,
+                reader_task: Arc::new(Mutex::new(Some(reader))),
+            };
+            serial_sessions
+                .lock()
+                .await
+                .insert(serial_id, runtime.clone());
+            let state = RequestRuntimeState {
+                log_observer: Some(observer),
+                file_commit: FileCommitControl::default(),
+                shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
+                serial_sessions,
+                file_uploads: Arc::new(Mutex::new(BTreeMap::new())),
+                used_credential_envelopes: Arc::new(Mutex::new(BTreeSet::new())),
+                visual_provider: default_visual_provider(),
+                boundary: Arc::new(runtime::RuntimeBoundary::default()),
+            };
+            let secret = "mock-private-input";
+            let bytes = format!("{secret}\n").into_bytes();
+            let request = RemoteRequest {
+                request_id: RequestId::new(),
+                session_id,
+                source: EventSource::Human,
+                operation: RemoteOperation::WriteSerial {
+                    serial_session_id: serial_id.to_string(),
+                    byte_count: bytes.len(),
+                    sha256: sha256_bytes(&bytes),
+                },
+                approval_id: None,
+                payload_base64: Some(BASE64.encode(&bytes)),
+                control_proof: None,
+            };
+            let write_task = tokio::spawn(async move {
+                execute_operation(
+                    &device,
+                    device.as_ref(),
+                    &request,
+                    &state,
+                    AgentInstanceId::new(),
+                    &CredentialEncryptionKeyPair::generate(),
+                    &sender,
+                    &sequence,
+                )
+                .await
+            });
+            let early = early_serial_echo(&mut wire).await;
+            assert!(!early.contains(secret));
+            assert!(early.contains("身份认证输入回显已隐藏"));
+            assert!(!write_task.is_finished());
+            assert!(
+                !assert_serial_logs_hide_secret(&local_receiver, secret),
+                "I/O 未完成前不得发布成功发送摘要"
+            );
+            release_write.notify_one();
+            let result = timeout(Duration::from_secs(2), write_task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.is_err(), fail_write);
+            assert_eq!(
+                assert_serial_logs_hide_secret(&local_receiver, secret),
+                !fail_write
+            );
+            // 部分写入失败也可能继续有迟到回显，隐藏登记不能回滚。
+            echo.send(bytes).unwrap();
+            assert!(!early_serial_echo(&mut wire).await.contains(secret));
+            assert!(!assert_serial_logs_hide_secret(&local_receiver, secret));
+            close_serial_runtime(&runtime).await;
+        }
+    }
+    fn coalescing_request() -> RemoteRequest {
+        RemoteRequest {
+            request_id: RequestId::new(),
+            session_id: SessionId::new(),
+            source: EventSource::Human,
+            operation: RemoteOperation::RunCommand {
+                shell: ShellKind::System,
+                command: "test-output".into(),
+                readonly: true,
+            },
+            approval_id: None,
+            payload_base64: None,
+            control_proof: None,
+        }
+    }
+    fn coalesced_chunk(message: WireMessage) -> CommandOutputChunk {
+        match message {
+            WireMessage::RemoteEvent(RemoteEvent {
+                payload: EventPayload::OutputChunk { stderr, text },
+                ..
+            }) => CommandOutputChunk { stderr, text },
+            other => panic!("预期输出片段，得到 {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn output_coalescing_ten_thousand_micro_chunks_preserves_full_text_with_few_frames() {
+        let (input, receiver) = mpsc::unbounded_channel();
+        let (sender, mut output) = mpsc::unbounded_channel();
+        let request = coalescing_request();
+        let task = spawn_command_output_forwarder(
+            receiver,
+            sender,
+            Arc::new(AtomicU64::new(1)),
+            request.clone(),
+        );
+        let mut expected = String::new();
+        for index in 0..10000 {
+            let text = format!("{index:05} 中文🔎\n");
+            expected.push_str(&text);
+            input
+                .send(CommandOutputChunk {
+                    stderr: false,
+                    text,
+                })
+                .unwrap();
+        }
+        drop(input);
+        task.await.unwrap();
+        let mut actual = String::new();
+        let mut frames = 0;
+        while let Ok(message) = output.try_recv() {
+            if let WireMessage::RemoteEvent(event) = &message {
+                assert_eq!(event.request_id, Some(request.request_id));
+                assert_eq!(event.session_id, request.session_id);
+            }
+            let chunk = coalesced_chunk(message);
+            assert!(!chunk.stderr);
+            assert!(chunk.text.len() <= OUTPUT_COALESCE_BYTES);
+            actual.push_str(&chunk.text);
+            frames += 1;
+        }
+        assert_eq!(actual, expected);
+        assert!(frames < 64, "万条微片应远少于 256 帧，实际 {frames}");
+    }
+    #[tokio::test]
+    async fn output_coalescing_preserves_stdout_stderr_order_and_unicode_boundaries() {
+        let (input, receiver) = mpsc::unbounded_channel();
+        let (sender, mut output) = mpsc::unbounded_channel();
+        let task = spawn_command_output_forwarder(
+            receiver,
+            sender,
+            Arc::new(AtomicU64::new(1)),
+            coalescing_request(),
+        );
+        for (stderr, text) in [
+            (false, "中"),
+            (false, "文🔎"),
+            (true, "错误"),
+            (true, "❌"),
+            (false, "尾"),
+            (false, "声"),
+        ] {
+            input
+                .send(CommandOutputChunk {
+                    stderr,
+                    text: text.into(),
+                })
+                .unwrap();
+        }
+        drop(input);
+        task.await.unwrap();
+        let mut chunks = Vec::new();
+        while let Ok(message) = output.try_recv() {
+            let chunk = coalesced_chunk(message);
+            chunks.push((chunk.stderr, chunk.text));
+        }
+        assert_eq!(
+            chunks,
+            [
+                (false, "中文🔎".to_owned()),
+                (true, "错误❌".to_owned()),
+                (false, "尾声".to_owned())
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn output_coalescing_flushes_low_volume_while_receiver_stays_open() {
+        let (input, receiver) = mpsc::unbounded_channel();
+        let (sender, mut output) = mpsc::unbounded_channel();
+        let task = spawn_command_output_forwarder(
+            receiver,
+            sender,
+            Arc::new(AtomicU64::new(1)),
+            coalescing_request(),
+        );
+        for text in ["第一段🔎", "第二段中文"] {
+            input
+                .send(CommandOutputChunk {
+                    stderr: false,
+                    text: text.into(),
+                })
+                .unwrap();
+            // 合并窗口为 8ms；宽于该值的测试超时只容纳 CI 调度抖动，证明无需关闭生产端。
+            let message = timeout(Duration::from_millis(100), output.recv())
+                .await
+                .expect("低流量也须按定时窗口刷新")
+                .unwrap();
+            assert_eq!(coalesced_chunk(message).text, text);
+            assert!(!task.is_finished());
+        }
+        drop(input);
+        task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn output_coalescing_flushes_close_tail_and_does_not_copy_oversized_input() {
+        let (input, receiver) = mpsc::unbounded_channel();
+        let (sender, mut output) = mpsc::unbounded_channel();
+        let task = spawn_command_output_forwarder(
+            receiver,
+            sender,
+            Arc::new(AtomicU64::new(1)),
+            coalescing_request(),
+        );
+        let near_limit = "界".repeat(OUTPUT_COALESCE_BYTES / 3);
+        input
+            .send(CommandOutputChunk {
+                stderr: false,
+                text: near_limit.clone(),
+            })
+            .unwrap();
+        input
+            .send(CommandOutputChunk {
+                stderr: false,
+                text: "🔎".into(),
+            })
+            .unwrap();
+        let oversized = "界".repeat(OUTPUT_COALESCE_BYTES);
+        let original_pointer = oversized.as_ptr() as usize;
+        let oversized_length = oversized.len();
+        input
+            .send(CommandOutputChunk {
+                stderr: false,
+                text: oversized,
+            })
+            .unwrap();
+        input
+            .send(CommandOutputChunk {
+                stderr: false,
+                text: "关闭前尾片".into(),
+            })
+            .unwrap();
+        drop(input);
+        task.await.unwrap();
+        let first = coalesced_chunk(output.recv().await.unwrap());
+        assert_eq!(first.text, near_limit);
+        assert_eq!(coalesced_chunk(output.recv().await.unwrap()).text, "🔎");
+        let large = coalesced_chunk(output.recv().await.unwrap());
+        assert_eq!(large.text.len(), oversized_length);
+        assert_eq!(large.text.as_ptr() as usize, original_pointer);
+        assert_eq!(
+            coalesced_chunk(output.recv().await.unwrap()).text,
+            "关闭前尾片"
+        );
+        assert!(output.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn upload_receipt_and_target_context_use_the_actual_canonical_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("中文 tools");
+        let device = SystemDevice::with_transfer_root(&root).unwrap();
+        let bytes = b"uploaded tool content";
+        let hash = sha256_bytes(bytes);
+        let response = execute_test_file_operation(
+            &device,
+            &Arc::new(Mutex::new(BTreeMap::new())),
+            SessionId::new(),
+            RemoteOperation::UploadFile {
+                remote_path: "nested/tool.exe".into(),
+                size: bytes.len() as u64,
+                sha256: hash.clone(),
+                overwrite: false,
+            },
+            Some(BASE64.encode(bytes)),
+        )
+        .await
+        .unwrap();
+        let receipt = response.details.unwrap();
+        assert_eq!(
+            receipt["agent_transfer_root"],
+            remoteops_device::path_for_child_process(&std::fs::canonicalize(&root).unwrap())
+        );
+        assert_eq!(receipt["remote_path"], "nested/tool.exe");
+        assert_eq!(receipt["size"], bytes.len() as u64);
+        assert_eq!(receipt["sha256"], hash);
+        assert_eq!(
+            receipt["remote_absolute_path"],
+            remoteops_device::path_for_child_process(
+                &device.resolved_transfer_file("nested/tool.exe").unwrap()
+            )
+        );
+        let context = runtime_target_context(&runtime::RuntimeBoundary::default(), &device);
+        assert_eq!(
+            context.transfer_root.as_deref(),
+            Some(remoteops_device::path_for_child_process(device.transfer_root()).as_str())
+        );
+        assert!(context.ssh_trust_cli.is_none());
+        assert!(context.validate().is_ok());
+        assert!(upload_receipt(&device, "../outside.exe", 1, &hash).is_err());
     }
 }

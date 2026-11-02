@@ -36,6 +36,10 @@ pub struct AgentRuntimeOptions {
     pub pairing_mode: PairingMode,
     /// 产品说明与案例引用，只提供给当前目标，不授予权限。
     pub guidance: Vec<TargetGuidance>,
+    /// 当前真实程序入口是否实现 SSH 主机密钥管理 CLI；仅由宿主声明。
+    pub ssh_trust_cli: bool,
+    /// 产品编译时内置的工具；普通 Agent 配置和远程请求不能替换。
+    pub bundled_tools: Option<remoteops_device::BundledTools>,
 }
 impl AgentRuntimeOptions {
     /// 创建兼容原 GUI 行为的交互宿主配置。
@@ -49,8 +53,24 @@ impl AgentRuntimeOptions {
             visual_provider_factory: None,
             pairing_mode: PairingMode::AutoPerBoot,
             guidance: Vec::new(),
+            ssh_trust_cli: false,
+            bundled_tools: None,
         }
     }
+    /// 声明当前程序已接入主机密钥核对 CLI，不从环境或远程配置推断。
+    #[must_use]
+    pub fn with_ssh_trust_cli(mut self) -> Self {
+        self.ssh_trust_cli = true;
+        self
+    }
+
+    /// 绑定本机产品的可信工具资源，不在构造时释放或执行。
+    #[must_use]
+    pub fn with_bundled_tools(mut self, tools: Option<remoteops_device::BundledTools>) -> Self {
+        self.bundled_tools = tools;
+        self
+    }
+
     /// 创建无图形服务产品配置；控制台诊断也保留该产品上限。
     #[must_use]
     pub fn service(product: ProductProfile) -> Self {
@@ -404,6 +424,13 @@ pub(crate) async fn prepare(
         facts,
         capabilities: statuses,
         guidance: options.guidance.clone(),
+        ssh_trust_cli: if ssh_trust_cli_available(options.ssh_trust_cli, environment) {
+            std::env::current_exe()
+                .ok()
+                .map(|path| path.display().to_string())
+        } else {
+            None
+        },
         ..TargetContext::default()
     };
     context
@@ -444,6 +471,14 @@ pub(crate) async fn prepare(
     let capabilities = capabilities_from_environment(environment, context.visual_allowed());
     boundary.context = Arc::new(context);
     Ok((boundary, provider, capabilities))
+}
+
+fn ssh_trust_cli_available(host_implemented: bool, environment: &EnvironmentProfile) -> bool {
+    host_implemented
+        && environment
+            .tools
+            .iter()
+            .any(|tool| tool.name == "ssh-keyscan" && tool.available)
 }
 
 fn set_visual_status(context: &mut TargetContext, reason: Option<&str>) {
@@ -654,6 +689,24 @@ pub(crate) fn visual_operations() -> Vec<RemoteOperation> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plink_does_not_claim_keyscan_cli_without_the_actual_scanner() {
+        let mut environment = EnvironmentProfile::empty();
+        environment.tools = vec![remoteops_domain::ToolProfile {
+            name: "plink".into(),
+            available: true,
+            version: None,
+        }];
+        assert!(!ssh_trust_cli_available(true, &environment));
+        environment.tools.push(remoteops_domain::ToolProfile {
+            name: "ssh-keyscan".into(),
+            available: true,
+            version: None,
+        });
+        assert!(ssh_trust_cli_available(true, &environment));
+        assert!(!ssh_trust_cli_available(false, &environment));
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

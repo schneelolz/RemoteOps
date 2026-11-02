@@ -20,14 +20,14 @@ impl Default for Redactor {
     fn default() -> Self {
         Self {
             rules: vec![
-                Regex::new(r"(?i)(api[_-]?key|token|password|passwd|cookie|session)\s*[:=]\s*([^\s,;]+)")
+                Regex::new(r#"(?i)(api[_-]?key|token|password|passwd|passphrase|cookie|session)\s*[:=]\s*("[^"]*"|'[^']*'|[^\s,;]+)"#)
                     .expect("内置脱敏正则必须有效"),
                 Regex::new(r"(?i)(authorization\s*:\s*bearer)\s+[A-Za-z0-9._~+/=-]+")
                     .expect("内置脱敏正则必须有效"),
                 Regex::new(r"(?i)\b(sk-[A-Za-z0-9_-]{12,})\b")
                     .expect("内置脱敏正则必须有效"),
                 Regex::new(
-                    r#"(?i)(--?(?:password|passwd|token|api[_-]?key|secret)|/(?:password|token))\s+("[^"]*"|'[^']*'|[^\s,;]+)"#,
+                    r#"(?i)(--?(?:password|passwd|passphrase|pw|token|api[_-]?key|secret)|/(?:password|token))(?:\s+|=)("[^"]*"|'[^']*'|[^\s,;]+)"#,
                 )
                 .expect("内置脱敏正则必须有效"),
                 Regex::new(r"(?i)(://[^:/\s]+:)([^@\s]+)(@)")
@@ -332,6 +332,25 @@ mod tests {
         assert!(!output.contains("eyJaaaaaaaaaaa"));
         assert!(!output.contains("private-material"));
         assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redacts_plink_password_and_quoted_assignments_without_hiding_pwfile() {
+        let redactor = Redactor::default();
+        for input in [
+            "plink.exe -pw 'synthetic secret tail' host command",
+            "plink.exe -pw=\"synthetic secret tail\" host command",
+            "tool --password='synthetic secret tail'",
+            "password=\"synthetic secret tail\"; ordinary output",
+            "tool --passphrase 'synthetic secret tail'",
+        ] {
+            let output = redactor.redact(input);
+            assert!(!output.contains("synthetic"));
+            assert!(!output.contains("secret tail"));
+            assert!(output.contains("[REDACTED]"));
+        }
+        let file_argument = "plink.exe -pwfile C:/temporary/credential.pw host command";
+        assert_eq!(redactor.redact(file_argument), file_argument);
     }
 
     #[test]

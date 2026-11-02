@@ -3759,7 +3759,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.28"
+version = "0.2.0-preview.30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3788,6 +3788,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "remoteops-agent-desktop-host"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "remoteops-agent",
+ "remoteops-domain",
+ "remoteops-product",
+ "remoteops-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "remoteops-agent-gui"
 version = "0.2.0-preview.32"
 dependencies = [
@@ -3811,7 +3826,29 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "wgpu",
  "winit",
+ "winresource",
+]
+
+[[package]]
+name = "remoteops-agent-native-prototype"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "remoteops-agent",
+ "remoteops-agent-desktop-host",
+ "remoteops-audit",
+ "remoteops-build",
+ "remoteops-device",
+ "remoteops-domain",
+ "remoteops-native-host",
+ "remoteops-product",
+ "remoteops-serial",
+ "serde",
+ "serde_json",
+ "tokio",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 
@@ -3951,12 +3988,13 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+ "wgpu",
  "winresource",
 ]
 
 [[package]]
 name = "remoteops-controller-mcp"
-version = "0.2.0-preview.16"
+version = "0.2.0-preview.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4246,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-ssh-askpass"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "remoteops-build",
  "winresource",

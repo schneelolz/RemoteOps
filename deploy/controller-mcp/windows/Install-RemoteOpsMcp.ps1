@@ -33,7 +33,7 @@ if (-not $setupMode) {
     throw '安装必须提供 SetupFile、SetupCode 或 SetupStdin；不再支持 Token 安装。'
 }
 
-$mcpVersion = '0.2.0-preview.16'
+$mcpVersion = '0.2.0-preview.17'
 $credentialPromptVersion = '0.2.0-preview.5'
 $sourceExecutable = Join-Path $PSScriptRoot 'remoteops-controller-mcp.exe'
 $sourceCredentialPrompt = Join-Path $PSScriptRoot 'remoteops-credential-prompt.exe'

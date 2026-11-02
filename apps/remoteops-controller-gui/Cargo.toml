@@ -40,6 +40,8 @@ toml = "1.1"
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# Windows 仅编译 DX12；OpenGL 兼容回退由独立 Glow 提供。
+wgpu = { workspace = true, features = ["dx12", "parking_lot"] }
 keyring = "4.1"
 keyring-core = "1.0"
 
@@ -50,6 +52,10 @@ winresource.workspace = true
 # Supply winit's platform backend for Linux workspace checks.
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { workspace = true, features = ["x11"] }
+
+# 非 Windows 保留上游默认图形后端和平台兼容设置。
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+eframe = { workspace = true, features = ["wgpu"] }
 
 [lints]
 workspace = true

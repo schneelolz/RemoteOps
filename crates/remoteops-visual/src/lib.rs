@@ -10,6 +10,10 @@ pub mod windows_provider;
 #[cfg(windows)]
 pub mod windows_mcp_stdio;
 
+// 在任何托管 UIA 查询前加载标准控件代理，避免 PowerShell 动态调用栈使默认代理初始化失败。
+#[cfg(windows)]
+const UIA_CLIENT_INITIALIZATION: &str = include_str!("windows_uia_initialize.ps1");
+
 /// 观察和动作共用相同的控件身份算法，区分同名、同类型的不同 UIA 实例。
 #[cfg(windows)]
 const UIA_CONTROL_HELPERS: &str = r"
@@ -457,6 +461,7 @@ if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$tr
         let script = format!(
             "{TARGET_WINDOW_GUARD}
 {UIA_CONTROL_HELPERS}
+{UIA_CLIENT_INITIALIZATION}
 {script}"
         );
         let mut command = hidden_powershell_command();
@@ -539,6 +544,7 @@ $pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pa
         let script = format!(
             "{TARGET_WINDOW_GUARD}
 {UIA_CONTROL_HELPERS}
+{UIA_CLIENT_INITIALIZATION}
 {script}"
         );
         let mut command = hidden_powershell_command();
@@ -889,6 +895,7 @@ try { $p = New-Object RemoteOpsUser32+POINT; if ([RemoteOpsUser32]::GetCursorPos
         let script = format!(
             "{TARGET_WINDOW_GUARD}
 {UIA_CONTROL_HELPERS}
+{UIA_CLIENT_INITIALIZATION}
 {script}"
         );
         let mut command = hidden_powershell_command();
@@ -1530,6 +1537,29 @@ impl VisualProvider for MockVisualProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn managed_uia_proxies_initialize_before_dynamic_powershell_calls() {
+        // 冷启动进程覆盖 WPF 的默认代理栈遍历错误；不依赖已打开的桌面窗口。
+        let script = format!(
+            r"{UIA_CLIENT_INITIALIZATION}
+[RemoteOpsUiaClientBootstrap]::Initialize()
+[System.Windows.Automation.ClientSettings]::RegisterClientSideProviders([System.Windows.Automation.ClientSideProviderDescription[]]@())
+[pscustomobject]@{{initialized=$true}} | ConvertTo-Json -Compress
+"
+        );
+        let mut command = hidden_powershell_command();
+        command.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", &script]);
+        let output = run_desktop_command(command).await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["initialized"], true);
+    }
 
     #[cfg(windows)]
     #[test]

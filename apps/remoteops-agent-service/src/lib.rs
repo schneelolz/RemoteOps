@@ -238,6 +238,8 @@ fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: Agen
         AgentEvent::ControllerBindingsChanged { .. } => {}
         // 操作日志不改变服务状态，避免按输出行重复写入状态文件。
         AgentEvent::OperationLog(_)
+        | AgentEvent::OperationPresentation { .. }
+        | AgentEvent::OperationContext { .. }
         | AgentEvent::OperationStateChanged { .. }
         | AgentEvent::ConnectionEpoch(_)
         | AgentEvent::ScopedOperation { .. }
@@ -627,6 +629,19 @@ mod operation_log_tests {
                 level: AgentLogLevel::Info,
                 message: "example command output".to_owned(),
             }),
+        );
+        assert_eq!(status.status, "controlled");
+        assert!(!path.exists());
+        update_status_from_event(
+            &path,
+            &mut status,
+            AgentEvent::OperationContext {
+                request_id: remoteops_domain::RequestId::new(),
+                kind: remoteops_agent::AgentOperationKind::Ssh,
+                shell: None,
+                source: remoteops_domain::EventSource::Ai,
+                resource_id: None,
+            },
         );
         assert_eq!(status.status, "controlled");
         assert!(!path.exists());

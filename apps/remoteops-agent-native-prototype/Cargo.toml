@@ -1,0 +1,48 @@
+[package]
+name = "remoteops-agent-native-prototype"
+version = "0.4.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "RemoteOps Windows 原生界面独立验证小样"
+build = "build.rs"
+
+[package.metadata.winresource]
+FileDescription = "RemoteOps Native UI Prototype"
+ProductName = "RemoteOps Native UI Prototype"
+OriginalFilename = "remoteops-agent-native-prototype.exe"
+
+[features]
+default = ["agent-runtime"]
+style-preview = []
+agent-runtime = ["remoteops-agent-desktop-host/agent-runtime", "dep:remoteops-agent", "dep:remoteops-product", "dep:remoteops-device", "dep:remoteops-domain", "dep:tokio"]
+
+[dependencies]
+anyhow.workspace = true
+remoteops-native-host = { path = "../../crates/remoteops-native-host" }
+remoteops-agent-desktop-host = { path = "../../crates/remoteops-agent-desktop-host", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+remoteops-audit = { path = "../../crates/remoteops-audit" }
+remoteops-serial = { path = "../../crates/remoteops-serial" }
+remoteops-agent = { path = "../remoteops-agent", optional = true }
+remoteops-product = { path = "../../crates/remoteops-product", optional = true }
+remoteops-device = { path = "../../crates/remoteops-device", optional = true }
+remoteops-domain = { path = "../../crates/remoteops-domain", optional = true }
+tokio = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_LibraryLoader", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_RemoteDesktop", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+remoteops-build = { path = "../../crates/remoteops-build" }
+winresource.workspace = true
+
+# 原生调用仅集中在 win32 模块，模型与后台保持安全 Rust。
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

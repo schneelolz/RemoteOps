@@ -3,7 +3,7 @@
 > 文档状态：当前现场客户机手册，适用于 Agent GUI `0.2.0-preview.23`。
 
 - 适用版本：`0.2.0-preview.23`
-- 本地验收程序：`target/release/remoteops-agent-gui.exe`（尚未发布）
+- 本地验收程序：`target/release-small/remoteops-agent-gui.exe`（尚未发布）
 - Relay：由部署者配置，不内置公共默认值
 - 使用方式：管理员完成一次配置后，现场人员双击启动
 - 运行依赖：正式发布 EXE 静态链接 MSVC CRT，不需要另装 VC++ 运行库
@@ -191,10 +191,12 @@ Windows 默认使用 WGPU 的 DirectX 12 后端和低延迟单帧交换链，避
 cargo test -p remoteops-agent -p remoteops-agent-gui --locked
 cargo clippy -p remoteops-agent -p remoteops-agent-gui --all-targets --locked -- -D warnings
 .\scripts\Build-Windows.ps1
-.\scripts\Test-AgentGuiConsole.ps1 -Executable .\target\release\remoteops-agent-gui.exe
+.\scripts\Test-AgentGuiConsole.ps1 -Executable .\target\release-small\remoteops-agent-gui.exe
 .\scripts\Test-AgentGuiCodexMcp.ps1
 ```
 
 `Test-AgentGuiCodexMcp.ps1` 默认从剪贴板读取 GUI 复制的控制码，也可以通过 `-PairingCode` 显式提供。脚本仅在子进程内传递控制码，最终结果不会输出控制码、Token、`session_id` 或审批标识。
+
+`Build-Windows.ps1` 仅对现场 Agent GUI 使用 `release-small` 体积优化配置，本地缓存位于 `target/release-small`；最终交付目录仍由发布脚本的输出目录决定。DX12 默认启动、Glow 兼容回退和 `--cli` 入口保持原有行为。
 
 无图形启动检查 `Test-AgentGuiConsole.ps1` 在独立目录复制指定 EXE，以帮助、版本和无效临时配置验证控制台输出、快速失败及诊断阶段没有进入窗口初始化。脚本不连接 Relay，不代替配对、Shell 执行或 Server 2016 现场验收。

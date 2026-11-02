@@ -85,8 +85,6 @@ $resolvedOutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 $packageDirectory = [IO.Path]::GetFullPath((Join-Path $resolvedOutputRoot $packageName))
 $archivePath = Join-Path $resolvedOutputRoot "$packageName.zip"
 $templateDirectory = Join-Path $workspaceRoot 'deploy\controller-mcp\windows'
-$releaseExecutable = Join-Path $workspaceRoot 'target\release\remoteops-controller-mcp.exe'
-$credentialPromptExecutable = Join-Path $workspaceRoot 'target\release\remoteops-credential-prompt.exe'
 $resolvedArtifactDirectory = [IO.Path]::GetFullPath($ArtifactDirectory)
 $artifactExecutable = Join-Path $resolvedArtifactDirectory 'remoteops-controller-mcp.exe'
 $manifestPath = Join-Path $resolvedArtifactDirectory 'manifest.json'
@@ -100,6 +98,17 @@ if (-not $packageDirectory.StartsWith(
 
 Push-Location $workspaceRoot
 try {
+    # 跟随 Cargo 实际缓存目录，避免设置 CARGO_TARGET_DIR 后取到旧程序。
+    $metadataJson = (& cargo metadata --locked --no-deps --format-version 1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw '读取 Cargo 构建目录失败。'
+    }
+    $cargoTargetDirectory = [string]($metadataJson | ConvertFrom-Json).target_directory
+    if ([string]::IsNullOrWhiteSpace($cargoTargetDirectory)) {
+        throw 'Cargo metadata 缺少实际构建目录。'
+    }
+    $releaseExecutable = Join-Path $cargoTargetDirectory 'release\remoteops-controller-mcp.exe'
+    $credentialPromptExecutable = Join-Path $cargoTargetDirectory 'release\remoteops-credential-prompt.exe'
     cargo build --release --locked -p remoteops-controller-mcp -p remoteops-credential-prompt
     if ($LASTEXITCODE -ne 0) {
         throw 'remoteops-controller-mcp Release 构建失败。'

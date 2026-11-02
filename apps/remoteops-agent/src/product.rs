@@ -239,4 +239,43 @@ mod tests {
         assert!(c.ca_cert.is_none() && c.tls_fingerprint.is_none());
         assert_ne!(c.state_file, old);
     }
+    #[test]
+    fn relative_configuration_repeated_save_does_not_rebase_runtime_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&cwd).unwrap();
+        let config_path = directory.path().join("config.json");
+        std::fs::write(&config_path, r#"{"relay":"localhost:7443","transfer_root":"中文 transfer","state_file":"state.json"}"#).unwrap();
+        let relative = config_path.strip_prefix(&cwd).unwrap();
+        let mut config = AgentConfig::load_file(Some(relative)).unwrap();
+        let original_root = config.transfer_root.clone();
+        let original_state = config.state_file.clone();
+        assert!(original_root.is_absolute());
+        assert!(original_state.is_absolute());
+        assert_eq!(original_root, directory.path().join("中文 transfer"));
+        for _ in 0..3 {
+            config.save_file(relative).unwrap();
+            config = AgentConfig::load_file(Some(relative)).unwrap();
+            assert_eq!(config.transfer_root, original_root);
+            assert_eq!(config.state_file, original_state);
+        }
+    }
+    #[test]
+    fn relative_service_configuration_anchors_implicit_transfer_directory_once() {
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&cwd).unwrap();
+        let config_path = directory.path().join("service.json");
+        std::fs::write(&config_path, "{}").unwrap();
+        let relative = config_path.strip_prefix(&cwd).unwrap();
+        let profile = ProductProfile::default();
+        let config = AgentConfig::load_service_file_with_profile(relative, &profile).unwrap();
+        assert_eq!(config.transfer_root, directory.path().join("transfer"));
+        assert!(config.state_file.is_absolute());
+        config.save_file(relative).unwrap();
+        assert_eq!(
+            AgentConfig::load_service_file_with_profile(relative, &profile)
+                .unwrap()
+                .transfer_root,
+            config.transfer_root
+        );
+    }
 }

@@ -22,6 +22,18 @@ pub async fn run_product_console(
     profile: ProductProfile,
     config: AgentConfig,
 ) -> anyhow::Result<()> {
+    run_product_console_with_tools(profile, config, None).await
+}
+
+/// 使用同一产品的内置工具运行控制台，直到实际 SSH 才释放工具。
+///
+/// # Errors
+/// 产品配置、Agent 生命周期或信号监听失败时返回错误。
+pub async fn run_product_console_with_tools(
+    profile: ProductProfile,
+    config: AgentConfig,
+    tools: Option<super::BundledTools>,
+) -> anyhow::Result<()> {
     profile.validate()?;
     initialize_tracing();
     println!("{} {} · CLI 无图形模式", profile.name, profile.version);
@@ -30,7 +42,7 @@ pub async fn run_product_console(
     let permission = AgentPermissionControl::from_config(&config);
     let (events, receiver) = std_mpsc::channel();
     let (shutdown, shutdown_receiver) = watch::channel(false);
-    let options = AgentRuntimeOptions::console(profile.clone());
+    let options = AgentRuntimeOptions::console(profile.clone()).with_bundled_tools(tools);
     let mut task = tokio::spawn(run_agent_with_options(
         config,
         Some(events),

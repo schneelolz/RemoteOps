@@ -11,7 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const options = {
-  agent: path.join(root, 'target/release/remoteops-agent-gui.exe'),
+  agent: path.join(root, 'target/release-small/remoteops-agent-gui.exe'),
   relay: path.join(root, 'target/release/remoteops-relay.exe'),
   mcp: path.join(root, 'target/release/remoteops-controller-mcp.exe'),
   output: path.join(root, 'artifacts/gui-console-e2e', `${Date.now()}-${randomUUID()}.json`),

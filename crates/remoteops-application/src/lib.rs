@@ -98,6 +98,13 @@ pub struct ControllerCore {
     policy: DefaultPolicy,
 }
 
+fn clear_runtime_paths(connection: &mut ConnectionDescriptor) {
+    if let Some(context) = connection.target_context.as_mut() {
+        context.transfer_root = None;
+        context.ssh_trust_cli = None;
+    }
+}
+
 impl Default for ControllerCore {
     fn default() -> Self {
         Self {
@@ -109,8 +116,45 @@ impl Default for ControllerCore {
 
 impl ControllerCore {
     /// 新增或更新 Relay 返回的连接。
-    pub fn upsert_connection(&mut self, connection: ConnectionDescriptor) -> ConnectionDescriptor {
+    pub fn upsert_connection(
+        &mut self,
+        mut connection: ConnectionDescriptor,
+    ) -> ConnectionDescriptor {
+        if connection.state != ConnectionState::Online {
+            clear_runtime_paths(&mut connection);
+        }
         self.registry.upsert(connection)
+    }
+
+    fn invalidate_runtime_paths(&mut self, session_id: SessionId) {
+        if let Some(mut connection) = self.registry.get(session_id).cloned() {
+            clear_runtime_paths(&mut connection);
+            self.registry.upsert(connection);
+        }
+    }
+
+    fn cache_refreshed_context(
+        &mut self,
+        expected: &ConnectionDescriptor,
+        context: TargetContext,
+    ) -> Result<TargetContext, ApplicationError> {
+        context.validate().map_err(ApplicationError::Transport)?;
+        let mut current = self
+            .registry
+            .get(expected.session_id)
+            .cloned()
+            .ok_or_else(|| ApplicationError::Transport("目标会话已结束".into()))?;
+        if current.state != ConnectionState::Online
+            || current.agent_instance_id != expected.agent_instance_id
+            || current.credential_encryption_key_id != expected.credential_encryption_key_id
+        {
+            return Err(ApplicationError::Transport(
+                "目标进程或连接已换代，请重新读取运行事实".into(),
+            ));
+        }
+        current.target_context = Some(context.clone());
+        self.registry.upsert(current);
+        Ok(context)
     }
 
     /// 返回全部连接。
@@ -163,6 +207,10 @@ impl ControllerCore {
     /// 将当前所有连接标记为传输重连中。
     pub fn mark_all_reconnecting(&mut self) {
         self.registry.mark_all_reconnecting();
+        for mut connection in self.registry.list() {
+            clear_runtime_paths(&mut connection);
+            self.registry.upsert(connection);
+        }
     }
 
     /// 根据策略创建可发送的远程请求，必要时生成审批。
@@ -968,7 +1016,7 @@ impl RelayClient {
         };
         let result = self
             .execute(
-                target,
+                &session_id.to_string(),
                 EventSource::Human,
                 RemoteOperation::CloseConnection,
                 None,
@@ -1017,6 +1065,13 @@ impl RelayClient {
         forget_session_pairing(&self.inner, session_id).await;
         // 受管会话会先收到ConnectionRemoved，成功释放后的本地收尾必须幂等。
         let _ = self.inner.core.lock().await.remove_connection(session_id);
+        self.inner.control_states.lock().await.remove(&session_id);
+        fail_session_pending(
+            &self.inner,
+            session_id,
+            "connection_closed",
+            "会话已关闭，未完成操作不再等待远端结果",
+        );
         Ok(result)
     }
 
@@ -1025,11 +1080,16 @@ impl RelayClient {
         &self,
         session_id: SessionId,
     ) -> Result<TargetContext, ApplicationError> {
-        {
-            let core = self.inner.core.lock().await;
+        let expected = {
+            let mut core = self.inner.core.lock().await;
             let connection = core
                 .get_connection(session_id)
                 .ok_or_else(|| ApplicationError::Transport("目标会话已结束".to_owned()))?;
+            if connection.state != ConnectionState::Online {
+                return Err(ApplicationError::Transport(
+                    "目标当前未在线，运行路径未知".into(),
+                ));
+            }
             if connection.environment.protocol_version < 18
                 || connection
                     .target_context
@@ -1041,7 +1101,18 @@ impl RelayClient {
                     message: "目标未声明安全上下文查询能力".to_owned(),
                 });
             }
-        }
+            let expected = connection.clone();
+            core.invalidate_runtime_paths(session_id);
+            expected
+        };
+        let transport_generation = self.inner.transport_generation.load(Ordering::Acquire);
+        let agent_generation = self
+            .inner
+            .control_states
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|state| state.agent_generation);
         let result = self
             .execute(
                 &session_id.to_string(),
@@ -1058,15 +1129,21 @@ impl RelayClient {
             .ok_or_else(|| ApplicationError::Transport("Agent 未返回目标上下文".to_owned()))?;
         let context: TargetContext = serde_json::from_value(value)
             .map_err(|_| ApplicationError::Transport("Agent 返回了无效目标上下文".to_owned()))?;
-        context.validate().map_err(ApplicationError::Transport)?;
+        // 锁序固定为 core → transport → control_states；状态更新不持 states 等 core。
+        // 最后核验必须在取得 core 之后，且提交前不再让出临界区。
         let mut core = self.inner.core.lock().await;
-        let mut connection = core
-            .get_connection(session_id)
-            .cloned()
-            .ok_or_else(|| ApplicationError::Transport("目标会话已结束".to_owned()))?;
-        connection.target_context = Some(context.clone());
-        core.upsert_connection(connection);
-        Ok(context)
+        let transport = self.inner.transport.lock().await;
+        let states = self.inner.control_states.lock().await;
+        let current_agent_generation = states.get(&session_id).map(|state| state.agent_generation);
+        if transport_generation != self.inner.transport_generation.load(Ordering::Acquire)
+            || transport.as_ref().map(|active| active.generation) != Some(transport_generation)
+            || agent_generation != current_agent_generation
+        {
+            return Err(ApplicationError::Transport(
+                "运行事实查询期间连接换代，请重新读取".into(),
+            ));
+        }
+        core.cache_refreshed_context(&expected, context)
     }
 
     /// 将指定会话的脱敏审计事件导出为 JSON。
@@ -1284,18 +1361,21 @@ async fn run_transport(
     stream: TlsStream<TcpStream>,
     initial_sender: Option<oneshot::Sender<Result<(), ApplicationError>>>,
 ) -> Result<(), ApplicationError> {
-    let generation = inner
-        .transport_generation
-        .fetch_add(1, Ordering::AcqRel)
-        .saturating_add(1);
     let (sender, receiver) = mpsc::unbounded_channel();
-    {
+    let generation = {
+        // 与运行事实缓存提交共用 core 边界，跳代不能发生在最后核验和提交之间。
+        let _core = inner.core.lock().await;
         let mut transport = inner.transport.lock().await;
+        let generation = inner
+            .transport_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
         *transport = Some(ActiveTransport {
             generation,
             sender: sender.clone(),
         });
-    }
+        generation
+    };
     set_connected(&inner.connected, true);
     let initial_controller_modes = inner.controller_modes.lock().await.clone();
     if !initial_controller_modes.is_empty() {
@@ -1595,7 +1675,7 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
             if let Some(pending) = manual {
                 if result.error.is_none()
                     && result.error_code.is_none()
-                    && let Some(connection) = result.connection.clone()
+                    && let Some(mut connection) = result.connection.clone()
                 {
                     if pending.excluded_sessions.contains(&connection.session_id) {
                         result.connection = None;
@@ -1611,6 +1691,9 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
                     }
                     // 先在副本中分配序号和别名；接收端仍在等待时才同步提交连接和恢复目标。
                     let mut registry = core.registry.clone();
+                    if connection.state != ConnectionState::Online {
+                        clear_runtime_paths(&mut connection);
+                    }
                     result.connection = Some(registry.upsert(connection.clone()));
                     let resume_token = result.connection_resume_token.clone();
                     if pending.sender.send(result).is_ok() {
@@ -1788,25 +1871,7 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
             inner.control_states.lock().await.remove(&session_id);
             forget_session_pairing(inner, session_id).await;
             let _ = inner.core.lock().await.remove_connection(session_id);
-            let pending = {
-                let mut pending = inner.pending.lock();
-                let request_ids = pending
-                    .iter()
-                    .filter_map(|(request_id, entry)| {
-                        (entry.session_id == session_id).then_some(*request_id)
-                    })
-                    .collect::<Vec<_>>();
-                request_ids
-                    .into_iter()
-                    .filter_map(|request_id| pending.remove(&request_id))
-                    .collect::<Vec<_>>()
-            };
-            for pending in pending {
-                let _ = pending.sender.send(Err(ApplicationError::Remote {
-                    code: "connection_removed".to_owned(),
-                    message: reason.clone(),
-                }));
-            }
+            fail_session_pending(inner, session_id, "connection_removed", &reason);
         }
         WireMessage::Error {
             code,
@@ -1825,6 +1890,29 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
     }
 }
 
+// 会话关闭只结束该目标的等待者；先移出锁再交付，避免影响其他目标和迟到回执。
+fn fail_session_pending(inner: &ClientInner, session_id: SessionId, code: &str, message: &str) {
+    let pending = {
+        let mut pending = inner.pending.lock();
+        let request_ids = pending
+            .iter()
+            .filter_map(|(request_id, entry)| {
+                (entry.session_id == session_id).then_some(*request_id)
+            })
+            .collect::<Vec<_>>();
+        request_ids
+            .into_iter()
+            .filter_map(|request_id| pending.remove(&request_id))
+            .collect::<Vec<_>>()
+    };
+    for pending in pending {
+        let _ = pending.sender.send(Err(ApplicationError::Remote {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        }));
+    }
+}
+
 /// 同一绑定只接受更新修订；传输重建时缓存由断线清理。
 async fn cache_control_state(inner: &ClientInner, state: SessionControlState) {
     let mut states = inner.control_states.lock().await;
@@ -1837,7 +1925,15 @@ async fn cache_control_state(inner: &ClientInner, state: SessionControlState) {
     }) {
         return;
     }
-    states.insert(state.session_id, state);
+    let changed_generation = states
+        .get(&state.session_id)
+        .is_some_and(|old| old.agent_generation != state.agent_generation);
+    let session_id = state.session_id;
+    states.insert(session_id, state);
+    drop(states);
+    if changed_generation {
+        inner.core.lock().await.invalidate_runtime_paths(session_id);
+    }
 }
 
 fn outgoing_approval_state(request: &RemoteRequest) -> ApprovalState {
@@ -2050,6 +2146,151 @@ mod tests {
         let session_id = SessionId::new();
         core.upsert_connection(test_connection(session_id, ConnectionState::Online));
         (core, session_id)
+    }
+
+    fn context_with_runtime_paths(root: &str) -> TargetContext {
+        TargetContext {
+            transfer_root: Some(root.to_owned()),
+            ssh_trust_cli: Some(format!("{root}/RemoteOps.exe")),
+            ..TargetContext::default()
+        }
+    }
+
+    #[test]
+    fn runtime_paths_refresh_only_the_requested_online_target() {
+        let mut core = ControllerCore::default();
+        let mut first = test_connection(SessionId::new(), ConnectionState::Online);
+        first.credential_encryption_key_id = "first-key".into();
+        first.target_context = Some(context_with_runtime_paths("/first/old"));
+        let mut second = test_connection(SessionId::new(), ConnectionState::Online);
+        second.target_context = Some(context_with_runtime_paths("/second"));
+        core.upsert_connection(first.clone());
+        core.upsert_connection(second.clone());
+        core.invalidate_runtime_paths(first.session_id);
+        assert!(
+            core.get_connection(first.session_id)
+                .unwrap()
+                .target_context
+                .as_ref()
+                .unwrap()
+                .transfer_root
+                .is_none()
+        );
+        assert_eq!(
+            core.get_connection(second.session_id)
+                .unwrap()
+                .target_context,
+            second.target_context
+        );
+        let fresh = context_with_runtime_paths("/first/new");
+        assert_eq!(
+            core.cache_refreshed_context(&first, fresh.clone()).unwrap(),
+            fresh
+        );
+        assert_eq!(
+            core.get_connection(first.session_id)
+                .unwrap()
+                .target_context
+                .as_ref(),
+            Some(&fresh)
+        );
+        assert_eq!(
+            core.get_connection(second.session_id)
+                .unwrap()
+                .target_context,
+            second.target_context
+        );
+    }
+
+    #[test]
+    fn runtime_paths_are_unknown_after_disconnect_replacement_or_legacy_update() {
+        let mut core = ControllerCore::default();
+        let mut connection = test_connection(SessionId::new(), ConnectionState::Online);
+        connection.target_context = Some(context_with_runtime_paths("/active"));
+        core.upsert_connection(connection.clone());
+        core.mark_all_reconnecting();
+        let stale = core
+            .get_connection(connection.session_id)
+            .unwrap()
+            .target_context
+            .as_ref()
+            .unwrap();
+        assert!(stale.transfer_root.is_none());
+        assert!(stale.ssh_trust_cli.is_none());
+        assert!(
+            core.cache_refreshed_context(&connection, context_with_runtime_paths("/late"))
+                .is_err()
+        );
+        for change_identity in [false, true] {
+            let mut replacement = connection.clone();
+            if change_identity {
+                replacement.agent_instance_id = AgentInstanceId::new();
+            } else {
+                replacement.credential_encryption_key_id = "new-process-key".into();
+            }
+            core.upsert_connection(replacement);
+            assert!(
+                core.cache_refreshed_context(&connection, context_with_runtime_paths("/late"))
+                    .is_err()
+            );
+        }
+        let mut legacy = connection.clone();
+        legacy.target_context = Some(TargetContext::default());
+        core.upsert_connection(legacy);
+        assert!(
+            core.get_connection(connection.session_id)
+                .unwrap()
+                .target_context
+                .as_ref()
+                .unwrap()
+                .transfer_root
+                .is_none()
+        );
+        connection.state = ConnectionState::Offline;
+        let offline = core.upsert_connection(connection);
+        assert!(offline.target_context.unwrap().ssh_trust_cli.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_paths_agent_generation_change_invalidates_only_its_session() {
+        let inner = transport_test_inner();
+        let mut state = control_fixture();
+        let mut first = test_connection(state.session_id, ConnectionState::Online);
+        first.target_context = Some(context_with_runtime_paths("/first"));
+        let mut second = test_connection(SessionId::new(), ConnectionState::Online);
+        second.target_context = Some(context_with_runtime_paths("/second"));
+        inner.core.lock().await.upsert_connection(first.clone());
+        inner.core.lock().await.upsert_connection(second.clone());
+        cache_control_state(&inner, state.clone()).await;
+        state.revision += 1;
+        cache_control_state(&inner, state.clone()).await;
+        assert_eq!(
+            inner
+                .core
+                .lock()
+                .await
+                .get_connection(first.session_id)
+                .unwrap()
+                .target_context,
+            first.target_context
+        );
+        state.agent_generation += 1;
+        cache_control_state(&inner, state).await;
+        let core = inner.core.lock().await;
+        let context = core
+            .get_connection(first.session_id)
+            .unwrap()
+            .target_context
+            .as_ref()
+            .unwrap();
+        assert!(context.transfer_root.is_none());
+        assert!(context.ssh_trust_cli.is_none());
+        assert_eq!(
+            core.get_connection(second.session_id)
+                .unwrap()
+                .target_context,
+            second.target_context
+        );
     }
 
     fn transport_test_inner() -> Arc<ClientInner> {
@@ -2372,6 +2613,160 @@ mod tests {
             assert!(matches!(client.refresh_target_context(session_id).await,
                 Err(ApplicationError::Remote { code, .. }) if code == "unsupported_mode"));
             assert!(receiver.try_recv().is_err(), "旧Agent不能接收到新操作");
+        }
+    }
+
+    #[tokio::test]
+    async fn context_refresh_caches_live_reply_and_rejects_late_generation_reply() {
+        for change in ["none", "transport", "agent"] {
+            let inner = transport_test_inner();
+            let session_id = SessionId::new();
+            let mut connection = test_connection(session_id, ConnectionState::Online);
+            connection.environment.protocol_version = 18;
+            connection.target_context = Some(context_with_runtime_paths("/old"));
+            inner.core.lock().await.upsert_connection(connection);
+            let (sender, mut outgoing) = mpsc::unbounded_channel();
+            *inner.transport.lock().await = Some(ActiveTransport {
+                generation: 1,
+                sender,
+            });
+            inner.transport_generation.store(1, Ordering::Release);
+            let client = RelayClient {
+                inner: inner.clone(),
+            };
+            let refresh =
+                tokio::spawn(async move { client.refresh_target_context(session_id).await });
+            let request = match outgoing.recv().await.unwrap() {
+                WireMessage::RemoteRequest(request) => request,
+                other => panic!("意外消息 {other:?}"),
+            };
+            assert!(matches!(
+                request.operation,
+                RemoteOperation::GetTargetContext
+            ));
+            assert!(
+                inner
+                    .core
+                    .lock()
+                    .await
+                    .get_connection(session_id)
+                    .unwrap()
+                    .target_context
+                    .as_ref()
+                    .unwrap()
+                    .transfer_root
+                    .is_none()
+            );
+            if change == "transport" {
+                inner.transport_generation.store(2, Ordering::Release);
+            } else if change == "agent" {
+                let mut state = control_fixture();
+                state.session_id = session_id;
+                cache_control_state(&inner, state).await;
+            }
+            let context = context_with_runtime_paths("/actual/live");
+            let mut response = successful_response(request.request_id, session_id);
+            response.details = Some(serde_json::to_value(&context).unwrap());
+            handle_wire_message(&inner, WireMessage::RemoteResponse(response)).await;
+            let result = refresh.await.unwrap();
+            let core = inner.core.lock().await;
+            let cached = core
+                .get_connection(session_id)
+                .unwrap()
+                .target_context
+                .as_ref()
+                .unwrap();
+            if change == "none" {
+                assert_eq!(result.unwrap(), context);
+                assert_eq!(cached, &context);
+            } else {
+                assert!(matches!(result, Err(ApplicationError::Transport(_))));
+                assert!(cached.transfer_root.is_none());
+                assert!(cached.ssh_trust_cli.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn context_refresh_rechecks_generation_after_waiting_for_core_mutex() {
+        for change in ["agent", "transport", "disconnect"] {
+            let inner = transport_test_inner();
+            let session_id = SessionId::new();
+            let mut connection = test_connection(session_id, ConnectionState::Online);
+            connection.environment.protocol_version = 18;
+            connection.target_context = Some(context_with_runtime_paths("/old"));
+            inner.core.lock().await.upsert_connection(connection);
+            let mut initial_state = control_fixture();
+            initial_state.session_id = session_id;
+            cache_control_state(&inner, initial_state.clone()).await;
+            let (sender, mut outgoing) = mpsc::unbounded_channel();
+            *inner.transport.lock().await = Some(ActiveTransport {
+                generation: 1,
+                sender,
+            });
+            inner.transport_generation.store(1, Ordering::Release);
+            let client = RelayClient {
+                inner: inner.clone(),
+            };
+            let mut refresh = Box::pin(client.refresh_target_context(session_id));
+            // 直接轮询真实 refresh 到待接收响应，不依赖 sleep 或线程调度猜测。
+            let request = tokio::select! {
+                biased;
+                result = &mut refresh => panic!("尚无回执：{result:?}"),
+                message = outgoing.recv() => match message.unwrap() {
+                    WireMessage::RemoteRequest(request) => request,
+                    other => panic!("意外消息：{other:?}"),
+                },
+            };
+            let core_guard = inner.core.lock().await;
+            let mut response = successful_response(request.request_id, session_id);
+            response.details =
+                Some(serde_json::to_value(context_with_runtime_paths("/late")).unwrap());
+            handle_wire_message(&inner, WireMessage::RemoteResponse(response)).await;
+            // biased 保证先轮询 refresh；它必须在实际 core mutex 上排队。
+            tokio::select! {
+                biased;
+                result = &mut refresh => panic!("core 被持有时不应提交：{result:?}"),
+                () = std::future::ready(()) => {},
+            }
+            initial_state.agent_generation += 1;
+            let mut state_update = Box::pin(cache_control_state(&inner, initial_state));
+            if change == "agent" {
+                // 状态已更新为新代，再在 refresh 之后排队清理同一个 core。
+                tokio::select! {
+                    biased;
+                    () = &mut state_update => panic!("core 被持有时清理不应完成"),
+                    () = std::future::ready(()) => {},
+                }
+                assert_eq!(
+                    inner
+                        .control_states
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .unwrap()
+                        .agent_generation,
+                    3
+                );
+            } else if change == "transport" {
+                inner.transport_generation.store(2, Ordering::Release);
+            } else {
+                *inner.transport.lock().await = None;
+            }
+            drop(core_guard);
+            assert!(matches!(refresh.await, Err(ApplicationError::Transport(_))));
+            if change == "agent" {
+                state_update.await;
+            }
+            let core = inner.core.lock().await;
+            let cached = core
+                .get_connection(session_id)
+                .unwrap()
+                .target_context
+                .as_ref()
+                .unwrap();
+            assert!(cached.transfer_root.is_none());
+            assert!(cached.ssh_trust_cli.is_none());
         }
     }
 
@@ -3030,6 +3425,193 @@ mod tests {
             "已成功关闭不能因通知先到而误报失败"
         );
         assert!(inner.core.lock().await.get_connection(session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn close_keeps_first_resolved_session_when_alias_changes_between_core_locks() {
+        let inner = transport_test_inner();
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let mut core = inner.core.lock().await;
+        for session in [first, second] {
+            core.upsert_connection(test_connection(session, ConnectionState::Online));
+        }
+        core.set_alias(first, "chosen").unwrap();
+        drop(core);
+        let (sender, mut outgoing) = mpsc::unbounded_channel();
+        *inner.transport.lock().await = Some(ActiveTransport {
+            generation: 1,
+            sender,
+        });
+        let client = RelayClient {
+            inner: inner.clone(),
+        };
+        let core_guard = inner.core.lock().await;
+        let mut closing = Box::pin(client.close_connection("chosen"));
+        // 第一轮解析先排队，别名变更排在其后；第二次取得 core 时必须固定 UUID。
+        tokio::select! {
+            biased;
+            result = &mut closing => panic!("首次解析必须等待 core：{result:?}"),
+            () = std::future::ready(()) => {},
+        }
+        let mut rename = Box::pin(async {
+            let mut core = inner.core.lock().await;
+            core.set_alias(first, "original-first").unwrap();
+            core.set_alias(second, "chosen").unwrap();
+        });
+        tokio::select! {
+            biased;
+            () = &mut rename => panic!("别名变更必须等待 core"),
+            () = std::future::ready(()) => {},
+        }
+        drop(core_guard);
+        tokio::select! {
+            biased;
+            result = &mut closing => panic!("执行应排在别名变更后：{result:?}"),
+            () = std::future::ready(()) => {},
+        }
+        rename.await;
+        let request = tokio::select! {
+            biased;
+            result = &mut closing => panic!("尚未响应关闭：{result:?}"),
+            message = outgoing.recv() => match message.unwrap() {
+                WireMessage::RemoteRequest(request) => request,
+                other => panic!("意外消息：{other:?}"),
+            },
+        };
+        assert_eq!(
+            inner.core.lock().await.resolve_target("chosen").unwrap(),
+            second
+        );
+        assert_eq!(request.session_id, first);
+        assert_eq!(request.operation, RemoteOperation::CloseConnection);
+        handle_wire_message(
+            &inner,
+            WireMessage::RemoteResponse(successful_response(request.request_id, first)),
+        )
+        .await;
+        let release = tokio::select! {
+            biased;
+            result = &mut closing => panic!("尚未响应释放：{result:?}"),
+            message = outgoing.recv() => match message.unwrap() {
+                WireMessage::ReleaseSessionRequest(request) => request,
+                other => panic!("意外消息：{other:?}"),
+            },
+        };
+        assert_eq!(release.session_id, first);
+        handle_wire_message(
+            &inner,
+            WireMessage::ReleaseSessionResult(ReleaseSessionResult {
+                request_id: release.request_id,
+                session_id: first,
+                released: true,
+                error: None,
+            }),
+        )
+        .await;
+        assert!(closing.await.is_ok());
+        let core = inner.core.lock().await;
+        assert!(core.get_connection(first).is_none());
+        assert!(core.get_connection(second).is_some());
+        assert_eq!(core.resolve_target("chosen").unwrap(), second);
+    }
+
+    #[tokio::test]
+    async fn ordinary_close_finishes_only_its_pending_operations_after_release() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        let other_session = SessionId::new();
+        for target in [session_id, other_session] {
+            inner
+                .core
+                .lock()
+                .await
+                .upsert_connection(test_connection(target, ConnectionState::Online));
+        }
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        *inner.transport.lock().await = Some(ActiveTransport {
+            generation: 1,
+            sender,
+        });
+        let client = RelayClient {
+            inner: inner.clone(),
+        };
+        let mut operations = Vec::new();
+        for target in [session_id, session_id, other_session] {
+            operations.push(
+                client
+                    .start_execute(
+                        &target.to_string(),
+                        EventSource::Ai,
+                        RemoteOperation::GetTargetContext,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert!(matches!(
+                receiver.recv().await,
+                Some(WireMessage::RemoteRequest(_))
+            ));
+        }
+        let other = operations.pop().unwrap();
+        let other_id = other.request_id;
+        let closing =
+            tokio::spawn(async move { client.close_connection(&session_id.to_string()).await });
+        let WireMessage::RemoteRequest(request) = receiver.recv().await.unwrap() else {
+            panic!("应请求关闭 Agent 资源")
+        };
+        assert_eq!(request.operation, RemoteOperation::CloseConnection);
+        handle_wire_message(
+            &inner,
+            WireMessage::RemoteResponse(successful_response(request.request_id, session_id)),
+        )
+        .await;
+        let WireMessage::ReleaseSessionRequest(release) = receiver.recv().await.unwrap() else {
+            panic!("应请求释放普通会话")
+        };
+        assert_eq!(inner.pending.lock().len(), 3, "释放确认之前保留原操作等待");
+        // 普通会话没有 ConnectionRemoved 通知，仅返回实际 release 回执。
+        handle_wire_message(
+            &inner,
+            WireMessage::ReleaseSessionResult(ReleaseSessionResult {
+                request_id: release.request_id,
+                session_id,
+                released: true,
+                error: None,
+            }),
+        )
+        .await;
+        assert!(closing.await.unwrap().is_ok());
+        assert_eq!(inner.pending.lock().len(), 1);
+        for operation in operations {
+            let result = tokio::time::timeout(TokioDuration::from_secs(1), operation.wait())
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, Err(ApplicationError::Remote { code, message })
+                if code == "connection_closed" && message.contains("会话已关闭"))
+            );
+        }
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+        assert!(
+            inner
+                .core
+                .lock()
+                .await
+                .get_connection(other_session)
+                .is_some()
+        );
+        assert!(inner.pending.lock().contains_key(&other_id));
+        handle_wire_message(
+            &inner,
+            WireMessage::RemoteResponse(successful_response(other_id, other_session)),
+        )
+        .await;
+        assert!(other.wait().await.is_ok(), "其他会话仍能正常完成");
+        assert!(inner.pending.lock().is_empty());
     }
 
     #[tokio::test]

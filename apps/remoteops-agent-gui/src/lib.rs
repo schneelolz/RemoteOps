@@ -926,6 +926,8 @@ impl RemoteOpsAgentApp {
                     }
                 }
             }
+            // 新原生观察宿主使用结构化上下文；旧版日志保持既有呈现。
+            AgentEvent::OperationContext { .. } | AgentEvent::OperationPresentation { .. } => {}
             AgentEvent::OperationLog(log) => {
                 if let Some(diagnostic) = log.message.strip_prefix("图形探测：") {
                     self.diagnostics.record_detail("visual_probe", diagnostic);

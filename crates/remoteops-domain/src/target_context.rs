@@ -126,6 +126,12 @@ pub struct TargetContext {
     pub capabilities: Vec<TargetCapabilityStatus>,
     /// 仅属于该目标的辅助说明。
     pub guidance: Vec<TargetGuidance>,
+    /// 当前 Agent 运行时确认的绝对文件交换根；旧组件未报告时未知。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_root: Option<String>,
+    /// 确实支持 SSH 信任管理 CLI 的 Agent 可执行文件绝对路径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_trust_cli: Option<String>,
 }
 
 fn unknown_schema_version() -> u16 {
@@ -143,6 +149,8 @@ impl Default for TargetContext {
             facts: TargetRuntimeFacts::default(),
             capabilities: Vec::new(),
             guidance: Vec::new(),
+            transfer_root: None,
+            ssh_trust_cli: None,
         }
     }
 }
@@ -166,6 +174,31 @@ impl TargetContext {
             || self.facts.source.len() > 128
         {
             return Err("invalid_target_identity".to_owned());
+        }
+        for path in [self.transfer_root.as_deref(), self.ssh_trust_cli.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let bytes = path.as_bytes();
+            // Controller 可运行在另一操作系统，不能用本机 Path 规则拒绝远端 Windows 路径。
+            let drive_absolute = bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/');
+            let unc_absolute = path.starts_with("\\\\")
+                && path[2..]
+                    .split(['\\', '/'])
+                    .filter(|part| !part.is_empty())
+                    .take(2)
+                    .count()
+                    == 2;
+            if path.trim().is_empty()
+                || path.len() > 8192
+                || path.chars().any(char::is_control)
+                || !(path.starts_with('/') || drive_absolute || unc_absolute)
+            {
+                return Err("invalid_target_runtime_path".to_owned());
+            }
         }
         if self.capabilities.len() > 64 || self.guidance.len() > 8 {
             return Err("target_context_limit_exceeded".to_owned());
@@ -465,5 +498,53 @@ mod tests {
         };
         context.capabilities = vec![capability.clone(), capability];
         assert!(context.validate().is_err());
+    }
+    #[test]
+    fn runtime_paths_are_optional_for_old_context_and_not_inferred() {
+        let context: TargetContext =
+            serde_json::from_value(serde_json::json!({"schema_version":1})).unwrap();
+        assert!(context.transfer_root.is_none());
+        assert!(context.ssh_trust_cli.is_none());
+        let encoded = serde_json::to_value(context).unwrap();
+        assert!(encoded.get("transfer_root").is_none());
+        assert!(encoded.get("ssh_trust_cli").is_none());
+    }
+    #[test]
+    fn runtime_paths_validate_cross_platform_absolute_values_and_bounds() {
+        for path in [
+            "/var/tmp/agent/中文 tools",
+            r"C:\Users\Operator\工具 空格",
+            r"\\?\C:\Agent\transfer",
+            r"\\server\share\agent",
+        ] {
+            let context = TargetContext {
+                transfer_root: Some(path.into()),
+                ssh_trust_cli: Some(path.into()),
+                ..TargetContext::default()
+            };
+            assert!(context.validate().is_ok(), "{path}");
+            assert_eq!(
+                serde_json::from_value::<TargetContext>(serde_json::to_value(&context).unwrap())
+                    .unwrap(),
+                context
+            );
+        }
+        for invalid in [
+            String::new(),
+            "  ".into(),
+            "relative/transfer".into(),
+            "C:drive-relative".into(),
+            "/tmp/a\nargument".into(),
+            format!("/{}", "x".repeat(8192)),
+        ] {
+            let mut context = TargetContext {
+                transfer_root: Some(invalid.clone()),
+                ..TargetContext::default()
+            };
+            assert!(context.validate().is_err());
+            context.transfer_root = None;
+            context.ssh_trust_cli = Some(invalid);
+            assert!(context.validate().is_err());
+        }
     }
 }

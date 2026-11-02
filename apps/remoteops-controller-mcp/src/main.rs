@@ -1103,6 +1103,14 @@ struct ConnectionOutput {
     control_sync_status: String,
     /// MCP 本地（控制端）的实际文件交换目录，供 `local_path` 使用；不是 Agent 远端目录。
     transfer_root: String,
+    /// MCP 本机交换根目录，与旧 `transfer_root` 等值。
+    local_transfer_root: String,
+    /// 由当前 Agent 实时确认的绝对交换目录；旧组件缺失时为空。
+    agent_transfer_root: Option<String>,
+    /// Agent 目录事实状态：reported、stale 或 unknown。
+    agent_transfer_root_status: String,
+    /// 确实支持 SSH 主机密钥管理命令的远端 Agent 程序；不猜测旧组件入口。
+    ssh_trust_cli: Option<String>,
     capabilities: Vec<String>,
     /// 当前目标专用上下文；旧组件缺少字段时明确显示未知。
     target_context: serde_json::Value,
@@ -1789,7 +1797,7 @@ impl RemoteOpsMcp {
     /// 列出所有已配对连接及其不可变 `session_id`。
     #[tool(
         name = "list_connections",
-        description = "列出 RemoteOps 当前连接。后续每个工具必须使用这里返回的不可变 session_id；不要根据别名猜测。transfer_root 是 MCP 本地（控制端）交换目录，供 local_path 使用，不是 Agent 远端目录。",
+        description = "列出 RemoteOps 当前连接。后续每个工具必须使用这里返回的不可变 session_id；不要根据别名猜测。transfer_root/local_transfer_root 是 MCP 本机目录；agent_transfer_root 是 Agent 已确认的目录，状态 unknown/stale 时不能猜路径。",
         annotations(
             title = "列出远程连接",
             read_only_hint = true,
@@ -1803,6 +1811,7 @@ impl RemoteOpsMcp {
         for connection in self.client.list_connections().await {
             let mut output = connection_output(connection);
             output.transfer_root = self.transfer_root.display().to_string();
+            output.local_transfer_root.clone_from(&output.transfer_root);
             let session_id =
                 parse_session_id(&output.session_id).expect("Relay 返回的 session_id 必须有效");
             let state = self.control_mode_output(session_id).await;
@@ -1855,6 +1864,7 @@ impl RemoteOpsMcp {
         let session_id = connection.session_id;
         let mut output = connection_output(connection);
         output.transfer_root = self.transfer_root.display().to_string();
+        output.local_transfer_root.clone_from(&output.transfer_root);
         let state = self.control_mode_output(session_id).await;
         output.control_mode = state.mode;
         output.control_source = state.source;
@@ -1941,7 +1951,7 @@ impl RemoteOpsMcp {
     /// 读取单个连接的主机、系统、能力和状态。
     #[tool(
         name = "get_target_info",
-        description = "按精确 session_id 获取目标详情。别名只用于展示，不能代替 session_id。transfer_root 是 MCP 本地（控制端）交换目录，供 local_path 使用，不是 Agent 远端目录。",
+        description = "按精确 session_id 获取目标详情。别名只用于展示，不能代替 session_id。transfer_root/local_transfer_root 是 MCP 本机目录；agent_transfer_root 来自当前 Agent 实时事实，旧组件缺失时明确 unknown。",
         annotations(
             title = "读取目标信息",
             read_only_hint = true,
@@ -1974,14 +1984,20 @@ impl RemoteOpsMcp {
                 if let Some(context) = connection.target_context.as_mut() {
                     context.facts.interactive_desktop =
                         remoteops_domain::CapabilityAvailability::Unknown;
+                    context.transfer_root = None;
+                    context.ssh_trust_cli = None;
                 }
             }
         }
         let mut output = connection_output(connection);
         if stale {
             "stale".clone_into(&mut output.target_context_status);
+            output.agent_transfer_root = None;
+            output.ssh_trust_cli = None;
+            "stale".clone_into(&mut output.agent_transfer_root_status);
         }
         output.transfer_root = self.transfer_root.display().to_string();
+        output.local_transfer_root.clone_from(&output.transfer_root);
         let state = self.control_mode_output(session_id).await;
         output.control_mode = state.mode;
         output.control_source = state.source;
@@ -3010,13 +3026,35 @@ impl RemoteOpsMcp {
         } else {
             None
         };
-        if let Some(authorization) = authorization {
+        let guidance_host = match &operation {
+            RemoteOperation::RunSsh { host, .. } => host.clone(),
+            _ => unreachable!(),
+        };
+        let Json(mut output) = if let Some(authorization) = authorization {
             self.execute_authorized(session_id, operation, authorization, payload)
-                .await
+                .await?
         } else {
             self.execute_simple(session_id.to_string(), operation, None, payload)
-                .await
-        }
+                .await?
+        };
+        let cli = self
+            .client
+            .list_connections()
+            .await
+            .into_iter()
+            .find(|connection| connection.session_id == session_id)
+            .and_then(|connection| connection_output(connection).ssh_trust_cli);
+        let mut details = output
+            .details
+            .take()
+            .map(details_object)
+            .unwrap_or_default();
+        details.insert(
+            "ssh_host_key_management".into(),
+            ssh_trust_guidance(cli.as_deref(), &guidance_host, port),
+        );
+        output.details = Some(details.into());
+        Ok(Json(output))
     }
 
     #[tool(
@@ -3068,7 +3106,7 @@ impl RemoteOpsMcp {
     /// 上传控制端本机文件到 Agent。
     #[tool(
         name = "upload_file",
-        description = "从 MCP 本地 transfer-root 以 1 MiB 分块上传文件到精确 session_id。local_path 必须是本地交换目录内已存在文件的相对路径，remote_path 必须是 Agent 自己交换目录内的相对目标路径；双方根目录可不同，拒绝绝对路径、.. 和链接逃逸。校验分块及完整 SHA-256；超过 1 GiB 时在读取文件前单独确认。",
+        description = "从 MCP 本地 transfer-root 以 1 MiB 分块上传文件到精确 session_id。成功后直接返回 Agent 报告的实际绝对路径；旧 Agent 未提供时明确标为未知，不使用 MCP 本机目录推算。local_path 必须是本地交换目录内已存在文件的相对路径，remote_path 必须是 Agent 自己交换目录内的相对目标路径；双方根目录可不同，拒绝绝对路径、.. 和链接逃逸。校验分块及完整 SHA-256；超过 1 GiB 时在读取文件前单独确认。",
         annotations(
             title = "上传诊断文件",
             read_only_hint = false,
@@ -3173,12 +3211,7 @@ impl RemoteOpsMcp {
             }
         };
         let mut output = action_output(session_id, result);
-        output.summary = format!("已分块上传 {size} 字节");
-        output.sha256 = Some(hash);
-        output.details = Some(serde_json::json!({
-            "size": size,
-            "chunk_size_bytes": FILE_CHUNK_BYTES,
-        }));
+        output = upload_receipt_output(output, size, hash, &self.transfer_root);
         Ok(Json(output))
     }
 
@@ -4241,6 +4274,31 @@ fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> Conn
             target_context[field] = "unknown".into();
         }
     }
+    let live_context = connection.target_context.as_ref().filter(|context| {
+        reported
+            && context.validate().is_ok()
+            && connection.state == remoteops_domain::ConnectionState::Online
+    });
+    let agent_transfer_root = live_context.and_then(|context| context.transfer_root.clone());
+    let ssh_trust_cli = live_context.and_then(|context| context.ssh_trust_cli.clone());
+    if live_context.is_none()
+        && let Some(fields) = target_context.as_object_mut()
+    {
+        fields.remove("transfer_root");
+        fields.remove("ssh_trust_cli");
+    }
+    let root_status = if agent_transfer_root.is_some() {
+        "reported"
+    } else if reported
+        && connection
+            .target_context
+            .as_ref()
+            .is_some_and(|context| context.transfer_root.is_some())
+    {
+        "stale"
+    } else {
+        "unknown"
+    };
     ConnectionOutput {
         display_name: connection.display_name(),
         alias: connection.alias,
@@ -4259,6 +4317,10 @@ fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> Conn
         control_revision: None,
         control_sync_status: "pending".into(),
         transfer_root: String::new(),
+        local_transfer_root: String::new(),
+        agent_transfer_root,
+        agent_transfer_root_status: root_status.into(),
+        ssh_trust_cli,
         target_context,
         target_context_status: if reported { "reported" } else { "unknown" }.to_owned(),
         guidance_is_advisory: true,
@@ -4269,6 +4331,135 @@ fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> Conn
             .map(|capability| format!("{capability:?}").to_lowercase())
             .chain(visual_allowed.then(|| "visual".to_owned()))
             .collect(),
+    }
+}
+
+/// 保留兼容组件的任意详情，不因新增结构化字段而丢弃原始回执。
+fn details_object(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    match value {
+        serde_json::Value::Object(fields) => fields,
+        value => serde_json::Map::from_iter([("agent_details".into(), value)]),
+    }
+}
+
+// 只识别远端明确给出的绝对路径，不按控制端操作系统解析或拼接远端位置。
+fn is_reported_agent_absolute_path(path: &str) -> bool {
+    if path.is_empty() || path.chars().any(char::is_control) {
+        return false;
+    }
+    if path.starts_with('/') {
+        return true;
+    }
+    let drive_absolute = |value: &str| {
+        let bytes = value.as_bytes();
+        bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/')
+    };
+    let unc_tail = |value: &str| {
+        let mut parts = value.split(['\\', '/']);
+        let valid = |part: &str| !part.is_empty() && !matches!(part, "." | ".." | "?");
+        parts.next().is_some_and(valid) && parts.next().is_some_and(valid)
+    };
+    if let Some(extended) = path.strip_prefix(r"\\?\") {
+        return drive_absolute(extended) || extended.strip_prefix(r"UNC\").is_some_and(unc_tail);
+    }
+    drive_absolute(path) || path.strip_prefix(r"\\").is_some_and(unc_tail)
+}
+
+/// 合并远端完成回执，失败和完整性冲突不能写成上传成功。
+fn upload_receipt_output(
+    mut output: ActionOutput,
+    size: u64,
+    hash: String,
+    local_root: &Path,
+) -> ActionOutput {
+    if output.status != "completed" {
+        return output;
+    }
+    if output.exit_code.is_some_and(|code| code != 0) {
+        "failed".clone_into(&mut output.status);
+        return output;
+    }
+    if output
+        .sha256
+        .as_ref()
+        .is_none_or(|reported| reported != &hash)
+    {
+        "failed".clone_into(&mut output.status);
+        "远端未返回匹配的 SHA-256，文件可能已写入，尚不能确认上传完整性；请核对后处理"
+            .clone_into(&mut output.summary);
+        return output;
+    }
+    let mut details = output
+        .details
+        .take()
+        .map(details_object)
+        .unwrap_or_default();
+    if details
+        .get("size")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|reported| reported != size)
+    {
+        "failed".clone_into(&mut output.status);
+        "远端返回的文件大小与上传源不一致，文件可能已写入，请核对后处理"
+            .clone_into(&mut output.summary);
+        output.details = Some(details.into());
+        return output;
+    }
+    if details
+        .get("sha256")
+        .filter(|reported| !reported.is_null())
+        .is_some_and(|reported| reported.as_str() != Some(hash.as_str()))
+    {
+        "failed".clone_into(&mut output.status);
+        "远端回执中的 SHA-256 与上传源不一致，文件可能已写入，请核对后处理"
+            .clone_into(&mut output.summary);
+        output.details = Some(details.into());
+        return output;
+    }
+    let reported_path = details
+        .get("remote_absolute_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| is_reported_agent_absolute_path(path))
+        .map(str::to_owned);
+    output.summary = format!("已分块上传 {size} 字节；Agent 未返回可用的实际绝对路径");
+    output.sha256 = Some(hash);
+    details.insert("size".into(), size.into());
+    details.insert("chunk_size_bytes".into(), FILE_CHUNK_BYTES.into());
+    details.insert(
+        "local_transfer_root".into(),
+        local_root.display().to_string().into(),
+    );
+    details.insert(
+        "agent_path_status".into(),
+        if reported_path.is_some() {
+            "reported"
+        } else {
+            "unknown"
+        }
+        .into(),
+    );
+    if let Some(path) = reported_path {
+        output.summary = format!("已分块上传 {size} 字节，远端文件：{path}");
+    }
+    output.details = Some(details.into());
+    output
+}
+
+/// 返回参数数组指引，不把远端路径插入待执行的 Shell 文本，也不自动信任。
+fn ssh_trust_guidance(executable: Option<&str>, host: &str, port: u16) -> serde_json::Value {
+    if let Some(executable) = executable {
+        serde_json::json!({"status":"available", "executable":executable,
+            "scan_arguments":["--ssh-key-scan",host,&port.to_string()],
+            "trust_arguments_template":["--ssh-key-trust",host,&port.to_string(),"<用户经可信渠道核对的完整指纹，可追加多个独立参数>"],
+            "automatic_trust":false,
+            "powershell_output_pipeline":"Out-String",
+            "instruction":"先核对目标和全部指纹；扫描结果本身不代表可信。用户确认前不得执行信任命令。Agent命令通过现有获授权run_command执行；PowerShell中使用 & 可执行文件 参数... | Out-String，以等待原生GUI宿主退出并捕获JSON。不自动重跑失败SSH命令。"})
+    } else {
+        serde_json::json!({"status":"unavailable", "automatic_trust":false,
+            "instruction":"当前Agent未报告SSH主机密钥管理入口。不能猜程序路径或自动接受密钥；请使用支持该能力的Agent或经核对的预置流程。"})
     }
 }
 
@@ -5132,6 +5323,272 @@ mod tests {
     }
 
     #[test]
+    fn agent_roots_are_per_target_and_offline_or_legacy_values_are_not_claimed() {
+        let make = |name: &str, root: &str| {
+            let mut connection = graphics_test_connection(name);
+            connection.target_context = Some(remoteops_domain::TargetContext {
+                transfer_root: Some(root.into()),
+                ssh_trust_cli: Some("C:/Agent/native-core.exe".into()),
+                ..remoteops_domain::TargetContext::default()
+            });
+            connection
+        };
+        let first = make("first", "C:/first transfer");
+        let mut second = make("second", "D:/second transfer");
+        assert_eq!(
+            connection_output(first).agent_transfer_root.as_deref(),
+            Some("C:/first transfer")
+        );
+        assert_eq!(
+            connection_output(second.clone())
+                .agent_transfer_root
+                .as_deref(),
+            Some("D:/second transfer")
+        );
+        second.state = remoteops_domain::ConnectionState::Offline;
+        let offline = connection_output(second);
+        assert!(offline.agent_transfer_root.is_none() && offline.ssh_trust_cli.is_none());
+        assert_eq!(offline.agent_transfer_root_status, "stale");
+        assert!(offline.target_context.get("transfer_root").is_none());
+        assert!(offline.target_context.get("ssh_trust_cli").is_none());
+        let old = connection_output(graphics_test_connection("old"));
+        assert!(old.agent_transfer_root.is_none());
+        assert_eq!(old.agent_transfer_root_status, "unknown");
+    }
+
+    #[test]
+    fn upload_preserves_actual_receipt_and_never_relabels_failure_or_conflict() {
+        let result = |status: &str| ActionOutput {
+            status: status.into(),
+            session_id: "fixture".into(),
+            request_id: None,
+            exit_code: None,
+            summary: "fixture".into(),
+            approval_id: None,
+            sha256: Some("hash".into()),
+            details: Some(
+                serde_json::json!({"remote_absolute_path":"C:/Agent transfer/tool.exe", "agent_transfer_root":"C:/Agent transfer", "remote_path":"tool.exe", "size":42, "custom":"preserved"}),
+            ),
+        };
+        let receipt = upload_receipt_output(
+            result("completed"),
+            42,
+            "hash".into(),
+            Path::new("D:/MCP local"),
+        );
+        let detail = receipt.details.unwrap();
+        assert_eq!(detail["remote_absolute_path"], "C:/Agent transfer/tool.exe");
+        assert_eq!(detail["local_transfer_root"], "D:/MCP local");
+        assert_eq!(detail["custom"], "preserved");
+        assert_eq!(receipt.status, "completed");
+        let failed = upload_receipt_output(result("failed"), 42, "hash".into(), Path::new("local"));
+        assert_eq!(failed.summary, "fixture");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            upload_receipt_output(result("completed"), 42, "other".into(), Path::new("local"))
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            upload_receipt_output(result("completed"), 43, "hash".into(), Path::new("local"))
+                .status,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn upload_does_not_claim_success_for_nonzero_exit_or_missing_hash() {
+        let result = || ActionOutput {
+            status: "completed".into(),
+            session_id: "fixture".into(),
+            request_id: None,
+            exit_code: Some(1),
+            summary: "real remote failure".into(),
+            approval_id: None,
+            sha256: Some("hash".into()),
+            details: None,
+        };
+        let failed = upload_receipt_output(result(), 42, "hash".into(), Path::new("local"));
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.summary, "real remote failure");
+        let mut missing = result();
+        missing.exit_code = None;
+        missing.sha256 = None;
+        assert_eq!(
+            upload_receipt_output(missing, 42, "hash".into(), Path::new("local")).status,
+            "failed"
+        );
+    }
+
+    fn upload_test_output(details: Option<serde_json::Value>) -> ActionOutput {
+        ActionOutput {
+            status: "completed".into(),
+            session_id: "fixture".into(),
+            request_id: Some("final-upload-request".into()),
+            exit_code: Some(0),
+            summary: "Agent completed upload".into(),
+            approval_id: None,
+            sha256: Some("hash".into()),
+            details,
+        }
+    }
+
+    #[test]
+    fn upload_final_response_retains_agent_path_through_mcp_json_serialization() {
+        let session_id = SessionId::new();
+        let absolute = r"C:\现场 Agent\transfer\中文 工具.txt";
+        let response = remoteops_protocol::RemoteResponse {
+            request_id: RequestId::new(),
+            session_id,
+            exit_code: Some(0),
+            summary: "已完成上传".into(),
+            error_code: None,
+            payload_base64: None,
+            sha256: Some("hash".into()),
+            details: Some(serde_json::json!({
+                "remote_absolute_path": absolute,
+                "agent_transfer_root": r"C:\现场 Agent\transfer",
+                "remote_path": "中文 工具.txt",
+                "size": 42,
+                "sha256": "hash",
+            })),
+        };
+        let decoded = serde_json::from_slice::<remoteops_protocol::RemoteResponse>(
+            &serde_json::to_vec(&response).unwrap(),
+        )
+        .unwrap();
+        let output = upload_receipt_output(
+            action_output(session_id, OperationResult { response: decoded }),
+            42,
+            "hash".into(),
+            Path::new("D:/MCP 本地 transfer"),
+        );
+        let direct = serde_json::to_value(output).unwrap();
+        assert_eq!(direct["status"], "completed");
+        assert!(direct["summary"].as_str().unwrap().contains(absolute));
+        assert_eq!(direct["details"]["remote_absolute_path"], absolute);
+        assert_eq!(
+            direct["details"]["agent_transfer_root"],
+            r"C:\现场 Agent\transfer"
+        );
+        assert_eq!(direct["details"]["agent_path_status"], "reported");
+        assert_eq!(
+            direct["details"]["local_transfer_root"],
+            "D:/MCP 本地 transfer"
+        );
+        assert_eq!(direct["details"]["sha256"], "hash");
+    }
+
+    #[test]
+    fn agent_absolute_path_recognition_is_independent_of_controller_os() {
+        for path in [
+            "/var/现场 transfer/中文工具.txt",
+            r"C:\现场 transfer\中文工具.txt",
+            "D:/现场 transfer/中文工具.txt",
+            r"\\server\share\中文工具.txt",
+            r"\\?\C:\现场 transfer\中文工具.txt",
+            r"\\?\UNC\server\share\中文工具.txt",
+        ] {
+            assert!(is_reported_agent_absolute_path(path), "{path:?}");
+        }
+        for path in [
+            "",
+            " ",
+            "中文工具.txt",
+            "folder/中文工具.txt",
+            r"C:中文工具.txt",
+            r"\current-drive-relative.txt",
+            r"\\server",
+            r"\\.\PhysicalDrive0",
+            "https://example.test/tool.txt",
+            "C:/transfer/tool.txt\n伪造状态",
+            "C:/transfer/\0tool.txt",
+        ] {
+            assert!(!is_reported_agent_absolute_path(path), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn upload_legacy_or_unusable_paths_are_explicitly_unknown_without_local_guessing() {
+        for details in [
+            None,
+            Some(serde_json::json!({"size": 42})),
+            Some(serde_json::json!({"size": 42, "sha256": null})),
+            Some(serde_json::json!({"remote_absolute_path": ""})),
+            Some(serde_json::json!({"remote_absolute_path": "  "})),
+            Some(serde_json::json!({"remote_absolute_path": "中文工具.txt"})),
+            Some(serde_json::json!({"remote_absolute_path": "C:relative.txt"})),
+            Some(serde_json::json!({"remote_absolute_path": null})),
+            Some(serde_json::json!(["legacy", "details"])),
+        ] {
+            let original = details.clone();
+            let output = upload_receipt_output(
+                upload_test_output(details),
+                42,
+                "hash".into(),
+                Path::new("D:/MCP local only"),
+            );
+            assert_eq!(output.status, "completed");
+            assert!(output.summary.contains("未返回可用的实际绝对路径"));
+            assert!(!output.summary.contains("D:/MCP"));
+            let details = output.details.unwrap();
+            assert_eq!(details["agent_path_status"], "unknown");
+            assert!(details.get("agent_transfer_root").is_none());
+            if let Some(original) = original {
+                if original.is_array() {
+                    assert_eq!(details["agent_details"], original);
+                } else if let Some(path) = original.get("remote_absolute_path") {
+                    // 保留异常回执供诊断，但绝不把它标为已确认绝对路径。
+                    assert_eq!(&details["remote_absolute_path"], path);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upload_pending_or_failed_receipts_are_not_decorated_as_completed_uploads() {
+        for status in ["unknown", "failed", "approval_required"] {
+            let mut output = upload_test_output(Some(serde_json::json!({
+                "offset": 0, "next_offset": 42,
+            })));
+            status.clone_into(&mut output.status);
+            let before = serde_json::to_value(&output).unwrap();
+            let after = upload_receipt_output(output, 42, "hash".into(), Path::new("local"));
+            assert_eq!(serde_json::to_value(after).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn upload_conflicting_agent_detail_hash_is_not_silently_overwritten() {
+        for wrong in [serde_json::json!("other"), serde_json::json!(42)] {
+            let output = upload_receipt_output(
+                upload_test_output(Some(serde_json::json!({
+                    "remote_absolute_path": "C:/Agent transfer/tool.exe",
+                    "size": 42,
+                    "sha256": wrong,
+                }))),
+                42,
+                "hash".into(),
+                Path::new("local"),
+            );
+            assert_eq!(output.status, "failed");
+            assert!(output.summary.contains("回执中的 SHA-256"));
+            assert_eq!(output.details.unwrap()["sha256"], wrong);
+        }
+    }
+
+    #[test]
+    fn ssh_guidance_is_explicit_and_does_not_infer_a_legacy_executable() {
+        let old = ssh_trust_guidance(None, "127.0.0.1", 2222);
+        assert_eq!(old["status"], "unavailable");
+        assert!(old.get("executable").is_none());
+        let current = ssh_trust_guidance(Some("C:/程序 带空格/native-core.exe"), "127.0.0.1", 2222);
+        assert_eq!(current["automatic_trust"], false);
+        assert_eq!(current["scan_arguments"][1], "127.0.0.1");
+        assert_eq!(current["scan_arguments"][2], "2222");
+    }
+
+    #[test]
     fn transfer_schemas_distinguish_controller_and_agent_roots() {
         for schema in [
             serde_json::to_value(schemars::schema_for!(UploadInput)).unwrap(),
@@ -5154,9 +5611,12 @@ mod tests {
             .unwrap();
         assert!(description.contains("MCP 本地"));
         assert!(description.contains("不是 Agent"));
+        assert!(schema["properties"].get("agent_transfer_root").is_some());
+        assert!(schema["properties"].get("local_transfer_root").is_some());
         assert!(
-            schema["properties"].get("remote_transfer_root").is_none(),
-            "本轮不扩展远端协议或修改输出字段"
+            schema["properties"]
+                .get("agent_transfer_root_status")
+                .is_some()
         );
     }
 

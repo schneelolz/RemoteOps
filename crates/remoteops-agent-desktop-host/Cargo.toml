@@ -1,0 +1,26 @@
+[package]
+name = "remoteops-agent-desktop-host"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "RemoteOps Win32 桌面产品宿主"
+
+[features]
+default = ["agent-runtime"]
+agent-runtime = ["dep:remoteops-agent", "dep:remoteops-product", "dep:remoteops-domain", "dep:remoteops-protocol", "dep:chrono", "dep:tempfile", "dep:tokio"]
+
+[dependencies]
+serde.workspace = true
+remoteops-agent = { path = "../../apps/remoteops-agent", optional = true }
+remoteops-product = { path = "../remoteops-product", optional = true }
+remoteops-domain = { path = "../remoteops-domain", optional = true }
+remoteops-protocol = { path = "../remoteops-protocol", optional = true }
+chrono = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+serde_json.workspace = true
+
+[lints]
+workspace = true

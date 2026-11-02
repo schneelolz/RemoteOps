@@ -91,6 +91,8 @@ remoteops-build = { git = "https://github.com/schneelolz/RemoteOps.git", rev = "
 
 不要混用 tag、branch、不同 URL 或不同 rev。若产品直接依赖 domain、protocol 等公共包，也使用完全相同来源；通过 `cargo tree -d` 和集成测试检查类型来源。依赖内部的路径包由同一 Git checkout 提供。维护产品自己的 Cargo.lock、工具链、目标平台、链接器和构建设置，升级通常只调整 rev 与锁文件并重新验证。
 
+Cargo 构建 profile 由调用构建的工作区根控制。薄产品拥有独立 `[workspace]`，不会继承 RemoteOps 根工作区的 `release-small`；仅更新依赖 rev 不会自动启用该体积优化配置。需要采用时，由产品在自己的工作区定义并显式选择相应 profile，同时保留 `panic = "unwind"`、Windows 静态 CRT 和路径重映射，并重新验证产品资源、GUI/CLI 与 DX12/Glow 兼容。
+
 启动时 `ProductProfile.version` 由产品包 `env!("CARGO_PKG_VERSION")` 提供。库内同名宏表示底座包版本，不能用作产品版本。公共 GUI 在首次启动和运行中切换语言时统一生成窗口标题：`<当前语言的产品名称> v<ProductProfile.version>`。通用版传入自身 GUI 包版本，外部产品传入自己的产品包版本；版本为空或只有空白时仅显示名称，不回填底座版本。产品文案只提供名称，不应自行再拼接版本。编译时在产品 `build.rs` 调用资源工具，图标路径从**产品自身** `CARGO_MANIFEST_DIR` 构造，设置 `binary_name` 与产品资源信息。工具只链接到指定二进制，不向依赖者传递底座的图标资源。不得复制仓库资源脚本。
 
 库依赖不会交付 CLI、服务、SSH 密码窗口、凭据窗口等伴随程序。由独立发布步骤从同一个审核 rev 构建所需程序，或取得明确记录源码提交和协议版本的兼容发布产物，并验 SHA-256。构建清单应读取实际依赖 `build_info`/Cargo metadata 和实际产物版本，不能手填陈旧协议号。源码归档无法确定 Git 来源时明确报告 `unknown`，不可伪造提交。未提交源码会标记 dirty，不能当作可固定的发布 rev。

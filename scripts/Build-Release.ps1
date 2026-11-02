@@ -2,14 +2,49 @@
 param(
     [string]$OutputRoot,
     [switch]$SkipLinux,
-    [switch]$CleanLegacyArtifacts
+    [switch]$CleanLegacyArtifacts,
+    [string]$PlinkSourcePath = 'D:\Tools\putty\PLINK.EXE',
+    [switch]$IncludeNativePreview
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($CleanLegacyArtifacts) {
+    throw '为保留旧版，本发布流程不再自动清理旧交付；请使用新的 -OutputRoot 路径。'
+}
 
 $workspaceRoot = Split-Path -Parent $PSScriptRoot
 $artifactsRoot = Join-Path $workspaceRoot 'artifacts'
+
+function Assert-NewReleaseDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force
+        if (-not $item.PSIsContainer -or
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+            @(Get-ChildItem -LiteralPath $Path -Force).Count -gt 0) {
+            throw '发布目录已存在且非空、不是目录或为链接；保留旧交付，请使用新的 -OutputRoot 路径。'
+        }
+    }
+    for ($ancestor = Split-Path -Parent $Path; -not [string]::IsNullOrEmpty($ancestor); $ancestor = Split-Path -Parent $ancestor) {
+        if ((Test-Path -LiteralPath $ancestor) -and
+            ((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw '发布目录父路径含重解析点，请使用新的普通目录。'
+        }
+    }
+}
+
+# 显式路径先做只读保护检查，不启动构建，也不删除任何已有文件。
+if (-not [string]::IsNullOrWhiteSpace($OutputRoot)) {
+    $requestedOutput = [IO.Path]::GetFullPath($OutputRoot)
+    Assert-NewReleaseDirectory -Path $requestedOutput
+    if (-not $requestedOutput.StartsWith(
+            [IO.Path]::GetFullPath($artifactsRoot) + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw '统一发布目录必须位于 artifacts 下。'
+    }
+}
 
 Push-Location $workspaceRoot
 try {
@@ -43,9 +78,7 @@ if (-not $resolvedReleaseRoot.StartsWith(
     throw '统一发布目录必须位于 artifacts 下。'
 }
 
-if (Test-Path -LiteralPath $resolvedReleaseRoot) {
-    Remove-Item -LiteralPath $resolvedReleaseRoot -Recurse -Force
-}
+Assert-NewReleaseDirectory -Path $resolvedReleaseRoot
 
 $windowsOutput = Join-Path $resolvedReleaseRoot 'windows-x64'
 $linuxOutput = Join-Path $resolvedReleaseRoot 'linux-x64'
@@ -53,7 +86,9 @@ $mcpOutput = Join-Path $resolvedReleaseRoot 'mcp'
 New-Item -ItemType Directory -Force -Path $resolvedReleaseRoot | Out-Null
 
 & (Join-Path $PSScriptRoot 'Build-Windows.ps1') `
-    -OutputDirectory $windowsOutput
+    -OutputDirectory $windowsOutput `
+    -PlinkSourcePath $PlinkSourcePath `
+    -IncludeNativePreview:$IncludeNativePreview
 if ($LASTEXITCODE -ne 0) {
     throw 'Windows 发布构建失败。'
 }
@@ -110,25 +145,6 @@ $checksumLines = Get-ChildItem -LiteralPath $resolvedReleaseRoot -Recurse -File 
     $checksumLines,
     [Text.UTF8Encoding]::new($false)
 )
-
-if ($CleanLegacyArtifacts) {
-    foreach ($legacyName in @('windows-x64', 'linux-x64', 'packages')) {
-        $legacyPath = [IO.Path]::GetFullPath((Join-Path $resolvedArtifactsRoot $legacyName))
-        if (
-            $legacyPath.StartsWith(
-                $resolvedArtifactsRoot + [IO.Path]::DirectorySeparatorChar,
-                [StringComparison]::OrdinalIgnoreCase
-            ) -and
-            -not $legacyPath.StartsWith(
-                $resolvedReleaseRoot + [IO.Path]::DirectorySeparatorChar,
-                [StringComparison]::OrdinalIgnoreCase
-            ) -and
-            (Test-Path -LiteralPath $legacyPath)
-        ) {
-            Remove-Item -LiteralPath $legacyPath -Recurse -Force
-        }
-    }
-}
 
 Write-Host "统一发布目录：$resolvedReleaseRoot"
 Write-Host "正式版本：$releaseVersion"
