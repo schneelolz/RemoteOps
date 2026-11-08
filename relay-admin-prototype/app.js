@@ -10,7 +10,7 @@ const state = {
   agentKeyword: '',
   agentStatus: 'ALL',
   shutdownBusy: false,
-  currentTab: 'overview', // 'overview', 'sessions', 'agents', 'mcp', 'identity', 'settings', 'audit'
+  currentTab: 'overview', // 'overview', 'sessions', 'agents', 'mcp', 'tools', 'identity', 'settings', 'audit'
   isLoggedIn: false,
   demoMode: false,
   adminUser: '',
@@ -606,11 +606,12 @@ async function restoreSession() {
     await refreshRealData();
     state.isLoggedIn = true;
     const hashMatch = window.location.hash.match(/tab=([a-z]+)/);
-    if (hashMatch && ['overview', 'sessions', 'agents', 'mcp', 'identity', 'settings', 'audit'].includes(hashMatch[1])) {
+    if (hashMatch && ['overview', 'sessions', 'agents', 'mcp', 'tools', 'identity', 'settings', 'audit'].includes(hashMatch[1])) {
       state.currentTab = hashMatch[1];
     }
     renderApp();
     if (state.currentTab === 'mcp') void refreshMcpData();
+    if (state.currentTab === 'tools') void refreshToolsData();
     return;
   }
 
@@ -622,7 +623,7 @@ async function restoreSession() {
     await refreshRealData();
     state.isLoggedIn = true;
     const hashMatch = window.location.hash.match(/tab=([a-z]+)/);
-    if (hashMatch && ['overview', 'sessions', 'agents', 'mcp', 'identity', 'settings', 'audit'].includes(hashMatch[1])) {
+    if (hashMatch && ['overview', 'sessions', 'agents', 'mcp', 'tools', 'identity', 'settings', 'audit'].includes(hashMatch[1])) {
       state.currentTab = hashMatch[1];
     }
   } catch (_) {
@@ -631,6 +632,7 @@ async function restoreSession() {
   }
   renderApp();
   if (state.isLoggedIn && state.currentTab === 'mcp') void refreshMcpData();
+  if (state.isLoggedIn && state.currentTab === 'tools') void refreshToolsData();
 }
 
 async function handleManualRefresh() {
@@ -639,6 +641,7 @@ async function handleManualRefresh() {
   try {
     await refreshRealData();
     if (state.currentTab === 'mcp' && !await refreshMcpData()) return;
+    if (state.currentTab === 'tools' && !await refreshToolsData()) return;
     showToast('控制台数据已刷新', 'success');
   } catch (error) {
     showToast(`刷新失败：${error.message}`, 'error');
@@ -704,12 +707,14 @@ function renderThemePicker() {
 }
 
 function navigateTo(tabName, updateHistory = true) {
-  if (!['overview', 'sessions', 'agents', 'mcp', 'identity', 'settings', 'audit'].includes(tabName)) return;
+  if (!['overview', 'sessions', 'agents', 'mcp', 'tools', 'identity', 'settings', 'audit'].includes(tabName)) return;
   invalidateMcpView();
+  invalidateToolsView();
   state.currentTab = tabName;
   if (updateHistory) window.history.replaceState(null, '', `#tab=${tabName}`);
   renderApp();
   if (tabName === 'mcp' && state.isLoggedIn) void refreshMcpData();
+  if (tabName === 'tools' && state.isLoggedIn) void refreshToolsData();
 }
 
 function enterDemoMode() {
@@ -728,6 +733,7 @@ async function logout() {
   const wasDemoMode = state.demoMode;
   // Clear transient setup credentials before waiting for the logout network request.
   invalidateMcpView(true);
+  invalidateToolsView();
   state.isLoggedIn = false;
   state.activeModal = null;
   state.modalTargetData = null;
@@ -788,7 +794,7 @@ function closeSessionDrawer() {
 
 // Modal Controls
 function openModal(modalName, data = null) {
-  if (state.shutdownBusy) return;
+  if (state.shutdownBusy || state.toolCenter?.busy) return;
   clearMcpSecret();
   if (modalName === 'shutdownAgent') {
     const agent = agents.find(item => item.id === data?.id);
@@ -1021,6 +1027,7 @@ function renderSidebar() {
     { id: 'sessions', name: '会话管理', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>', badge: activeCount },
     { id: 'agents', name: 'Agent 节点', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>', badge: agentCount },
     { id: 'mcp', name: 'MCP 客户端接入', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="12" rx="2"/><path d="M8 21h8M12 15v6M8 8h8M12 5v6"/></svg>' },
+    { id: 'tools', name: '工具中心', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m12 3 9 5-9 5-9-5 9-5zM3 8v9l9 5 9-5V8M12 13v9"/></svg>' },
     { id: 'identity', name: 'Relay 身份凭据', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="11" r="3"/></svg>' },
     { id: 'settings', name: '安全设置', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-1.9 1.9-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V20h-2.7v-.09a1.7 1.7 0 0 0-1.03-1.56 1.7 1.7 0 0 0-1.88.34l-.06.06-1.9-1.9.06-.06A1.7 1.7 0 0 0 7.76 15a1.7 1.7 0 0 0-1.56-1.03H6v-2.7h.2A1.7 1.7 0 0 0 7.76 10a1.7 1.7 0 0 0-.34-1.88l-.06-.06 1.9-1.9.06.06a1.7 1.7 0 0 0 1.88.34 1.7 1.7 0 0 0 1.03-1.56V5h2.7v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 1.9 1.9-.06.06A1.7 1.7 0 0 0 19.4 10c.18.62.75 1.03 1.4 1.03h.2v2.7h-.2A1.7 1.7 0 0 0 19.4 15z"/></svg>' },
     { id: 'audit', name: '审计日志', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>', badge: auditCount }
@@ -1765,7 +1772,7 @@ async function refreshMcpData() {
     }));
     state.mcp.clients = (Array.isArray(clients) ? clients : []).map(item => ({
       installation_id: String(item.installation_id), client_name: item.client_name,
-      created_at: item.created_at, last_seen: item.last_seen, revoked: Boolean(item.revoked)
+      created_at: item.created_at, last_seen: item.last_seen, revoked: Boolean(item.revoked), tool_management: item.tool_management === true
     }));
     state.mcp.loaded = true;
     return true;
@@ -2030,8 +2037,8 @@ function renderMcpView() {
       <p class="mcp-table-note">这里只保留状态与标识，不可重新查看或下载历史设置代码。已注册客户端的凭据请在下方单独撤销。</p>
     </section>
     <section class="table-container" aria-labelledby="mcp-clients-title">
-      <div class="table-header-bar"><div><h2 class="table-title" id="mcp-clients-title">3. 已注册客户端</h2><p class="section-desc mcp-table-desc">每台安装实例拥有独立凭据，可分别改名或撤销；修改名称会同步关联设置，不影响凭据。“最后在线”为空表示还没有客户端连接记录。</p></div></div>
-      ${mcp.clients.length ? `<div class="table-wrapper"><table class="ops-table mcp-table"><thead><tr><th>客户端 / 安装实例</th><th>凭据状态</th><th>注册时间</th><th>最后在线</th><th>操作</th></tr></thead><tbody>${mcp.clients.map(item => `<tr><td><div class="table-primary-text">${escapeHtml(item.client_name || '未命名客户端')}</div><div class="font-mono table-secondary-text">${escapeHtml(item.installation_id)}</div></td><td>${item.revoked ? mcpStateBadge('revoked') : '<span class="badge badge-online"><span class="badge-dot"></span>凭据有效</span>'}</td><td>${escapeHtml(formatApiDate(item.created_at))}</td><td>${escapeHtml(item.last_seen ? formatApiDate(item.last_seen) : '尚未连接')}</td><td><button class="btn btn-secondary btn-sm" ${state.demoMode || mcp.renaming.has(`clients:${item.installation_id}`) ? 'disabled' : ''} onclick="openMcpRename('clients', ${eventValue(item.installation_id)})">修改名称</button> <button class="btn btn-secondary btn-sm" ${state.demoMode || item.revoked || mcp.revoking.has(`clients:${item.installation_id}`) ? 'disabled' : ''} onclick="openMcpRevoke('clients', ${eventValue(item.installation_id)})">撤销客户端</button></td></tr>`).join('')}</tbody></table></div>` : renderEmptyState('暂无已注册客户端', '目标客户端首次兑换设置后，将出现在这里。')}
+      <div class="table-header-bar"><div><h2 class="table-title" id="mcp-clients-title">3. 已注册客户端</h2><p class="section-desc mcp-table-desc">新安装默认普通使用。授予工具管理权后，可上传、登记、修改及启停工具；与现场完全控制独立。权限绑定安装身份，共用安装凭据的宿主共用权限。旧共享 Token 无管理权。可分别改名或撤销凭据；“最后在线”为空表示尚无连接记录。</p></div></div>
+      ${mcp.clients.length ? `<div class="table-wrapper"><table class="ops-table mcp-table mcp-clients-table"><thead><tr><th>客户端 / 安装实例</th><th>凭据状态</th><th>使用与管理权限</th><th>注册时间</th><th>最后在线</th><th>操作</th></tr></thead><tbody>${mcp.clients.map(item => `<tr><td><div class="table-primary-text">${escapeHtml(item.client_name || '未命名客户端')}</div><div class="font-mono table-secondary-text">${escapeHtml(item.installation_id)}</div></td><td>${item.revoked ? mcpStateBadge('revoked') : '<span class="badge badge-online"><span class="badge-dot"></span>凭据有效</span>'}</td><td><div class="table-primary-text">${item.tool_management ? '普通使用＋工具管理' : '普通使用'}</div><label class="tool-permission"><input type="checkbox" aria-label="${escapeHtml(item.client_name || '未命名客户端')}的工具管理权限" ${item.tool_management ? 'checked' : ''} ${state.demoMode || item.revoked || state.mcp.revoking.has(`permission:${item.installation_id}`) ? 'disabled' : ''} onchange="saveToolManagementPermission(${eventValue(item.installation_id)}, this.checked)" /> ${item.tool_management ? '已授予' : '未授予'}</label></td><td>${escapeHtml(formatApiDate(item.created_at))}</td><td>${escapeHtml(item.last_seen ? formatApiDate(item.last_seen) : '尚未连接')}</td><td><button class="btn btn-secondary btn-sm" ${state.demoMode || mcp.renaming.has(`clients:${item.installation_id}`) ? 'disabled' : ''} onclick="openMcpRename('clients', ${eventValue(item.installation_id)})">修改名称</button> <button class="btn btn-secondary btn-sm" ${state.demoMode || item.revoked || mcp.revoking.has(`clients:${item.installation_id}`) ? 'disabled' : ''} onclick="openMcpRevoke('clients', ${eventValue(item.installation_id)})">撤销客户端</button></td></tr>`).join('')}</tbody></table></div>` : renderEmptyState('暂无已注册客户端', '目标客户端首次兑换设置后，将出现在这里。')}
     </section>
   </div>`;
 }
@@ -2898,7 +2905,9 @@ function renderModal() {
 
   let modalContent = '';
 
-  if (['mcpCreate', 'mcpFresh', 'mcpRevoke', 'mcpRename', 'mcpLegacyDisable'].includes(mType)) {
+  if (mType.startsWith('toolCenter')) {
+    modalContent = renderToolCenterModal();
+  } else if (['mcpCreate', 'mcpFresh', 'mcpRevoke', 'mcpRename', 'mcpLegacyDisable'].includes(mType)) {
     modalContent = renderMcpModal();
   } else if (mType === 'terminateSession') {
     modalContent = `
@@ -3072,6 +3081,7 @@ function renderApp() {
     case 'sessions': contentHtml = renderSessionsView(); break;
     case 'agents': contentHtml = renderAgentsView(); break;
     case 'mcp': contentHtml = renderMcpView(); break;
+    case 'tools': contentHtml = renderToolsView(); break;
     case 'identity': contentHtml = renderIdentityView(); break;
     case 'settings': contentHtml = renderSettingsView(); break;
     case 'audit': contentHtml = renderAuditView(); break;
@@ -3125,10 +3135,11 @@ document.addEventListener('DOMContentLoaded', () => {
 // Browser history navigation must discard a fresh setup just like sidebar navigation.
 window.addEventListener?.('hashchange', () => {
   const match = window.location.hash.match(/^#tab=([a-z]+)$/);
-  const tab = match && ['overview', 'sessions', 'agents', 'mcp', 'identity', 'settings', 'audit'].includes(match[1]) ? match[1] : 'overview';
+  const tab = match && ['overview', 'sessions', 'agents', 'mcp', 'tools', 'identity', 'settings', 'audit'].includes(match[1]) ? match[1] : 'overview';
   if (state.isLoggedIn) navigateTo(tab, false);
 });
-window.addEventListener?.('pagehide', () => { invalidateMcpView(true); });
+window.addEventListener?.('pagehide', () => { invalidateMcpView(true); invalidateToolsView(); });
 window.addEventListener?.('pageshow', event => {
   if (event.persisted && state.isLoggedIn && state.currentTab === 'mcp') void refreshMcpData();
+  if (event.persisted && state.isLoggedIn && state.currentTab === 'tools') void refreshToolsData();
 });

@@ -23,7 +23,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const APPLICATION_ID: i64 = 0x524f_454e;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const GRANT_DOMAIN: &[u8] = b"remoteops-setup-grant-v1\0";
 const INSTALLATION_DOMAIN: &[u8] = b"remoteops-installation-v1\0";
 
@@ -59,6 +59,8 @@ pub type Error = StoreError;
 pub struct AuthenticatedInstallation {
     pub installation_id: Uuid,
     pub owner_id: ControllerOwnerId,
+    /// 当前安装实例的工具管理授权；每次管理操作仍须重新读取。
+    pub tool_management: bool,
 }
 
 /// `SQLite`-backed enrollment authority. Independent processes coordinate through
@@ -135,6 +137,11 @@ impl EnrollmentStore {
                 [owner_id.to_string()],
             )?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if application == APPLICATION_ID && version == 1 {
+            transaction.execute_batch(
+                "ALTER TABLE enrollment_clients ADD COLUMN tool_management INTEGER NOT NULL DEFAULT 0 CHECK (tool_management IN (0, 1));",
+            )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if application != APPLICATION_ID || version != SCHEMA_VERSION {
             return Err(corrupt("unsupported enrollment database schema"));
@@ -519,7 +526,43 @@ impl EnrollmentStore {
         Ok(AuthenticatedInstallation {
             installation_id,
             owner_id: self.owner_id,
+            tool_management: client.tool_management,
         })
+    }
+
+    /// 单独授予或撤销安装实例的工具管理权限，不改变远程控制权限。
+    ///
+    /// # Errors
+    /// 安装实例不存在、已撤销或存储不可用时拒绝。
+    pub fn set_tool_management(
+        &self,
+        installation_id: Uuid,
+        enabled: bool,
+    ) -> Result<bool, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let client =
+            read_client(&transaction, installation_id)?.ok_or(StoreError::InvalidCredential)?;
+        if client.revoked {
+            return Err(StoreError::Revoked);
+        }
+        let changed = client.tool_management != enabled;
+        transaction.execute(
+            "UPDATE enrollment_clients SET tool_management = ?1 WHERE installation_id = ?2",
+            params![enabled, installation_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// 读取当前工具管理授权；未知或已撤销的安装实例始终没有权限。
+    ///
+    /// # Errors
+    /// 存储不可用或记录损坏时拒绝。
+    pub fn has_tool_management(&self, installation_id: Uuid) -> Result<bool, StoreError> {
+        let connection = self.connection()?;
+        Ok(read_client(&connection, installation_id)?
+            .is_some_and(|client| !client.revoked && client.tool_management))
     }
 
     /// Lists client metadata only, never credential hashes or tokens.
@@ -539,6 +582,7 @@ impl EnrollmentStore {
                 created_at: client.created_at,
                 last_seen: client.last_seen,
                 revoked: client.revoked,
+                tool_management: client.tool_management,
             })
         })
         .collect()
@@ -553,7 +597,8 @@ CREATE TABLE enrollment_settings (
 CREATE TABLE enrollment_clients (
     installation_id TEXT PRIMARY KEY, secret_hash BLOB NOT NULL CHECK (length(secret_hash) = 32),
     client_name TEXT, created_at TEXT NOT NULL, last_seen TEXT,
-    revoked INTEGER NOT NULL CHECK (revoked IN (0, 1))
+    revoked INTEGER NOT NULL CHECK (revoked IN (0, 1)),
+    tool_management INTEGER NOT NULL DEFAULT 0 CHECK (tool_management IN (0, 1))
 ) STRICT;
 CREATE TABLE enrollment_grants (
     grant_id TEXT PRIMARY KEY, secret_hash BLOB NOT NULL CHECK (length(secret_hash) = 32),
@@ -566,7 +611,7 @@ CREATE TABLE enrollment_grants (
 const GRANT_SELECT: &str = "SELECT grant_id, secret_hash, client_name, created_at, expires_at,
     revoked, endpoints_json, installation_id, response_json FROM enrollment_grants";
 const CLIENT_SELECT: &str = "SELECT installation_id, secret_hash, client_name, created_at,
-    last_seen, revoked FROM enrollment_clients";
+    last_seen, revoked, tool_management FROM enrollment_clients";
 
 fn create_private_database_file(path: &Path) -> Result<(), StoreError> {
     let mut options = OpenOptions::new();
@@ -823,6 +868,7 @@ struct ClientRecord {
     created_at: String,
     last_seen: Option<String>,
     revoked: i64,
+    tool_management: i64,
 }
 
 struct ValidatedClient {
@@ -832,6 +878,7 @@ struct ValidatedClient {
     created_at: DateTime<Utc>,
     last_seen: Option<DateTime<Utc>>,
     revoked: bool,
+    tool_management: bool,
 }
 
 impl ClientRecord {
@@ -843,6 +890,7 @@ impl ClientRecord {
             created_at: row.get(3)?,
             last_seen: row.get(4)?,
             revoked: row.get(5)?,
+            tool_management: row.get(6)?,
         })
     }
 
@@ -856,6 +904,7 @@ impl ClientRecord {
             created_at: parse_timestamp(&self.created_at)?,
             last_seen: self.last_seen.as_deref().map(parse_timestamp).transpose()?,
             revoked: stored_bool(self.revoked)?,
+            tool_management: stored_bool(self.tool_management)?,
         })
     }
 }

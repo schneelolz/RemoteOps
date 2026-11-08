@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-agent"
-version = "0.2.0-preview.30"
+version = "0.2.0-preview.36"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,7 @@ OriginalFilename = "remoteops-agent.exe"
 LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [dependencies]
+remoteops-resources = { path = "../../crates/remoteops-resources" }
 remoteops-product = { path = "../../crates/remoteops-product" }
 remoteops-native-host = { path = "../../crates/remoteops-native-host" }
 tempfile = "3"

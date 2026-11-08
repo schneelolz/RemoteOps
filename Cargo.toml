@@ -12,6 +12,8 @@ members = [
     "crates/remoteops-policy",
     "crates/remoteops-audit",
     "crates/remoteops-device",
+    "crates/remoteops-resources",
+    "crates/remoteops-tool-center",
     "crates/remoteops-application",
     "crates/remoteops-ai",
     "crates/remoteops-i18n",

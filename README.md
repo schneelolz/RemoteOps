@@ -79,6 +79,8 @@ Relay 需要 Linux x64、Docker 和一个 Agent 与工程师本机都能访问�
 
 ```bash
 cp deploy/relay/.env.example deploy/relay/.env
+npm --prefix relay-admin ci --ignore-scripts
+npm --prefix relay-admin run build
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml config --quiet
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml up -d --build
 curl --fail http://127.0.0.1:18080/health
@@ -183,3 +185,5 @@ python3 scripts/Test-LinuxAgentE2E.py --output artifacts/acceptance/linux-e2e.js
 ## 许可证
 
 RemoteOps 使用 [AGPL-3.0-only](LICENSE)。项目保持自托管和供应商中立；接入第三方 AI 或 Visual Provider 时，请单独核对其许可证和商用限制。
+
+管理控制台已独立为 Vue 前端，前后端构建、发布与回退说明见 [独立前端部署](deploy/relay-admin/README.md) 和 [preview.17 交付记录](docs/relay-admin-split-preview17.md)。

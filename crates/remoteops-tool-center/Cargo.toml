@@ -1,0 +1,36 @@
+[package]
+name = "remoteops-tool-center"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[features]
+json-schema = ["dep:schemars", "remoteops-resources/json-schema"]
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+remoteops-resources = { path = "../remoteops-resources" }
+reqwest.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+schemars = { version = "1.0", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rcgen = "0.14"
+tokio-rustls.workspace = true
+zip = { version = "4.6", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

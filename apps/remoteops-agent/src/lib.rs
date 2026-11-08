@@ -21,12 +21,15 @@ pub use observation::{BoundedAgentEventReceiver, BoundedAgentEventSender, bounde
 mod product;
 mod runtime;
 mod ssh_trust_cli;
+mod tool_transport;
 pub use console::{run_product_console, run_product_console_with_tools};
 pub use remoteops_device::{BundledToolPaths, BundledTools, EmbeddedTool};
 pub use remoteops_domain::AgentRunMode;
 pub use remoteops_product::{EndpointPolicy, ProductProfile};
-pub use runtime::{AgentCapabilityPolicy, AgentRuntimeOptions, VisualProviderFactory};
-pub use ssh_trust_cli::handle_ssh_trust_cli;
+pub use runtime::{
+    AgentCapabilityPolicy, AgentRuntimeOptions, AgentUiLanguage, VisualProviderFactory,
+};
+pub use ssh_trust_cli::{handle_ssh_trust_cli, handle_ssh_trust_cli_with_tools};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -106,6 +109,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 可以安全写入普通 JSON 文件的 Agent 配置。
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AgentFileConfig {
+    /// 本地显式配置的资源仓库与 HTTPS 下载来源；缺省关闭。
+    #[serde(default)]
+    pub resource_tools: remoteops_resources::ResourceConfig,
     /// 新绑定的默认控制偏好；旧配置保持逐项确认。
     #[serde(default)]
     pub default_full_control: bool,
@@ -143,6 +149,8 @@ pub struct TrustedOwnerAuthorization {
 /// Agent 运行参数，由 CLI 和 GUI 共同使用。
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
+    /// 本地配置的公开工具资源；远程请求不能更改下载信任来源。
+    pub resource_tools: remoteops_resources::ResourceConfig,
     /// 新绑定是否请求现场默认完全控制。
     pub default_full_control: bool,
     /// Relay TLS 地址。
@@ -172,6 +180,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            resource_tools: remoteops_resources::ResourceConfig::default(),
             default_full_control: false,
             relay: String::new(),
             server_name: String::new(),
@@ -247,6 +256,7 @@ impl AgentConfig {
         let file_config = stored.config;
         let base_directory = path.parent().unwrap_or_else(|| Path::new("."));
         let mut config = defaults;
+        config.resource_tools = file_config.resource_tools;
         if let Some(relay) = file_config.relay {
             if relay != config.relay && file_config.server_name.is_none() {
                 config.server_name.clear();
@@ -296,7 +306,9 @@ impl AgentConfig {
     ///
     /// 当父目录无法创建、JSON 无法序列化或文件无法替换时返回错误。
     pub fn save_file(&self, path: &Path) -> anyhow::Result<()> {
+        self.resource_tools.validate()?;
         let file_config = AgentFileConfig {
+            resource_tools: self.resource_tools.clone(),
             default_full_control: self.default_full_control,
             relay: Some(self.relay.clone()),
             server_name: (!self.server_name.is_empty()).then(|| self.server_name.clone()),
@@ -326,6 +338,7 @@ impl AgentConfig {
     ///
     /// Relay 地址为空、格式无效或重试间隔为零时返回错误。
     pub fn normalize_and_validate(mut self) -> anyhow::Result<Self> {
+        self.resource_tools.validate()?;
         self.relay = self.relay.trim().to_owned();
         self.server_name = self.server_name.trim().to_owned();
         if self.relay.is_empty() {
@@ -508,6 +521,15 @@ pub enum AgentEvent {
         /// 本条是否为显示终态；标准错误输出为 false。
         terminal: bool,
     },
+    /// 已聚合的完整串口输出；累计值不依赖显示队列是否丢帧。
+    OperationOutputUpdate {
+        /// 对应的串口打开请求。
+        request_id: RequestId,
+        /// 完整、已脱敏的输出正文。
+        text: String,
+        /// 稳定显示记录及累计次数。
+        repetition: AgentOutputRepetition,
+    },
     /// 远程请求的真实执行阶段发生变化，独立于输出日志级别。
     OperationStateChanged {
         /// 对应远程请求，便于区分并发操作。
@@ -570,6 +592,8 @@ pub enum AgentPresentationRole {
     Success,
     /// 标准错误或失败结果，不据此推断任务终态。
     Error,
+    /// 同一请求的资源准备进度，界面原位更新。
+    Progress,
     /// 简短的过程说明。
     Info,
 }
@@ -587,9 +611,20 @@ pub enum AgentLogLevel {
     Info,
 }
 
+/// 本地显示旁路的重复记录标识；不进入远程线协议。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentOutputRepetition {
+    /// 进程内唯一的记录标识。
+    pub record_id: u64,
+    /// 包含首次输出的累计次数。
+    pub total: u64,
+}
+
 /// 一条供本地 GUI 展示的远程操作日志。
 #[derive(Clone, Debug)]
 pub struct AgentOperationLog {
+    /// 连续串口输出的稳定记录及累计次数；普通日志为空。
+    pub repetition: Option<AgentOutputRepetition>,
     /// 对应远程请求，便于区分并发操作。
     pub request_id: Option<RequestId>,
     /// 日志发生时间。
@@ -965,6 +1000,8 @@ struct RequestRuntimeState {
 }
 
 struct PendingTask {
+    // 外部调用取消后不能把未知远端结果解释为尚未执行。
+    resource_call: bool,
     /// 完成上传被取消时回收对应的暂存会话。
     file_transfer_id: Option<FileTransferId>,
     /// 文件请求必须与 blocking 提交协作取消，不能只 abort 外层 future。
@@ -1403,12 +1440,21 @@ async fn run_agent_with_event_sink(
     // 同一运行只使用 Device 创建并规范化后的根，后续展示不能重新按 CWD 推导。
     config.transfer_root = device.transfer_root().to_path_buf();
     let environment = detect_environment_profile(device.as_ref()).await;
-    let (boundary, visual_provider, capabilities) =
+    let (mut boundary, visual_provider, capabilities) =
         runtime::prepare(&options, &environment, runtime::native_facts()).await?;
+    let cache = config
+        .state_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("resource-cache");
+    boundary.resources = Some(Arc::new(
+        remoteops_resources::ResourceManager::new_centralized(cache)?,
+    ));
     if let Some(diagnostic) = boundary.visual_diagnostic() {
         emit_agent_event(
             event_sender.as_ref(),
             AgentEvent::OperationLog(AgentOperationLog {
+                repetition: None,
                 request_id: None,
                 occurred_at: Utc::now(),
                 level: AgentLogLevel::Info,
@@ -1636,6 +1682,8 @@ where
     }
     let (reader, mut writer) = tokio::io::split(stream);
     let (sender, mut receiver) = mpsc::unbounded_channel::<WireMessage>();
+    let tool_transport =
+        tool_transport::AgentToolTransport::attach(boundary.resources.clone(), sender.clone());
     let _ = sender.send(WireMessage::AgentPermissionModeChanged(
         AgentPermissionModeChanged {
             permission_mode: if boundary.policy.read_only() {
@@ -1732,6 +1780,11 @@ where
         };
         incoming_future = Box::pin(read_agent_frame(reader));
         match incoming {
+            Ok(
+                message @ (WireMessage::ToolCatalog { .. } | WireMessage::ToolPackageChunk { .. }),
+            ) => {
+                tool_transport.handle(message).await;
+            }
             Ok(WireMessage::ControllerBinding(mut binding)) => {
                 info!(
                     session_id = %binding.session_id,
@@ -1893,6 +1946,12 @@ where
                         )
                         .await;
                         close_file_uploads_for_session(&file_uploads, session_id).await;
+                        if let Some(resources) = &boundary.resources
+                            && let Err(error) =
+                                resources.stop_session(&session_id.to_string()).await
+                        {
+                            record_resource_cleanup_error(event_sender, &error);
+                        }
                         close_session_resources(&shell_sessions, &serial_sessions, session_id)
                             .await;
                     }
@@ -1982,11 +2041,13 @@ where
                     request_id: target_request_id,
                 } = &request.operation
                 {
-                    let cancelled_upload = tasks
+                    let (cancelled_upload, resource_call) = tasks
                         .lock()
                         .await
                         .get(target_request_id)
-                        .and_then(|task| task.file_transfer_id);
+                        .map_or((None, false), |task| {
+                            (task.file_transfer_id, task.resource_call)
+                        });
                     let outcome =
                         cancel_pending_task(&tasks, &recent_task_terminals, *target_request_id)
                             .await;
@@ -2004,16 +2065,12 @@ where
                             &request,
                             EventPayload::OperationCancelled,
                         );
-                        let _ = sender.send(WireMessage::RemoteResponse(RemoteResponse {
-                            request_id: *target_request_id,
-                            session_id: request.session_id,
-                            exit_code: None,
-                            summary: "远程请求已被人工中断".to_owned(),
-                            error_code: Some("cancelled".to_owned()),
-                            payload_base64: None,
-                            sha256: None,
-                            details: None,
-                        }));
+                        let _ =
+                            sender.send(WireMessage::RemoteResponse(cancelled_operation_response(
+                                *target_request_id,
+                                request.session_id,
+                                resource_call,
+                            )));
                     }
                     let _ = sender.send(WireMessage::RemoteResponse(RemoteResponse {
                         request_id: request.request_id,
@@ -2037,6 +2094,14 @@ where
                     abort_pending_tasks(&tasks, Some(&log_observer), "紧急停止，操作已中断").await;
                     close_agent_resources(&shell_sessions, &serial_sessions).await;
                     close_file_uploads(&file_uploads).await;
+                    let cleanup_error = if let Some(resources) = &boundary.resources {
+                        resources.stop_all().await.err()
+                    } else {
+                        None
+                    };
+                    if let Some(error) = &cleanup_error {
+                        record_resource_cleanup_error(event_sender, error);
+                    }
                     send_event(
                         &sender,
                         &sequence,
@@ -2046,12 +2111,20 @@ where
                     let _ = sender.send(WireMessage::RemoteResponse(RemoteResponse {
                         request_id: request.request_id,
                         session_id: request.session_id,
-                        exit_code: Some(0),
-                        summary: "已紧急停止全部任务并关闭 Shell、串口和文件上传资源".to_owned(),
-                        error_code: None,
+                        exit_code: cleanup_error.is_none().then_some(0),
+                        summary: cleanup_error.as_ref().map_or_else(
+                            || {
+                                "已紧急停止全部任务并关闭 Shell、串口、文件上传和资源工具"
+                                    .to_owned()
+                            },
+                            |error| error.message.clone(),
+                        ),
+                        error_code: cleanup_error.as_ref().map(|error| error.code.clone()),
                         payload_base64: None,
                         sha256: None,
-                        details: None,
+                        details: cleanup_error
+                            .as_ref()
+                            .map(|error| serde_json::json!({"code":error.code,"retry_safe":false})),
                     }));
                     continue;
                 }
@@ -2087,6 +2160,8 @@ where
                 }
                 let request_id = request.request_id;
                 let request_session_id = request.session_id;
+                let resource_call =
+                    matches!(request.operation, RemoteOperation::CallResourceTool { .. });
                 let device = device.clone();
                 let sender_clone = sender.clone();
                 let sequence_clone = sequence.clone();
@@ -2166,6 +2241,7 @@ where
                 tasks.lock().await.insert(
                     request_id,
                     PendingTask {
+                        resource_call,
                         file_transfer_id,
                         file_commit,
                         session_id: request_session_id,
@@ -2195,6 +2271,7 @@ where
             }
         }
     };
+    tool_transport.close().await;
     heartbeat_task.abort();
     if graceful_shutdown {
         drop(sender);
@@ -2207,6 +2284,11 @@ where
     // 先等待在途请求停止，再释放设备，避免重连后保留旧 sender 或重放写操作。
     close_agent_resources(&shell_sessions, &serial_sessions).await;
     close_file_uploads(&file_uploads).await;
+    if let Some(resources) = &boundary.resources
+        && let Err(error) = resources.stop_all().await
+    {
+        record_resource_cleanup_error(event_sender, &error);
+    }
     local_permission_policy.set_active_owner(None);
     emit_agent_event(
         event_sender,
@@ -2411,6 +2493,24 @@ fn verify_authorized_request(
         PolicyDecision::Deny { reason } => bail!("Agent 策略拒绝请求：{reason}"),
     }
     Ok(request)
+}
+
+// 停止路径也保留固定脱敏诊断，不能将未清理状态记为成功。
+fn record_resource_cleanup_error(
+    event_sender: Option<&AgentEventSink>,
+    error: &remoteops_resources::ResourceError,
+) {
+    warn!(code = %error.code, "资源工具临时状态清理未完成");
+    emit_agent_event(
+        event_sender,
+        AgentEvent::OperationLog(AgentOperationLog {
+            repetition: None,
+            request_id: None,
+            occurred_at: Utc::now(),
+            level: AgentLogLevel::Error,
+            message: format!("资源工具清理未完成 [{}]：{}", error.code, error.message),
+        }),
+    );
 }
 
 fn emit_controller_bindings(
@@ -2639,18 +2739,42 @@ async fn execute_request(
     final_terminal
 }
 
+fn cancelled_operation_response(
+    request_id: RequestId,
+    session_id: SessionId,
+    resource_call: bool,
+) -> RemoteResponse {
+    RemoteResponse {
+        request_id, session_id, exit_code: None,
+        summary: if resource_call { "资源调用已中断，操作可能已提交，结果未知；禁止自动重放或切换后端重试" } else { "远程请求已被人工中断" }.into(),
+        error_code: Some(if resource_call { "result_unknown" } else { "cancelled" }.into()),
+        payload_base64: None, sha256: None,
+        details: resource_call.then(|| serde_json::json!({ "execution_state":"unknown", "retry_safe":false, "operation_replay":"never_automatic", "cancelled":true })),
+    }
+}
+
 fn operation_error_response(request: &RemoteRequest, error: &anyhow::Error) -> RemoteResponse {
     let error_code = error
         .downcast_ref::<runtime::RuntimeDenied>()
         .map_or("agent_operation_failed", |denied| denied.code.as_str())
         .to_owned();
-    let details = error.downcast_ref::<ShellOperationError>().map(|error| {
+    let mut details = error.downcast_ref::<ShellOperationError>().map(|error| {
         serde_json::json!({
             "shell_id": error.shell_id.to_string(),
             "shell": format!("{:?}", error.shell),
             "shell_closed": error.shell_closed,
         })
     });
+    let error_code = if let Some(resource_error) =
+        error.downcast_ref::<remoteops_resources::ResourceError>()
+    {
+        details = Some(
+            serde_json::json!({ "code": resource_error.code, "retry_safe": resource_error.retry_safe, "operation_replay": "never_automatic", "diagnostics": resource_error.diagnostics }),
+        );
+        resource_error.code.clone()
+    } else {
+        error_code
+    };
     RemoteResponse {
         request_id: request.request_id,
         session_id: request.session_id,
@@ -2732,6 +2856,182 @@ async fn execute_operation(
         details: None,
     };
     match &request.operation {
+        RemoteOperation::ListResourceTools => {
+            let resources = runtime_state
+                .boundary
+                .resources
+                .as_ref()
+                .context("资源工具未在目标本地启用")?;
+            let (guide_markdown, tools) = resources.list_catalog().await?;
+            response.details = Some(
+                serde_json::json!({ "schema_version": 1, "guide_markdown": guide_markdown, "tools": tools.iter().map(|tool| serde_json::json!({
+                "compatible": tool.compatible(), "compatibility_reason": tool.platform_assessment().reason, "platform": tool.platform_assessment(), "tool": tool
+            })).collect::<Vec<_>>() }),
+            );
+            "资源工具候选清单".clone_into(&mut response.summary);
+        }
+        RemoteOperation::StartResourceTool {
+            tool_id,
+            version,
+            sha256,
+        }
+        | RemoteOperation::ValidateResourceTool {
+            tool_id,
+            version,
+            sha256,
+        } => {
+            let resources = runtime_state
+                .boundary
+                .resources
+                .as_ref()
+                .context("资源工具未在目标本地启用")?;
+            let event_sender = sender.clone();
+            let event_sequence = sequence.clone();
+            let progress_request = request.clone();
+            let observer = runtime_state.log_observer.clone();
+            let progress = remoteops_resources::ProgressReporter::new(tool_id.clone(), move |p| {
+                if let Some(observer) = &observer
+                    && let Ok(observer) = observer.lock()
+                {
+                    observer.resource_progress(progress_request.request_id, &p);
+                }
+                send_event(
+                    &event_sender,
+                    &event_sequence,
+                    &progress_request,
+                    EventPayload::ResourceToolProgress {
+                        tool_id: p.tool_id,
+                        stage: p.stage,
+                        completed: p.completed,
+                        total: p.total,
+                        bytes_per_second: p.bytes_per_second,
+                    },
+                );
+            });
+            response.details = Some(serde_json::to_value(
+                resources
+                    .start_with_options(
+                        &request.session_id.to_string(),
+                        tool_id,
+                        version,
+                        sha256,
+                        matches!(
+                            request.operation,
+                            RemoteOperation::ValidateResourceTool { .. }
+                        ),
+                        Some(progress),
+                    )
+                    .await?,
+            )?);
+            "资源工具实例已启动".clone_into(&mut response.summary);
+        }
+        RemoteOperation::PrepareBrowserPassword {
+            instance_id,
+            expected_origin,
+            selector,
+            username,
+        } => {
+            let resources = runtime_state
+                .boundary
+                .resources
+                .as_ref()
+                .context("资源工具未启用")?;
+            response.details = Some(
+                resources
+                    .prepare_browser_password(
+                        &request.session_id.to_string(),
+                        instance_id,
+                        expected_origin,
+                        selector,
+                        username,
+                    )
+                    .await?,
+            );
+            response.summary = "网页密码目标已核验；等待控制端本机输入".into();
+        }
+        RemoteOperation::FillBrowserPassword {
+            instance_id,
+            binding_id,
+        } => {
+            let resources = runtime_state
+                .boundary
+                .resources
+                .as_ref()
+                .context("资源工具未启用")?;
+            let encoded = request
+                .payload_base64
+                .as_deref()
+                .context("缺少网页加密凭据")?;
+            let payload: EncryptedCredentialPayload =
+                serde_json::from_slice(&BASE64.decode(encoded).context("网页凭据编码无效")?)
+                    .context("网页凭据格式无效")?;
+            {
+                let mut used = runtime_state.used_credential_envelopes.lock().await;
+                if used.len() >= MAX_RECENT_TASK_TERMINALS || !used.insert(payload.envelope_id) {
+                    bail!("网页凭据已消费或超过安全上限");
+                }
+            }
+            let context = remoteops_protocol::BrowserCredentialContext {
+                protocol_version: PROTOCOL_VERSION,
+                agent_instance_id,
+                session_id: request.session_id,
+                envelope_id: payload.envelope_id,
+                instance_id: instance_id.clone(),
+                binding_id: binding_id.clone(),
+            };
+            let password = remoteops_protocol::open_browser_credential(
+                credential_encryption,
+                &context,
+                &payload,
+            )?;
+            response.details = Some(
+                resources
+                    .fill_browser_password(
+                        &request.session_id.to_string(),
+                        instance_id,
+                        binding_id,
+                        &password,
+                    )
+                    .await?,
+            );
+            response.summary = "网页密码已填写；尚未提交登录".into();
+        }
+        RemoteOperation::CallResourceTool {
+            instance_id,
+            tool_name,
+            arguments,
+        } => {
+            if tool_name.starts_with("__remoteops_") {
+                bail!("内部秘密操作只能通过专用凭据通道调用");
+            }
+            let resources = runtime_state
+                .boundary
+                .resources
+                .as_ref()
+                .context("资源工具未在目标本地启用")?;
+            response.details = Some(
+                resources
+                    .call(
+                        &request.session_id.to_string(),
+                        instance_id,
+                        tool_name,
+                        arguments.clone(),
+                    )
+                    .await?,
+            );
+            "资源工具调用已返回；不得自动重放此操作".clone_into(&mut response.summary);
+        }
+        RemoteOperation::StopResourceTool { instance_id } => {
+            let resources = runtime_state
+                .boundary
+                .resources
+                .as_ref()
+                .context("资源工具未在目标本地启用")?;
+            resources
+                .stop(&request.session_id.to_string(), instance_id)
+                .await?;
+            "资源工具实例已停止".clone_into(&mut response.summary);
+        }
         RemoteOperation::GetTargetContext => {
             let context = runtime_target_context(runtime_state.boundary.as_ref(), device);
             response.summary = runtime_state.boundary.visual_diagnostic().map_or_else(
@@ -3225,8 +3525,8 @@ async fn execute_operation(
                 sequence.clone(),
                 request.clone(),
             );
-            let result = ssh_provider
-                .run_command_streaming(
+            let (result, execution) = ssh_provider
+                .run_command_streaming_diagnosed(
                     host,
                     *port,
                     username,
@@ -3239,7 +3539,15 @@ async fn execute_operation(
                 )
                 .await;
             let _ = output_task.await;
-            let result = result?;
+            response.details = Some(serde_json::json!({"ssh_execution": execution}));
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    response.error_code = Some("agent_operation_failed".into());
+                    response.summary = error.to_string();
+                    return Ok(response);
+                }
+            };
             response.exit_code = result.exit_code;
             let stdout = remoteops_serial::redact_serial_text(&result.stdout);
             let stderr = remoteops_serial::redact_serial_text(&result.stderr);
@@ -3465,6 +3773,11 @@ async fn execute_operation(
         }
         RemoteOperation::CloseConnection => {
             close_session_resources(shell_sessions, serial_sessions, request.session_id).await;
+            if let Some(resources) = &runtime_state.boundary.resources {
+                resources
+                    .stop_session(&request.session_id.to_string())
+                    .await?;
+            }
             response.summary.push_str("会话关闭请求已确认");
         }
         RemoteOperation::HumanTakeover => {
@@ -3591,9 +3904,17 @@ async fn decrypt_ssh_password(
         username: username.trim().to_owned(),
         command_sha256: sha256_bytes(command.as_bytes()),
     };
-    open_credential(credential_encryption, &context, &payload)
-        .map(Some)
-        .map_err(anyhow::Error::from)
+    if let Ok(password) = open_credential(credential_encryption, &context, &payload) {
+        Ok(Some(password))
+    } else {
+        let legacy = CredentialEncryptionContext {
+            protocol_version: 19,
+            ..context
+        };
+        open_credential(credential_encryption, &legacy, &payload)
+            .map(Some)
+            .map_err(anyhow::Error::from)
+    }
 }
 
 fn set_structured_inventory_response(
@@ -3744,6 +4065,7 @@ async fn abort_pending_tasks(
     };
     for (request_id, pending) in pending {
         let PendingTask {
+            resource_call: _,
             file_transfer_id: _,
             file_commit,
             session_id,
@@ -3812,6 +4134,7 @@ async fn abort_pending_tasks_for_session(
     };
     for (pending, request_id) in pending {
         let PendingTask {
+            resource_call: _,
             file_transfer_id: _,
             file_commit,
             session_id,
@@ -3862,6 +4185,7 @@ async fn cancel_pending_task(
         };
     };
     let PendingTask {
+        resource_call: _,
         file_transfer_id: _,
         file_commit,
         session_id: _,
@@ -4218,11 +4542,7 @@ async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile
     .collect();
     let ssh_executable = if cfg!(windows) { "ssh.exe" } else { "ssh" };
     let ssh_available = command_exists(ssh_executable);
-    let keyscan_available = command_exists(if cfg!(windows) {
-        "ssh-keyscan.exe"
-    } else {
-        "ssh-keyscan"
-    });
+    let keyscan_available = device.has_ssh_scanner();
 
     EnvironmentProfile {
         schema_version: remoteops_domain::ENVIRONMENT_PROFILE_SCHEMA_VERSION,
@@ -4912,6 +5232,7 @@ fn print_agent_event(event: &AgentEvent) {
         AgentEvent::ConnectionEpoch(_)
         | AgentEvent::OperationStateChanged { .. }
         | AgentEvent::OperationPresentation { .. }
+        | AgentEvent::OperationOutputUpdate { .. }
         | AgentEvent::OperationContext { .. } => {}
         AgentEvent::ScopedOperation { event, .. } => print_agent_event(event),
         AgentEvent::ControlStatePending(_) => println!("正在同步现场控制权限"),
@@ -6021,6 +6342,7 @@ mod tests {
         tasks.lock().await.insert(
             request_id,
             PendingTask {
+                resource_call: false,
                 file_transfer_id: None,
                 file_commit: None,
                 session_id: SessionId::new(),
@@ -6062,6 +6384,7 @@ mod tests {
         let tasks = Arc::new(Mutex::new(BTreeMap::from([(
             request_id,
             PendingTask {
+                resource_call: false,
                 file_transfer_id: None,
                 file_commit: Some(control),
                 session_id: SessionId::new(),
@@ -6098,6 +6421,7 @@ mod tests {
         let tasks = Arc::new(Mutex::new(BTreeMap::from([(
             request_id,
             PendingTask {
+                resource_call: false,
                 file_transfer_id: None,
                 file_commit: Some(control.clone()),
                 session_id: SessionId::new(),
@@ -6130,6 +6454,7 @@ mod tests {
         tasks.lock().await.insert(
             request_id,
             PendingTask {
+                resource_call: false,
                 file_transfer_id: None,
                 file_commit: None,
                 session_id: SessionId::new(),
@@ -6169,6 +6494,7 @@ mod tests {
             tasks.insert(
                 running_id,
                 PendingTask {
+                    resource_call: false,
                     file_transfer_id: None,
                     file_commit: None,
                     session_id: SessionId::new(),
@@ -6180,6 +6506,7 @@ mod tests {
             tasks.insert(
                 completed_id,
                 PendingTask {
+                    resource_call: false,
                     file_transfer_id: None,
                     file_commit: None,
                     session_id: SessionId::new(),
@@ -7557,7 +7884,7 @@ mod tests {
         };
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let credential_encryption = CredentialEncryptionKeyPair::generate();
-        execute_operation(
+        let response = execute_operation(
             &device,
             &ssh_provider,
             &approved,
@@ -7569,6 +7896,12 @@ mod tests {
         )
         .await
         .expect("Relay 已批准的 SSH 修改命令应到达设备适配器");
+        assert_eq!(response.exit_code, Some(0));
+        let execution = &response.details.expect("SSH 必须返回执行诊断")["ssh_execution"];
+        assert_eq!(execution["backend"], "unknown");
+        assert_eq!(execution["selection_reason"], "provider_did_not_report");
+        assert_eq!(execution["execution_mode"], "exec_no_pty");
+        assert!(execution["error_category"].is_null());
         let streamed = receiver.try_recv().expect("SSH 输出应经过共同流式转发器");
         assert!(
             matches!(streamed, WireMessage::RemoteEvent(RemoteEvent { payload: EventPayload::OutputChunk { stderr: false, text }, .. }) if text == "ok")
@@ -8112,5 +8445,75 @@ mod tests {
         assert!(context.ssh_trust_cli.is_none());
         assert!(context.validate().is_ok());
         assert!(upload_receipt(&device, "../outside.exe", 1, &hash).is_err());
+    }
+}
+
+#[cfg(test)]
+mod resource_response_tests {
+    use super::*;
+    #[test]
+    fn startup_diagnostics_survive_agent_error_conversion() {
+        let request = RemoteRequest {
+            request_id: RequestId::new(),
+            session_id: SessionId::new(),
+            source: remoteops_domain::EventSource::Ai,
+            operation: RemoteOperation::StartResourceTool {
+                tool_id: "fixture".into(),
+                version: "1".into(),
+                sha256: "a".repeat(64),
+            },
+            approval_id: None,
+            payload_base64: None,
+            control_proof: None,
+        };
+        let error = remoteops_resources::ResourceError {
+            code: "startup_protocol".into(),
+            message: "fixture failure".into(),
+            retry_safe: true,
+            diagnostics: Some(Box::new(remoteops_resources::StartupDiagnostics {
+                launch_context: Some(remoteops_resources::LaunchContext {
+                    interface: "stdio_mcp".into(),
+                    browser_adapter: Some("agent_browser".into()),
+                    adapter_source: "explicit".into(),
+                    injected_args: vec![],
+                    injected_env_names: vec!["AGENT_BROWSER_EXECUTABLE_PATH".into()],
+                }),
+                stage: "initialize".into(),
+                reason: "eof".into(),
+                exit_code: Some(23),
+                stderr_tail: "filtered stderr".into(),
+                last_sent: Some(serde_json::json!({"method":"initialize"})),
+                last_received: None,
+                record_id: None,
+            })),
+        };
+        let response = operation_error_response(&request, &anyhow::Error::new(error));
+        let details = response.details.unwrap();
+        assert_eq!(details["retry_safe"], true);
+        assert_eq!(details["diagnostics"]["stage"], "initialize");
+        assert_eq!(details["diagnostics"]["exit_code"], 23);
+        assert_eq!(
+            details["diagnostics"]["launch_context"]["browser_adapter"],
+            "agent_browser"
+        );
+    }
+
+    #[test]
+    fn cancelled_resource_call_keeps_unknown_result_and_original_request() {
+        let request = RequestId::new();
+        let session = SessionId::new();
+        let response = cancelled_operation_response(request, session, true);
+        assert_eq!(response.request_id, request);
+        assert_eq!(response.session_id, session);
+        assert_eq!(response.error_code.as_deref(), Some("result_unknown"));
+        let details = response.details.unwrap();
+        assert_eq!(details["retry_safe"], false);
+        assert_eq!(details["execution_state"], "unknown");
+        assert_eq!(
+            cancelled_operation_response(request, session, false)
+                .error_code
+                .as_deref(),
+            Some("cancelled")
+        );
     }
 }

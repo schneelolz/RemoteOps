@@ -1,3 +1,26 @@
+.tools-guide { border-block: 1px solid var(--border-default); padding-block: 20px; margin-bottom: 20px; min-width: 0; }
+.tools-guide-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.tools-guide-text { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.65; max-height: 320px; overflow-y: auto; margin: 0; }
+.tools-guide-input { width: 100%; box-sizing: border-box; min-height: 240px; resize: vertical; line-height: 1.6; margin-block: 8px 12px; }
+.tools-guide-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+@media (max-width: 767px) {
+  .tools-guide-heading { align-items: flex-start; }
+  .tools-guide-heading .section-title { font-size: 16px; }
+  .tools-guide-heading .btn { flex-shrink: 0; min-height: 44px; }
+  .tools-guide-actions .btn { min-height: 44px; }
+  .mcp-clients-table { display: block; min-width: 0; width: 100%; }
+  .mcp-clients-table thead { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip-path: inset(50%); }
+  .mcp-clients-table tbody { display: block; }
+  .mcp-clients-table tbody tr { display: grid; grid-template-columns: minmax(0, 1fr); padding: 12px; border-bottom: 1px solid var(--border-default); }
+  .mcp-clients-table td, .mcp-clients-table td:first-child { display: block; border: 0; min-width: 0; max-width: none; padding: 8px; overflow-wrap: anywhere; }
+  .mcp-clients-table td:nth-child(2)::before { content: "凭据状态"; }
+  .mcp-clients-table td:nth-child(4)::before { content: "注册时间"; }
+  .mcp-clients-table td:nth-child(5)::before { content: "最后在线"; }
+  .mcp-clients-table td::before { display: block; color: var(--text-secondary); font-size: 13px; margin-bottom: 6px; }
+  .mcp-clients-table td:last-child { display: flex; gap: 8px; }
+  .mcp-clients-table .btn, .mcp-clients-table .tool-permission { min-height: 44px; }
+}
+
 /* ==========================================================================
    RemoteOps Relay Admin - Modernized Design System & Stylesheet
    Design Philosophy: Clean, Modern, Aesthetic, High-Density Ops Console
@@ -2253,4 +2276,70 @@ input[type="checkbox"]:disabled {
   .mcp-onboarding .section-title { flex-wrap: wrap; }
   .mcp-modal .modal-footer .btn { flex: 1 1 auto; }
   .mcp-form-actions .btn { width: 100%; }
+}
+
+
+/* 工具中心复用后台色彩、字体和控件，只增加资料密度与小屏重排。 */
+.tool-center { display: grid; gap: 20px; }
+.tools-policy { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.tools-policy .section-title { margin-bottom: 8px; }
+.tools-policy .section-desc { max-width: 72ch; }
+.tool-permission { display: inline-flex; align-items: center; gap: 8px; color: var(--text-primary); font-size: 14px; cursor: pointer; white-space: nowrap; min-height: 32px; }
+.tool-permission input { width: 18px; height: 18px; accent-color: var(--color-brand); }
+.tools-toolbar { display: flex; align-items: end; gap: 12px; flex-wrap: wrap; }
+.tools-toolbar .input-group:first-child { flex: 1; min-width: 220px; }
+.tools-toolbar .input-group { margin: 0; }
+.tools-table td { vertical-align: top; }
+.tools-table td:first-child { min-width: 220px; max-width: 360px; }
+.tools-purpose { margin: 8px 0 0; font-size: 14px; color: var(--text-secondary); line-height: 1.6; white-space: normal; overflow-wrap: anywhere; }
+.tools-table .table-secondary-text { white-space: normal; overflow-wrap: anywhere; }
+.tools-details h3 { margin: 24px 0 12px; font-size: 16px; }
+.tools-details li, .tools-audit li, .tools-sync li { margin: 8px 0; color: var(--text-secondary); line-height: 1.6; overflow-wrap: anywhere; }
+.tools-prose { white-space: pre-wrap; color: var(--text-secondary); line-height: 1.7; overflow-wrap: anywhere; max-width: 80ch; }
+.tools-package-detail { border-top: 1px solid var(--border-default); padding: 16px 0; }
+.tools-package-detail p { line-height: 1.6; }
+.tools-facts { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 10px 18px; font-size: 14px; line-height: 1.6; }
+.tools-facts dt { color: var(--text-muted); }
+.tools-facts dd { margin: 0; overflow-wrap: anywhere; }
+.tools-editor { width: min(860px, calc(100vw - 32px)); max-width: 860px; }
+.tools-editor form { min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+.tools-editor .modal-body { overflow-y: auto; }
+.tools-fields { border: 0; margin: 0; padding: 0; min-width: 0; }
+.tools-form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+.tools-wide { grid-column: 1 / -1; }
+.tools-definition { margin-top: 12px; }
+.tools-definition summary, .tools-audit summary { cursor: pointer; color: var(--text-primary); font-weight: 600; padding: 8px 0; }
+.tools-code { tab-size: 2; font-size: 13px; line-height: 1.6; white-space: pre; min-height: 260px; }
+.tools-editor .input-group { margin: 0 0 16px; }
+.tools-receipt { padding: 16px; border: 1px solid var(--status-online-border); background: var(--status-online-bg); border-radius: var(--radius-md); }
+.tools-receipt p { font-size: 14px; line-height: 1.6; margin: 8px 0; }
+.tool-center :focus-visible, .tools-editor :focus-visible { outline: 2px solid var(--border-focus); outline-offset: 3px; }
+@media (max-width: 767px) {
+  .tool-center { gap: 16px; }
+  .tools-policy { align-items: start; flex-direction: column; gap: 12px; }
+  .tools-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .tools-toolbar .input-group:first-child { grid-column: 1 / -1; min-width: 0; }
+  .tools-toolbar .input-group:nth-child(2) { grid-column: 1 / -1; }
+  .tools-toolbar .btn { min-height: 44px; }
+  .tools-form-grid { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .tools-editor { width: calc(100vw - 24px); max-height: calc(100dvh - 24px); }
+  .tools-editor .modal-body { padding: 16px; }
+  .tools-facts { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .tools-facts dd { margin-bottom: 12px; }
+}
+
+@media (max-width: 767px) {
+  .tools-table { display: block; min-width: 0; width: 100%; }
+  .tools-table thead { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); }
+  .tools-table tbody { display: block; }
+  .tools-table tbody tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); padding: 12px; border-bottom: 1px solid var(--border-default); }
+  .tools-table tbody tr:last-child { border-bottom: 0; }
+  .tools-table td { display: block; padding: 8px; border: 0; white-space: normal; min-width: 0; }
+  .tools-table td:first-child { grid-column: 1 / -1; min-width: 0; max-width: none; }
+  .tools-table td:nth-child(2), .tools-table td:nth-child(5), .tools-table td:nth-child(6) { grid-column: 1 / -1; }
+  .tools-table td:nth-child(3)::before { content: "文件校验"; }
+  .tools-table td:nth-child(4)::before { content: "平台测试"; }
+  .tools-table td:nth-child(3)::before, .tools-table td:nth-child(4)::before { display: block; color: var(--text-secondary); font-size: 13px; margin-bottom: 8px; }
+  .tools-table td:nth-child(6) { display: flex; gap: 8px; }
+  .tools-table td .btn { min-height: 44px; flex: 1; }
 }

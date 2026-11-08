@@ -1,8 +1,12 @@
 //! 将 Agent 已执行的操作和输出转为有界、脱敏的本地日志，不改变远程协议。
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use chrono::{DateTime, Utc};
@@ -18,7 +22,7 @@ use crate::AgentEventSender;
 
 use crate::{
     AgentEvent, AgentEventSink, AgentLogLevel, AgentOperationKind, AgentOperationLog,
-    AgentOperationState, AgentPresentationRole, emit_agent_event,
+    AgentOperationState, AgentOutputRepetition, AgentPresentationRole, emit_agent_event,
 };
 
 /// 单行输出超过此长度时整行隐藏，避免截断后泄漏部分凭据。
@@ -33,6 +37,8 @@ const MAX_INTERRUPTED_REQUESTS: usize = 128;
 const MAX_CLOSED_SERIAL_REQUESTS: usize = 128;
 /// 超长行只需保留边界附近的少量文本来识别跨分片 PEM 标记。
 const MARKER_CONTEXT_BYTES: usize = 256;
+
+static NEXT_SERIAL_RECORD: AtomicU64 = AtomicU64::new(1);
 
 enum ResponsePresentation {
     Metadata,
@@ -95,8 +101,24 @@ struct OutputPolicy {
     serial: bool,
 }
 
+struct OutputLine {
+    text: String,
+    repeatable: bool,
+    display: bool,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum CompletedLineKind {
+    #[default]
+    Opaque,
+    Repeatable,
+    Empty,
+}
+
 #[derive(Default)]
 struct OutputBuffer {
+    // 在原始完整行脱敏前计算，避免不同输入映射到相同占位文本后误合并。
+    last_line_kind: CompletedLineKind,
     /// 尚未遇到换行符的文本。
     pending: String,
     /// 当前行是否已超过长度上限。
@@ -116,6 +138,14 @@ struct OutputBuffer {
 impl OutputBuffer {
     /// 缓冲完整行，凭据被拆到多个协议分片时仍可整体脱敏。
     fn push(&mut self, text: &str, redactor: &Redactor) -> Vec<String> {
+        self.push_lines(text, redactor)
+            .into_iter()
+            .filter(|line| line.display)
+            .map(|line| line.text)
+            .collect()
+    }
+
+    fn push_lines(&mut self, text: &str, redactor: &Redactor) -> Vec<OutputLine> {
         let mut lines = Vec::new();
         for piece in text.split_inclusive('\n') {
             let was_oversized = self.oversized;
@@ -145,10 +175,21 @@ impl OutputBuffer {
             if !self.oversized {
                 self.pending.push_str(piece);
             }
-            if piece.ends_with('\n')
-                && let Some(line) = self.finish_line(redactor)
-            {
-                lines.push(line);
+            if piece.ends_with('\n') {
+                if let Some(line) = self.finish_line(redactor) {
+                    lines.push(OutputLine {
+                        text: line,
+                        repeatable: self.last_line_kind == CompletedLineKind::Repeatable,
+                        display: true,
+                    });
+                } else if self.last_line_kind == CompletedLineKind::Empty {
+                    // 空行不进入既有远程输出，但结束本地连续重复段。
+                    lines.push(OutputLine {
+                        text: String::new(),
+                        repeatable: false,
+                        display: false,
+                    });
+                }
             }
         }
         lines
@@ -156,6 +197,7 @@ impl OutputBuffer {
 
     /// 返回一条已脱敏的完整行；被隐藏的内容不会进入 GUI 事件通道。
     fn finish_line(&mut self, redactor: &Redactor) -> Option<String> {
+        self.last_line_kind = CompletedLineKind::Opaque;
         let line = std::mem::take(&mut self.pending);
         let oversized = std::mem::take(&mut self.oversized);
         if oversized {
@@ -182,16 +224,24 @@ impl OutputBuffer {
             self.emitted += 1;
             return Some("[单行输出过长，内容已隐藏]".to_owned());
         }
+        let original = line.strip_suffix('\n').unwrap_or(&line);
+        let original = original.strip_suffix('\r').unwrap_or(original);
+        let no_terminal_controls = !original.chars().any(char::is_control);
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
+            self.last_line_kind = CompletedLineKind::Empty;
             return None;
         }
         self.emitted += 1;
-        Some(redactor.redact(&if self.policy.serial {
+        let text = redactor.redact(&if self.policy.serial {
             remoteops_serial::redact_serial_text(line)
         } else {
             line.to_owned()
-        }))
+        });
+        if no_terminal_controls && text == line && repeatable_serial_line(&text) {
+            self.last_line_kind = CompletedLineKind::Repeatable;
+        }
+        Some(text)
     }
 }
 
@@ -228,7 +278,27 @@ fn append_tail(previous: &str, piece: &str) -> String {
 }
 
 /// 旁路观察已有协议事件；不影响请求执行、授权和网络消息。
+struct SerialRepetition {
+    session: SessionId,
+    resource: SerialSessionId,
+    request: RequestId,
+    text: String,
+    value: AgentOutputRepetition,
+}
+
+// 脱敏占位、截断及终端控制行无法证明正文相同，因此始终单独显示。
+fn repeatable_serial_line(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().count() <= 2048
+        && !text.chars().any(char::is_control)
+        && !["[REDACTED", "已隐藏", "已遮盖", "已截断", "已省略"]
+            .iter()
+            .any(|marker| text.contains(marker))
+}
+
 pub(super) struct LogObserver {
+    // 只保存最后一条可靠串口完整行，任何其他显示来源都会结束连续段。
+    repetition: RefCell<Option<SerialRepetition>>,
     epoch: Option<u64>,
     /// 可选的本地表现层订阅端。
     sender: Option<AgentEventSink>,
@@ -314,18 +384,26 @@ impl SerialLogStream {
             line
         }
     }
-    fn local_lines(&mut self, lines: &[String], unlimited: bool) -> Vec<String> {
-        let mut visible = Vec::new();
-        for line in lines {
-            if unlimited || self.shown < MAX_OUTPUT_LINES {
-                visible.push(line.clone());
+    fn local_line(
+        &mut self,
+        line: OutputLine,
+        unlimited: bool,
+        repeated: bool,
+    ) -> Option<OutputLine> {
+        if unlimited || self.shown < MAX_OUTPUT_LINES || repeated {
+            if !repeated {
                 self.shown += 1;
-            } else if !self.omission_reported {
-                self.omission_reported = true;
-                visible.push("[后续输出已省略，仍会显示执行结果]".to_owned());
             }
+            Some(line)
+        } else if !std::mem::replace(&mut self.omission_reported, true) {
+            Some(OutputLine {
+                text: "[后续输出已省略，仍会显示执行结果]".to_owned(),
+                repeatable: false,
+                display: true,
+            })
+        } else {
+            None
         }
-        visible
     }
     fn update_prompt_hint(&mut self, input: &[u8]) {
         let visible = String::from_utf8_lossy(input);
@@ -368,7 +446,16 @@ impl SerialLogStream {
             self.pending_hint = Some(hint);
         }
     }
+    #[cfg(test)]
     fn push(&mut self, bytes: &[u8], redactor: &Redactor) -> Vec<String> {
+        self.push_lines(bytes, redactor)
+            .into_iter()
+            .filter(|line| line.display)
+            .map(|line| line.text)
+            .collect()
+    }
+
+    fn push_lines(&mut self, bytes: &[u8], redactor: &Redactor) -> Vec<OutputLine> {
         let mut input = std::mem::take(&mut self.utf8_pending);
         input.extend_from_slice(bytes);
         let mut lines = Vec::new();
@@ -376,19 +463,23 @@ impl SerialLogStream {
         while !remaining.is_empty() {
             match std::str::from_utf8(remaining) {
                 Ok(text) => {
-                    lines.extend(self.output.push(text, redactor));
+                    lines.extend(self.output.push_lines(text, redactor));
                     break;
                 }
                 Err(error) => {
                     let valid = error.valid_up_to();
                     if valid > 0 {
-                        lines.extend(self.output.push(
+                        lines.extend(self.output.push_lines(
                             std::str::from_utf8(&remaining[..valid]).expect("UTF-8 已验证前缀"),
                             redactor,
                         ));
                     }
                     if let Some(length) = error.error_len() {
-                        lines.push("[二进制串口内容已隐藏]".to_owned());
+                        lines.push(OutputLine {
+                            text: "[二进制串口内容已隐藏]".to_owned(),
+                            repeatable: false,
+                            display: true,
+                        });
                         // 非文本字节不能作为凭据续行的一部分展示。
                         self.output.oversized = true;
                         remaining = &remaining[valid + length..];
@@ -400,7 +491,9 @@ impl SerialLogStream {
             }
         }
         for line in &mut lines {
-            *line = self.sanitize_echo(std::mem::take(line));
+            let sanitized = self.sanitize_echo(line.text.clone());
+            line.repeatable &= sanitized == line.text;
+            line.text = sanitized;
         }
         self.update_prompt_hint(&input);
         lines
@@ -416,6 +509,7 @@ impl LogObserver {
 
     pub(super) fn with_sink(sender: Option<AgentEventSink>) -> Self {
         Self {
+            repetition: RefCell::new(None),
             epoch: None,
             sender,
             redactor: Redactor::default(),
@@ -431,6 +525,49 @@ impl LogObserver {
         }
     }
 
+    pub(super) fn resource_progress(
+        &self,
+        request_id: RequestId,
+        p: &remoteops_resources::PreparationProgress,
+    ) {
+        let phase = match p.stage.as_str() {
+            "waiting" => "等待准备",
+            "download" => "下载中",
+            "verify" => "校验SHA-256",
+            "extract" => "解压检查",
+            "cached" => "使用已校验缓存",
+            "starting" => "启动及健康检查",
+            "ready" => "已就绪",
+            "cancelled" => "已取消",
+            _ => "准备失败",
+        };
+        let text = if p.stage == "download" {
+            format!(
+                "{}：{} {}/{} MiB（{}%），{} KiB/s",
+                p.tool_id,
+                phase,
+                p.completed / 1_048_576,
+                p.total.unwrap_or(0) / 1_048_576,
+                p.total
+                    .filter(|t| *t > 0)
+                    .map_or(0, |t| p.completed.saturating_mul(100) / t),
+                p.bytes_per_second / 1024
+            )
+        } else {
+            format!("{}：{}", p.tool_id, phase)
+        };
+        emit_scoped(
+            self.epoch,
+            self.sender.as_ref(),
+            AgentEvent::OperationPresentation {
+                request_id,
+                role: AgentPresentationRole::Progress,
+                text,
+                terminal: false,
+            },
+        );
+    }
+
     pub(super) fn ssh_connecting(&self, request_id: RequestId) {
         self.emit(
             Some(request_id),
@@ -441,6 +578,7 @@ impl LogObserver {
     }
 
     pub(super) fn record_request(&mut self, request: &RemoteRequest, shell: Option<ShellKind>) {
+        self.repetition.replace(None);
         if presented_operation(&request.operation) {
             self.presentation_requests.insert(request.request_id);
         }
@@ -495,6 +633,7 @@ impl LogObserver {
         request_id: RequestId,
         source: remoteops_domain::EventSource,
     ) {
+        self.repetition.replace(None);
         emit_scoped(
             self.epoch,
             self.sender.as_ref(),
@@ -541,9 +680,8 @@ impl LogObserver {
             return Vec::new();
         };
         let request = stream.request_id;
-        let lines = stream.push(bytes, &self.redactor);
+        let lines = stream.push_lines(bytes, &self.redactor);
         let hint = stream.pending_hint.take();
-        let visible = stream.local_lines(&lines, unlimited);
         if let Some(hint) = hint {
             self.emit(
                 Some(request),
@@ -552,10 +690,34 @@ impl LogObserver {
                 hint.message(),
             );
         }
-        for line in visible {
-            self.emit(Some(request), Utc::now(), AgentLogLevel::Info, &line);
+        let raw = lines
+            .iter()
+            .filter(|line| line.display)
+            .map(|line| line.text.clone())
+            .collect();
+        for line in lines {
+            if !line.display {
+                self.repetition.replace(None);
+                continue;
+            }
+            let repeated = line.repeatable
+                && self.repetition.borrow().as_ref().is_some_and(|previous| {
+                    previous.session == session
+                        && previous.resource == resource
+                        && previous.request == request
+                        && previous.text == line.text
+                });
+            let line = self
+                .serial_streams
+                .get_mut(&(session, resource))
+                .and_then(|stream| stream.local_line(line, unlimited, repeated));
+            if let Some(line) = line {
+                self.emit_serial_line(session, resource, request, &line.text, line.repeatable);
+            } else {
+                self.repetition.replace(None);
+            }
         }
-        lines
+        raw
     }
 
     pub(super) fn close_serial(
@@ -573,18 +735,27 @@ impl LogObserver {
             if let Some(line) = stream.output.finish_line(&self.redactor) {
                 lines.push(stream.sanitize_echo(line));
             }
-            let visible = stream.local_lines(
-                &lines,
-                self.sender.as_ref().is_some_and(AgentEventSink::bounded),
-            );
-            for line in visible {
-                self.emit(
-                    Some(stream.request_id),
-                    Utc::now(),
-                    AgentLogLevel::Info,
-                    &line,
-                );
+            for line in &lines {
+                let line = OutputLine {
+                    text: line.clone(),
+                    repeatable: false,
+                    display: true,
+                };
+                if let Some(line) = stream.local_line(
+                    line,
+                    self.sender.as_ref().is_some_and(AgentEventSink::bounded),
+                    false,
+                ) {
+                    // 关闭时冲刷的是未完成行，不参与完整行重复合并。
+                    self.emit(
+                        Some(stream.request_id),
+                        Utc::now(),
+                        AgentLogLevel::Info,
+                        &line.text,
+                    );
+                }
             }
+            self.repetition.replace(None);
             self.presentation_requests.remove(&stream.request_id);
         }
         lines
@@ -653,6 +824,7 @@ impl LogObserver {
     }
 
     pub(super) fn with_epoch(mut self, epoch: Option<u64>) -> Self {
+        self.repetition.replace(None);
         self.epoch = epoch;
         self
     }
@@ -918,6 +1090,7 @@ impl LogObserver {
 
     /// 只在真实执行阶段变化时通知本地表现层，标准错误输出不改变执行状态。
     fn emit_state(&mut self, request_id: RequestId, state: AgentOperationState) {
+        self.repetition.replace(None);
         emit_scoped(
             self.epoch,
             self.sender.as_ref(),
@@ -983,6 +1156,70 @@ impl LogObserver {
     }
 
     // 重复的“开始执行”只进入诊断，执行状态仍由关键事件单独发布。
+    fn emit_serial_line(
+        &self,
+        session: SessionId,
+        resource: SerialSessionId,
+        request: RequestId,
+        line: &str,
+        reliable: bool,
+    ) {
+        if !reliable || !repeatable_serial_line(line) {
+            self.emit(Some(request), Utc::now(), AgentLogLevel::Info, line);
+            return;
+        }
+        let repetition = {
+            let mut previous = self.repetition.borrow_mut();
+            if let Some(previous) = previous.as_mut()
+                && previous.session == session
+                && previous.resource == resource
+                && previous.request == request
+                && previous.text == line
+            {
+                previous.value.total = previous.value.total.saturating_add(1);
+                previous.value
+            } else {
+                let value = AgentOutputRepetition {
+                    record_id: NEXT_SERIAL_RECORD.fetch_add(1, Ordering::Relaxed),
+                    total: 1,
+                };
+                *previous = Some(SerialRepetition {
+                    session,
+                    resource,
+                    request,
+                    text: line.to_owned(),
+                    value,
+                });
+                value
+            }
+        };
+        let message = if repetition.total > 1 {
+            format!("{line} × {}", repetition.total)
+        } else {
+            line.to_owned()
+        };
+        emit_scoped(
+            self.epoch,
+            self.sender.as_ref(),
+            AgentEvent::OperationLog(AgentOperationLog {
+                repetition: Some(repetition),
+                request_id: Some(request),
+                occurred_at: Utc::now(),
+                level: AgentLogLevel::Info,
+                message,
+            }),
+        );
+        emit_scoped(
+            self.epoch,
+            self.sender.as_ref(),
+            AgentEvent::OperationOutputUpdate {
+                request_id: request,
+                text: line.to_owned(),
+                repetition,
+            },
+        );
+    }
+
     fn emit_diagnostic(
         &self,
         request_id: Option<RequestId>,
@@ -990,10 +1227,12 @@ impl LogObserver {
         level: AgentLogLevel,
         message: &str,
     ) {
+        self.repetition.replace(None);
         emit_scoped(
             self.epoch,
             self.sender.as_ref(),
             AgentEvent::OperationLog(AgentOperationLog {
+                repetition: None,
                 request_id,
                 occurred_at,
                 level,
@@ -1010,6 +1249,7 @@ impl LogObserver {
         message: &str,
         terminal: bool,
     ) {
+        self.repetition.replace(None);
         let text = safe_text(&self.redactor, message);
         let presentation = request_id
             .filter(|request| self.presentation_requests.contains(request))
@@ -1028,6 +1268,7 @@ impl LogObserver {
             self.epoch,
             self.sender.as_ref(),
             AgentEvent::OperationLog(AgentOperationLog {
+                repetition: None,
                 request_id,
                 occurred_at,
                 level,
@@ -1132,6 +1373,7 @@ pub(super) fn record_request(
         epoch,
         sender,
         AgentEvent::OperationLog(AgentOperationLog {
+            repetition: None,
             request_id: Some(request.request_id),
             occurred_at: Utc::now(),
             level: AgentLogLevel::Info,
@@ -1238,6 +1480,13 @@ fn safe_text(redactor: &Redactor, message: &str) -> String {
 fn operation_label(operation: &RemoteOperation) -> &'static str {
     match operation {
         RemoteOperation::GetTargetContext => "读取目标上下文",
+        RemoteOperation::ValidateResourceTool { .. } => "受控验证资源工具",
+        RemoteOperation::PrepareBrowserPassword { .. } => "核验网页密码目标",
+        RemoteOperation::FillBrowserPassword { .. } => "安全填写网页密码",
+        RemoteOperation::ListResourceTools => "列出资源工具",
+        RemoteOperation::StartResourceTool { .. } => "启动资源工具",
+        RemoteOperation::CallResourceTool { .. } => "调用资源工具",
+        RemoteOperation::StopResourceTool { .. } => "停止资源工具",
         RemoteOperation::OpenShell { .. } => "打开 Shell",
         RemoteOperation::RunShellCommand { .. } | RemoteOperation::RunCommand { .. } => "命令",
         RemoteOperation::CloseShell { .. } => "关闭 Shell",
@@ -2366,6 +2615,244 @@ mod tests {
         assert!(lines.last().unwrap().contains("退出码 0"));
         assert_eq!(receiver.dropped_log_lines(), 0);
     }
+    fn serial_logs(receiver: &crate::BoundedAgentEventReceiver) -> Vec<AgentOperationLog> {
+        let mut logs = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            let event = match event {
+                AgentEvent::ScopedOperation { event, .. } => *event,
+                other => other,
+            };
+            if let AgentEvent::OperationLog(log) = event {
+                logs.push(log);
+            }
+        }
+        logs
+    }
+
+    #[test]
+    fn serial_repetition_counts_survive_slow_consumer_without_changing_raw_lines() {
+        for count in [1, 128, 10_000] {
+            let (sender, receiver) = crate::bounded_agent_events(4);
+            let mut observer = LogObserver::with_sink(Some(AgentEventSink::Bounded(sender)));
+            let session = SessionId::new();
+            let resource = SerialSessionId::new();
+            observer.open_serial(session, resource, RequestId::new(), EventSource::Human);
+            for _ in 0..count {
+                assert_eq!(
+                    observer.serial_output(session, resource, b"same line\r\n"),
+                    ["same line"]
+                );
+            }
+            let logs = serial_logs(&receiver);
+            assert_eq!(logs.len(), 1);
+            let repetition = logs[0].repetition.unwrap();
+            assert_eq!(repetition.total, count);
+            assert_eq!(
+                logs[0].message,
+                if count == 1 {
+                    "same line".into()
+                } else {
+                    format!("same line × {count}")
+                }
+            );
+            assert_eq!(receiver.dropped_log_lines(), 0);
+        }
+    }
+
+    #[test]
+    fn serial_repetition_only_merges_adjacent_complete_identical_lines() {
+        let (sender, receiver) = crate::bounded_agent_events(32);
+        let mut observer = LogObserver::with_sink(Some(AgentEventSink::Bounded(sender)));
+        let session = SessionId::new();
+        let resource = SerialSessionId::new();
+        observer.open_serial(session, resource, RequestId::new(), EventSource::Human);
+        assert_eq!(
+            observer.serial_output(session, resource, b"A\nA\nB\nA\n"),
+            ["A", "A", "B", "A"]
+        );
+        let logs = serial_logs(&receiver);
+        assert_eq!(
+            logs.iter()
+                .map(|log| log.message.as_str())
+                .collect::<Vec<_>>(),
+            ["A × 2", "B", "A"]
+        );
+        assert_ne!(
+            logs[0].repetition.unwrap().record_id,
+            logs[2].repetition.unwrap().record_id
+        );
+    }
+
+    #[test]
+    fn blank_lines_break_repetition_without_changing_remote_output() {
+        let (sender, receiver) = crate::bounded_agent_events(16);
+        let mut observer = LogObserver::with_sink(Some(AgentEventSink::Bounded(sender)));
+        let session = SessionId::new();
+        let resource = SerialSessionId::new();
+        observer.open_serial(session, resource, RequestId::new(), EventSource::Human);
+        assert_eq!(
+            observer.serial_output(session, resource, b"A\n\nA\n"),
+            ["A", "A"]
+        );
+        let logs = serial_logs(&receiver);
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().all(|log| log.repetition.unwrap().total == 1));
+        assert_ne!(
+            logs[0].repetition.unwrap().record_id,
+            logs[1].repetition.unwrap().record_id
+        );
+    }
+
+    #[test]
+    fn legacy_limit_counts_new_records_after_other_resources_interrupt_repetition() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut observer = LogObserver::new(Some(sender));
+        let session = SessionId::new();
+        let first = SerialSessionId::new();
+        let second = SerialSessionId::new();
+        observer.open_serial(session, first, RequestId::new(), EventSource::Human);
+        observer.open_serial(session, second, RequestId::new(), EventSource::Ai);
+        for _ in 0..MAX_OUTPUT_LINES {
+            observer.serial_output(session, first, b"A\n");
+            observer.serial_output(session, second, b"B\n");
+        }
+        observer.serial_output(session, first, b"A\n");
+        assert_eq!(
+            observer.serial_streams[&(session, first)].shown,
+            MAX_OUTPUT_LINES
+        );
+        let logs = receiver
+            .try_iter()
+            .filter_map(|event| {
+                if let AgentEvent::OperationLog(log) = event {
+                    Some(log)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(logs.len(), MAX_OUTPUT_LINES * 2 + 1);
+        assert!(logs.last().unwrap().message.contains("后续输出已省略"));
+        assert!(
+            logs.iter()
+                .filter_map(|log| log.repetition)
+                .all(|value| value.total == 1)
+        );
+    }
+
+    #[test]
+    fn serial_repetition_joins_utf8_and_crlf_across_reads() {
+        let (sender, receiver) = crate::bounded_agent_events(8);
+        let mut observer = LogObserver::with_sink(Some(AgentEventSink::Bounded(sender)));
+        let session = SessionId::new();
+        let resource = SerialSessionId::new();
+        observer.open_serial(session, resource, RequestId::new(), EventSource::Human);
+        let bytes = "中文\r\n中文\r\n".as_bytes();
+        let mut raw = Vec::new();
+        for byte in bytes {
+            raw.extend(observer.serial_output(session, resource, &[*byte]));
+        }
+        assert_eq!(raw, ["中文", "中文"]);
+        let logs = serial_logs(&receiver);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].repetition.unwrap().total, 2);
+    }
+
+    #[test]
+    fn serial_repetition_does_not_merge_masked_truncated_or_terminal_lines() {
+        let (sender, receiver) = crate::bounded_agent_events(64);
+        let mut observer = LogObserver::with_sink(Some(AgentEventSink::Bounded(sender)));
+        let session = SessionId::new();
+        let resource = SerialSessionId::new();
+        observer.open_serial(session, resource, RequestId::new(), EventSource::Human);
+        for line in [
+            "password=secret\n",
+            "local-user admin password cipher value\n",
+            "A\u{1b}[0m\n",
+            "A\r\r\n",
+        ] {
+            observer.serial_output(session, resource, line.as_bytes());
+            observer.serial_output(session, resource, line.as_bytes());
+        }
+        let long = format!("{}\n", "x".repeat(2200));
+        observer.serial_output(session, resource, long.as_bytes());
+        observer.serial_output(session, resource, long.as_bytes());
+        let logs = serial_logs(&receiver);
+        assert_eq!(logs.len(), 10);
+        assert!(logs.iter().all(|log| log.repetition.is_none()));
+        assert!(logs.iter().all(|log| !log.message.contains("secret") && !log.message.contains("cipher value")));
+    }
+
+    #[test]
+    fn serial_repetition_breaks_on_resource_session_source_and_epoch_changes() {
+        let (sender, receiver) = crate::bounded_agent_events(64);
+        let mut observer = LogObserver::with_sink(Some(AgentEventSink::Bounded(sender)));
+        let session = SessionId::new();
+        let other_session = SessionId::new();
+        let resource = SerialSessionId::new();
+        let other_resource = SerialSessionId::new();
+        observer.open_serial(session, resource, RequestId::new(), EventSource::Human);
+        observer.open_serial(session, other_resource, RequestId::new(), EventSource::Ai);
+        observer.open_serial(
+            other_session,
+            resource,
+            RequestId::new(),
+            EventSource::Human,
+        );
+        for (session, resource) in [
+            (session, resource),
+            (session, other_resource),
+            (session, resource),
+            (other_session, resource),
+        ] {
+            observer.serial_output(session, resource, b"A\n");
+        }
+        observer.emit(None, Utc::now(), AgentLogLevel::Info, "different source");
+        observer.serial_output(other_session, resource, b"A\n");
+        observer = observer.with_epoch(Some(2));
+        observer.serial_output(other_session, resource, b"A\n");
+        let logs = serial_logs(&receiver);
+        let repeats = logs
+            .iter()
+            .filter_map(|log| log.repetition)
+            .collect::<Vec<_>>();
+        assert_eq!(repeats.len(), 6);
+        assert!(repeats.iter().all(|value| value.total == 1));
+        assert_eq!(
+            repeats
+                .iter()
+                .map(|value| value.record_id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            6
+        );
+    }
+
+    #[test]
+    fn serial_repetition_cumulative_update_survives_missing_initial_event() {
+        let (sender, receiver) = crate::bounded_agent_events(2);
+        let mut observer = LogObserver::with_sink(Some(AgentEventSink::Bounded(sender)));
+        let session = SessionId::new();
+        let resource = SerialSessionId::new();
+        observer.open_serial(session, resource, RequestId::new(), EventSource::Human);
+        receiver.try_recv().unwrap();
+        observer.serial_output(session, resource, b"A\n");
+        let initial = serial_logs(&receiver);
+        let record_id = initial[0].repetition.unwrap().record_id;
+        for _ in 1..10_000 {
+            observer.serial_output(session, resource, b"A\n");
+        }
+        let logs = serial_logs(&receiver);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].repetition,
+            Some(AgentOutputRepetition {
+                record_id,
+                total: 10_000
+            })
+        );
+    }
+
     #[test]
     fn serial_utf8_and_sensitive_lines_are_joined_before_redaction() {
         let (sender, receiver) = crate::bounded_agent_events(128);

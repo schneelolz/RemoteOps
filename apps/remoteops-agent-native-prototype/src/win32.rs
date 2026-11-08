@@ -521,26 +521,18 @@ impl App {
         };
         self.peak_drain_events
             .set(self.peak_drain_events.get().max(observations.len()));
-        let mut received = false;
         let receive_timer = PhaseTimer::new(&self.product_timings.receive);
         for observation in observations {
-            if observation.new_task {
-                self.allow_observer.set(true);
-            }
             let mut core = self.core.borrow_mut();
-            core.transcript.append(&observation.text);
+            if let Some(repetition) = observation.repetition {
+                core.transcript
+                    .update_record(repetition.record_id, &observation.text);
+            } else {
+                core.transcript.append(&observation.text);
+            }
             core.dirty = true;
-            received = true;
         }
         drop(receive_timer);
-        if received
-            && self.allow_observer.get()
-            && (self.observer.get().is_null()
-                || unsafe { IsWindowVisible(self.observer.get()) } == 0)
-        {
-            let _timer = PhaseTimer::new(&self.product_timings.observer);
-            let _ = self.open_observer();
-        }
         {
             let _timer = PhaseTimer::new(&self.product_timings.flush);
             self.flush();

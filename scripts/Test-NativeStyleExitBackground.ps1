@@ -24,7 +24,7 @@ foreach($name in @('APPDATA','LOCALAPPDATA','TEMP','TMP')){$directory=Join-Path 
 foreach($key in @($start.Environment.Keys)){if($key -match '^(REMOTEOPS_|JLAI_)'){$null=$start.Environment.Remove($key)}}
 $app=[Diagnostics.Process]::Start($start);$identity=$app.StartTime.ToUniversalTime().ToString('o')
 function Client([string]$Action='Snapshot',[int]$Id=0,[string]$Path){
-    $parameters=@{Action=$Action;ProcessId=$app.Id;ProcessStartUtc=$identity;ExpectedHash=$ExpectedHash;ControlId=$Id}
+    $parameters=@{Action=$Action;ProcessId=$app.Id;ProcessStartUtc=$identity;ExpectedHash=$ExpectedHash;ExpectedVersion=[Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion;ControlId=$Id}
     if($Path){$parameters.OutputPath=$Path}
     $json=& $helper @parameters
     if(-not $? -or $LASTEXITCODE){throw '退出背景测试客户端失败。'}

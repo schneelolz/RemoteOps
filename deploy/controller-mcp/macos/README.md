@@ -2,11 +2,34 @@
 
 > 当前安装规则：新版安装器只支持设置码/设置文件，不再支持 Token 安装。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](../../../docs/mcp-one-time-setup.md)。
 
-- 版本：`0.2.0-preview.16`
+- 版本：`0.2.0-preview.25`
 - 适用系统：macOS 13 或更高版本，Apple Silicon（arm64）
 - Codex MCP 名称：`remoteops`
 
 本安装包只安装工程师本机使用的 STDIO MCP。它可以通过 Relay 控制现有 Windows Agent；不要求现场电脑是 Mac，也不代表 macOS Agent 已经完成。
+
+## MCP 与 Skill 分开安装和更新
+
+MCP `0.2.0-preview.25` 随附密码辅助程序 `0.2.0-preview.7`，不再包含或强制安装
+Skill。Skill `0.1.6` 使用独立的 `RemoteOps-Skill-0.1.6.zip`，最低 MCP 为 `.25`、
+协议 20。先按本文安装 MCP，再进入解压后的 Skill 包执行：
+
+```bash
+bash ./install-remoteops-skill.sh
+```
+
+使用自定义 `CODEX_HOME` 时，两个安装器应使用同一环境值。pi 的 Skill 目录及
+显式目标参数以独立 Skill 包文档为准；MCP 安装器不会改写 pi 配置。
+Skill 包中的 `skills/remoteops/skill.json` 记录独立版本和兼容要求。完整工具中心 Schema 和字段级本地诊断需要 MCP `.22`。
+
+仅更新操作指引时只安装新版 Skill，无需重新编译或更新 MCP、helper、Agent、Relay，
+也不改变凭据或连接配置。MCP 安装、自检和卸载不要求 Skill 存在，不会覆盖或删除
+独立 Skill；Skill 卸载使用其自己的卸载器。重新读取 Skill 的时机取决于宿主，
+新会话或重载后核对其已加载内容。MCP 程序更新则仍需完全重开 Codex，pi 重开或
+`/reload`，单独 reconnect 不会重读程序路径。
+
+本脚本的设置流程用于新安装及同一设置检查点的失败重试，不是无凭据变更的升级入口。
+已有 macOS 安装升级应由维护者保留原凭据与配置进行迁移，不要默认重新登记。
 
 ## 使用一次性设置安装
 
@@ -57,13 +80,11 @@ Keychain，不使用旧 Token 启动脚本，也不改写旧 Token。登记成�
 安装位置：
 
 ```text
-~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.16
+~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.25
 ~/.codex/remoteops/remoteops-credential-prompt
 ~/.codex/remoteops/controller-config.json
 ~/.codex/remoteops/setup-state.json
 ~/.codex/config.toml
-~/.agents/skills/remoteops/SKILL.md
-~/.codex/skills/remoteops/SKILL.md
 ```
 
 ## 验证
@@ -90,7 +111,7 @@ Keychain，不使用旧 Token 启动脚本，也不改写旧 Token。登记成�
 ./uninstall-remoteops-mcp.sh
 ```
 
-卸载器会先删除当前独立 Keychain 凭据，再删除 MCP、Codex 配置段、RemoteOps skill
-和设置检查点；手工模式只删除兼容的旧 Keychain Token。一次性设置模式不改动旧
+卸载器会先删除当前独立 Keychain 凭据，再删除 MCP、Codex 配置段
+和设置检查点；独立 Skill 保留。手工模式只删除兼容的旧 Keychain Token。一次性设置模式不改动旧
 Token。本地审计日志与文件交换目录保留。
 若程序或凭据存储暂时不可用，卸载会停止并保留凭据引用，恢复后可重试。

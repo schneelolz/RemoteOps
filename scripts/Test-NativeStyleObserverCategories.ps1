@@ -43,7 +43,7 @@ $app=[Diagnostics.Process]::Start($start);$applicationError=$app.StandardError.R
 function Client([string]$Action='Snapshot',[int]$Id=0,[string]$Path){
     $script:step=$Action+'_'+$Id
     $client=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'));$client.UseShellExecute=$false;$client.CreateNoWindow=$true;$client.RedirectStandardOutput=$true;$client.RedirectStandardError=$true;$client.StandardOutputEncoding=[Text.UTF8Encoding]::new($false)
-    foreach($item in @('-NoProfile','-STA','-File',$helper,'-Action',$Action,'-ProcessId',[string]$app.Id,'-ProcessStartUtc',$identity,'-ExpectedHash',$ExpectedHash,'-ControlId',[string]$Id)){$client.ArgumentList.Add($item)}
+    foreach($item in @('-NoProfile','-STA','-File',$helper,'-ExpectedVersion',([Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion),'-Action',$Action,'-ProcessId',[string]$app.Id,'-ProcessStartUtc',$identity,'-ExpectedHash',$ExpectedHash,'-ControlId',[string]$Id)){$client.ArgumentList.Add($item)}
     if($Action -eq 'Invoke'){$client.ArgumentList.Add('-FocusBeforeInvoke')}
     if($Path){$client.ArgumentList.Add('-OutputPath');$client.ArgumentList.Add($Path)}
     $worker=[Diagnostics.Process]::Start($client);$stdout=$worker.StandardOutput.ReadToEndAsync();$stderr=$worker.StandardError.ReadToEndAsync()

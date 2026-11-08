@@ -12,8 +12,9 @@ mod tls;
 
 pub use codec::{FrameError, MAX_FRAME_SIZE, read_frame, write_frame};
 pub use credential::{
-    CredentialEncryptionContext, CredentialEncryptionError, CredentialEncryptionKeyPair,
-    EncryptedCredentialPayload, open_credential, seal_credential,
+    BrowserCredentialContext, CredentialEncryptionContext, CredentialEncryptionError,
+    CredentialEncryptionKeyPair, EncryptedCredentialPayload, open_browser_credential,
+    open_credential, seal_browser_credential, seal_credential,
 };
 pub use message::{
     AgentHello, AgentLeaseRenewed, AgentPermissionModeChanged, AgentResumeCommitAck,

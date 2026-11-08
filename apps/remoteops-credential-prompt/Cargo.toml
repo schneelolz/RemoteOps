@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-credential-prompt"
-version.workspace = true
+version = "0.2.0-preview.7"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,7 @@ OriginalFilename = "remoteops-credential-prompt.exe"
 LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [dependencies]
+remoteops-i18n = { path = "../../crates/remoteops-i18n" }
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true

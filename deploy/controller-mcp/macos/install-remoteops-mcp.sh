@@ -3,8 +3,8 @@ set +x
 set -euo pipefail
 umask 077
 
-MCP_PACKAGE_VERSION="0.2.0-preview.16"
-CREDENTIAL_PROMPT_VERSION="0.2.0-preview.5"
+MCP_PACKAGE_VERSION="0.2.0-preview.25"
+CREDENTIAL_PROMPT_VERSION="0.2.0-preview.7"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 COMMAND_MODE="agent-controlled"
 SETUP_FILE=""
@@ -68,7 +68,6 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 SOURCE_BINARY="$SCRIPT_DIR/remoteops-controller-mcp"
 SOURCE_CREDENTIAL_PROMPT="$SCRIPT_DIR/remoteops-credential-prompt"
-SOURCE_SKILL="$SCRIPT_DIR/skills/remoteops"
 if [[ ! -x "$SOURCE_BINARY" ]]; then
   echo "安装包缺少可执行文件：$SOURCE_BINARY" >&2
   exit 1
@@ -77,16 +76,18 @@ if [[ ! -x "$SOURCE_CREDENTIAL_PROMPT" ]]; then
   echo "安装包缺少可执行文件：$SOURCE_CREDENTIAL_PROMPT" >&2
   exit 1
 fi
-if [[ ! -f "$SOURCE_SKILL/SKILL.md" ]]; then
-  echo "安装包缺少 RemoteOps skill。" >&2
-  exit 1
-fi
 if ! "$SOURCE_BINARY" --version | grep -Fq "$MCP_PACKAGE_VERSION"; then
   echo "MCP 可执行文件版本与安装包不一致。" >&2
   exit 1
 fi
 if ! "$SOURCE_CREDENTIAL_PROMPT" --version | grep -Fq "$CREDENTIAL_PROMPT_VERSION"; then
   echo "SSH 密码安全输入程序版本与安装包不一致。" >&2
+  exit 1
+fi
+
+# 在安装、登记或读取凭据之前验证实际工具目录；无需 Node。
+if ! "$SOURCE_BINARY" --check-tool-schemas >/dev/null; then
+  echo "MCP 工具 Schema 离线自检失败；尚未更改安装、配置或凭据。" >&2
   exit 1
 fi
 
@@ -99,9 +100,7 @@ INSTALLED_BINARY="$INSTALL_DIR/remoteops-controller-mcp-$MCP_PACKAGE_VERSION"
 INSTALLED_CREDENTIAL_PROMPT="$INSTALL_DIR/remoteops-credential-prompt"
 CONNECTION_CONFIG="$INSTALL_DIR/controller-config.json"
 CONFIG_PATH="$CODEX_HOME/config.toml"
-STANDARD_SKILL_DIR="$HOME/.agents/skills/remoteops"
-COMPAT_SKILL_DIR="$CODEX_HOME/skills/remoteops"
-mkdir -p "$INSTALL_DIR" "$STANDARD_SKILL_DIR" "$COMPAT_SKILL_DIR"
+mkdir -p "$INSTALL_DIR"
 install -m 755 "$SOURCE_BINARY" "$INSTALLED_BINARY"
 install -m 755 "$SOURCE_CREDENTIAL_PROMPT" "$INSTALLED_CREDENTIAL_PROMPT"
 
@@ -132,14 +131,6 @@ printf '%s' "$setup_content" | "$INSTALLED_BINARY" --setup-stdin --setup-enroll 
 unset setup_content
 [[ -s "$CONNECTION_CONFIG" ]] || { echo "登记程序未生成连接配置。" >&2; exit 1; }
 
-cp "$SOURCE_SKILL/SKILL.md" "$STANDARD_SKILL_DIR/SKILL.md"
-cp "$SOURCE_SKILL/SKILL.md" "$COMPAT_SKILL_DIR/SKILL.md"
-if [[ -d "$SOURCE_SKILL/agents" ]]; then
-  mkdir -p "$STANDARD_SKILL_DIR/agents" "$COMPAT_SKILL_DIR/agents"
-  cp "$SOURCE_SKILL/agents/openai.yaml" "$STANDARD_SKILL_DIR/agents/openai.yaml"
-  cp "$SOURCE_SKILL/agents/openai.yaml" "$COMPAT_SKILL_DIR/agents/openai.yaml"
-fi
-
 # The helper parses TOML and preserves unrelated settings, quoted keys and
 # multiline strings. Never edit Codex TOML with line-oriented substitutions.
 "$INSTALLED_BINARY" --configure-codex "$CONFIG_PATH" \
@@ -152,5 +143,6 @@ echo "RemoteOps MCP $MCP_PACKAGE_VERSION 已安装。"
 echo "程序：$INSTALLED_BINARY"
 echo "配置：$CONFIG_PATH"
 echo "Relay 配置：$CONNECTION_CONFIG"
+echo "Skill 独立安装和更新；本安装器不读取、覆盖或删除已安装的 Skill。"
 echo "独立 Controller 凭据：已保存到 macOS Keychain；登记与 Relay 身份自检通过。"
 echo "请完全退出并重新打开 Codex，然后输入 /mcp 检查 remoteops。"

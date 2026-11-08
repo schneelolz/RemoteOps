@@ -2712,6 +2712,15 @@ fn render_event(ui: &mut Ui, event: &RemoteEvent, palette: Palette, translator: 
             });
             ui.add_space(4.0);
             match &event.payload {
+                EventPayload::ResourceToolProgress {
+                    tool_id,
+                    stage,
+                    completed,
+                    total,
+                    ..
+                } => {
+                    ui.label(format!("{tool_id}: {stage} {completed}/{total:?}"));
+                }
                 EventPayload::OperationRequested { operation } => {
                     let summary = if event.source == EventSource::Ai
                         && matches!(

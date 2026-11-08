@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-EXPECTED_MCP_VERSION="0.2.0-preview.16"
-EXPECTED_CREDENTIAL_PROMPT_VERSION="0.2.0-preview.5"
+EXPECTED_MCP_VERSION="0.2.0-preview.25"
+EXPECTED_CREDENTIAL_PROMPT_VERSION="0.2.0-preview.7"
 KEYCHAIN_SERVICE="RemoteOps Controller Token"
 CURRENT_USER="$(id -un)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
@@ -34,6 +34,14 @@ fi
 if [[ -x "$CREDENTIAL_PROMPT" ]]; then
   prompt_version_output="$("$CREDENTIAL_PROMPT" --version 2>&1 || true)"
   [[ "$prompt_version_output" == *"$EXPECTED_CREDENTIAL_PROMPT_VERSION"* ]] && pass "SSH 密码安全输入程序版本：$prompt_version_output" || fail "SSH 密码安全输入程序版本不正确：$prompt_version_output"
+fi
+# 离线检查程序真实工具目录；安装者无需 Node。
+if [[ -x "$BINARY" ]]; then
+  if "$BINARY" --check-tool-schemas >/dev/null; then
+    pass "离线工具 Schema 自检通过。"
+  else
+    fail "MCP 工具 Schema 离线自检失败；请保留报告并升级配套程序。"
+  fi
 fi
 credential_id="$(plutil -extract credential_id raw "$CONNECTION_CONFIG" 2>/dev/null || true)"
 MCP_COMMAND="$LAUNCHER"
@@ -92,8 +100,13 @@ if [[ -f "$CONNECTION_CONFIG" ]] && owner_id="$(plutil -extract owner_id raw "$C
 else
   fail "RemoteOps 连接配置缺失或无效。"
 fi
-[[ -f "$HOME/.agents/skills/remoteops/SKILL.md" ]] && pass "标准 RemoteOps skill 已安装。" || fail "标准 RemoteOps skill 未安装。"
-[[ -f "$CODEX_HOME/skills/remoteops/SKILL.md" ]] && pass "兼容 RemoteOps skill 已安装。" || fail "兼容 RemoteOps skill 未安装。"
+for skill_path in "$HOME/.agents/skills/remoteops/SKILL.md" "$CODEX_HOME/skills/remoteops/SKILL.md"; do
+  if [[ -f "$skill_path" ]]; then
+    echo "[信息] 发现独立 RemoteOps Skill：$skill_path；版本与完整性请使用 Skill 安装包核验。"
+  else
+    echo "[信息] 未安装独立 RemoteOps Skill：$skill_path；不影响 MCP 自检。"
+  fi
+done
 
 if [[ "$SKIP_NETWORK" -eq 0 && -f "$CONNECTION_CONFIG" ]]; then
   relay="$(plutil -extract relay raw "$CONNECTION_CONFIG" 2>/dev/null || true)"

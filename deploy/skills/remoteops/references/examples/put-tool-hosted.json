@@ -1,0 +1,92 @@
+{
+  "request_id": "example-put-tool-hosted-001",
+  "expected_revision": 0,
+  "command": {
+    "action": "put_tool",
+    "tool": {
+      "id": "sample-stdio-mcp",
+      "name": "示例 STDIO MCP",
+      "purpose": "演示工具登记结构",
+      "instructions": "替换为实际程序的调用说明",
+      "examples": [
+        "替换为已验证的调用示例"
+      ],
+      "dependencies": [
+        "替换为实际运行依赖"
+      ],
+      "enabled": false,
+      "versions": [
+        {
+          "version": "1.0.0",
+          "packages": [
+            {
+              "tool": {
+                "id": "sample-stdio-mcp",
+                "documentation": {
+                  "name": "示例 STDIO MCP",
+                  "purpose": "演示工具登记结构",
+                  "instructions": "替换为实际程序的调用说明",
+                  "examples": [
+                    "替换为已验证的调用示例"
+                  ],
+                  "dependencies": [
+                    "替换为实际运行依赖"
+                  ]
+                },
+                "version": "1.0.0",
+                "description": "工具中心登记结构示例，实际程序与运行结果须另行验证",
+                "capabilities": [
+                  "example"
+                ],
+                "documentation_url": "https://docs.example.invalid/sample-stdio-mcp",
+                "publisher": "示例发布者",
+                "license": "MIT",
+                "limitations": [
+                  "尚未完成实际平台测试"
+                ],
+                "release_notes": "示例固定版本",
+                "permissions": [
+                  "按实际工具填写所需权限"
+                ],
+                "requires_desktop": false,
+                "platforms": [
+                  {
+                    "os": "windows",
+                    "arch": "x86_64",
+                    "os_versions": "待记录实际 Windows 版本与 build",
+                    "status": "pending",
+                    "min_windows_build": null,
+                    "max_windows_build": null
+                  }
+                ],
+                "package": {
+                  "url": "relay://packages/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.zip",
+                  "size": 123456,
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "format": "zip"
+                },
+                "startup": {
+                  "interface": "stdio_mcp",
+                  "executable": "bin/tool.exe",
+                  "args": [],
+                  "browser_executable": "",
+                  "operations": []
+                },
+                "health_check": {
+                  "method": "tools/list",
+                  "timeout_secs": 30
+                },
+                "timeout_secs": 60
+              },
+              "source": {
+                "kind": "hosted"
+              },
+              "file_verified": false,
+              "tests": []
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

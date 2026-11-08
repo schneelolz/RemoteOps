@@ -105,6 +105,28 @@ pub struct TargetGuidance {
     pub references: Vec<GuidanceReference>,
 }
 
+/// 目标宿主明确选择的界面语言，不从自由文本或控制端环境推断。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TargetUiLanguage {
+    /// 简体中文。
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    /// 美国英语。
+    #[serde(rename = "en-US")]
+    EnUs,
+}
+
+impl TargetUiLanguage {
+    /// 返回传递给安全输入程序的稳定语言代码。
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ZhCn => "zh-CN",
+            Self::EnUs => "en-US",
+        }
+    }
+}
+
 /// 随 Agent 的当前启动和目标会话传播的标准上下文。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -132,6 +154,9 @@ pub struct TargetContext {
     /// 确实支持 SSH 信任管理 CLI 的 Agent 可执行文件绝对路径。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_trust_cli: Option<String>,
+    /// 目标当前选择的界面语言；旧 Agent 未报告时由控制端回退。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_language: Option<TargetUiLanguage>,
 }
 
 fn unknown_schema_version() -> u16 {
@@ -151,6 +176,7 @@ impl Default for TargetContext {
             guidance: Vec::new(),
             transfer_root: None,
             ssh_trust_cli: None,
+            ui_language: None,
         }
     }
 }
@@ -351,6 +377,28 @@ impl TargetContext {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_language_is_optional_and_uses_stable_codes() {
+        let old: super::TargetContext = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.ui_language, None);
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("ui_language")
+                .is_none()
+        );
+        for (code, language) in [
+            ("zh-CN", super::TargetUiLanguage::ZhCn),
+            ("en-US", super::TargetUiLanguage::EnUs),
+        ] {
+            let context: super::TargetContext =
+                serde_json::from_value(serde_json::json!({ "ui_language": code })).unwrap();
+            assert_eq!(context.ui_language, Some(language));
+            assert_eq!(language.code(), code);
+            assert_eq!(serde_json::to_value(context).unwrap()["ui_language"], code);
+        }
+    }
+
     use super::*;
     #[test]
     fn unknown_or_service_context_never_enables_visual() {

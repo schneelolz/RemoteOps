@@ -7,8 +7,8 @@
 本机已安装环境的日常使用、自然语言示例和现场实测结果见
 [RemoteOps MCP 使用手册](RemoteOpsMCP使用手册.md)。
 
-- 核对日期：2026-08-13
-- 当前版本：`0.2.0-preview.5`
+- 核对日期：2026-11-05
+- 当前 MCP 发布候选：`0.2.0-preview.20`；Skill 独立版本：`0.1.0`（最低 MCP `0.2.0-preview.19`）
 - MCP 传输：本地 STDIO
 - MCP SDK：官方 `modelcontextprotocol/rust-sdk` 的 `rmcp`
 - 官方依据：[Model Context Protocol](https://learn.chatgpt.com/docs/extend/mcp.md)
@@ -47,7 +47,7 @@ RemoteOps 只启动本地 STDIO MCP，不开放公网 MCP HTTP。公网只部署
 Windows x64 优先使用：
 
 ```text
-artifacts\release\0.2.0-preview.5\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.5.zip
+RemoteOps-MCP-Windows-x64-0.2.0-preview.20.zip
 ```
 
 安装包内的 `README.md` 可直接交给安装者或安装者的 Codex 阅读。`Install-RemoteOpsMcp.ps1 -SetupFile <路径>` 或 `-SetupCode` 会兑换独立凭据、保留其他 Codex 配置并创建备份；不再提供手工 Token 安装。
@@ -55,7 +55,7 @@ artifacts\release\0.2.0-preview.5\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.5.
 Apple Silicon Mac 使用：
 
 ```text
-RemoteOps-MCP-macOS-arm64-0.2.0-preview.5.tar.gz
+RemoteOps-MCP-macOS-arm64-0.2.0-preview.20.tar.gz
 ```
 
 macOS 安装器通过设置码/文件兑换独立凭据，保存到当前用户 Keychain。非敏感的 Owner UUID 和凭据引用写入 `controller-config.json`，运行时由 MCP 直接读取凭据，因此从 Finder 启动 Codex 时不依赖 shell 环境变量继承。完整步骤见 [macOS MCP 接入说明](macOSMCP接入说明.md)。
@@ -66,7 +66,7 @@ macOS 安装器通过设置码/文件兑换独立凭据，保存到当前用户 
 approval_policy = { granular = { sandbox_approval = true, rules = true, mcp_elicitations = true, request_permissions = false, skill_approval = false } }
 
 [mcp_servers.remoteops]
-command = 'C:\Users\<用户名>\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.12.exe'
+command = 'C:\Users\<用户名>\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.20.exe'
 args = ['--config', 'C:\Users\<用户名>\.codex\remoteops\controller-config.json', '--command-mode', 'agent-controlled']
 startup_timeout_sec = 15
 tool_timeout_sec = 180
@@ -86,7 +86,7 @@ approval_mode = 'prompt'
 
 全新 Agent 首次运行只需填写 Relay 地址并等待九位控制码，不需要在 MCP 中申请入网码，也不需要部署级 Agent 注册 Token。MCP 必须先通过有效凭据认证；Agent 控制码只用于把当前 Agent 会话绑定到该 Controller。
 
-安装包同时将 `remoteops` skill 安装到当前 Codex 使用的标准目录 `~/.agents/skills/remoteops`，并同步写入兼容目录 `~/.codex/skills/remoteops`。它负责把“RemoteOps 控制码 + 诊断目标”这样的自然语言请求路由到 MCP，并在当前任务未加载 RemoteOps 工具时明确要求刷新，而不是误用远程桌面或本机命令。安装或更新后必须完全退出并重新打开 Codex，再新建任务使 MCP 工具和 skill 同时生效。
+MCP 与 `remoteops` Skill 已拆分为独立版本与安装包。MCP 安装、升级、自检和卸载不再强制复制、覆盖或删除 Skill；标准目录 `~/.agents/skills/remoteops` 及兼容目录由独立 Skill 安装器维护。Skill 负责把“RemoteOps 控制码 + 诊断目标”这样的自然语言请求路由到 MCP，并提供交换机 SSH、指纹核对和排障流程。独立包、组合包、安装边界及 Y 盘发布约定见 [MCP 与 Skill 独立发布规范](mcp-skill-release.md)。MCP 更新后完全退出实际 Codex 宿主并重开；Skill 更新后按宿主方式重新加载或新建会话，不保证当前任务自动读取新内容。
 
 同一 MCP 进程已经成功配对后，即使 Relay 长时间停机，连接恢复时也会自动重试原配对；Controller 先恢复而 Agent 后恢复时，重试会持续到 Agent 在线。Agent 使用有效恢复令牌重新认证后保留原控制码和 `session_id`，不需要另一端再次确认。Codex 思考或本地开发期间没有工具调用，不会因为普通业务空闲而永久失去该配对。
 

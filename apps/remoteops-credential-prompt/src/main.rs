@@ -14,6 +14,12 @@ use zeroize::Zeroizing;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
+    /// 凭据用途；browser不提供密码记忆。
+    #[arg(long, default_value="ssh", value_parser=["ssh", "browser"])]
+    purpose: String,
+    /// 网页凭据的远端目标及字段说明，不含秘密。
+    #[arg(long, default_value = "")]
+    browser_target: String,
     #[arg(long)]
     host: String,
     #[arg(long, default_value_t = 22)]
@@ -43,18 +49,27 @@ struct PromptResponse<'a> {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("RemoteOps 凭据输入失败：{error:#}");
+        eprintln!("RemoteOps: {error:#}");
         std::process::exit(2);
     }
 }
 
 fn run() -> anyhow::Result<()> {
     let args = Args::parse();
+    let language = prompt_language(args.language.as_deref());
     if std::io::stdout().is_terminal() {
-        bail!("该内部程序只能由 RemoteOps MCP 通过受控管道启动");
+        bail!(localized(
+            language,
+            "该内部程序只能由 RemoteOps MCP 通过受控管道启动",
+            "This internal program must be started by RemoteOps MCP through a managed pipe"
+        ));
     }
-    if args.host.trim().is_empty() || args.username.trim().is_empty() {
-        bail!("SSH 主机和用户名不能为空");
+    if args.host.trim().is_empty() || (args.purpose == "ssh" && args.username.trim().is_empty()) {
+        bail!(localized(
+            language,
+            "SSH 主机和用户名不能为空",
+            "SSH host and username cannot be empty"
+        ));
     }
     if args.command_sha256.len() != 64
         || !args
@@ -62,24 +77,49 @@ fn run() -> anyhow::Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
     {
-        bail!("命令摘要无效");
+        bail!(localized(
+            language,
+            "命令摘要无效",
+            "Invalid command digest"
+        ));
     }
-    let target = format!(
-        "{}@{}:{}",
-        args.username.trim(),
-        args.host.trim(),
-        args.port
-    );
-    let language = prompt_language(args.language.as_deref());
-    let mut platform = platform_prompt(&target, &args.command_sha256, language)?;
+    let target = if args.purpose == "browser" {
+        format!(
+            "{} | {} | {}",
+            args.host.trim(),
+            args.username.trim(),
+            args.browser_target
+        )
+    } else {
+        format!(
+            "{}@{}:{}",
+            args.username.trim(),
+            args.host.trim(),
+            args.port
+        )
+    };
+    let mut platform = platform_prompt(
+        &target,
+        &args.command_sha256,
+        language,
+        args.purpose == "browser",
+    )?;
     let action = match platform.action.as_str() {
         "use_once" => "use_once",
         "remember_10_minutes" => "remember_10_minutes",
         "cancel" => "cancel",
-        _ => bail!("安全输入窗口返回了未知操作"),
+        _ => bail!(localized(
+            language,
+            "安全输入窗口返回了未知操作",
+            "The credential window returned an unknown action"
+        )),
     };
     if action != "cancel" && platform.password.is_empty() {
-        bail!("SSH 密码不能为空");
+        bail!(localized(
+            language,
+            "SSH 密码不能为空",
+            "SSH password cannot be empty"
+        ));
     }
     let password = Zeroizing::new(std::mem::take(&mut platform.password));
     let response = PromptResponse {
@@ -87,22 +127,30 @@ fn run() -> anyhow::Result<()> {
         password: (action != "cancel").then_some(password.as_str()),
     };
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &response).context("无法编码安全输入结果")?;
+    serde_json::to_writer(&mut stdout, &response).context(localized(
+        language,
+        "无法编码安全输入结果",
+        "Cannot encode the credential response",
+    ))?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())
 }
 
 fn prompt_language(explicit: Option<&str>) -> &'static str {
-    let value = explicit
-        .map(str::to_owned)
-        .or_else(|| std::env::var("LC_ALL").ok())
-        .or_else(|| std::env::var("LANG").ok())
-        .unwrap_or_default();
-    if value.to_ascii_lowercase().starts_with("zh") {
-        "zh"
+    explicit
+        .map_or_else(
+            remoteops_i18n::Language::detect,
+            remoteops_i18n::Language::parse,
+        )
+        .code()
+}
+
+fn localized<'a>(language: &str, chinese: &'a str, english: &'a str) -> &'a str {
+    if language == "zh-CN" {
+        chinese
     } else {
-        "en"
+        english
     }
 }
 
@@ -112,6 +160,7 @@ fn platform_prompt(
     target: &str,
     command_sha256: &str,
     language: &str,
+    browser: bool,
 ) -> anyhow::Result<PlatformResponse> {
     use std::os::windows::process::CommandExt as _;
 
@@ -122,68 +171,88 @@ $inputJson = [Console]::In.ReadToEnd() | ConvertFrom-Json
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $form = New-Object Windows.Forms.Form
-$form.Text = 'RemoteOps SSH credential'
+$form.Text = if ($inputJson.browser) { 'RemoteOps 网页凭据 / Browser credential' } elseif ($inputJson.language -eq 'zh-CN') { 'RemoteOps SSH 凭据' } else { 'RemoteOps SSH credential' }
 $form.StartPosition = 'CenterScreen'
 $form.TopMost = $true
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
-$form.ClientSize = New-Object Drawing.Size(520, 330)
+$form.ClientSize = New-Object Drawing.Size(520, 352)
 $form.Font = New-Object Drawing.Font('Segoe UI', 10)
 $form.BackColor = [Drawing.Color]::White
 $label = New-Object Windows.Forms.Label
 $label.Location = New-Object Drawing.Point(28, 24)
 $label.Size = New-Object Drawing.Size(464, 32)
 $label.Font = New-Object Drawing.Font('Segoe UI Semibold', 16)
-$label.Text = if ($inputJson.language -eq 'zh') { '需要 SSH 凭据' } else { 'SSH credential required' }
+$label.Text = if ($inputJson.browser) { '填写网页密码 / Browser password' } elseif ($inputJson.language -eq 'zh-CN') { '需要 SSH 凭据' } else { 'SSH credential required' }
 $form.Controls.Add($label)
 $description = New-Object Windows.Forms.Label
 $description.Location = New-Object Drawing.Point(28, 62)
 $description.Size = New-Object Drawing.Size(464, 24)
 $description.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
-$description.Text = if ($inputJson.language -eq 'zh') { '输入密码以建立安全连接' } else { 'Enter your password to connect securely' }
+$description.Text = if ($inputJson.browser) { '仅填写指定页面，不会自动提交登录；请核对协议与站点' } elseif ($inputJson.language -eq 'zh-CN') { '输入密码以建立安全连接' } else { 'Enter your password to connect securely' }
 $form.Controls.Add($description)
 $targetLabel = New-Object Windows.Forms.Label
 $targetLabel.Location = New-Object Drawing.Point(28, 102)
-$targetLabel.Size = New-Object Drawing.Size(464, 25)
+$targetLabel.Size = New-Object Drawing.Size(464, 48)
 $targetLabel.Font = New-Object Drawing.Font('Consolas', 11)
 $targetLabel.Text = $inputJson.target
 $form.Controls.Add($targetLabel)
 $fingerprint = New-Object Windows.Forms.Label
-$fingerprint.Location = New-Object Drawing.Point(28, 128)
+$fingerprint.Location = New-Object Drawing.Point(28, 148)
 $fingerprint.Size = New-Object Drawing.Size(464, 25)
 $fingerprint.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
 $fingerprint.Font = New-Object Drawing.Font('Consolas', 9)
-$fingerprint.Text = if ($inputJson.language -eq 'zh') { "命令指纹  $($inputJson.command_sha256.Substring(0, 16))..." } else { "Command fingerprint  $($inputJson.command_sha256.Substring(0, 16))..." }
+$fingerprint.Text = if ($inputJson.browser) { '密码仅本次使用，不进入 AI 对话或日志' } elseif ($inputJson.language -eq 'zh-CN') { "命令指纹  $($inputJson.command_sha256.Substring(0, 16))..." } else { "Command fingerprint  $($inputJson.command_sha256.Substring(0, 16))..." }
 $form.Controls.Add($fingerprint)
+$passwordLabel = New-Object Windows.Forms.Label
+$passwordLabel.Location = New-Object Drawing.Point(28, 174)
+$passwordLabel.Size = New-Object Drawing.Size(464, 22)
+$passwordLabel.Text = if ($inputJson.browser) { '网页密码 / Browser password' } elseif ($inputJson.language -eq 'zh-CN') { 'SSH 密码' } else { 'SSH password' }
+$form.Controls.Add($passwordLabel)
 $password = New-Object Windows.Forms.TextBox
-$password.Location = New-Object Drawing.Point(28, 176)
+$password.Location = New-Object Drawing.Point(28, 197)
 $password.Size = New-Object Drawing.Size(464, 30)
 $password.Font = New-Object Drawing.Font('Segoe UI', 11)
 $password.UseSystemPasswordChar = $true
 $form.Controls.Add($password)
 $remember = New-Object Windows.Forms.CheckBox
-$remember.Location = New-Object Drawing.Point(28, 220)
+$remember.Location = New-Object Drawing.Point(28, 233)
 $remember.Size = New-Object Drawing.Size(464, 26)
-$remember.Text = if ($inputJson.language -eq 'zh') { '记住 10 分钟（仅保存在内存中）' } else { 'Remember for 10 minutes (stored in memory only)' }
+$remember.Text = if ($inputJson.language -eq 'zh-CN') { '记住 10 分钟（仅保存在内存中）' } else { 'Remember for 10 minutes (stored in memory only)' }
 $remember.Checked = $false
+$remember.Visible = -not $inputJson.browser
 $form.Controls.Add($remember)
 $ok = New-Object Windows.Forms.Button
-$ok.Location = New-Object Drawing.Point(390, 278)
+$ok.Location = New-Object Drawing.Point(390, 302)
 $ok.Size = New-Object Drawing.Size(102, 34)
-$ok.Text = if ($inputJson.language -eq 'zh') { '仅本次使用' } else { 'Use once' }
+$ok.Text = if ($inputJson.language -eq 'zh-CN') { '仅本次使用' } else { 'Use once' }
 $ok.BackColor = [Drawing.Color]::FromArgb(30, 110, 230)
 $ok.ForeColor = [Drawing.Color]::White
 $ok.DialogResult = [Windows.Forms.DialogResult]::OK
 $form.AcceptButton = $ok
 $form.Controls.Add($ok)
 $cancel = New-Object Windows.Forms.Button
-$cancel.Location = New-Object Drawing.Point(278, 278)
+$cancel.Location = New-Object Drawing.Point(278, 302)
 $cancel.Size = New-Object Drawing.Size(102, 34)
-$cancel.Text = if ($inputJson.language -eq 'zh') { '取消' } else { 'Cancel' }
+$cancel.Text = if ($inputJson.language -eq 'zh-CN') { '取消' } else { 'Cancel' }
 $cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
 $form.CancelButton = $cancel
 $form.Controls.Add($cancel)
+$errorLabel = New-Object Windows.Forms.Label
+$errorLabel.Location = New-Object Drawing.Point(28, 263)
+$errorLabel.Size = New-Object Drawing.Size(464, 24)
+$errorLabel.ForeColor = [Drawing.Color]::Firebrick
+$form.Controls.Add($errorLabel)
+$form.Add_FormClosing({
+  param($sender, $eventArgs)
+  if ($form.DialogResult -eq [Windows.Forms.DialogResult]::OK -and [string]::IsNullOrEmpty($password.Text)) {
+    $eventArgs.Cancel = $true
+    $form.DialogResult = [Windows.Forms.DialogResult]::None
+    $errorLabel.Text = if ($inputJson.browser) { '网页密码不能为空 / Password is required' } elseif ($inputJson.language -eq 'zh-CN') { 'SSH 密码不能为空' } else { 'SSH password cannot be empty' }
+    $password.Focus()
+  }
+})
 $form.Add_Shown({
   $form.Activate()
   $form.BringToFront()
@@ -204,6 +273,7 @@ $password.Clear()
         "target": target,
         "command_sha256": command_sha256,
         "language": language,
+        "browser": browser,
     });
     let mut child = Command::new("powershell.exe")
         .args([
@@ -219,13 +289,21 @@ $password.Clear()
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
-        .context("无法启动 Windows 安全输入窗口")?;
+        .context(localized(
+            language,
+            "无法启动 Windows 安全输入窗口",
+            "Cannot start the Windows credential window",
+        ))?;
     serde_json::to_writer(
-        child.stdin.as_mut().context("安全输入窗口 stdin 不可用")?,
+        child.stdin.as_mut().context(localized(
+            language,
+            "安全输入窗口 stdin 不可用",
+            "Credential window stdin is unavailable",
+        ))?,
         &input,
     )?;
     drop(child.stdin.take());
-    decode_platform_response(child.wait_with_output()?)
+    decode_platform_response(child.wait_with_output()?, language)
 }
 
 #[cfg(target_os = "macos")]
@@ -233,6 +311,7 @@ fn platform_prompt(
     target: &str,
     command_sha256: &str,
     language: &str,
+    browser: bool,
 ) -> anyhow::Result<PlatformResponse> {
     const SCRIPT: &str = r"
 ObjC.import('Cocoa')
@@ -240,9 +319,10 @@ ObjC.import('Cocoa')
 function run(argv) {
   const targetName = argv[0]
   const commandHash = argv[1]
-  const chinese = argv[2] === 'zh'
+  const chinese = argv[2] === 'zh-CN'
+  const browser = argv[3] === 'browser'
   const alert = $.NSAlert.alloc.init
-  const title = chinese ? '需要 SSH 凭据' : 'SSH credential required'
+  const title = browser ? (chinese ? '需要网页凭据' : 'Browser credential required') : (chinese ? '需要 SSH 凭据' : 'SSH credential required')
   const description = chinese ? '输入密码以建立安全连接' : 'Enter your password to connect securely'
   const fingerprint = chinese ? '命令指纹  ' : 'Command fingerprint  '
   const placeholder = chinese ? '输入 SSH 密码' : 'Enter SSH password'
@@ -262,12 +342,18 @@ function run(argv) {
   remember.setButtonType($.NSSwitchButton)
   remember.setTitle($(rememberTitle))
   accessory.addSubview(password)
-  accessory.addSubview(remember)
+  if (!browser) accessory.addSubview(remember)
   alert.setAccessoryView(accessory)
   alert.window.setInitialFirstResponder(password)
 
-  const result = alert.runModal
-  if (result == $.NSAlertSecondButtonReturn) return 'cancel\n'
+  while (true) {
+    const result = alert.runModal
+    if (result == $.NSAlertSecondButtonReturn) return 'cancel\n'
+    if (password.stringValue.js.length > 0) break
+    const emptyMessage = chinese ? 'SSH 密码不能为空' : 'SSH password cannot be empty'
+    alert.setInformativeText($(description + '\n' + targetName + '\n' + fingerprint + commandHash.slice(0, 16) + '…\n' + emptyMessage))
+    alert.window.makeFirstResponder(password)
+  }
   const action = remember.state == $.NSControlStateValueOn ? 'remember_10_minutes' : 'use_once'
   const secret = password.stringValue.js
   password.setStringValue($(''))
@@ -284,20 +370,33 @@ function run(argv) {
             target,
             command_sha256,
             language,
+            if browser { "browser" } else { "ssh" },
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .context("无法启动 macOS 安全输入窗口")?;
+        .context(localized(
+            language,
+            "无法启动 macOS 安全输入窗口",
+            "Cannot start the macOS credential window",
+        ))?;
     if !output.status.success() {
         bail!(
-            "macOS 安全输入窗口失败：{}",
+            "{}: {}",
+            localized(
+                language,
+                "macOS 安全输入窗口失败",
+                "macOS credential window failed"
+            ),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let mut text =
-        Zeroizing::new(String::from_utf8(output.stdout).context("安全输入结果不是 UTF-8")?);
+    let mut text = Zeroizing::new(String::from_utf8(output.stdout).context(localized(
+        language,
+        "安全输入结果不是 UTF-8",
+        "Credential response is not UTF-8",
+    ))?);
     let (action, password) = text
         .split_once('\n')
         .map_or((text.trim(), ""), |(action, password)| {
@@ -315,22 +414,79 @@ function run(argv) {
 fn platform_prompt(
     _target: &str,
     _command_sha256: &str,
-    _language: &str,
+    language: &str,
+    _browser: bool,
 ) -> anyhow::Result<PlatformResponse> {
-    bail!("SSH 密码安全输入仅支持 Windows 和 macOS Controller")
+    bail!(localized(
+        language,
+        "SSH 密码安全输入仅支持 Windows 和 macOS Controller",
+        "SSH password prompting supports Windows and macOS Controllers only"
+    ))
 }
 
 #[cfg(target_os = "windows")]
-fn decode_platform_response(output: std::process::Output) -> anyhow::Result<PlatformResponse> {
+fn decode_platform_response(
+    output: std::process::Output,
+    language: &str,
+) -> anyhow::Result<PlatformResponse> {
     if !output.status.success() {
         bail!(
-            "Windows 安全输入窗口失败：{}",
+            "{}: {}",
+            localized(
+                language,
+                "Windows 安全输入窗口失败",
+                "Windows credential window failed"
+            ),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let mut text =
-        Zeroizing::new(String::from_utf8(output.stdout).context("安全输入结果不是 UTF-8")?);
-    let response = serde_json::from_str(text.trim()).context("安全输入结果格式无效")?;
+    let mut text = Zeroizing::new(String::from_utf8(output.stdout).context(localized(
+        language,
+        "安全输入结果不是 UTF-8",
+        "Credential response is not UTF-8",
+    ))?);
+    let response = serde_json::from_str(text.trim()).context(localized(
+        language,
+        "安全输入结果格式无效",
+        "Invalid credential response format",
+    ))?;
     text.zeroize();
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_language_overrides_controller_environment() {
+        assert_eq!(prompt_language(Some("zh-CN")), "zh-CN");
+        assert_eq!(prompt_language(Some("en-US")), "en-US");
+        assert_eq!(
+            prompt_language(None),
+            remoteops_i18n::Language::detect().code()
+        );
+        assert_eq!(localized("zh-CN", "密码", "Password"), "密码");
+        assert_eq!(localized("en-US", "密码", "Password"), "Password");
+    }
+
+    #[test]
+    fn helper_accepts_target_language_and_retains_optional_legacy_argument() {
+        let arguments = [
+            "prompt",
+            "--host",
+            "example.invalid",
+            "--username",
+            "admin",
+            "--command-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+        let old = Args::try_parse_from(arguments).unwrap();
+        for language in ["zh-CN", "en-US"] {
+            let args = Args::try_parse_from(arguments.into_iter().chain(["--language", language]))
+                .unwrap();
+            assert_eq!(args.language.as_deref(), Some(language));
+        }
+        assert_eq!(old.host, "example.invalid");
+    }
 }

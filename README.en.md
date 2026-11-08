@@ -79,6 +79,8 @@ The Relay requires Linux x64, Docker, and an address reachable by both the Agent
 
 ```bash
 cp deploy/relay/.env.example deploy/relay/.env
+npm --prefix relay-admin ci --ignore-scripts
+npm --prefix relay-admin run build
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml config --quiet
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml up -d --build
 curl --fail http://127.0.0.1:18080/health
@@ -183,3 +185,5 @@ Recorded validation: 262 macOS workspace tests, Linux workspace checks, and 50 i
 ## License
 
 RemoteOps is licensed under [AGPL-3.0-only](LICENSE). It remains self-hosted and vendor-neutral; check the license and commercial terms of any third-party AI or Visual Provider integration separately.
+
+The management console is now a separately built Vue frontend. See [deployment instructions](deploy/relay-admin/README.md) and [preview.17 delivery](docs/relay-admin-split-preview17.md).

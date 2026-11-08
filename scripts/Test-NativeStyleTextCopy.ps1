@@ -32,7 +32,7 @@ function Fingerprint($Value){
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$bytes))
 }
 function Check([string]$Name,[bool]$Passed){$checks.Add([pscustomobject]@{name=$Name;passed=$Passed});if(-not $Passed){throw $Name}}
-function Client([string]$Action='Snapshot',[int]$Id=0){$json=& $helper -Action $Action -ControlId $Id -ProcessId $app.Id -ProcessStartUtc $identity -ExpectedHash $ExpectedHash -FocusBeforeInvoke:($Action -eq 'Invoke');if(-not $? -or $LASTEXITCODE){throw 'own_client_failed'};return $json|ConvertFrom-Json}
+function Client([string]$Action='Snapshot',[int]$Id=0){$json=& $helper -ExpectedVersion ([Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion) -Action $Action -ControlId $Id -ProcessId $app.Id -ProcessStartUtc $identity -ExpectedHash $ExpectedHash -FocusBeforeInvoke:($Action -eq 'Invoke');if(-not $? -or $LASTEXITCODE){throw 'own_client_failed'};return $json|ConvertFrom-Json}
 try{
     Assert-NativeStyleDesktopUnlocked
     $sequence=[StyleCopyNative]::GetClipboardSequenceNumber();$original=[Windows.Forms.Clipboard]::GetDataObject();$wasEmpty=$null -eq $original -or @($original.GetFormats($false)).Count -eq 0

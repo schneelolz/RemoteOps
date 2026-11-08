@@ -1,3 +1,6 @@
+#[path = "relay_tools_admin.rs"]
+mod tools;
+
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -10,7 +13,7 @@ use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Json as ExtractJson, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
@@ -237,16 +240,11 @@ pub(crate) async fn serve(
             post(shutdown_agent),
         )
         .route("/api/admin/audit", get(audit))
-        .route("/", get(index))
-        .route("/index.html", get(index))
-        .route("/app.js", get(app_js))
-        .route("/theme.js", get(theme_js))
-        .route("/style.css", get(style_css))
         .layer(DefaultBodyLimit::max(8 * 1024))
+        .merge(tools::router())
         .merge(crate::enrollment::router())
         .merge(crate::portal::router())
-        .with_state(state)
-        .fallback(index);
+        .with_state(state);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -696,45 +694,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-async fn index() -> Response {
-    (
-        [(
-            axum::http::header::CONTENT_SECURITY_POLICY,
-            "default-src 'self'; script-src 'self'; script-src-attr 'unsafe-inline'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
-        )],
-        Html(include_str!("../../../relay-admin-prototype/index.html")),
-    )
-        .into_response()
-}
-async fn app_js() -> Response {
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        include_str!("../../../relay-admin-prototype/app.js"),
-    )
-        .into_response()
-}
-/// 在样式表前提供同源主题初始化，保持脚本来源限制。
-async fn theme_js() -> Response {
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        include_str!("../../../relay-admin-prototype/theme.js"),
-    )
-        .into_response()
-}
-async fn style_css() -> Response {
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../../../relay-admin-prototype/style.css"),
-    )
-        .into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,6 +792,7 @@ mod tests {
         async fn request(&self, method: &str, path: &str, body: &str, admin: bool) -> Response {
             use tower::ServiceExt as _;
             let app = crate::enrollment::router()
+                .merge(tools::router())
                 .with_state(self.state.clone())
                 .layer(axum::Extension(ConnectInfo(
                     "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
@@ -885,6 +845,12 @@ mod tests {
             ("GET", "/api/admin/mcp/setups"),
             ("POST", "/api/admin/mcp/setups"),
             ("GET", "/api/admin/mcp/clients"),
+            ("GET", "/api/admin/tools"),
+            ("POST", "/api/admin/tools"),
+            (
+                "PUT",
+                "/api/admin/mcp/clients/00000000-0000-0000-0000-000000000001/tool-management",
+            ),
             ("GET", "/api/admin/mcp/access-policy"),
             ("PUT", "/api/admin/mcp/access-policy"),
             (
@@ -917,6 +883,112 @@ mod tests {
             .request("POST", "/api/admin/mcp/setups", "{}", true)
             .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn tool_management_http_grants_and_revokes_only_the_selected_installation() {
+        use remoteops_enrollment::{AdvertisedEndpoints, CreateGrantRequest, RedeemRequest};
+        let fixture = EnrollmentFixture::new();
+        let store = fixture.state.relay.enrollment_store().unwrap();
+        store
+            .set_settings(AdvertisedEndpoints {
+                enrollment_url: "https://relay.example.test/api/mcp/enroll".into(),
+                relay: "relay.example.test:7443".into(),
+                server_name: "relay.example.test".into(),
+                relay_ca_pem: None,
+                enrollment_ca_pem: None,
+            })
+            .unwrap();
+        let now = Utc::now();
+        let grant = store
+            .create_grant(
+                CreateGrantRequest {
+                    client_name: None,
+                    expires_in_hours: Some(1),
+                },
+                now,
+            )
+            .unwrap();
+        let id = Uuid::new_v4();
+        store
+            .redeem(
+                RedeemRequest {
+                    grant_id: grant.setup.grant_id,
+                    grant_secret: grant.setup.grant_secret.clone(),
+                    installation_id: id,
+                    installation_secret: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI".into(),
+                },
+                now,
+            )
+            .unwrap();
+        let path = format!("/api/admin/mcp/clients/{id}/tool-management");
+        assert!(!store.has_tool_management(id).unwrap());
+        let response = fixture
+            .request("PUT", &path, r#"{"enabled":true}"#, true)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_response(response).await["tool_management"], true);
+        assert!(store.has_tool_management(id).unwrap());
+        assert!(!store.has_tool_management(Uuid::new_v4()).unwrap());
+        let response = fixture
+            .request("PUT", &path, r#"{"enabled":false}"#, true)
+            .await;
+        assert_eq!(json_response(response).await["tool_management"], false);
+        assert!(!store.has_tool_management(id).unwrap());
+        assert_eq!(
+            fixture
+                .request(
+                    "PUT",
+                    &path,
+                    r#"{"enabled":true,"remote_full_access":true}"#,
+                    true
+                )
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!store.has_tool_management(id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn tool_center_http_maintains_disabled_catalog_and_rejects_stale_writes() {
+        let fixture = EnrollmentFixture::new();
+        let snapshot =
+            json_response(fixture.request("GET", "/api/admin/tools", "", true).await).await;
+        assert!(snapshot["error"].is_null(), "{snapshot}");
+        assert_eq!(snapshot["data"]["enabled"], false);
+        let revision = snapshot["revision"].as_u64().unwrap();
+        let request = serde_json::json!({"request_id": Uuid::new_v4().to_string(), "expected_revision": revision, "command": {"action":"set_policy","enabled":true}});
+        let first = json_response(
+            fixture
+                .request("POST", "/api/admin/tools", &request.to_string(), true)
+                .await,
+        )
+        .await;
+        assert!(first["error"].is_null(), "{first}");
+        let retry = json_response(
+            fixture
+                .request("POST", "/api/admin/tools", &request.to_string(), true)
+                .await,
+        )
+        .await;
+        assert_eq!(retry, first);
+        let stale = serde_json::json!({"request_id": Uuid::new_v4().to_string(), "expected_revision": revision, "command": {"action":"set_policy","enabled":false}});
+        let conflict = json_response(
+            fixture
+                .request("POST", "/api/admin/tools", &stale.to_string(), true)
+                .await,
+        )
+        .await;
+        assert!(
+            conflict["error"]["code"]
+                .as_str()
+                .unwrap()
+                .contains("revision")
+        );
+        let snapshot =
+            json_response(fixture.request("GET", "/api/admin/tools", "", true).await).await;
+        assert_eq!(snapshot["data"]["enabled"], true);
     }
 
     #[tokio::test]

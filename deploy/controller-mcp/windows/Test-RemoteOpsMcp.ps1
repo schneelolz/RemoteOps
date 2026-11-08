@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$CandidateDirectory,
@@ -11,8 +11,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$expectedMcpVersion = '0.2.0-preview.17'
-$expectedCredentialPromptVersion = '0.2.0-preview.5'
+$expectedMcpVersion = '0.2.0-preview.25'
+$expectedCredentialPromptVersion = '0.2.0-preview.7'
 $expectedToolTimeoutSec = 360
 $configPath = Join-Path $CodexHome 'config.toml'
 $installDirectory = Join-Path $CodexHome 'remoteops'
@@ -119,6 +119,48 @@ if ($candidateRequested) {
     Write-Host '[通过] 旁路目录边界与两个程序的 SHA-256 已验证。'
 }
 
+# 同目录清单只能检查包内一致性，不能替代旁路安装要求的外部可信 EXE 摘要。
+$verificationDirectory = if ($candidateRequested) { $selectedDirectory } else { $installDirectory }
+$packageManifestPath = Join-Path $verificationDirectory 'manifest.json'
+if (Test-Path -LiteralPath $packageManifestPath -PathType Leaf) {
+    if ((Get-Item -LiteralPath $packageManifestPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw 'MCP 包清单不允许是重解析点。'
+    }
+    $packageManifest = [IO.File]::ReadAllText($packageManifestPath) | ConvertFrom-Json
+    if ($packageManifest.schema_version -ne 1 -or $packageManifest.component -ne 'remoteops-mcp' -or
+        $packageManifest.version -ne $expectedMcpVersion -or
+        $packageManifest.credential_prompt_version -ne $expectedCredentialPromptVersion -or
+        $packageManifest.protocol -ne 20 -or $packageManifest.contains_credentials -ne $false) {
+        throw 'MCP 包清单版本、协议或组件声明无效。'
+    }
+    $manifestNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $packageManifest.files) {
+        $relative = [string]$entry.file
+        if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or
+            $relative.Contains('\') -or $relative.Contains(':') -or
+            @($relative.Split('/') | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' }).Count -ne 0 -or
+            -not $manifestNames.Add($relative) -or [string]$entry.sha256 -notmatch '^[a-fA-F0-9]{64}$') {
+            throw 'MCP 包清单包含无效或重复路径、摘要。'
+        }
+        $path = Join-Path $verificationDirectory $relative
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'MCP 包清单中的文件缺失。' }
+        for ($current = $path; $current.Length -gt $verificationDirectory.Length; $current = Split-Path -Parent $current) {
+            if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'MCP 包清单路径不允许包含重解析点。'
+            }
+        }
+        if ((Get-Item -LiteralPath $path).Length -ne $entry.bytes -or
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $entry.sha256) {
+            throw 'MCP 包文件大小或 SHA-256 与清单不一致；未执行程序。'
+        }
+    }
+    if (-not $manifestNames.Contains('remoteops-controller-mcp.exe') -or
+        -not $manifestNames.Contains('remoteops-credential-prompt.exe')) {
+        throw 'MCP 包清单缺少两个必需程序。'
+    }
+    Write-Host '[通过] MCP 包清单声明、文件大小和 SHA-256 一致；信任来源仍以外部构建记录为准。'
+}
+
 if (-not (Test-Path -LiteralPath $credentialPromptPath -PathType Leaf)) {
     $failures.Add("未找到 SSH 密码安全输入程序：$credentialPromptPath")
 }
@@ -134,30 +176,12 @@ else {
     catch { $failures.Add('无法安全检查 SSH 密码输入程序版本。') }
 }
 
+# Skill 为独立组件，只报告发现状态，不参与 MCP 安装通过判定。
 foreach ($skillPath in @($standardSkillPath, $compatSkillPath) | Select-Object -Unique) {
-    if (-not (Test-Path -LiteralPath $skillPath -PathType Leaf)) {
-        $failures.Add("未找到 RemoteOps skill：$skillPath")
+    if (Test-Path -LiteralPath $skillPath -PathType Leaf) {
+        Write-Host "[信息] 发现独立 RemoteOps Skill：$skillPath；版本与完整性请使用 Skill 安装包核验。"
     }
-    else {
-        $skillContent = [IO.File]::ReadAllText($skillPath)
-        $description = [regex]::Match(
-            $skillContent,
-            '(?m)^description:\s*(?<value>.+)$'
-        )
-        if (
-            $skillContent -notmatch '(?m)^name:\s*remoteops\s*$' -or
-            $skillContent -notmatch '九位控制码' -or
-            $skillContent -notmatch '当前任务未加载 RemoteOps MCP' -or
-            -not $description.Success -or
-            $description.Groups['value'].Value -notmatch '看不到 RemoteOps MCP 工具时' -or
-            $description.Groups['value'].Value -notmatch '禁止改用 Computer Use'
-        ) {
-            $failures.Add("RemoteOps skill 缺少发现阶段的自然语言触发或 MCP 不可用保护规则：$skillPath")
-        }
-        else {
-            Write-Host "[通过] RemoteOps skill 已安装且路由规则完整：$skillPath"
-        }
-    }
+    else { Write-Host "[信息] 未安装独立 RemoteOps Skill：$skillPath；不影响 MCP 自检。" }
 }
 
 $connectionConfig = $null
@@ -254,6 +278,18 @@ else {
         else { Write-Host "[通过] MCP 版本：$versionOutput" }
     }
     catch { $failures.Add('无法安全检查 MCP 版本。'); $installedExecutable = $null }
+}
+
+# 工具契约自检完全离线，普通安装者无需 Node 或测试依赖。
+if ($installedExecutable) {
+    try {
+        $schemaReport = Invoke-CheckExecutable -Executable $installedExecutable -Arguments @('--check-tool-schemas') | ConvertFrom-Json
+        if ($schemaReport.passed -ne $true -or $schemaReport.tool_count -lt 1 -or @($schemaReport.failures).Count -ne 0) {
+            throw '工具 Schema 契约无效。'
+        }
+        Write-Host "[通过] 离线工具 Schema 自检：$($schemaReport.tool_count) 个工具。"
+    }
+    catch { $failures.Add('MCP 工具 Schema 离线自检失败；请保留报告并升级配套程序。') }
 }
 
 if ($usesCredentialStore) {

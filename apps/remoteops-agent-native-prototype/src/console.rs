@@ -66,7 +66,10 @@ pub(super) fn run(
 }
 
 #[cfg(not(feature = "style-preview"))]
-pub(super) fn handle_ssh_trust(args: &[OsString]) -> Option<ExitCode> {
+pub(super) fn handle_ssh_trust(
+    args: &[OsString],
+    tools: Option<&remoteops_agent::BundledTools>,
+) -> Option<ExitCode> {
     if args
         .get(1)
         .is_some_and(|value| value == "--ssh-key-scan" || value == "--ssh-key-trust")
@@ -78,7 +81,9 @@ pub(super) fn handle_ssh_trust(args: &[OsString]) -> Option<ExitCode> {
             .map_err(|error| error.to_string())
             .and_then(|runtime| {
                 runtime
-                    .block_on(remoteops_agent::handle_ssh_trust_cli(args))
+                    .block_on(remoteops_agent::handle_ssh_trust_cli_with_tools(
+                        args, tools,
+                    ))
                     .ok_or_else(|| "未识别 SSH 主机密钥命令".to_owned())?
                     .map_err(|error| remoteops_agent::redact_diagnostic(&error.to_string()))
             });

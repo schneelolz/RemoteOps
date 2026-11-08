@@ -61,6 +61,9 @@ pub(super) struct SetupArgs {
     /// Configure only the `RemoteOps` MCP table.
     #[arg(long, requires_all = ["mcp_command", "mcp_config"])]
     configure_codex: Option<PathBuf>,
+    /// 仅更新现有 `RemoteOps` MCP 程序路径，保留参数、权限与超时。
+    #[arg(long, requires = "mcp_command")]
+    update_codex_command: Option<PathBuf>,
     /// Remove only the `RemoteOps` MCP table.
     #[arg(long)]
     unconfigure_codex: Option<PathBuf>,
@@ -88,12 +91,14 @@ impl SetupArgs {
             || self.inspect_codex.is_some()
             || self.configure_codex.is_some()
             || self.unconfigure_codex.is_some()
+            || self.update_codex_command.is_some()
     }
     fn run_codex_action(&self) -> anyhow::Result<bool> {
         let codex_actions = usize::from(self.validate_codex.is_some())
             + usize::from(self.inspect_codex.is_some())
             + usize::from(self.configure_codex.is_some())
-            + usize::from(self.unconfigure_codex.is_some());
+            + usize::from(self.unconfigure_codex.is_some())
+            + usize::from(self.update_codex_command.is_some());
         if codex_actions > 0 {
             if codex_actions != 1
                 || self.setup_file.is_some()
@@ -114,6 +119,12 @@ impl SetupArgs {
             }
             if let Some(path) = &self.unconfigure_codex {
                 super::codex_config::unconfigure(path)?;
+            }
+            if let Some(path) = &self.update_codex_command {
+                super::codex_config::update_command(
+                    path,
+                    self.mcp_command.as_deref().context("缺少 MCP command")?,
+                )?;
             }
             if let Some(path) = &self.configure_codex {
                 super::codex_config::configure(
@@ -507,6 +518,7 @@ async fn check_relay(response: &RedeemResponse, path: &Path, secret: &str) -> an
         match read_frame::<WireMessage, _>(&mut stream).await? {
             WireMessage::ControllerWelcome {
                 protocol_version: PROTOCOL_VERSION,
+                ..
             } => Ok(()),
             _ => bail!("Relay 未确认此安装的 AI Controller 身份"),
         }
@@ -874,6 +886,8 @@ mod tests {
             write_frame(
                 &mut stream,
                 &WireMessage::ControllerWelcome {
+                    resource_tools_schema_version: None,
+                    tool_center_schema_version: None,
                     protocol_version: PROTOCOL_VERSION,
                 },
             )

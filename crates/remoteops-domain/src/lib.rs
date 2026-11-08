@@ -32,7 +32,7 @@ pub use permission::PermissionMode;
 pub use target_context::{
     AgentRunMode, CapabilityAvailability, GuidanceReference, MAX_TARGET_CONTEXT_BYTES,
     TARGET_CONTEXT_SCHEMA_VERSION, TargetCapabilityStatus, TargetContext, TargetGuidance,
-    TargetRuntimeFacts,
+    TargetRuntimeFacts, TargetUiLanguage,
 };
 pub use visual::{
     VisualActionResult, VisualCapability, VisualDisplay, VisualObservation, VisualSessionState,

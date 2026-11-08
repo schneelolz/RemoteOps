@@ -79,6 +79,31 @@ struct PairSpec {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// 列出显式启用的公开资源工具和兼容状态。
+    ResourceList { target: String },
+    /// 按固定版本和包摘要启动工具。
+    ResourceStart {
+        target: String,
+        tool_id: String,
+        version: String,
+        sha256: String,
+        /// 对本条高风险操作执行一次显式人工审批。
+        #[arg(long)]
+        approve: bool,
+    },
+    /// 调用会话内实例；结果未知时禁止自动重放。
+    ResourceCall {
+        target: String,
+        instance_id: String,
+        tool_name: String,
+        /// JSON对象参数，禁止Shell命令字符串。
+        arguments: serde_json::Value,
+        /// 对本条高风险操作执行一次显式人工审批。
+        #[arg(long)]
+        approve: bool,
+    },
+    /// 停止会话内工具并清理浏览器临时状态。
+    ResourceStop { target: String, instance_id: String },
     /// 列出已配对连接。
     List,
     /// 修改连接别名。
@@ -549,6 +574,83 @@ async fn main() -> anyhow::Result<()> {
     spawn_event_printer(client.clone(), args.json);
 
     match args.command {
+        Command::ResourceList { target } => {
+            ensure_resource_context(&client, &target).await?;
+            let result = client
+                .execute(
+                    &target,
+                    EventSource::Human,
+                    RemoteOperation::ListResourceTools,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            print_result(&result, args.json)?;
+        }
+        Command::ResourceStart {
+            target,
+            tool_id,
+            version,
+            sha256,
+            approve,
+        } => {
+            ensure_resource_context(&client, &target).await?;
+            let result = execute_with_approval(
+                &client,
+                &target,
+                EventSource::Human,
+                RemoteOperation::StartResourceTool {
+                    tool_id,
+                    version,
+                    sha256,
+                },
+                approve,
+                None,
+            )
+            .await?;
+            print_result(&result, args.json)?;
+        }
+        Command::ResourceCall {
+            target,
+            instance_id,
+            tool_name,
+            arguments,
+            approve,
+        } => {
+            ensure_resource_context(&client, &target).await?;
+            let result = execute_with_approval(
+                &client,
+                &target,
+                EventSource::Human,
+                RemoteOperation::CallResourceTool {
+                    instance_id,
+                    tool_name,
+                    arguments,
+                },
+                approve,
+                None,
+            )
+            .await?;
+            print_result(&result, args.json)?;
+        }
+        Command::ResourceStop {
+            target,
+            instance_id,
+        } => {
+            ensure_resource_context(&client, &target).await?;
+            let result = client
+                .execute(
+                    &target,
+                    EventSource::Human,
+                    RemoteOperation::StopResourceTool { instance_id },
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            print_result(&result, args.json)?;
+        }
         Command::List => print_connections(&client, args.json).await?,
         Command::Alias { target, alias } => {
             client.set_alias(&target, alias).await?;
@@ -1352,6 +1454,19 @@ fn print_result(result: &OperationResult, json: bool) -> anyhow::Result<()> {
             println!("SHA-256：{hash}");
         }
     }
+    if let Some(code) = &result.response.error_code {
+        anyhow::bail!("远程操作失败 [{code}]：{}", result.response.summary);
+    }
+    Ok(())
+}
+
+/// CLI同样要求当前Relay和目标显式报告支持，不从协议版本猜测。
+async fn ensure_resource_context(client: &RelayClient, target: &str) -> anyhow::Result<()> {
+    if !client.supports_resource_tools() {
+        anyhow::bail!("Relay未声明资源工具协议v1");
+    }
+    let session = client.resolve_target(target).await?;
+    client.refresh_target_context(session).await?;
     Ok(())
 }
 
@@ -1448,7 +1563,7 @@ fn spawn_event_printer(client: RelayClient, json: bool) {
 #[allow(clippy::too_many_lines)]
 async fn interactive(client: RelayClient) -> anyhow::Result<()> {
     println!(
-        "交互模式命令：list、alias、cmd、powershell、pwsh、shell-open、shell-run、shell-close、port、serial-list、events、cancel、takeover、release-takeover、close、quit"
+        "交互模式命令：list、alias、cmd、powershell、pwsh、shell-open、shell-run、shell-close、port、serial-list、resource-list、resource-start、resource-call、resource-stop、events、cancel、takeover、release-takeover、close、quit"
     );
     loop {
         print!("remoteops> ");
@@ -1464,6 +1579,80 @@ async fn interactive(client: RelayClient) -> anyhow::Result<()> {
         match command {
             "quit" | "exit" => break,
             "list" => print_connections(&client, false).await?,
+            "resource-list" if parts.len() == 2 => {
+                ensure_resource_context(&client, &parts[1]).await?;
+                let result = client
+                    .execute(
+                        &parts[1],
+                        EventSource::Human,
+                        RemoteOperation::ListResourceTools,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                print_result(&result, false)?;
+            }
+            "resource-start"
+                if parts.len() == 5 || (parts.len() == 6 && parts[5] == "--approve") =>
+            {
+                ensure_resource_context(&client, &parts[1]).await?;
+                let result = execute_with_approval(
+                    &client,
+                    &parts[1],
+                    EventSource::Human,
+                    RemoteOperation::StartResourceTool {
+                        tool_id: parts[2].clone(),
+                        version: parts[3].clone(),
+                        sha256: parts[4].clone(),
+                    },
+                    parts.len() == 6,
+                    None,
+                )
+                .await?;
+                print_result(&result, false)?;
+            }
+            "resource-call"
+                if parts.len() == 5 || (parts.len() == 6 && parts[5] == "--approve") =>
+            {
+                // 交互式入口从JSON文件读取参数，避免自己的命令拆词改变JSON引号。
+                let bytes = std::fs::read(&parts[4])?;
+                if bytes.len() > 1024 * 1024 {
+                    anyhow::bail!("资源工具JSON参数超过1MiB");
+                }
+                let arguments = serde_json::from_slice(&bytes)?;
+                ensure_resource_context(&client, &parts[1]).await?;
+                let result = execute_with_approval(
+                    &client,
+                    &parts[1],
+                    EventSource::Human,
+                    RemoteOperation::CallResourceTool {
+                        instance_id: parts[2].clone(),
+                        tool_name: parts[3].clone(),
+                        arguments,
+                    },
+                    parts.len() == 6,
+                    None,
+                )
+                .await?;
+                print_result(&result, false)?;
+            }
+            "resource-stop" if parts.len() == 3 => {
+                ensure_resource_context(&client, &parts[1]).await?;
+                let result = client
+                    .execute(
+                        &parts[1],
+                        EventSource::Human,
+                        RemoteOperation::StopResourceTool {
+                            instance_id: parts[2].clone(),
+                        },
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                print_result(&result, false)?;
+            }
             "alias" if parts.len() >= 3 => {
                 client.set_alias(&parts[1], parts[2..].join(" ")).await?;
             }

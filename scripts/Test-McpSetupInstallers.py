@@ -71,7 +71,7 @@ fn main() {
     if args.iter().any(|a| a == "--version") {
         if args[0].contains("credential-prompt") {
             println!("remoteops-credential-prompt {}", env::var("INSTALLER_TEST_PROMPT_VERSION")
-                .unwrap_or_else(|_| "0.2.0-preview.5".to_owned()));
+                .unwrap_or_else(|_| "0.2.0-preview.7".to_owned()));
         } else { println!("remoteops-controller-mcp {}", env::var("INSTALLER_TEST_MCP_VERSION")
             .unwrap_or_else(|_| "@MCP_VERSION@".to_owned())); }
         return;
@@ -79,9 +79,15 @@ fn main() {
     let mut log = fs::OpenOptions::new().create(true).append(true)
         .open(env::var("INSTALLER_TEST_CALLS").unwrap()).unwrap();
     writeln!(log, "{}", args[1..].join("\t")).unwrap();
-    if args.iter().any(|a| a == "--validate-codex" || a == "--configure-codex" || a == "--unconfigure-codex" || a == "--inspect-codex") {
+    if args.iter().any(|a| a == "--validate-codex" || a == "--configure-codex" || a == "--unconfigure-codex" || a == "--inspect-codex" || a == "--update-codex-command") {
         let status = std::process::Command::new(env::var("INSTALLER_TEST_CODEX_HELPER").unwrap())
             .args(&args[1..]).status().unwrap();
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    if args.iter().any(|a| a == "--check-tool-schemas") {
+        if env::var_os("INSTALLER_TEST_SCHEMA_FAILURE").is_some() { std::process::exit(7); }
+        let status = std::process::Command::new(env::var("INSTALLER_TEST_CODEX_HELPER").unwrap())
+            .arg("--check-tool-schemas").status().unwrap();
         std::process::exit(status.code().unwrap_or(1));
     }
     if args.iter().any(|a| a == "--check-credential" || a == "--remove-credential") { return; }
@@ -179,6 +185,8 @@ def fixture_process_alive(pid):
 
 
 class InstallerVersionTests(unittest.TestCase):
+    targets = ("windows", "macos")
+
     def test_templates_match_mcp_manifest(self):
         declarations = {
             "windows/Install-RemoteOpsMcp.ps1": r"^\$mcpVersion = '([^']+)'$",
@@ -188,13 +196,15 @@ class InstallerVersionTests(unittest.TestCase):
             "macos/uninstall-remoteops-mcp.sh": r'^BINARY=".*remoteops-controller-mcp-([^"]+)"$',
         }
         for relative, pattern in declarations.items():
+            if relative.split("/")[0] not in self.targets:
+                continue
             with self.subTest(template=relative):
                 source = (ROOT / "deploy/controller-mcp" / relative).read_text(encoding="utf-8")
                 self.assertEqual(re.findall(pattern, source, re.MULTILINE), [VERSION],
                                  f"{relative} must match the MCP Cargo version")
 
     def test_package_readmes_match_mcp_manifest(self):
-        for target in ("windows", "macos"):
+        for target in self.targets:
             with self.subTest(target=target):
                 source = (ROOT / "deploy/controller-mcp" / target / "README.md").read_text(encoding="utf-8")
                 self.assertEqual(re.findall(r"^- 版本：`([^`]+)`$", source, re.MULTILINE), [VERSION])
@@ -339,7 +349,11 @@ class InstallerTests(unittest.TestCase):
         connection = json.loads((self.codex / "remoteops/controller-config.json").read_text())
         self.assertEqual(connection["helper_marker"], "preserve-generated-config")
         self.assertIn("credential_id", connection)
-        self.assertTrue((self.codex / "skills/remoteops/SKILL.md").exists())
+        for path, content in getattr(self, "skill_sentinels", {}).items():
+            self.assertEqual(path.read_bytes(), content, "MCP installation changed an independent Skill")
+        if not getattr(self, "skill_sentinels", {}):
+            self.assertFalse((self.codex / "skills").exists(), "MCP installation unexpectedly installed a Skill")
+            self.assertFalse((self.home / ".agents/skills").exists())
         calls = self.calls.read_text()
         self.assertLess(calls.index("--validate-codex"), calls.index("--setup-preview"))
         self.assertLess(calls.index("--setup-preview"), calls.index("--setup-enroll"))
@@ -353,6 +367,113 @@ class InstallerTests(unittest.TestCase):
         backups = list(self.codex.glob("config.toml.remoteops-*.bak"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_bytes(), self.original.encode())
+
+    def seed_independent_skill(self):
+        self.skill_sentinels = {}
+        for directory in [self.codex / "skills/remoteops", self.home / ".agents/skills/remoteops"]:
+            directory.mkdir(parents=True)
+            for name, content in {"SKILL.md": b"local independent Skill instruction, preserve exactly\n",
+                                  "skill.json": b'{"name":"remoteops","version":"99.0.0"}\n'}.items():
+                path = directory / name
+                path.write_bytes(content)
+                self.skill_sentinels[path] = content
+
+    def test_mcp_install_and_verification_work_without_skill_package(self):
+        bundled = self.package / "skills"
+        if bundled.exists():
+            shutil.rmtree(bundled)
+        self.assert_success(self.run_installer())
+        self.assert_verifier_success()
+
+    def test_mcp_install_preserves_newer_independent_skill(self):
+        self.seed_independent_skill()
+        self.assert_success(self.run_installer())
+        self.assert_verifier_success()
+        for path, content in self.skill_sentinels.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_windows_upgrade_preserves_independent_skill(self):
+        if self.target != "windows":
+            self.skipTest("Windows existing-installation upgrade")
+        self.seed_independent_skill()
+        self.assert_success(self.run_installer())
+        result = self.run_installer(setup=False, extra=["-UpgradeExisting"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for path, content in self.skill_sentinels.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_windows_upgrade_isolates_changed_package_without_overwriting_old_files(self):
+        if self.target != "windows":
+            self.skipTest("Windows existing-installation upgrade")
+        self.assert_success(self.run_installer())
+        result = self.run_installer(setup=False, extra=["-UpgradeExisting"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        before = tomllib.loads(self.config.read_text(encoding="utf-8"))["mcp_servers"]["remoteops"]["command"]
+        previous_readme = (Path(before).parent / "README.md").read_bytes()
+        readme = self.package / "README.md"
+        readme.write_bytes(readme.read_bytes() + b"\nNew independent documentation revision\n")
+        result = self.run_installer(setup=False, extra=["-UpgradeExisting"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        after = tomllib.loads(self.config.read_text(encoding="utf-8"))["mcp_servers"]["remoteops"]["command"]
+        self.assertNotEqual(Path(before).parent, Path(after).parent)
+        self.assertEqual(Path(before).read_bytes(), Path(after).read_bytes())
+        self.assertEqual((Path(before).parent / "README.md").read_bytes(), previous_readme)
+        self.assertEqual((Path(after).parent / "README.md").read_bytes(), readme.read_bytes())
+
+    def test_windows_upgrade_preserves_identity_config_and_only_changes_command(self):
+        if self.target != "windows":
+            self.skipTest("Windows existing-installation upgrade")
+        self.assert_success(self.run_installer())
+        original = self.config.read_text(encoding="utf-8")
+        original = original.replace('"agent-controlled"', '"readonly"').replace("tool_timeout_sec = 360", "tool_timeout_sec = 987")
+        original += "\n[mcp_servers.remoteops.tools.extra]\napproval_mode = 'prompt'\n"
+        self.config.write_text(original, encoding="utf-8", newline="")
+        connection_path = self.codex / "remoteops/controller-config.json"
+        connection = connection_path.read_bytes()
+        checkpoint_path = self.codex / "remoteops/setup-state.json"
+        checkpoint = checkpoint_path.read_bytes()
+        self.calls.unlink()
+        result = self.run_installer(setup=False, extra=["-UpgradeExisting"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        before_document = tomllib.loads(original)
+        after_bytes = self.config.read_bytes()
+        after_document = tomllib.loads(after_bytes.decode("utf-8"))
+        before = before_document["mcp_servers"]["remoteops"]["command"]
+        after = after_document["mcp_servers"]["remoteops"]["command"]
+        self.assertIn("protocol20-preview25-", after)
+        after_document["mcp_servers"]["remoteops"]["command"] = before
+        self.assertEqual(after_document, before_document)
+        def mask_command_line(content, expected_command):
+            lines = content.splitlines(keepends=True)
+            selected = []
+            for index, line in enumerate(lines):
+                if not line.startswith(b"command = "):
+                    continue
+                if tomllib.loads(line.decode("utf-8"))["command"] == expected_command:
+                    selected.append(index)
+            self.assertEqual(len(selected), 1)
+            lines[selected[0]] = b"command = <only permitted change>\n"
+            return b"".join(lines)
+        self.assertEqual(mask_command_line(after_bytes, after),
+                         mask_command_line(original.encode("utf-8"), before))
+        self.assertEqual(connection_path.read_bytes(), connection)
+        self.assertEqual(checkpoint_path.read_bytes(), checkpoint)
+        self.assertTrue(Path(before).exists())
+        self.assertTrue((Path(after).parent / "remoteops-credential-prompt.exe").exists())
+        calls = self.calls.read_text()
+        self.assertIn("--update-codex-command", calls)
+        self.assertNotIn("--setup-", calls)
+        self.assertNotIn("--configure-codex", calls)
+        self.assertEqual(self.run_installer(setup=False, extra=["-UpgradeExisting"]).returncode, 0)
+
+    def test_windows_upgrade_rejects_mixed_setup_and_command_mode(self):
+        if self.target != "windows":
+            self.skipTest("Windows existing-installation upgrade")
+        for setup, extra in [(True, ["-UpgradeExisting"]), (False, ["-UpgradeExisting", "-CommandMode", "full-access"])]:
+            result = self.run_installer(setup=setup, extra=extra)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.calls.exists())
+            self.assertEqual(self.config.read_bytes(), self.original.encode())
 
     def test_fresh_codex_home(self):
         self.original = ""
@@ -390,7 +511,7 @@ class InstallerTests(unittest.TestCase):
         boundary = "        if (-not $process.WaitForExit($helperTimeoutMilliseconds)) {"
         self.assertEqual(script.count(boundary), 1)
         script = script.replace(boundary,
-                                '        [IO.File]::WriteAllText($env:INSTALLER_TEST_TRANSFER_PHASE, "input transferred")\n' + boundary)
+                                '        if ($Arguments -contains "--setup-stdin") { [IO.File]::WriteAllText($env:INSTALLER_TEST_TRANSFER_PHASE, "input transferred") }\n' + boundary)
         installer.write_text(script, encoding="utf-8-sig")
         # Exceed buffering so a reader which never consumes input blocks Write.
         self.setup_file.write_text("isolated dummy input " * 65536, encoding="utf-8")
@@ -499,6 +620,45 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(marker.exists(), "Verifier executed an untrusted fixture program")
         self.assertEqual(self.config.read_bytes(), previous)
 
+    def write_candidate_manifest(self, directory):
+        entries = []
+        for name in ["remoteops-controller-mcp.exe", "remoteops-credential-prompt.exe"]:
+            content = (directory / name).read_bytes()
+            entries.append({"file": name, "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()})
+        manifest = {"schema_version": 1, "component": "remoteops-mcp", "version": VERSION,
+                    "credential_prompt_version": "0.2.0-preview.7", "protocol": 20,
+                    "contains_credentials": False, "files": entries}
+        path = directory / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path, manifest
+
+    def test_windows_candidate_verifier_accepts_matching_component_manifest(self):
+        directory = self.prepare_windows_candidate()
+        self.write_candidate_manifest(directory)
+        result = self.run_verifier(extra=self.candidate_arguments(directory))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_windows_candidate_verifier_rejects_invalid_manifest_before_execution(self):
+        directory = self.prepare_windows_candidate()
+        arguments = self.candidate_arguments(directory)
+        path, manifest = self.write_candidate_manifest(directory)
+        marker = self.forbid_fixture_execution(directory / "remoteops-controller-mcp.exe")
+        variants = [dict(manifest, version="0.0.0"), dict(manifest, files=manifest["files"][:1]),
+                    dict(manifest, contains_credentials=True)]
+        altered = json.loads(json.dumps(manifest))
+        altered["files"][0]["sha256"] = "0" * 64
+        variants.append(altered)
+        traversal = json.loads(json.dumps(manifest))
+        traversal["files"][0]["file"] = "../remoteops-controller-mcp.exe"
+        variants.append(traversal)
+        duplicate = json.loads(json.dumps(manifest))
+        duplicate["files"].append(dict(duplicate["files"][0]))
+        variants.append(duplicate)
+        for variant in variants:
+            with self.subTest(manifest=variant):
+                path.write_text(json.dumps(variant), encoding="utf-8")
+                self.assert_candidate_rejected_without_execution(arguments, marker)
+
     def test_windows_candidate_verifier_accepts_unicode_and_uses_selected_helper(self):
         directory = self.prepare_windows_candidate()
         marker = self.forbid_fixture_execution(self.codex / "remoteops/remoteops-credential-prompt.exe")
@@ -536,6 +696,24 @@ class InstallerTests(unittest.TestCase):
                 invalid = arguments.copy()
                 invalid[position] = value
                 self.assert_candidate_rejected_without_execution(invalid, marker)
+
+    def test_schema_failure_rejected_before_installation_or_enrollment(self):
+        self.env["INSTALLER_TEST_SCHEMA_FAILURE"] = "1"
+        before = self.config.read_bytes() if self.config.exists() else None
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.config.read_bytes() if self.config.exists() else None, before)
+        self.assertNotIn("--setup-enroll", self.calls.read_text())
+        self.assertFalse((self.codex / "remoteops/controller-config.json").exists())
+
+    def test_windows_candidate_verifier_runs_offline_schema_check_and_rejects_failure(self):
+        directory = self.prepare_windows_candidate()
+        result = self.run_verifier(extra=self.candidate_arguments(directory))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--check-tool-schemas", self.calls.read_text())
+        self.env["INSTALLER_TEST_SCHEMA_FAILURE"] = "1"
+        result = self.run_verifier(extra=self.candidate_arguments(directory))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_windows_candidate_verifier_requires_exact_mcp_and_helper_versions(self):
         directory = self.prepare_windows_candidate()
@@ -690,6 +868,7 @@ class InstallerTests(unittest.TestCase):
     def test_macos_uninstall_removes_credential_before_config(self):
         if self.target != "macos":
             self.skipTest("Windows has no bundled uninstaller")
+        self.seed_independent_skill()
         self.assert_success(self.run_installer())
         result = subprocess.run(["bash", str(self.package / "uninstall-remoteops-mcp.sh")],
                                 capture_output=True, text=True, env=self.env, timeout=30)
@@ -698,6 +877,8 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("[mcp_servers.remoteops]", self.config.read_text())
         self.assertFalse((self.codex / "remoteops/controller-config.json").exists())
         self.assertFalse((self.codex / "remoteops/setup-state.json").exists())
+        for path, content in self.skill_sentinels.items():
+            self.assertEqual(path.read_bytes(), content)
 
     def test_changed_file_does_not_change_confirmed_input(self):
         self.env["INSTALLER_TEST_MUTATE_FILE"] = str(self.setup_file)
@@ -803,7 +984,8 @@ class InstallerTests(unittest.TestCase):
                   for path in self.codex.rglob("*") if path.is_file()}
         result = self.run_installer(setup=False, extra=extra)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Token", result.stdout + result.stderr)
+        expected_message = "UpgradeExisting" if self.target == "windows" and not extra else "Token"
+        self.assertIn(expected_message, result.stdout + result.stderr)
         self.assertNotIn("legacy-dummy-token-must-remain-untouched", result.stdout + result.stderr)
         self.assertFalse(self.calls.exists(), "Rejected installation executed the setup helper")
         self.assertFalse((self.root / "security-calls").exists(), "Rejected installation accessed Keychain")
@@ -860,6 +1042,7 @@ def main():
     parser.add_argument("--check-versions", action="store_true",
                         help="Check package templates against Cargo.toml without building or running installers (Python 3.11+)")
     options = parser.parse_args()
+    InstallerVersionTests.targets = ("windows", "macos") if options.platform == "all" else (options.platform,)
     version_suite = unittest.defaultTestLoader.loadTestsFromTestCase(InstallerVersionTests)
     if not unittest.TextTestRunner(verbosity=2).run(version_suite).wasSuccessful():
         return 1

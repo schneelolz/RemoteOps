@@ -1,6 +1,8 @@
 //! 可复用的 Win32 界面入口；产品身份由调用方提供。
 
 #[cfg(windows)]
+mod activity_view;
+#[cfg(windows)]
 mod backend;
 #[cfg(any(windows, test))]
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -219,7 +221,7 @@ type CustomProfile = Option<()>;
 fn run_impl(profile: CustomProfile, product_options: ProductOptions) -> ExitCode {
     let args: Vec<_> = std::env::args_os().collect();
     #[cfg(all(feature = "agent-runtime", not(feature = "style-preview")))]
-    if let Some(result) = console::handle_ssh_trust(&args) {
+    if let Some(result) = console::handle_ssh_trust(&args, product_options.bundled_tools.as_ref()) {
         return result;
     }
     #[cfg(feature = "agent-runtime")]

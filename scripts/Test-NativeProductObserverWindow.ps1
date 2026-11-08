@@ -4,6 +4,7 @@
 param(
     [Parameter(Mandatory)][string]$Executable,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ExpectedHash,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedVersion,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [ValidateRange(7,300)][int]$InitialFocusWaitSeconds = 7,
     [switch]$WaitForManualStart,
@@ -23,7 +24,7 @@ for ($ancestor = Split-Path -Parent $output; $ancestor; $ancestor = Split-Path -
     if ((Test-Path -LiteralPath $ancestor) -and ((Get-Item -LiteralPath $ancestor).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw '输出路径不能经过链接。' }
 }
 $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion
-if ((Get-FileHash -LiteralPath $exe).Hash -ine $ExpectedHash -or $version -notin @('0.4.0', '0.4.0-jlai.3', '0.4.0-jlai.4', '0.4.0-jlai.5')) { throw '只接受指定摘要的本轮原生产品。' }
+if ((Get-FileHash -LiteralPath $exe).Hash -ine $ExpectedHash -or $version -cne $ExpectedVersion) { throw '只接受指定摘要的本轮原生产品。' }
 . (Join-Path $PSScriptRoot 'NativeStyle-DesktopGate.ps1')
 Assert-NativeStyleDesktopUnlocked
 & (Join-Path $PSScriptRoot '../crates/remoteops-visual/src/windows_uia_initialize.ps1') | Out-Null
@@ -135,7 +136,7 @@ function Wait-Own([string]$Name, [scriptblock]$Condition, [int]$TimeoutMilliseco
 function Snapshot {
     Assert-Own
     $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe')); $start.UseShellExecute=$false; $start.CreateNoWindow=$true; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true; $start.StandardOutputEncoding=[Text.UTF8Encoding]::new($false)
-    foreach ($arg in @('-NoProfile','-STA','-File',$helper,'-Action','Snapshot','-ProcessId',[string]$app.Id,'-ProcessStartUtc',$identity,'-ExpectedHash',$ExpectedHash)) { $start.ArgumentList.Add($arg) }
+    foreach ($arg in @('-NoProfile','-STA','-File',$helper,'-ExpectedVersion',$ExpectedVersion,'-Action','Snapshot','-ProcessId',[string]$app.Id,'-ProcessStartUtc',$identity,'-ExpectedHash',$ExpectedHash)) { $start.ArgumentList.Add($arg) }
     $worker=[Diagnostics.Process]::Start($start); $stdout=$worker.StandardOutput.ReadToEndAsync(); $stderr=$worker.StandardError.ReadToEndAsync()
     try { if (-not $worker.WaitForExit(12000)) { $worker.Kill(); $worker.WaitForExit(); throw 'Own snapshot worker timeout' }; if ($worker.ExitCode) { throw ('Own snapshot failed: '+$stderr.GetAwaiter().GetResult().Trim()) }; return $stdout.GetAwaiter().GetResult() | ConvertFrom-Json } finally { $worker.Dispose() }
 }

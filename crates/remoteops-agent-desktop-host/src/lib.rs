@@ -8,6 +8,8 @@ use std::{
 #[cfg(feature = "agent-runtime")]
 mod runtime;
 
+pub mod lifecycle;
+
 /// 窗口实现类型；仅决定预览产品的数据隔离，不改变核心授权行为。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum UiFlavor {
@@ -157,6 +159,8 @@ pub struct ActiveOperation {
 #[derive(Clone, Debug)]
 /// 一条已脱敏并关联任务的本地显示记录。
 pub struct ProductLog {
+    /// 可更新的串口显示记录；普通日志为空。
+    pub record_id: Option<u64>,
     /// 记录发生时间，仅作显示。
     pub occurred: String,
     /// 任务关联短号。
@@ -212,6 +216,10 @@ pub struct ProductSnapshot {
     pub config_path: String,
     /// 当前文件交换目录。
     pub transfer_root: String,
+    /// 兼容保留的旧 HTTPS 资源站入口；集中模式不使用该字段运行工具。
+    pub resource_tools_index_url: String,
+    /// 兼容保留的旧 HTTPS 来源白名单；集中模式不使用该字段授权下载。
+    pub resource_tools_allowed_origins: Vec<String>,
     /// 当前进程是否具有提升后的管理员权限。
     pub elevated: bool,
     /// 公共核心报告的能力及可用状态。
@@ -230,6 +238,8 @@ pub struct ProductSnapshot {
     pub running_count: usize,
     /// 已开始且未终止的结构化请求集合，与日志历史容量独立。
     pub active_operations: Vec<ActiveOperation>,
+    /// 有界结构化生命周期历史，不包含命令、认证输入或终端正文。
+    pub lifecycle_events: VecDeque<lifecycle::LifecycleEvent>,
     /// 主窗口活动摘要。
     pub activity: String,
     /// 最近任务的真实终态。
@@ -256,6 +266,8 @@ pub struct ProductSnapshot {
     pub logs: VecDeque<ProductLog>,
     /// 未读记录数。
     pub unread: usize,
+    /// 当前工具准备进度，仅含已脱敏的结构化阶段和计数。
+    pub resource_progress: Option<(remoteops_domain::RequestId, String)>,
     /// 本地观察订阅中因展示落后而淘汰的日志数，不代表远程传输丢行。
     pub dropped_observations: u64,
 }
@@ -276,6 +288,8 @@ impl Default for ProductSnapshot {
             endpoint_editable: true,
             config_path: String::new(),
             transfer_root: String::new(),
+            resource_tools_index_url: String::new(),
+            resource_tools_allowed_origins: Vec::new(),
             elevated: false,
             capabilities: Vec::new(),
             code: None,
@@ -285,6 +299,7 @@ impl Default for ProductSnapshot {
             controllers: 0,
             running_count: 0,
             active_operations: Vec::new(),
+            lifecycle_events: VecDeque::new(),
             activity: "系统就绪 · 等待操作".to_owned(),
             last_result: String::new(),
             control_summary: "等待控制端连接".to_owned(),
@@ -299,11 +314,32 @@ impl Default for ProductSnapshot {
             logs: VecDeque::new(),
             unread: 0,
             dropped_observations: 0,
+            resource_progress: None,
         }
     }
 }
 
 impl ProductSnapshot {
+    /// 记录用于三行动态摘要的生命周期，不依赖日志刷新或清空。
+    pub fn record_lifecycle(
+        &mut self,
+        kind: lifecycle::LifecycleKind,
+        category: Option<ObservationCategory>,
+    ) {
+        let sequence = self
+            .lifecycle_events
+            .back()
+            .map_or(1, |event| event.sequence.saturating_add(1));
+        if self.lifecycle_events.len() >= 64 {
+            self.lifecycle_events.pop_front();
+        }
+        self.lifecycle_events.push_back(lifecycle::LifecycleEvent {
+            sequence,
+            kind,
+            category,
+        });
+    }
+
     /// 按当前语言选择用于显示的文本。
     #[must_use]
     pub fn t<'a>(&self, chinese: &'a str, english: &'a str) -> &'a str {
@@ -316,6 +352,16 @@ impl ProductSnapshot {
 
     /// 将已脱敏日志保存到有界显示历史。
     pub fn record(&mut self, log: ProductLog) {
+        if let Some(record_id) = log.record_id
+            && let Some(existing) = self
+                .logs
+                .iter_mut()
+                .find(|item| item.record_id == Some(record_id))
+        {
+            *existing = log;
+            self.revision = self.revision.wrapping_add(1);
+            return;
+        }
         if self.logs.len() >= 1000 {
             self.logs.pop_front();
         }
@@ -348,9 +394,20 @@ impl ProductSnapshot {
 #[derive(Clone, Debug)]
 /// 由窗口提交的明确动作；保存和权限变更交给宿主处理。
 pub enum ProductAction {
-    SaveSetup { relay: String },
-    RequestControl { full: bool },
-    SaveDefaultControl { full: bool },
+    SaveSetup {
+        relay: String,
+    },
+    /// 兼容旧调用方的资源保存动作；集中模式明确拒绝且保留原配置。
+    SaveResourceTools {
+        index_url: String,
+        allowed_origins: Vec<String>,
+    },
+    RequestControl {
+        full: bool,
+    },
+    SaveDefaultControl {
+        full: bool,
+    },
     TrustCancel,
     TrustOnce,
     TrustSave,
@@ -373,12 +430,25 @@ pub enum ObservationRole {
     Success,
     /// 标准错误或失败信息，不代表一定终止。
     Error,
+    /// 同一请求原位更新的资源准备进度。
+    Progress,
     /// 简短过程说明。
     Info,
 }
 
+/// 本地观察记录的稳定标识及包含首次输出的累计次数。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservationRepetition {
+    /// 进程内唯一的显示记录标识。
+    pub record_id: u64,
+    /// 包含首次输出的累计次数。
+    pub total: u64,
+}
+
 /// 已脱敏的观察记录；`new_task` 仅在新任务真正开始时恢复自动弹窗。
 pub struct Observation {
+    /// 可更新的串口完整行；累计次数独立于队列省略计数。
+    pub repetition: Option<ObservationRepetition>,
     /// 已脱敏的终端展示文本。
     pub text: String,
     /// 此文本的结构化显示角色。
@@ -449,6 +519,7 @@ impl ProductHost {
                 (LogLevel::Info, "Info"),
             ] {
                 host.state.record(ProductLog {
+                    record_id: None,
                     occurred: "12:00:00".into(),
                     request: "demo".into(),
                     source: "演示".into(),
@@ -510,6 +581,15 @@ impl ProductHost {
     /// # Errors
     /// 配置保存、权限确认或宿主生命周期不能继续时返回已脱敏原因。
     pub fn action(&mut self, action: ProductAction) -> Result<(), String> {
+        if matches!(action, ProductAction::SaveResourceTools { .. }) {
+            return Err(self
+                .state
+                .t(
+                    "集中管理模式不支持保存本地资源设置；工具由已连接中继统一管理。",
+                    "Centralized mode does not support saving local resource settings; tools are managed by the connected relay.",
+                )
+                .into());
+        }
         match &action {
             ProductAction::ClearLogs => {
                 self.state.logs.clear();
@@ -611,6 +691,7 @@ fn demo_observations() -> Vec<Observation> {
     ]
     .into_iter()
     .map(|(category, role, text)| Observation {
+        repetition: None,
         text: format!("[界面演示/合成数据，未实际执行] {text}"),
         role,
         new_task: false,
@@ -630,6 +711,30 @@ fn demo_observations() -> Vec<Observation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_rejects_legacy_resource_saves_without_changing_permissions() {
+        let mut host = ProductHost::new(&HostOptions {
+            product_demo: true,
+            ..HostOptions::default()
+        });
+        for language in [NativeLanguage::Chinese, NativeLanguage::English] {
+            host.action(ProductAction::SetLanguage(language)).unwrap();
+            let before = format!("{:?}", host.snapshot());
+            let error = host
+                .action(ProductAction::SaveResourceTools {
+                    index_url: String::new(),
+                    allowed_origins: vec![],
+                })
+                .unwrap_err();
+            assert!(error.contains(if language == NativeLanguage::Chinese {
+                "工具由已连接中继统一管理"
+            } else {
+                "tools are managed by the connected relay"
+            }));
+            assert_eq!(format!("{:?}", host.snapshot()), before);
+        }
+    }
 
     #[test]
     fn win32_host_keeps_frontend_version_and_demo_actions() {
@@ -687,6 +792,7 @@ mod tests {
         assert!(!snapshot.can_copy);
         for index in 0..1200 {
             snapshot.record(ProductLog {
+                record_id: None,
                 occurred: String::new(),
                 request: String::new(),
                 source: "Shell".into(),

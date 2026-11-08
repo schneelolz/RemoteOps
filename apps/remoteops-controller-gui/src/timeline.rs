@@ -103,6 +103,19 @@ pub fn aggregate_events(events: impl IntoIterator<Item = RemoteEvent>) -> Vec<Ti
         match event.payload {
             EventPayload::OperationRequested { operation } => item.operation = Some(operation),
             EventPayload::OperationStarted => item.started = true,
+            EventPayload::ResourceToolProgress {
+                tool_id,
+                stage,
+                completed,
+                total,
+                ..
+            } => {
+                append_output(
+                    &mut item.output,
+                    false,
+                    format!("{tool_id}: {stage} {completed}/{total:?}"),
+                );
+            }
             EventPayload::OutputChunk { stderr, text } => {
                 append_output(&mut item.output, stderr, text);
             }

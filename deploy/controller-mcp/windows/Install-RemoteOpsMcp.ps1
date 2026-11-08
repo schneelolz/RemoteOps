@@ -1,4 +1,4 @@
-﻿[CmdletBinding(PositionalBinding = $false)]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
     [string]$RelayAddress,
@@ -12,7 +12,8 @@ param(
     [string]$SetupFile,
     [switch]$SetupStdin,
     [switch]$SetupCode,
-    [switch]$ConfirmEnrollment
+    [switch]$ConfirmEnrollment,
+    [switch]$UpgradeExisting
 )
 
 Set-StrictMode -Version Latest
@@ -29,19 +30,17 @@ foreach ($manualParameter in @('RelayAddress', 'OwnerId', 'ServerName', 'CaCert'
         throw '已停用 Token 手工安装；请使用 SetupFile、SetupCode 或 SetupStdin。'
     }
 }
-if (-not $setupMode) {
-    throw '安装必须提供 SetupFile、SetupCode 或 SetupStdin；不再支持 Token 安装。'
+if ($UpgradeExisting -and ($setupMode -or $ConfirmEnrollment -or $PSBoundParameters.ContainsKey('CommandMode'))) {
+    throw 'UpgradeExisting 不能与设置输入、ConfirmEnrollment 或 CommandMode 混用；升级保留原安装参数。'
+}
+if (-not $setupMode -and -not $UpgradeExisting) {
+    throw '新安装必须提供 SetupFile、SetupCode 或 SetupStdin；已有安装请使用 UpgradeExisting。'
 }
 
-$mcpVersion = '0.2.0-preview.17'
-$credentialPromptVersion = '0.2.0-preview.5'
+$mcpVersion = '0.2.0-preview.25'
+$credentialPromptVersion = '0.2.0-preview.7'
 $sourceExecutable = Join-Path $PSScriptRoot 'remoteops-controller-mcp.exe'
 $sourceCredentialPrompt = Join-Path $PSScriptRoot 'remoteops-credential-prompt.exe'
-$sourceSkill = Join-Path $PSScriptRoot 'skills\remoteops'
-$defaultCodexHome = Join-Path $env:USERPROFILE '.codex'
-$isDefaultCodexHome = [IO.Path]::GetFullPath($CodexHome).TrimEnd('\') -eq
-    [IO.Path]::GetFullPath($defaultCodexHome).TrimEnd('\')
-
 # Use a managed worker for the complete transfer: .NET Framework's FlushAsync
 # may synchronously flush its buffer before returning a Task. No PowerShell
 # scriptblock runs on this worker, and setup material is never a process argument.
@@ -72,7 +71,7 @@ function Invoke-SetupHelper {
     param(
         [Parameter(Mandatory)][string]$Executable,
         [Parameter(Mandatory)][string[]]$Arguments,
-        [Parameter(Mandatory)][string]$InputContent
+        [Parameter(Mandatory)][AllowEmptyString()][string]$InputContent
     )
 
     # .Arguments works on Windows PowerShell 5.1 as well as PowerShell 7.
@@ -117,11 +116,17 @@ function Invoke-SetupHelper {
         # do not depend on the console code page or newer encoding properties.
         $inputBytes = [Text.Encoding]::UTF8.GetBytes($InputContent)
         # Bound the whole write/flush/close, including synchronous pipe calls.
-        $inputTransfer = [RemoteOps.SetupPipeTransfer]::SendAsync($process.StandardInput.BaseStream, $inputBytes)
-        if (-not $inputTransfer.Wait(10000)) {
-            throw '设置输入传输超时；请保留设置文件并重试。'
+        if ($inputBytes.Length -eq 0) {
+            # 离线检查不读取输入，直接关闭管道，避免快速退出与占位写入竞争。
+            $process.StandardInput.Close()
         }
-        $inputTransfer.GetAwaiter().GetResult()
+        else {
+            $inputTransfer = [RemoteOps.SetupPipeTransfer]::SendAsync($process.StandardInput.BaseStream, $inputBytes)
+            if (-not $inputTransfer.Wait(10000)) {
+                throw '设置输入传输超时；请保留设置文件并重试。'
+            }
+            $inputTransfer.GetAwaiter().GetResult()
+        }
         # Preview only parses local input. Do not give a stuck preview the full
         # network-enrollment window, including Framework's silent pipe closure.
         $helperTimeoutMilliseconds = if ($Arguments -contains '--setup-preview') { 10000 } else { 180000 }
@@ -169,17 +174,21 @@ if (-not (Test-Path -LiteralPath $sourceExecutable -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $sourceCredentialPrompt -PathType Leaf)) {
     throw "安装包缺少 $sourceCredentialPrompt"
 }
-if (-not (Test-Path -LiteralPath (Join-Path $sourceSkill 'SKILL.md') -PathType Leaf)) {
-    throw "安装包缺少 RemoteOps skill：$sourceSkill"
-}
 
 $versionOutput = (& $sourceExecutable --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($mcpVersion)) {
+if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch ('^remoteops-controller-mcp\s+' + [regex]::Escape($mcpVersion) + '$')) {
     throw "MCP 可执行文件版本不正确：$versionOutput"
 }
 $promptVersionOutput = (& $sourceCredentialPrompt --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $promptVersionOutput -notmatch [regex]::Escape($credentialPromptVersion)) {
+if ($LASTEXITCODE -ne 0 -or $promptVersionOutput -notmatch ('^remoteops-credential-prompt\s+' + [regex]::Escape($credentialPromptVersion) + '$')) {
     throw "SSH 密码安全输入程序版本不正确：$promptVersionOutput"
+}
+
+# 在登记、凭据或配置变更之前验证实际工具目录；此入口完全离线。
+$schemaReport = (Invoke-SetupHelper -Executable $sourceExecutable `
+    -Arguments @('--check-tool-schemas') -InputContent '') | ConvertFrom-Json
+if ($schemaReport.passed -ne $true -or $schemaReport.tool_count -lt 1 -or @($schemaReport.failures).Count -ne 0) {
+    throw 'MCP 工具 Schema 离线自检失败；尚未更改安装、配置或凭据。'
 }
 
 $configPath = Join-Path $CodexHome 'config.toml'
@@ -191,14 +200,92 @@ $installDirectory = Join-Path $CodexHome 'remoteops'
 $installedExecutable = Join-Path $installDirectory "remoteops-controller-mcp-$mcpVersion.exe"
 $installedCredentialPrompt = Join-Path $installDirectory 'remoteops-credential-prompt.exe'
 $connectionConfigPath = Join-Path $installDirectory 'controller-config.json'
-$standardSkillDirectory = if ($isDefaultCodexHome) {
-    Join-Path $env:USERPROFILE '.agents\skills\remoteops'
+if ($UpgradeExisting) {
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $connectionConfigPath -PathType Leaf)) {
+        throw '升级需要现有 Codex 配置和 controller-config.json；未更改安装或凭据。'
+    }
+    $connectionConfigHash = (Get-FileHash -LiteralPath $connectionConfigPath -Algorithm SHA256).Hash
+    # JSON 路径可能包含中文，复用明确 UTF-8 的子进程读取，避免 PowerShell 5.1 OEM 解码。
+    $inspection = (Invoke-SetupHelper -Executable $sourceExecutable `
+        -Arguments @('--inspect-codex', $configPath) -InputContent '') | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace($inspection.command) -or
+        [string]::IsNullOrWhiteSpace($inspection.args_config) -or
+        [IO.Path]::GetFullPath([string]$inspection.args_config) -ine [IO.Path]::GetFullPath($connectionConfigPath)) {
+        throw '现有 RemoteOps 配置不属于此安装；未更改安装或凭据。'
+    }
+    $existingConnection = [IO.File]::ReadAllText($connectionConfigPath) | ConvertFrom-Json
+    if ($null -ne $existingConnection.PSObject.Properties['credential_id'] -and
+        -not [string]::IsNullOrWhiteSpace($existingConnection.credential_id)) {
+        & $sourceExecutable --check-credential --config $connectionConfigPath | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw '现有安装凭据不可用；未进行登记或更换凭据。' }
+    }
+    $sourceHash = (Get-FileHash -LiteralPath $sourceExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
+    $candidateRoot = Join-Path $installDirectory 'candidates'
+    $packageFiles = @('remoteops-controller-mcp.exe', 'remoteops-credential-prompt.exe',
+        'Install-RemoteOpsMcp.ps1', 'Test-RemoteOpsMcp.ps1', 'README.md', 'LICENSE',
+        'THIRD_PARTY_NOTICES.md', 'THIRD_PARTY_LICENSES.txt', 'DEPENDENCIES.json', 'manifest.json', 'SHA256SUMS.txt')
+    # 同一程序配套文档或脚本变化也生成独立目录，避免覆盖当前宿主文件。
+    $packageEntries = foreach ($name in $packageFiles | Sort-Object) {
+        $source = Join-Path $PSScriptRoot $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            $name + ':' + (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+    $packageHasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $packageHash = [BitConverter]::ToString($packageHasher.ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes(($packageEntries -join "`n"))
+        )).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $packageHasher.Dispose() }
+    $candidateDirectory = Join-Path $candidateRoot (
+        "protocol20-preview25-" + $sourceHash.Substring(0, 12) + '-' + $packageHash.Substring(0, 12)
+    )
+    foreach ($directory in @($installDirectory, $candidateRoot, $candidateDirectory)) {
+        if ((Test-Path -LiteralPath $directory) -and
+            ((Get-Item -LiteralPath $directory -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw '升级目录不允许链接或重解析点。'
+        }
+    }
+    # 完整配套并排安装，当前宿主的程序及 helper 均不覆盖、不清理。
+    New-Item -ItemType Directory -Force -Path $candidateDirectory | Out-Null
+    foreach ($name in $packageFiles) {
+        $source = Join-Path $PSScriptRoot $name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+        $destination = Join-Path $candidateDirectory $name
+        for ($parent = Split-Path -Parent $destination; $parent.Length -ge $candidateDirectory.Length; $parent = Split-Path -Parent $parent) {
+            if ((Test-Path -LiteralPath $parent) -and
+                ((Get-Item -LiteralPath $parent -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw '升级目录不允许链接或重解析点。'
+            }
+        }
+        if (Test-Path -LiteralPath $destination) {
+            if (((Get-Item -LiteralPath $destination -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne
+                (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash) {
+                throw '并排升级目录已有不同内容；保留原目录，未切换配置。'
+            }
+        }
+        else {
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+            Copy-Item -LiteralPath $source -Destination $destination
+        }
+    }
+    $installedExecutable = Join-Path $candidateDirectory 'remoteops-controller-mcp.exe'
+    & $installedExecutable --update-codex-command $configPath --mcp-command $installedExecutable | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw '升级配置未完成；原安装与凭据保留。' }
+    if ((Get-FileHash -LiteralPath $connectionConfigPath -Algorithm SHA256).Hash -cne $connectionConfigHash) {
+        throw '升级期间连接配置发生并发变化，请检查配置；本次未登记或写入凭据。'
+    }
+    Write-Host "RemoteOps MCP $mcpVersion 配置已更新，现有身份、凭据、命令模式和超时保持。"
+    Write-Host "程序：$installedExecutable"
+    Write-Host '当前 Codex/pi 进程未中断；完全重开 Codex，pi 重开或 /reload 后生效。'
+    Write-Host 'Skill 独立安装和更新，本次未修改任何 Skill。'
+    Write-Host '此安装器仅更新 Codex；pi 共用程序时由维护者单独结构化更新 pi 配置。'
+    return
 }
-else {
-    Join-Path $CodexHome 'skills\remoteops'
-}
-$compatSkillDirectory = Join-Path $CodexHome 'skills\remoteops'
-$configPath = Join-Path $CodexHome 'config.toml'
+
 New-Item -ItemType Directory -Force -Path $installDirectory | Out-Null
 Copy-Item -LiteralPath $sourceCredentialPrompt -Destination $installedCredentialPrompt -Force
 try {
@@ -274,17 +361,6 @@ finally {
     Remove-Variable setupInput -ErrorAction SilentlyContinue
 }
 
-foreach ($skillDirectory in @($standardSkillDirectory, $compatSkillDirectory) | Select-Object -Unique) {
-    New-Item -ItemType Directory -Force -Path $skillDirectory | Out-Null
-    Copy-Item -LiteralPath (Join-Path $sourceSkill 'SKILL.md') -Destination $skillDirectory -Force
-    $sourceSkillAgents = Join-Path $sourceSkill 'agents'
-    if (Test-Path -LiteralPath $sourceSkillAgents -PathType Container) {
-        $skillAgentsDirectory = Join-Path $skillDirectory 'agents'
-        New-Item -ItemType Directory -Force -Path $skillAgentsDirectory | Out-Null
-        Copy-Item -LiteralPath (Join-Path $sourceSkillAgents 'openai.yaml') -Destination $skillAgentsDirectory -Force
-    }
-}
-
 # The helper parses TOML and preserves unrelated settings, quoted keys and
 # multiline strings. Never edit Codex TOML with line-oriented substitutions.
 $configurationArguments = @(
@@ -326,10 +402,7 @@ Write-Host "RemoteOps MCP $mcpVersion 已安装。"
 Write-Host "程序：$installedExecutable"
 Write-Host "配置：$configPath"
 Write-Host "Relay 配置：$connectionConfigPath"
-Write-Host "RemoteOps skill（标准目录）：$standardSkillDirectory"
-if ($compatSkillDirectory -ne $standardSkillDirectory) {
-    Write-Host "RemoteOps skill（兼容目录）：$compatSkillDirectory"
-}
+Write-Host 'Skill 独立安装和更新；本安装器不读取、覆盖或删除已安装的 Skill。'
 Write-Host "命令模式：$CommandMode"
 Write-Host '独立 Controller 凭据已保存到 Windows Credential Manager；登记与 Relay 身份自检通过。'
 Write-Host '请完全退出并重新打开 Codex，然后输入 /mcp 检查 remoteops。'

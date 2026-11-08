@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory,ParameterSetName='Capture')][string]$Executable,
     [Parameter(Mandatory,ParameterSetName='Capture')][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ExpectedHash,
     [Parameter(Mandatory,ParameterSetName='Capture')][string]$OutputDirectory,
+    [Parameter(ParameterSetName='Capture')][ValidateNotNullOrEmpty()][string]$ExpectedVersion='0.5.0',
     [Parameter(Mandatory,ParameterSetName='SelfTest')][switch]$SelfTest
 )
 Set-StrictMode -Version Latest
@@ -44,7 +45,7 @@ function Get-GalleryHtml {
     return @"
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>RemoteOps · 逐窗体亮暗对照</title><style>
 *{box-sizing:border-box}body{margin:0;background:#edf0f4;color:#182434;font:15px/1.6 'Segoe UI','Microsoft YaHei UI',sans-serif}main{max-width:1500px;margin:32px auto;padding:0 24px}h1{font-size:27px;margin:0 0 8px}header p{max-width:980px;color:#526072;margin:4px 0}section{margin:24px 0;background:#fff;border:1px solid #d7dee7;border-radius:12px;padding:20px}h2{font-size:19px;margin:0 0 12px}h3{font-size:14px;margin:0 0 10px;color:#526072}.pair{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:24px}.theme{min-width:0}img{display:block;max-width:100%;height:auto;border:1px solid #d7dee7;background:#e7ebf0}.theme p{color:#627084;font-size:12px;margin:8px 0 0}a{color:#234f82}@media(max-width:850px){main{padding:0 12px}.pair{grid-template-columns:1fr}section{padding:14px}}
-</style></head><body><main><header><h1>RemoteOps · 逐窗体亮暗对照</h1><p>每一张均为本脚本独立启动的 0.4.0 纯样式窗口实拍，点击图片查看原图；演示数据均为合成内容，未连接现场业务。</p><p>原生设置菜单可能跟随 Windows 系统颜色。暗色列保留真实菜单截图，不对截图改色。完整尺寸、DPI、摘要和失败记录见 <a href="index.json">index.json</a>。</p></header>
+</style></head><body><main><header><h1>RemoteOps · 逐窗体亮暗对照</h1><p>每一张均为本脚本独立启动的 $([Net.WebUtility]::HtmlEncode($ExpectedVersion)) 纯样式窗口实拍，点击图片查看原图；演示数据均为合成内容，未连接现场业务。</p><p>原生设置菜单可能跟随 Windows 系统颜色。暗色列保留真实菜单截图，不对截图改色。完整尺寸、DPI、摘要和失败记录见 <a href="index.json">index.json</a>。</p></header>
 $($cards -join "`n")
 </main></body></html>
 "@
@@ -64,7 +65,7 @@ $output=[IO.Path]::GetFullPath($OutputDirectory)
 if(-not $temporary.StartsWith('C:\',[StringComparison]::OrdinalIgnoreCase) -or -not $output.StartsWith($temporary+'\',[StringComparison]::OrdinalIgnoreCase) -or (Test-Path -LiteralPath $output)){throw '必须提供全新的 C 盘本地 Temp 子目录。'}
 for($ancestor=Split-Path -Parent $output;$ancestor;$ancestor=Split-Path -Parent $ancestor){if((Test-Path -LiteralPath $ancestor) -and ((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)){throw '截图目录不能经过重解析点。'}}
 $exe=(Resolve-Path -LiteralPath $Executable).Path
-if((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ine $ExpectedHash -or [Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion -cne '0.4.0'){throw '截图只接受精确 SHA256 对应的 0.4.0 样式预览。'}
+if((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ine $ExpectedHash -or [Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion -cne $ExpectedVersion){throw "截图只接受精确 SHA256 对应的 $ExpectedVersion 样式预览。"}
 $helper=Join-Path $PSScriptRoot 'Test-NativeStylePreview.ps1'
 if(-not(Test-Path -LiteralPath $helper -PathType Leaf)){throw '缺少原生样式测试客户端。'}
 New-Item -ItemType Directory -Path $output|Out-Null
@@ -83,7 +84,7 @@ function Client {
     $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
     $start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
     $start.StandardOutputEncoding=[Text.UTF8Encoding]::new($false);$start.StandardErrorEncoding=[Text.UTF8Encoding]::new($false)
-    foreach($argument in @('-NoProfile','-STA','-File',$helper,'-ExpectedHash',$ExpectedHash,'-Action',$Action,'-ProcessId',[string]$script:app.Id,'-ProcessStartUtc',$script:identity,'-ControlId',[string]$Id)){$start.ArgumentList.Add($argument)}
+    foreach($argument in @('-NoProfile','-STA','-File',$helper,'-ExpectedVersion',([Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion),'-ExpectedHash',$ExpectedHash,'-Action',$Action,'-ProcessId',[string]$script:app.Id,'-ProcessStartUtc',$script:identity,'-ControlId',[string]$Id)){$start.ArgumentList.Add($argument)}
     if($CapturePath){$start.ArgumentList.Add('-OutputPath');$start.ArgumentList.Add($CapturePath)}
     $worker=[Diagnostics.Process]::Start($start)
     $stdout=$worker.StandardOutput.ReadToEndAsync();$stderr=$worker.StandardError.ReadToEndAsync()
@@ -106,7 +107,7 @@ function Wait-State {
         $snapshot=Client
         if($MenuCount -ge 0){if($snapshot.menu_count -eq $MenuCount){return $snapshot}}
         else{
-            $matches=@($snapshot.windows|Where-Object{@($_.controls|Where-Object id -eq $Id).Count -eq 1})
+            $matches=if($Id -eq 0){@($snapshot.windows|Where-Object class -eq 'RemoteOpsStylePreviewMain')}else{@($snapshot.windows|Where-Object{@($_.controls|Where-Object id -eq $Id).Count -eq 1})}
             if($matches.Count -eq 1 -and ($null -eq $Enabled -or $matches[0].enabled -eq $Enabled)){return $snapshot}
         }
         if($watch.ElapsedMilliseconds -ge 15000){[IO.File]::WriteAllText((Join-Path $output 'wait-last-state.json'),(@{expected_id=$Id;expected_menu_count=$MenuCount;snapshot=$snapshot}|ConvertTo-Json -Depth 10),[Text.UTF8Encoding]::new($false));throw '等待本次隔离预览窗体超时。'}
@@ -200,7 +201,7 @@ finally{
     Stop-OwnedPreview
     $count=@($items|ForEach-Object{if($null -ne $_.light){$_.light};if($null -ne $_.dark){$_.dark}}).Count
     if($null -eq $failure -and $count -ne 24){$failure=@{category='incomplete_gallery';captured=$count;expected=24}}
-    $record=[ordered]@{schema_version=1;version='0.4.0';executable_sha256=$ExpectedHash.ToLowerInvariant();passed=$null -eq $failure;captured_images=$count;expected_images=24;synthetic_data_only=$true;real_business_verified=$false;menu_note='原生菜单颜色由 Windows 决定，未对截图改色。';items=$items;checks=@($checks);failure=$failure}
+    $record=[ordered]@{schema_version=1;version=$ExpectedVersion;executable_sha256=$ExpectedHash.ToLowerInvariant();passed=$null -eq $failure;captured_images=$count;expected_images=24;synthetic_data_only=$true;real_business_verified=$false;menu_note='原生菜单颜色由 Windows 决定，未对截图改色。';items=$items;checks=@($checks);failure=$failure}
     [IO.File]::WriteAllText((Join-Path $output 'index.json'),($record|ConvertTo-Json -Depth 10),[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $output 'index.html'),(Get-GalleryHtml $items),[Text.UTF8Encoding]::new($false))
 }

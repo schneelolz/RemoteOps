@@ -13,6 +13,32 @@ use remoteops_visual::{VisualProvider, VisualProviderError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// 宿主与后台共享的界面语言状态；连接重试与运行中切换均保留当前选择。
+#[derive(Clone, Default)]
+pub struct AgentUiLanguage {
+    // 语言独立于图形探测缓存，避免后续探测恢复旧值。
+    selected: Arc<Mutex<Option<remoteops_domain::TargetUiLanguage>>>,
+}
+
+impl AgentUiLanguage {
+    /// 设置宿主明确选择的界面语言。
+    pub fn set(&self, language: remoteops_domain::TargetUiLanguage) {
+        *self
+            .selected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(language);
+    }
+
+    /// 读取当前语言；没有界面的宿主允许不报告。
+    #[must_use]
+    pub fn get(&self) -> Option<remoteops_domain::TargetUiLanguage> {
+        *self
+            .selected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 const VISUAL_PROBE_BUDGET: Duration = Duration::from_secs(35);
 const VISUAL_PROBE_COOLDOWN: Duration = Duration::from_secs(3);
 
@@ -40,6 +66,8 @@ pub struct AgentRuntimeOptions {
     pub ssh_trust_cli: bool,
     /// 产品编译时内置的工具；普通 Agent 配置和远程请求不能替换。
     pub bundled_tools: Option<remoteops_device::BundledTools>,
+    /// 宿主当前选择的语言；与运行中的目标上下文同步。
+    pub ui_language: AgentUiLanguage,
 }
 impl AgentRuntimeOptions {
     /// 创建兼容原 GUI 行为的交互宿主配置。
@@ -55,6 +83,7 @@ impl AgentRuntimeOptions {
             guidance: Vec::new(),
             ssh_trust_cli: false,
             bundled_tools: None,
+            ui_language: AgentUiLanguage::default(),
         }
     }
     /// 声明当前程序已接入主机密钥核对 CLI，不从环境或远程配置推断。
@@ -68,6 +97,13 @@ impl AgentRuntimeOptions {
     #[must_use]
     pub fn with_bundled_tools(mut self, tools: Option<remoteops_device::BundledTools>) -> Self {
         self.bundled_tools = tools;
+        self
+    }
+
+    /// 绑定与宿主共享的语言状态。
+    #[must_use]
+    pub fn with_ui_language(mut self, language: AgentUiLanguage) -> Self {
+        self.ui_language = language;
         self
     }
 
@@ -120,6 +156,10 @@ struct VisualState {
 pub(crate) struct RuntimeBoundary {
     pub context: Arc<TargetContext>,
     pub policy: AgentCapabilityPolicy,
+    // 本地显式配置后创建，不能由远程上下文构造或扩张。
+    pub resources: Option<Arc<remoteops_resources::ResourceManager>>,
+    // 不与图形缓存共用，以便下一次上下文查询立即反映语言切换。
+    ui_language: AgentUiLanguage,
     // 同步快照不跨异步等待持锁。
     visual_state: Arc<Mutex<Option<VisualState>>>,
     // 同一目标的主动查询合并为串行且有冷却的探测。
@@ -130,6 +170,8 @@ impl Default for RuntimeBoundary {
         Self {
             context: Arc::new(TargetContext::default()),
             policy: AgentCapabilityPolicy::default(),
+            resources: None,
+            ui_language: AgentUiLanguage::default(),
             visual_state: Arc::new(Mutex::new(None)),
             visual_probe: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -137,11 +179,14 @@ impl Default for RuntimeBoundary {
 }
 impl RuntimeBoundary {
     fn latest_context(&self) -> TargetContext {
-        self.visual_state
+        let mut context = self
+            .visual_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map_or_else(|| (*self.context).clone(), |state| state.context.clone())
+            .map_or_else(|| (*self.context).clone(), |state| state.context.clone());
+        context.ui_language = self.ui_language.get();
+        context
     }
 
     fn hard_visual_reason(&self) -> Option<&'static str> {
@@ -157,6 +202,60 @@ impl RuntimeBoundary {
     pub fn snapshot(&self) -> TargetContext {
         let mut context = self.latest_context();
         context.facts = native_facts();
+        context
+            .capabilities
+            .retain(|status| status.capability != "resource_tools_v1");
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "resource_tools_v1".into(),
+            status: if self.resources.is_some() {
+                CapabilityAvailability::Available
+            } else {
+                CapabilityAvailability::Unavailable
+            },
+            reasons: if self.resources.is_some() {
+                Vec::new()
+            } else {
+                vec!["resource_tools_disabled".into()]
+            },
+        });
+        context
+            .capabilities
+            .retain(|status| status.capability != "resource_tools_browser_adapters_v1");
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "resource_tools_browser_adapters_v1".into(),
+            status: if self.resources.is_some() {
+                CapabilityAvailability::Available
+            } else {
+                CapabilityAvailability::Unavailable
+            },
+            reasons: if self.resources.is_some() {
+                Vec::new()
+            } else {
+                vec!["resource_tools_disabled".into()]
+            },
+        });
+        for capability in [
+            "resource_tools_validation_v1",
+            "resource_tools_progress_v1",
+            "browser_password_v1",
+        ] {
+            context
+                .capabilities
+                .retain(|entry| entry.capability != capability);
+            context.capabilities.push(TargetCapabilityStatus {
+                capability: capability.into(),
+                status: if self.resources.is_some() {
+                    CapabilityAvailability::Available
+                } else {
+                    CapabilityAvailability::Unavailable
+                },
+                reasons: if self.resources.is_some() {
+                    vec![]
+                } else {
+                    vec!["resource_tools_disabled".into()]
+                },
+            });
+        }
         if let Some(reason) = self.hard_visual_reason() {
             set_visual_status(&mut context, Some(reason));
         } else if context.facts.interactive_desktop != CapabilityAvailability::Available {
@@ -226,6 +325,7 @@ impl RuntimeBoundary {
                 && let Some(state) = state.as_mut()
             {
                 state.context.facts = context.facts;
+                state.context.ui_language = self.ui_language.get();
                 return state.context.clone();
             }
             // 先发布最新宿主事实，延迟 Provider 只在此硬边界允许后创建。
@@ -283,6 +383,7 @@ impl RuntimeBoundary {
                 Ok(Ok(_)) => (None, None),
             }
         };
+        context.ui_language = self.ui_language.get();
         set_visual_status(&mut context, reason);
         let diagnostic = format!(
             "{}; elapsed_ms={}; {}",
@@ -339,6 +440,12 @@ impl RuntimeBoundary {
     }
 
     pub fn check(&self, operation: &RemoteOperation) -> anyhow::Result<()> {
+        if operation.is_resource_tool() && self.resources.is_none() {
+            return Err(RuntimeDenied {
+                code: "resource_tools_disabled".into(),
+            }
+            .into());
+        }
         if operation.is_visual() {
             if !self.policy.visual_allowed() {
                 return Err(RuntimeDenied {
@@ -450,6 +557,7 @@ pub(crate) async fn prepare(
     let mut boundary = RuntimeBoundary {
         context: Arc::new(context),
         policy,
+        ui_language: options.ui_language.clone(),
         ..RuntimeBoundary::default()
     };
     let provider: Arc<dyn VisualProvider> = Arc::new(DeferredVisualProvider {
@@ -689,6 +797,36 @@ pub(crate) fn visual_operations() -> Vec<RemoteOperation> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn language_switch_is_live_and_isolated_from_other_targets_and_visual_cache() {
+        let selected = super::AgentUiLanguage::default();
+        let boundary = super::RuntimeBoundary {
+            ui_language: selected.clone(),
+            ..super::RuntimeBoundary::default()
+        };
+        assert_eq!(boundary.snapshot().ui_language, None);
+        selected.set(remoteops_domain::TargetUiLanguage::ZhCn);
+        assert_eq!(
+            boundary.snapshot().ui_language,
+            Some(remoteops_domain::TargetUiLanguage::ZhCn)
+        );
+        let cached = boundary.snapshot();
+        *boundary.visual_state.lock().unwrap() = Some(super::VisualState {
+            context: cached,
+            diagnostic: None,
+            last_probe: Some(std::time::Instant::now()),
+        });
+        selected.set(remoteops_domain::TargetUiLanguage::EnUs);
+        assert_eq!(
+            boundary.latest_context().ui_language,
+            Some(remoteops_domain::TargetUiLanguage::EnUs)
+        );
+        assert_eq!(
+            super::RuntimeBoundary::default().snapshot().ui_language,
+            None
+        );
+    }
+
     #[test]
     fn plink_does_not_claim_keyscan_cli_without_the_actual_scanner() {
         let mut environment = EnvironmentProfile::empty();

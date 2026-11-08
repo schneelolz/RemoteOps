@@ -33,6 +33,9 @@ pub struct BundledTools {
     directory: PathBuf,
     plink: EmbeddedTool,
     askpass: EmbeddedTool,
+    // 官方扫描器及运行依赖、许可共同参与内容寻址。
+    scanner: Option<EmbeddedTool>,
+    scanner_support: Vec<(&'static str, EmbeddedTool)>,
 }
 
 /// 已释放并核对摘要的路径；诊断调用不执行这些文件。
@@ -42,6 +45,8 @@ pub struct BundledToolPaths {
     pub plink: PathBuf,
     /// 实际 askpass helper 路径。
     pub askpass: PathBuf,
+    /// 已绑定时的微软官方主机密钥扫描器路径。
+    pub ssh_keyscan: Option<PathBuf>,
 }
 
 // 实际执行期间保持文件及祖先目录句柄；Windows 禁止并发改写、删除或替换。
@@ -108,7 +113,52 @@ impl BundledTools {
             directory: cache_root,
             plink,
             askpass,
+            scanner: None,
+            scanner_support: Vec::new(),
         })
+    }
+
+    /// 绑定构建时已经核对官方摘要、签名和 PE 依赖的微软扫描组件。
+    ///
+    /// # Errors
+    /// 资源为空、摘要格式错误、支持文件不完整或文件名不属于固定集合时返回错误。
+    pub fn with_ssh_scanner(
+        mut self,
+        scanner: EmbeddedTool,
+        mut support: Vec<(&'static str, EmbeddedTool)>,
+    ) -> Result<Self, DeviceError> {
+        support.sort_unstable_by_key(|(name, _)| *name);
+        if support.iter().map(|(name, _)| *name).collect::<Vec<_>>()
+            != ["LICENSE.txt", "NOTICE.txt", "libcrypto.dll"]
+            || std::iter::once(scanner)
+                .chain(support.iter().map(|(_, tool)| *tool))
+                .any(|tool| {
+                    tool.bytes.is_empty()
+                        || tool.sha256.len() != 64
+                        || !tool.sha256.bytes().all(|value| value.is_ascii_hexdigit())
+                })
+        {
+            return Err(invalid("内置 SSH 扫描器及固定依赖、许可资源不完整"));
+        }
+        let mut identity = Sha256::new();
+        identity.update(self.plink.sha256.to_ascii_lowercase());
+        identity.update(self.askpass.sha256.to_ascii_lowercase());
+        identity.update(scanner.sha256.to_ascii_lowercase());
+        for (name, tool) in &support {
+            identity.update(name.as_bytes());
+            identity.update(tool.sha256.to_ascii_lowercase());
+        }
+        self.directory
+            .set_file_name(format!("{:x}", identity.finalize()));
+        self.scanner = Some(scanner);
+        self.scanner_support = support;
+        Ok(self)
+    }
+
+    /// 查询是否绑定可信扫描组件，不释放文件或启动进程。
+    #[must_use]
+    pub fn has_ssh_scanner(&self) -> bool {
+        self.scanner.is_some()
     }
 
     /// 返回不会随工作目录变化的真实缓存目录。
@@ -124,10 +174,28 @@ impl BundledTools {
     pub fn prepare_all(&self) -> Result<BundledToolPaths, DeviceError> {
         let plink = self.prepare_plink()?;
         let askpass = self.prepare_askpass()?;
+        let scanner = self.prepare_ssh_scanner()?;
         Ok(BundledToolPaths {
+            ssh_keyscan: scanner.as_ref().map(|scanner| scanner.path().to_owned()),
             plink: plink.path.clone(),
             askpass: askpass.path.clone(),
         })
+    }
+
+    pub(crate) fn prepare_ssh_scanner(&self) -> Result<Option<PreparedSshScanner>, DeviceError> {
+        let Some(scanner) = self.scanner else {
+            return Ok(None);
+        };
+        let support = self
+            .scanner_support
+            .iter()
+            .map(|(name, tool)| self.prepare(name, *tool))
+            .collect::<Result<Vec<_>, _>>()?;
+        let executable = self.prepare("ssh-keyscan.exe", scanner)?;
+        Ok(Some(PreparedSshScanner {
+            executable,
+            _support: support,
+        }))
     }
 
     pub(crate) fn prepare_plink(&self) -> Result<PreparedTool, DeviceError> {
@@ -175,6 +243,74 @@ impl BundledTools {
         }
         drop(temporary_guard);
         verified(path, tool, directories)
+    }
+}
+
+/// 随包微软扫描组件的固定版本；Preview 属性不能省略。
+pub const SSH_SCANNER_VERSION: &str = "10.4.0.0p1-Preview";
+
+#[cfg(windows)]
+pub(crate) fn prepare_sidecar_ssh_scanner() -> Result<Option<PreparedSshScanner>, DeviceError> {
+    let executable = std::env::current_exe().map_err(|_| invalid("无法定位随包 SSH 扫描器"))?;
+    let Some(parent) = executable.parent() else {
+        return Ok(None);
+    };
+    let directory = parent.join("tools").join("ssh-scanner");
+    if !directory.exists() {
+        return Ok(None);
+    }
+    prepare_sidecar_ssh_scanner_at(&directory).map(Some)
+}
+
+#[cfg(any(windows, test))]
+fn prepare_sidecar_ssh_scanner_at(directory: &Path) -> Result<PreparedSshScanner, DeviceError> {
+    // 摘要来自微软官方 ZIP，不能接受同目录可替换 manifest 提供的任意摘要。
+    const FILES: [(&str, u64, &str); 4] = [
+        (
+            "ssh-keyscan.exe",
+            858_400,
+            "069c4ce7ee3ab94e3db4fd8ef5ee053190b769c7c661ee1ee1bb346112fc6476",
+        ),
+        (
+            "libcrypto.dll",
+            1_801_032,
+            "b4cbfd202d52ec0f094bfa328414c74b05b51234df95d2eb42e5fdb47160c9b5",
+        ),
+        (
+            "LICENSE.txt",
+            21552,
+            "568c41f330a50a7d2d2eba9d3f7807caaaf4e091705ab6652ec26a3f9d1acfdb",
+        ),
+        (
+            "NOTICE.txt",
+            36008,
+            "2cd5f5d0064bc909dfe0f0fc8f4787882c7c379f2730d89e5faa0c2bc57c620b",
+        ),
+    ];
+    let mut prepared = Vec::new();
+    for (name, length, digest) in FILES {
+        prepared.push(verified_digest(
+            directory.join(name),
+            length,
+            digest,
+            create_locked_directories(directory)?,
+        )?);
+    }
+    let executable = prepared.remove(0);
+    Ok(PreparedSshScanner {
+        executable,
+        _support: prepared,
+    })
+}
+
+// 运行期间同时锁定扫描器和 DLL，防止已核验组件被并发替换。
+pub(crate) struct PreparedSshScanner {
+    executable: PreparedTool,
+    _support: Vec<PreparedTool>,
+}
+impl PreparedSshScanner {
+    pub(crate) fn path(&self) -> &Path {
+        self.executable.path()
     }
 }
 
@@ -295,6 +431,15 @@ fn verified(
     tool: EmbeddedTool,
     directories: Vec<File>,
 ) -> Result<PreparedTool, DeviceError> {
+    verified_digest(path, tool.bytes.len() as u64, tool.sha256, directories)
+}
+
+fn verified_digest(
+    path: PathBuf,
+    expected_length: u64,
+    expected_sha256: &str,
+    directories: Vec<File>,
+) -> Result<PreparedTool, DeviceError> {
     reject_link(&std::fs::symlink_metadata(&path).map_err(|error| operation(&error))?)?;
     let mut options = OpenOptions::new();
     options.read(true);
@@ -307,7 +452,7 @@ fn verified(
     let mut file = options.open(&path).map_err(|error| operation(&error))?;
     let metadata = file.metadata().map_err(|error| operation(&error))?;
     reject_link(&metadata)?;
-    if !metadata.is_file() || metadata.len() != tool.bytes.len() as u64 {
+    if !metadata.is_file() || metadata.len() != expected_length {
         return Err(invalid("内置工具缓存大小不符，拒绝执行"));
     }
     let mut hash = Sha256::new();
@@ -319,7 +464,7 @@ fn verified(
         }
         hash.update(&buffer[..length]);
     }
-    if !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(tool.sha256) {
+    if !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected_sha256) {
         return Err(invalid("内置工具缓存 SHA-256 不符，拒绝执行"));
     }
     Ok(PreparedTool {
@@ -401,6 +546,53 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn scanner_bundle_requires_complete_fixed_support_and_hashes_every_asset() {
+        let root = Directory::new();
+        let support = vec![
+            ("libcrypto.dll", asset(b"dll")),
+            ("LICENSE.txt", asset(b"license")),
+            ("NOTICE.txt", asset(b"notice")),
+        ];
+        assert!(
+            bundle(&root.0)
+                .with_ssh_scanner(asset(b"scanner"), Vec::new())
+                .is_err()
+        );
+        let tools = bundle(&root.0)
+            .with_ssh_scanner(asset(b"scanner"), support.clone())
+            .unwrap();
+        assert_eq!(
+            tools.cache_directory().parent(),
+            Some(root.0.join("runtime").as_path())
+        );
+        let paths = tools.prepare_all().unwrap();
+        let scanner = paths.ssh_keyscan.unwrap();
+        assert_eq!(std::fs::read(scanner).unwrap(), b"scanner");
+        assert_eq!(
+            std::fs::read(tools.cache_directory().join("libcrypto.dll")).unwrap(),
+            b"dll"
+        );
+        let changed = bundle(&root.0)
+            .with_ssh_scanner(asset(b"other"), support)
+            .unwrap();
+        assert_ne!(changed.cache_directory(), tools.cache_directory());
+        std::fs::write(tools.cache_directory().join("libcrypto.dll"), b"bad").unwrap();
+        assert!(tools.prepare_all().is_err());
+    }
+
+    #[test]
+    fn scanner_sidecars_cannot_supply_their_own_hash_manifest() {
+        let root = Directory::new();
+        std::fs::write(root.0.join("ssh-keyscan.exe"), b"untrusted").unwrap();
+        std::fs::write(
+            root.0.join("scanner-manifest.json"),
+            b"{\"sha256\":\"untrusted\"}",
+        )
+        .unwrap();
+        assert!(prepare_sidecar_ssh_scanner_at(&root.0).is_err());
     }
 
     #[test]

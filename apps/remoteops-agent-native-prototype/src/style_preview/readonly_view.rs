@@ -806,8 +806,8 @@ fn role_color(role: remoteops_agent_desktop_host::ObservationRole, dark: bool) -
         (ObservationRole::Success, true) => 0x86_EF_AC,
         (ObservationRole::Error, false) => 0xB9_1C_1C,
         (ObservationRole::Error, true) => 0xFD_A4_AF,
-        (ObservationRole::Info, false) => 0x47_55_69,
-        (ObservationRole::Info, true) => 0x94_A3_B8,
+        (ObservationRole::Info | ObservationRole::Progress, false) => 0x47_55_69,
+        (ObservationRole::Info | ObservationRole::Progress, true) => 0x94_A3_B8,
         (ObservationRole::Output, false) => 0x17_20_33,
         (ObservationRole::Output, true) => 0xE2_E8_F0,
     };

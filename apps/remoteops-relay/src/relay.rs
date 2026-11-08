@@ -2,6 +2,8 @@
 mod control;
 #[path = "relay_portal.rs"]
 mod portal_access;
+#[path = "relay_tools.rs"]
+mod tools;
 use control::{broadcast_control_state, refresh_control_state};
 use remoteops_protocol::{
     ControlBasis, ControlSource, ControlStateRequest, ControlStateResult, SessionControlState,
@@ -331,6 +333,7 @@ struct AgentRegistration {
 
 #[derive(Default)]
 struct RelayState {
+    tool_state: tools::ToolRelayState,
     agents: BTreeMap<AgentInstanceId, AgentRecord>,
     pairing_index: BTreeMap<PairingCode, AgentInstanceId>,
     controllers: BTreeMap<ControllerInstanceId, ControllerRecord>,
@@ -415,6 +418,9 @@ type ShutdownWaiters = Arc<Mutex<BTreeMap<RequestId, ShutdownWaiter>>>;
 pub struct Relay {
     state: Arc<Mutex<RelayState>>,
     state_path: Option<PathBuf>,
+    tool_center: Option<Arc<remoteops_tool_center::ToolCenter>>,
+    tool_catalog_started: std::sync::atomic::AtomicBool,
+    tool_management_leases: tools::ManagementLeases,
     enrollment_store: Option<Arc<EnrollmentStore>>,
     portal_store: Option<Arc<PortalStore>>,
     /// Serializes credential validation + registration against durable revoke + disconnect.
@@ -443,6 +449,9 @@ impl Relay {
         Self {
             state: Arc::new(Mutex::new(RelayState::default())),
             state_path: None,
+            tool_center: None,
+            tool_catalog_started: std::sync::atomic::AtomicBool::new(false),
+            tool_management_leases: Arc::default(),
             enrollment_store: None,
             portal_store: None,
             enrollment_gate: Mutex::new(()),
@@ -1153,6 +1162,12 @@ impl Relay {
             ai_controller_token,
         );
         relay.state_path = Some(state_path.clone());
+        relay.tool_center = Some(Arc::new(remoteops_tool_center::ToolCenter::open(
+            state_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("tool-center"),
+        )?));
         let mut restored = RelayState::default();
         load_persisted_state(&state_path, &mut restored)?;
         save_persisted_state(&state_path, &restored)?;
@@ -1361,6 +1376,8 @@ impl Relay {
             bail!("Agent 协议版本不兼容：{}", hello.protocol_version);
         }
         let agent_id = hello.agent_instance_id;
+        let central_tools = hello.protocol_version >= 19;
+        let package_busy = Arc::new(tokio::sync::Semaphore::new(1));
         let registration = self.register_agent(hello, sender.clone()).await?;
         let connection_generation = registration.connection_generation;
         sender
@@ -1402,6 +1419,9 @@ impl Relay {
                         .finalize_agent_resume(agent_id, connection_generation)
                         .await
                     {
+                        if central_tools {
+                            self.send_tool_catalog(&sender);
+                        }
                         self.forward_connection_update(update).await;
                         info!(
                             agent_instance_id = %agent_id,
@@ -1445,6 +1465,25 @@ impl Relay {
                         &sender,
                     )
                     .await;
+                }
+                Ok(WireMessage::ToolCatalogApplied { revision, error }) if central_tools => {
+                    self.record_catalog_applied(agent_id, connection_generation, revision, error)
+                        .await;
+                }
+                Ok(WireMessage::ToolPackageRequest {
+                    request_id,
+                    sha256,
+                    offset,
+                }) if central_tools => {
+                    self.send_tool_package(
+                        agent_id,
+                        connection_generation,
+                        request_id,
+                        sha256,
+                        offset,
+                        sender.clone(),
+                        package_busy.clone(),
+                    );
                 }
                 Ok(WireMessage::AgentPermissionModeChanged(update)) => {
                     self.update_agent_permission_mode(
@@ -1540,6 +1579,8 @@ impl Relay {
         }
         if sender
             .send(WireMessage::ControllerWelcome {
+                resource_tools_schema_version: Some(1),
+                tool_center_schema_version: (hello.protocol_version >= 19).then_some(1),
                 protocol_version: hello.protocol_version,
             })
             .is_err()
@@ -1548,6 +1589,7 @@ impl Relay {
                 .await;
             bail!("Controller 连接已关闭");
         }
+        let tool_management_busy = Arc::new(tokio::sync::Semaphore::new(1));
         info!(
             controller_instance_id = %controller_id,
             owner_id = %owner_id,
@@ -1573,6 +1615,20 @@ impl Relay {
                 break;
             }
             match message {
+                Ok(WireMessage::ToolCenterRequest {
+                    request_id,
+                    request,
+                }) if hello.protocol_version >= 19 => {
+                    self.dispatch_tool_management(
+                        controller_id,
+                        connection_generation,
+                        request_id,
+                        request,
+                        sender.clone(),
+                        tool_management_busy.clone(),
+                    )
+                    .await;
+                }
                 Ok(WireMessage::ControlStateRequest(request)) => {
                     self.handle_controller_control_state(
                         controller_id,
@@ -1784,6 +1840,7 @@ impl Relay {
         installation_id: Uuid,
     ) -> Result<bool, StoreError> {
         let _gate = self.enrollment_gate.lock().await;
+        self.cancel_tool_management(installation_id).await;
         // Acquire the state lock before committing. No await may intervene between the durable
         // revoke and live cleanup, even if the requesting HTTP connection gets cancelled.
         let mut state = self.state.lock().await;
@@ -2994,6 +3051,53 @@ impl Relay {
             );
             return;
         }
+        if matches!(
+            request.operation,
+            RemoteOperation::ValidateResourceTool { .. }
+                | RemoteOperation::PrepareBrowserPassword { .. }
+                | RemoteOperation::FillBrowserPassword { .. }
+        ) && (controller.protocol_version < 20
+            || !state.agents.values().any(|agent| {
+                agent.session_id == request.session_id && agent.hello.protocol_version >= 20
+            }))
+        {
+            send_request_error(
+                controller_sender,
+                &request,
+                "resource_tools_v2_unsupported",
+                "该操作需要协议20的MCP、Relay和Agent",
+            );
+            return;
+        }
+        if let Err((code, message)) = self.check_tool_request(&state, &request) {
+            send_request_error(controller_sender, &request, code, message);
+            return;
+        }
+        if request.operation.is_resource_tool()
+            && !state
+                .agents
+                .values()
+                .find(|agent| agent.session_id == request.session_id)
+                .is_some_and(|agent| {
+                    agent.hello.protocol_version >= 18
+                        && agent.hello.target_context.as_ref().is_some_and(|context| {
+                            context.schema_version == 1
+                                && context.capabilities.iter().any(|status| {
+                                    status.capability == "resource_tools_v1"
+                                        && status.status
+                                            == remoteops_domain::CapabilityAvailability::Available
+                                })
+                        })
+                })
+        {
+            send_request_error(
+                controller_sender,
+                &request,
+                "resource_tools_unsupported",
+                "目标未启用资源工具协议v1",
+            );
+            return;
+        }
         if request.operation.is_visual()
             && let Some(context) = state
                 .agents
@@ -3306,6 +3410,7 @@ impl Relay {
             None
         };
         refresh_control_state(&mut state, request.session_id);
+        tools::track_tool_start(&mut state.tool_state, &request);
         state.in_flight.insert(
             request.request_id,
             InFlightRequest {
@@ -3446,12 +3551,15 @@ impl Relay {
                 );
                 return;
             }
+            tools::track_tool_response(&mut state.tool_state, &message);
             let original_binding_active = in_flight_binding_is_active(&state, &in_flight);
             let mut senders = Vec::new();
             if original_binding_active
                 && let Some(controller) = state.controllers.get(&in_flight.controller_id)
                 && controller.connection_generation == in_flight.controller_generation
                 && controller.kind == in_flight.controller_kind
+                && (controller.protocol_version >= 20
+                    || !matches!(&message, WireMessage::RemoteEvent(event) if matches!(event.payload, remoteops_domain::EventPayload::ResourceToolProgress { .. } | remoteops_domain::EventPayload::OperationRequested { operation: RemoteOperation::ValidateResourceTool { .. } | RemoteOperation::PrepareBrowserPassword { .. } | RemoteOperation::FillBrowserPassword { .. } })))
             {
                 senders.push(controller.sender.clone());
             }
@@ -3467,6 +3575,7 @@ impl Relay {
                     .get(&human_binding.controller_id)
                     .filter(|controller| {
                         controller.connection_generation == human_binding.controller_generation
+                            && (controller.protocol_version >= 20 || !matches!(&message, WireMessage::RemoteEvent(event) if matches!(event.payload, remoteops_domain::EventPayload::ResourceToolProgress { .. } | remoteops_domain::EventPayload::OperationRequested { operation: RemoteOperation::ValidateResourceTool { .. } | RemoteOperation::PrepareBrowserPassword { .. } | RemoteOperation::FillBrowserPassword { .. } })))
                     })
             {
                 senders.push(human_controller.sender.clone());
@@ -3551,7 +3660,8 @@ impl Relay {
                 update
             });
             let mut failures = Vec::new();
-            if update.is_some() {
+            if let Some(descriptor) = &update {
+                tools::clear_session(&mut state.tool_state, descriptor.session_id);
                 let abandoned: Vec<_> = state
                     .in_flight
                     .iter()
@@ -4410,6 +4520,8 @@ fn new_secret_token() -> String {
 mod tests {
     include!("relay_control_tests.rs");
     include!("relay_enrollment_tests.rs");
+    include!("relay_tool_tests.rs");
+    include!("relay_tool_transfer_tests.rs");
     include!("relay_boot_tests.rs");
     include!("relay_portal_tests.rs");
     use std::path::PathBuf;

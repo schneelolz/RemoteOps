@@ -1,5 +1,6 @@
 //! 复用公共 Agent 的配置、TLS、权限与生命周期，不在原生控件中执行网络操作。
 
+use super::lifecycle::LifecycleKind;
 use super::{
     ActiveOperation, LogLevel, NativeAppearance, NativeLanguage, Observation, ObservationCategory,
     ObservationRole, ProductAction, ProductLog, ProductPhase, ProductSnapshot, TrustPrompt,
@@ -80,6 +81,8 @@ pub(super) struct RuntimeHost {
     preferences_path: PathBuf,
     explicit_config: bool,
     permission: AgentPermissionControl,
+    // 宿主切换语言后，后台目标上下文立即读取当前值。
+    ui_language: remoteops_agent::AgentUiLanguage,
     worker: Option<Worker>,
     events: Option<BoundedAgentEventReceiver>,
     trust_events: Option<mpsc::Receiver<TrustResult>>,
@@ -91,6 +94,13 @@ pub(super) struct RuntimeHost {
     pending_control: Option<(RequestId, Instant)>,
     last_control: Option<RequestId>,
     reported_dropped: u64,
+}
+
+fn target_ui_language(language: NativeLanguage) -> remoteops_domain::TargetUiLanguage {
+    match language {
+        NativeLanguage::Chinese => remoteops_domain::TargetUiLanguage::ZhCn,
+        NativeLanguage::English => remoteops_domain::TargetUiLanguage::EnUs,
+    }
 }
 
 fn safe(text: &str) -> String {
@@ -146,10 +156,17 @@ impl RuntimeHost {
         state.relay.clone_from(&config.relay);
         state.server_name.clone_from(&config.server_name);
         state.transfer_root = config.transfer_root.display().to_string();
+        state.resource_tools_index_url =
+            config.resource_tools.index_url.clone().unwrap_or_default();
+        state
+            .resource_tools_allowed_origins
+            .clone_from(&config.resource_tools.allowed_origins);
         state.default_full = config.default_full_control;
         state.endpoint_editable = !profile.endpoint.is_fixed();
         state.setup_needed = config.relay.trim().is_empty() || !state.detail.is_empty();
         let permission = AgentPermissionControl::from_config(&config);
+        let ui_language = remoteops_agent::AgentUiLanguage::default();
+        ui_language.set(target_ui_language(state.language));
         let mut host = Self {
             profile,
             bundled_tools: options.bundled_tools.clone(),
@@ -158,6 +175,7 @@ impl RuntimeHost {
             preferences_path,
             explicit_config: options.agent_config.is_some(),
             permission,
+            ui_language,
             worker: None,
             events: None,
             trust_events: None,
@@ -249,7 +267,14 @@ impl RuntimeHost {
                 state.detail.clear();
                 self.begin_connect(state)
             }
+            ProductAction::SaveResourceTools { .. } => Err(state
+                .t(
+                    "集中管理模式不支持保存本地资源设置；工具由已连接中继统一管理。",
+                    "Centralized mode does not support saving local resource settings; tools are managed by the connected relay.",
+                )
+                .into()),
             ProductAction::SetLanguage(_) | ProductAction::SetAppearance(_) => {
+                self.ui_language.set(target_ui_language(state.language));
                 self.save_preferences(state)?;
                 Self::update_status(state);
                 self.update_control(state);
@@ -328,6 +353,7 @@ impl RuntimeHost {
             }
             ProductAction::Stop => {
                 let clean = self.shutdown();
+                self.pending_trust = None;
                 self.clear_connection(state);
                 state.phase = ProductPhase::Stopped;
                 state.tls = None;
@@ -427,6 +453,7 @@ impl RuntimeHost {
         let permission = self.permission.clone();
         let profile = self.profile.clone();
         let bundled_tools = self.bundled_tools.clone();
+        let ui_language = self.ui_language.clone();
         let (error_sender, error_receiver) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("remoteops-native-agent".into())
@@ -443,6 +470,7 @@ impl RuntimeHost {
                         permission,
                         AgentRuntimeOptions::interactive(profile)
                             .with_ssh_trust_cli()
+                            .with_ui_language(ui_language)
                             .with_bundled_tools(bundled_tools),
                     ));
                     if let Err(error) = result {
@@ -576,8 +604,9 @@ impl RuntimeHost {
         if dropped > self.reported_dropped {
             let count = dropped - self.reported_dropped;
             self.reported_dropped = dropped;
-            let message = format!("[界面处理落后，{count} 条中间显示记录已合并；任务状态继续保留]");
+            let message = format!("[界面处理落后，{count} 条中间显示记录已省略；任务状态继续保留]");
             output.push(Observation {
+                repetition: None,
                 text: message.clone(),
                 role: ObservationRole::Info,
                 category: ObservationCategory::Other,
@@ -585,6 +614,7 @@ impl RuntimeHost {
                 new_task: false,
             });
             state.record(ProductLog {
+                record_id: None,
                 occurred: chrono::Local::now().format("%H:%M:%S").to_string(),
                 request: String::new(),
                 source: "观察窗".into(),
@@ -635,6 +665,7 @@ impl RuntimeHost {
             remoteops_agent::AgentPresentationRole::Success => ObservationRole::Success,
             remoteops_agent::AgentPresentationRole::Error => ObservationRole::Error,
             remoteops_agent::AgentPresentationRole::Info => ObservationRole::Info,
+            remoteops_agent::AgentPresentationRole::Progress => ObservationRole::Progress,
         };
         let short = request_id.to_string().chars().take(8).collect::<String>();
         let text = safe(text);
@@ -656,7 +687,17 @@ impl RuntimeHost {
         } else {
             text
         };
+        if role == ObservationRole::Progress
+            && let Some(row) = output.iter_mut().rev().find(|row| {
+                row.request.as_deref() == Some(&request_id.to_string())
+                    && row.role == ObservationRole::Progress
+            })
+        {
+            row.text = text;
+            return;
+        }
         output.push(Observation {
+            repetition: None,
             text,
             role,
             new_task: false,
@@ -731,6 +772,11 @@ impl RuntimeHost {
                 state.code_expires_unix = Some(lease_expires_at.timestamp());
             }
             AgentEvent::ControllerCountChanged { active_connections } => {
+                if active_connections > state.controllers {
+                    state.record_lifecycle(LifecycleKind::Connected, None);
+                } else if active_connections < state.controllers {
+                    state.record_lifecycle(LifecycleKind::Disconnected, None);
+                }
                 state.controllers = active_connections;
                 if active_connections == 0 {
                     self.bindings.clear();
@@ -852,7 +898,9 @@ impl RuntimeHost {
                     },
                 );
                 if !previously_visible && visible && self.running.contains(&request_id) {
+                    state.record_lifecycle(LifecycleKind::Running, Some(category));
                     output.push(Observation {
+                        repetition: None,
                         text: String::new(),
                         role: ObservationRole::Info,
                         new_task: true,
@@ -867,7 +915,44 @@ impl RuntimeHost {
                 text,
                 terminal,
             } => {
+                if role == remoteops_agent::AgentPresentationRole::Progress {
+                    if state
+                        .resource_progress
+                        .as_ref()
+                        .is_none_or(|(id, _)| *id != request_id)
+                    {
+                        state.record_lifecycle(
+                            LifecycleKind::Running,
+                            Some(ObservationCategory::Other),
+                        );
+                    }
+                    state.resource_progress = Some((request_id, safe(&text)));
+                }
                 self.present(output, request_id, role, &text, terminal);
+            }
+            AgentEvent::OperationOutputUpdate {
+                request_id,
+                text,
+                repetition,
+            } => {
+                let text = if repetition.total > 1 {
+                    format!("{text} × {}", repetition.total)
+                } else {
+                    text
+                };
+                self.present(
+                    output,
+                    request_id,
+                    remoteops_agent::AgentPresentationRole::Output,
+                    &text,
+                    false,
+                );
+                if let Some(observation) = output.last_mut() {
+                    observation.repetition = Some(super::ObservationRepetition {
+                        record_id: repetition.record_id,
+                        total: repetition.total,
+                    });
+                }
             }
             AgentEvent::OperationLog(log) => {
                 let source = log
@@ -878,6 +963,7 @@ impl RuntimeHost {
                     .request_id
                     .map_or_else(String::new, |id| id.to_string().chars().take(8).collect());
                 let entry = ProductLog {
+                    record_id: log.repetition.map(|value| value.record_id),
                     occurred: log
                         .occurred_at
                         .with_timezone(&chrono::Local)
@@ -899,10 +985,19 @@ impl RuntimeHost {
                 request_id,
                 state: operation_state,
             } => {
+                if operation_state != AgentOperationState::Running
+                    && state
+                        .resource_progress
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == request_id)
+                {
+                    state.resource_progress = None;
+                }
                 let visible = self
                     .contexts
                     .get(&request_id)
                     .is_some_and(|context| context.observer_visible);
+                let was_running = self.running.contains(&request_id);
                 let new_task = if operation_state == AgentOperationState::Running {
                     self.running.insert(request_id)
                 } else {
@@ -912,7 +1007,24 @@ impl RuntimeHost {
                     }
                     false
                 };
+                if visible
+                    && ((new_task && !was_running)
+                        || (was_running && operation_state != AgentOperationState::Running))
+                {
+                    let kind = match operation_state {
+                        AgentOperationState::Running => LifecycleKind::Running,
+                        AgentOperationState::Succeeded => LifecycleKind::Succeeded,
+                        _ => LifecycleKind::Failed,
+                    };
+                    state.record_lifecycle(
+                        kind,
+                        self.contexts
+                            .get(&request_id)
+                            .map(|context| context.category),
+                    );
+                }
                 state.record(ProductLog {
+                    record_id: None,
                     occurred: chrono::Local::now().format("%H:%M:%S").to_string(),
                     request: request_id.to_string().chars().take(8).collect(),
                     source: self
@@ -934,6 +1046,7 @@ impl RuntimeHost {
                 if visible {
                     if operation_state == AgentOperationState::Running {
                         output.push(Observation {
+                            repetition: None,
                             text: String::new(),
                             role: ObservationRole::Info,
                             new_task,
@@ -1008,6 +1121,10 @@ impl RuntimeHost {
     }
 
     fn clear_connection(&mut self, state: &mut ProductSnapshot) {
+        state.resource_progress = None;
+        if state.controllers > 0 {
+            state.record_lifecycle(LifecycleKind::Disconnected, None);
+        }
         self.epoch = None;
         self.bindings.clear();
         self.running.clear();
@@ -1082,7 +1199,7 @@ impl RuntimeHost {
             ProductPhase::Setup => state.t("首次使用，请配置连接", "Configure the connection"),
             ProductPhase::Connecting => state.t("正在连接", "Connecting"),
             ProductPhase::Waiting => state.t("等待工程师连接", "Waiting for engineer"),
-            ProductPhase::Controlled => state.t("工程师已连接", "Engineer connected"),
+            ProductPhase::Controlled => state.t("AI工程师已连接", "AI engineer connected"),
             ProductPhase::Reconnecting => state.t("连接中断，正在重连", "Reconnecting"),
             ProductPhase::Failed => state.t("连接失败，请查看详情", "Connection failed"),
             ProductPhase::Stopped => state.t("远程协助已停止", "Remote assistance stopped"),
@@ -1227,6 +1344,127 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_preserves_all_batched_transitions_and_parallel_execution_without_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut host, mut state) = isolated_host(directory.path());
+        let mut output = Vec::new();
+        host.apply(
+            AgentEvent::ControllerCountChanged {
+                active_connections: 1,
+            },
+            &mut state,
+            &mut output,
+        );
+        let first = RequestId::new();
+        let second = RequestId::new();
+        for id in [first, second] {
+            host.apply(
+                context(id, remoteops_agent::AgentOperationKind::Ssh, None),
+                &mut state,
+                &mut output,
+            );
+            host.apply(
+                operation_state(id, AgentOperationState::Running),
+                &mut state,
+                &mut output,
+            );
+            host.apply(
+                operation_state(id, AgentOperationState::Running),
+                &mut state,
+                &mut output,
+            );
+        }
+        assert_eq!(state.running_count, 2);
+        host.apply(
+            operation_state(first, AgentOperationState::Succeeded),
+            &mut state,
+            &mut output,
+        );
+        assert_eq!(state.running_count, 1);
+        host.apply(
+            operation_state(second, AgentOperationState::Failed),
+            &mut state,
+            &mut output,
+        );
+        assert_eq!(state.running_count, 0);
+        host.apply(
+            AgentEvent::ControllerCountChanged {
+                active_connections: 0,
+            },
+            &mut state,
+            &mut output,
+        );
+        assert_eq!(
+            state
+                .lifecycle_events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                LifecycleKind::Connected,
+                LifecycleKind::Running,
+                LifecycleKind::Running,
+                LifecycleKind::Succeeded,
+                LifecycleKind::Failed,
+                LifecycleKind::Disconnected
+            ]
+        );
+        let before = state.lifecycle_events.clone();
+        state.logs.clear();
+        assert_eq!(state.lifecycle_events, before);
+        assert!(
+            state
+                .lifecycle_events
+                .iter()
+                .all(|event| event.text(NativeLanguage::Chinese).len() < 128)
+        );
+        state.language = NativeLanguage::English;
+        assert_eq!(
+            state.lifecycle_events[0].text(state.language),
+            "AI engineer connected"
+        );
+    }
+
+    #[test]
+    fn resource_progress_updates_one_observation_and_main_activity() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut host, mut state) = isolated_host(directory.path());
+        let mut output = Vec::new();
+        let id = RequestId::new();
+        host.apply(
+            operation_state(id, AgentOperationState::Running),
+            &mut state,
+            &mut output,
+        );
+        for percent in [10, 50, 100] {
+            host.apply(
+                AgentEvent::OperationPresentation {
+                    request_id: id,
+                    role: remoteops_agent::AgentPresentationRole::Progress,
+                    text: format!("browser：下载中 {percent}%"),
+                    terminal: false,
+                },
+                &mut state,
+                &mut output,
+            );
+        }
+        assert_eq!(
+            output
+                .iter()
+                .filter(|row| row.role == ObservationRole::Progress)
+                .count(),
+            1
+        );
+        assert!(state.resource_progress.as_ref().unwrap().1.contains("100%"));
+        host.apply(
+            operation_state(id, AgentOperationState::Succeeded),
+            &mut state,
+            &mut output,
+        );
+        assert!(state.resource_progress.is_none());
+    }
+
+    #[test]
     fn internal_diagnostics_keep_realtime_details_without_observer_or_activity() {
         let directory = tempfile::tempdir().unwrap();
         let (mut host, mut state) = isolated_host(directory.path());
@@ -1244,6 +1482,7 @@ mod tests {
         );
         host.apply(
             AgentEvent::OperationLog(remoteops_agent::AgentOperationLog {
+                repetition: None,
                 request_id: Some(id),
                 occurred_at: chrono::Utc::now(),
                 level: AgentLogLevel::Info,
@@ -1347,6 +1586,18 @@ mod tests {
         assert_eq!(output.last().unwrap().role, ObservationRole::Success);
         assert!(output.last().unwrap().text.contains("退出码 0"));
         assert_eq!(state.running_count, 0);
+    }
+
+    #[test]
+    fn language_switch_updates_live_runtime_before_saving_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut host, mut state) = isolated_host(directory.path());
+        for language in [NativeLanguage::English, NativeLanguage::Chinese] {
+            state.language = language;
+            host.action(ProductAction::SetLanguage(language), &mut state)
+                .unwrap();
+            assert_eq!(host.ui_language.get(), Some(target_ui_language(language)));
+        }
     }
 
     #[test]
@@ -1513,6 +1764,7 @@ mod tests {
         );
         host.apply(
             AgentEvent::OperationLog(remoteops_agent::AgentOperationLog {
+                repetition: None,
                 request_id: Some(id),
                 occurred_at: chrono::Utc::now(),
                 level: AgentLogLevel::Running,
@@ -1672,6 +1924,7 @@ mod tests {
                 &mut output,
             );
             state.record(ProductLog {
+                record_id: None,
                 occurred: String::new(),
                 request: String::new(),
                 source: "fixture".into(),
@@ -1706,22 +1959,22 @@ mod tests {
     #[test]
     fn custom_product_identity_reaches_native_host_without_connecting_or_writing_config() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("jlai.json");
+        let path = directory.path().join("example.json");
         let original = r#"{"relay":"other.invalid:7443"}"#;
         std::fs::write(&path, original).unwrap();
         let profile = ProductProfile {
-            id: "jlai-agent".into(),
-            name: "精灵 AI · JLAI".into(),
-            version: "0.4.0-jlai.1".into(),
-            directory_name: "RemoteOps-JLAI".into(),
-            config_file_name: "jlai-agent-config.json".into(),
+            id: "example-agent".into(),
+            name: "示例产品 · Example".into(),
+            version: "9.8.7-example.1".into(),
+            directory_name: "RemoteOps-Example".into(),
+            config_file_name: "example-agent-config.json".into(),
             state_file_name: "agent-state.json".into(),
-            env_prefix: "JLAI".into(),
+            env_prefix: "EXAMPLE".into(),
             default_full_control: true,
             legacy_remoteops_paths: false,
             endpoint: remoteops_product::EndpointPolicy::Fixed {
-                relay: "remote-ops.izyfarm.com:7443".into(),
-                server_name: "remote-ops.izyfarm.com".into(),
+                relay: "relay.example.invalid:7443".into(),
+                server_name: "relay.example.invalid".into(),
             },
         };
         let mut state = ProductSnapshot::default();
@@ -1737,10 +1990,10 @@ mod tests {
         assert!(host.worker.is_none());
         assert!(state.setup_needed);
         assert!(!state.endpoint_editable);
-        assert_eq!(state.product_name, "精灵 AI · JLAI");
-        assert_eq!(state.version, "0.4.0-jlai.1");
-        assert!(state.title.starts_with("精灵 AI · JLAI"));
-        assert_eq!(state.relay, "remote-ops.izyfarm.com:7443");
+        assert_eq!(state.product_name, "示例产品 · Example");
+        assert_eq!(state.version, "9.8.7-example.1");
+        assert!(state.title.starts_with("示例产品 · Example"));
+        assert_eq!(state.relay, "relay.example.invalid:7443");
         assert!(state.default_full);
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
         assert_eq!(
@@ -1749,8 +2002,8 @@ mod tests {
         );
         state.language = NativeLanguage::English;
         RuntimeHost::update_status(&mut state);
-        assert!(state.title.contains("精灵 AI · JLAI"));
-        assert!(state.title.ends_with("v0.4.0-jlai.1"));
+        assert!(state.title.contains("示例产品 · Example"));
+        assert!(state.title.ends_with("v9.8.7-example.1"));
     }
 
     #[test]
@@ -1992,6 +2245,7 @@ mod tests {
         let mut output = Vec::new();
         host.apply(
             AgentEvent::OperationLog(remoteops_agent::AgentOperationLog {
+                repetition: None,
                 request_id: None,
                 occurred_at: chrono::Utc::now(),
                 level: AgentLogLevel::Info,
@@ -2038,6 +2292,126 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"not json");
         assert!(host.shutdown());
+    }
+
+    #[test]
+    fn centralized_resources_preserve_legacy_config_and_reject_local_saves() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("agent-config.json");
+        std::fs::write(
+            &path,
+            br#"{"resource_tools":{"index_url":"https://legacy.example.test/remoteops/v1/index.json","allowed_origins":["https://legacy.example.test"]},"default_full_control":false}"#,
+        )
+        .unwrap();
+        let mut state = ProductSnapshot::default();
+        let mut host = RuntimeHost::load(
+            &crate::HostOptions {
+                agent_config: Some(path.clone()),
+                ..crate::HostOptions::default()
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            state.resource_tools_index_url,
+            "https://legacy.example.test/remoteops/v1/index.json"
+        );
+        assert_eq!(
+            state.resource_tools_allowed_origins,
+            ["https://legacy.example.test"]
+        );
+        host.action(
+            ProductAction::SaveDefaultControl { full: false },
+            &mut state,
+        )
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let saved = AgentConfig::load_file(Some(&path)).unwrap();
+        assert_eq!(
+            saved.resource_tools.index_url,
+            host.config.resource_tools.index_url
+        );
+        assert_eq!(
+            saved.resource_tools.allowed_origins,
+            host.config.resource_tools.allowed_origins
+        );
+        for language in [NativeLanguage::Chinese, NativeLanguage::English] {
+            state.language = language;
+            for index_url in [
+                "https://replacement.example.test/index.json",
+                "http://invalid.test",
+                "",
+            ] {
+                let before = format!("{state:?}");
+                let error = host
+                    .action(
+                        ProductAction::SaveResourceTools {
+                            index_url: index_url.into(),
+                            allowed_origins: vec!["https://replacement.example.test".into()],
+                        },
+                        &mut state,
+                    )
+                    .unwrap_err();
+                assert!(error.contains(if language == NativeLanguage::Chinese {
+                    "集中管理模式不支持"
+                } else {
+                    "Centralized mode does not support"
+                }));
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert_eq!(format!("{state:?}"), before);
+                assert!(!host.config.default_full_control);
+                assert!(host.worker.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn serial_output_updates_preserve_stable_id_total_and_single_log_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut host, mut state) = isolated_host(directory.path());
+        let mut output = Vec::new();
+        let id = RequestId::new();
+        host.apply(
+            context(id, remoteops_agent::AgentOperationKind::Serial, None),
+            &mut state,
+            &mut output,
+        );
+        for total in [1, 128, 10_000] {
+            let repetition = remoteops_agent::AgentOutputRepetition {
+                record_id: 3,
+                total,
+            };
+            host.apply(
+                AgentEvent::OperationLog(remoteops_agent::AgentOperationLog {
+                    repetition: Some(repetition),
+                    request_id: Some(id),
+                    occurred_at: chrono::Utc::now(),
+                    level: AgentLogLevel::Info,
+                    message: format!("same × {total}"),
+                }),
+                &mut state,
+                &mut output,
+            );
+            host.apply(
+                AgentEvent::OperationOutputUpdate {
+                    request_id: id,
+                    text: "same".into(),
+                    repetition,
+                },
+                &mut state,
+                &mut output,
+            );
+        }
+        assert_eq!(state.logs.len(), 1);
+        assert_eq!(state.unread, 1);
+        assert_eq!(output.last().unwrap().text, "same × 10000");
+        assert_eq!(
+            output.last().unwrap().repetition,
+            Some(super::super::ObservationRepetition {
+                record_id: 3,
+                total: 10_000
+            })
+        );
     }
 
     #[test]

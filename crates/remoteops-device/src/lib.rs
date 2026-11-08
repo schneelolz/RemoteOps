@@ -5,13 +5,14 @@
 
 mod bundled_tools;
 mod file_commit;
-pub use bundled_tools::{BundledToolPaths, BundledTools, EmbeddedTool};
+pub use bundled_tools::{BundledToolPaths, BundledTools, EmbeddedTool, SSH_SCANNER_VERSION};
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod ssh_atomic_file;
 mod ssh_host_keys;
 pub use ssh_host_keys::{
-    scan_ssh_host_keys, scan_ssh_host_keys_async, trust_ssh_host_keys, trust_ssh_host_keys_verified,
+    scan_ssh_host_keys, scan_ssh_host_keys_async, scan_ssh_host_keys_with_tools,
+    trust_ssh_host_keys, trust_ssh_host_keys_verified, trust_ssh_host_keys_verified_with_tools,
 };
 #[cfg(any(windows, unix))]
 #[allow(unsafe_code)]
@@ -81,6 +82,21 @@ pub struct SshHostKeyScan {
     entries: Vec<String>,
     /// 供现场用户核对的 SHA-256 指纹。
     pub fingerprints: Vec<String>,
+    /// 本次扫描的有界脱敏诊断；手工构造的已核验记录不包含进程诊断。
+    pub diagnostics: Option<SshScanDiagnostics>,
+}
+
+/// 主机密钥扫描进程的有界诊断，不含认证信息。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SshScanDiagnostics {
+    /// 实际扫描实现。
+    pub backend: &'static str,
+    /// 组件版本；Unix 系统组件版本未知时为空。
+    pub version: Option<&'static str>,
+    /// 实际进程退出码。
+    pub exit_code: Option<i32>,
+    /// 最多 1024 字符的脱敏 stderr。
+    pub stderr: String,
 }
 
 impl SshHostKeyScan {
@@ -343,6 +359,16 @@ pub enum DeviceError {
         /// 不含凭据或原始输出的固定错误类别。
         category: &'static str,
     },
+    /// 主机密钥扫描失败，保留实际退出码与有界脱敏 stderr。
+    #[error("SSH [keyscan/{category}] 失败；exit_code={exit_code:?}；{stderr}")]
+    SshScan {
+        /// 固定失败类别。
+        category: &'static str,
+        /// 实际进程退出码，无法取得时为空。
+        exit_code: Option<i32>,
+        /// 有界脱敏诊断。
+        stderr: String,
+    },
     /// 操作超时。
     #[error("设备操作超时")]
     Timeout,
@@ -363,6 +389,30 @@ pub struct CommandResult {
     pub stderr: String,
     /// 进程退出码。
     pub exit_code: Option<i32>,
+}
+
+/// 一次 SSH 执行的实际后端及可确认的诊断，不依赖终端关键词推断阶段。
+#[derive(Clone, Debug, Serialize)]
+pub struct SshExecutionDetails {
+    /// 已选择的实际客户端；准备失败时尚未启动客户端。
+    pub backend: &'static str,
+    /// 后端选择的固定原因码。
+    pub selection_reason: &'static str,
+    /// 命令执行模式。
+    pub execution_mode: &'static str,
+    /// 可确认的错误类别；未知阶段明确保留 unknown。
+    pub error_category: Option<&'static str>,
+}
+
+impl Default for SshExecutionDetails {
+    fn default() -> Self {
+        Self {
+            backend: "unknown",
+            selection_reason: "provider_did_not_report",
+            execution_mode: "exec_no_pty",
+            error_category: None,
+        }
+    }
 }
 
 /// 命令执行期间产生的一段实时输出。
@@ -595,6 +645,43 @@ pub trait SshProvider: Send + Sync {
             }
         }
         Ok(result)
+    }
+
+    /// 返回执行结果及同一次执行的诊断；不支持诊断的旧 Provider 明确返回 unknown。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_command_streaming_diagnosed(
+        &self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: Option<&str>,
+        identity_file: Option<&str>,
+        known_hosts_file: Option<&str>,
+        command: &str,
+        timeout_seconds: u64,
+        output: mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> (Result<CommandResult, DeviceError>, SshExecutionDetails) {
+        let result = self
+            .run_command_streaming(
+                host,
+                port,
+                username,
+                password,
+                identity_file,
+                known_hosts_file,
+                command,
+                timeout_seconds,
+                output,
+            )
+            .await;
+        let mut execution = SshExecutionDetails::default();
+        if !result
+            .as_ref()
+            .is_ok_and(|result| result.exit_code == Some(0))
+        {
+            execution.error_category = Some("unknown");
+        }
+        (result, execution)
     }
 }
 
@@ -1351,6 +1438,26 @@ impl SystemDevice {
     #[must_use]
     pub fn has_bundled_ssh(&self) -> bool {
         self.bundled_tools.is_some()
+    }
+
+    /// 返回主机密钥扫描能力；Windows 只承认内嵌组件或摘要核验的固定随包路径。
+    #[must_use]
+    pub fn has_ssh_scanner(&self) -> bool {
+        if self
+            .bundled_tools
+            .as_ref()
+            .is_some_and(BundledTools::has_ssh_scanner)
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            bundled_tools::prepare_sidecar_ssh_scanner().is_ok_and(|scanner| scanner.is_some())
+        }
+        #[cfg(not(windows))]
+        {
+            command_exists("ssh-keyscan")
+        }
     }
 
     /// 返回规范化后的文件交换根目录。
@@ -2582,7 +2689,6 @@ impl SshProvider for SystemDevice {
         .await
     }
 
-    #[allow(clippy::too_many_lines)] // 保持认证、主机密钥与进程取消路径在同一生命周期内。
     async fn run_command_streaming(
         &self,
         host: &str,
@@ -2594,6 +2700,78 @@ impl SshProvider for SystemDevice {
         command: &str,
         timeout_seconds: u64,
         output: mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> Result<CommandResult, DeviceError> {
+        self.run_command_streaming_diagnosed(
+            host,
+            port,
+            username,
+            password,
+            identity_file,
+            known_hosts_file,
+            command,
+            timeout_seconds,
+            output,
+        )
+        .await
+        .0
+    }
+
+    async fn run_command_streaming_diagnosed(
+        &self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: Option<&str>,
+        identity_file: Option<&str>,
+        known_hosts_file: Option<&str>,
+        command: &str,
+        timeout_seconds: u64,
+        output: mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> (Result<CommandResult, DeviceError>, SshExecutionDetails) {
+        let mut execution = SshExecutionDetails {
+            backend: "preparation",
+            selection_reason: "client_not_started",
+            ..SshExecutionDetails::default()
+        };
+        let result = self
+            .run_ssh_command_streaming(
+                host,
+                port,
+                username,
+                password,
+                identity_file,
+                known_hosts_file,
+                command,
+                timeout_seconds,
+                output,
+                &mut execution,
+            )
+            .await;
+        execution.error_category = match &result {
+            Ok(result) if result.exit_code == Some(0) => None,
+            Err(DeviceError::Ssh { category, .. }) => Some(category),
+            Err(DeviceError::InvalidInput(_) | DeviceError::Unsupported(_)) => Some("preparation"),
+            Err(DeviceError::OutputLimit { .. }) => Some("output_limit"),
+            Ok(_) | Err(_) => Some("unknown"),
+        };
+        (result, execution)
+    }
+}
+
+impl SystemDevice {
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn run_ssh_command_streaming(
+        &self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: Option<&str>,
+        identity_file: Option<&str>,
+        known_hosts_file: Option<&str>,
+        command: &str,
+        timeout_seconds: u64,
+        output: mpsc::UnboundedSender<CommandOutputChunk>,
+        execution: &mut SshExecutionDetails,
     ) -> Result<CommandResult, DeviceError> {
         if host.trim().is_empty() || username.trim().is_empty() || command.trim().is_empty() {
             return Err(DeviceError::InvalidInput(
@@ -2661,6 +2839,8 @@ impl SshProvider for SystemDevice {
                     );
                 }
                 backend = "plink";
+                execution.backend = backend;
+                execution.selection_reason = "bundled_plink_exact_pinned_keys";
                 ssh_backend_preparing(&output, "Plink", "已找到随包组件与精确固定密钥");
                 let diagnostic_output = output.clone();
                 let result = self
@@ -2678,6 +2858,21 @@ impl SshProvider for SystemDevice {
                 return Ok(result);
             }
             backend = "openssh";
+            execution.backend = backend;
+            #[cfg(windows)]
+            {
+                execution.selection_reason = if password.is_none() {
+                    "private_key_or_passwordless"
+                } else if plink_path.is_none() {
+                    "bundled_plink_unavailable"
+                } else {
+                    "trust_rules_require_openssh"
+                };
+            }
+            #[cfg(not(windows))]
+            {
+                execution.selection_reason = "platform_openssh";
+            }
             #[cfg(windows)]
             let fallback_reason = if password.is_none() {
                 "当前采用私钥／无密码模式"
@@ -2691,6 +2886,7 @@ impl SshProvider for SystemDevice {
             ssh_backend_preparing(&output, "OpenSSH", fallback_reason);
             let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
             let mut arguments = vec![
+                "-T".to_owned(),
                 "-F".to_owned(),
                 null_config.to_owned(),
                 "-o".to_owned(),

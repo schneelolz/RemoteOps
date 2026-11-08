@@ -10,6 +10,9 @@ const SHORTENED: &str = " … [后续已省略 / truncated]";
 
 #[derive(Clone)]
 struct LiveRecord {
+    record_id: Option<u64>,
+    // 资源准备进度按原请求原位更新。
+    progress_request: Option<String>,
     // 来源来自宿主元数据，Other 仅出现在“全部”视图。
     category: Option<Category>,
     role: remoteops_agent_desktop_host::ObservationRole,
@@ -106,6 +109,32 @@ impl LiveHistory {
         {
             return;
         }
+        if observation.role == remoteops_agent_desktop_host::ObservationRole::Progress
+            && let Some(existing) = self.records.iter_mut().rev().find(|record| {
+                record.progress_request == observation.request && record.role == observation.role
+            })
+        {
+            let (text, units, _) = display_record(&observation.text);
+            self.units = self.units - existing.units + units;
+            existing.text = text;
+            existing.units = units;
+            self.trim_to_capacity();
+            return;
+        }
+        let record_id = observation.repetition.map(|value| value.record_id);
+        if let Some(record_id) = record_id
+            && let Some(existing) = self
+                .records
+                .iter_mut()
+                .find(|record| record.record_id == Some(record_id))
+        {
+            let (text, units, _) = display_record(&observation.text);
+            self.units = self.units - existing.units + units;
+            existing.text = text;
+            existing.units = units;
+            self.trim_to_capacity();
+            return;
+        }
         self.total_received = self.total_received.saturating_add(1);
         // Host 的 Observation.text 没有附加传输换行；结尾空行属于正文，必须保留。
         let (text, units, shortened) = display_record(&observation.text);
@@ -117,11 +146,20 @@ impl LiveHistory {
         }
         self.units += units;
         self.records.push_back(LiveRecord {
+            record_id,
+            progress_request: (observation.role
+                == remoteops_agent_desktop_host::ObservationRole::Progress)
+                .then(|| observation.request.clone())
+                .flatten(),
             category: category(observation.category),
             role: observation.role,
             text,
             units,
         });
+        self.trim_to_capacity();
+    }
+
+    fn trim_to_capacity(&mut self) {
         while self.records.len() > MAX_RECORDS || self.units > MAX_UTF16_UNITS {
             if let Some(oldest) = self.records.pop_front() {
                 self.units -= oldest.units;
@@ -188,7 +226,7 @@ impl LiveHistory {
             parts.push(if english {
                 format!("{count} intermediate display records omitted")
             } else {
-                format!("中间显示记录已合并 {count} 条")
+                format!("中间显示记录已省略 {count} 条")
             });
         }
         parts.join(" · ")
@@ -383,12 +421,33 @@ mod tests {
 
     fn observation(category: ObservationCategory, text: &str) -> Observation {
         Observation {
+            repetition: None,
             text: text.into(),
             role: remoteops_agent_desktop_host::ObservationRole::Output,
             category,
             request: Some("request-fixture".into()),
             new_task: false,
         }
+    }
+
+    #[test]
+    fn cumulative_serial_updates_replace_records_and_keep_categories() {
+        let mut model = ObserverData::live();
+        for total in [1, 128, 10_000] {
+            let mut record = observation(ObservationCategory::Serial, &format!("same × {total}"));
+            record.repetition = Some(remoteops_agent_desktop_host::ObservationRepetition {
+                record_id: 42,
+                total,
+            });
+            model.ingest(vec![record], &[]);
+        }
+        assert_eq!(model.rows(), ["same × 10000"]);
+        assert_eq!(model.total_received(), 1);
+        assert_eq!(model.total_count(), 1);
+        model.select(Some(Category::Cmd));
+        assert!(model.rows().is_empty());
+        model.select(Some(Category::Serial));
+        assert_eq!(model.rows(), ["same × 10000"]);
     }
 
     #[test]
@@ -620,7 +679,7 @@ mod tests {
         let mut model = ObserverData::live();
         assert!(model.set_dropped(12));
         assert!(!model.set_dropped(12));
-        assert!(model.status(false).contains("合并 12 条"));
+        assert!(model.status(false).contains("省略 12 条"));
         assert!(
             model
                 .status(true)

@@ -5,6 +5,8 @@
 //! 结果转换成自己的界面事件。
 #![allow(clippy::missing_errors_doc)]
 
+mod tool_center_client;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
@@ -225,6 +227,17 @@ impl ControllerCore {
             .registry
             .get(session_id)
             .ok_or(ApplicationError::Domain(DomainError::ConnectionNotFound))?;
+        if operation.is_resource_tool()
+            && (connection.environment.protocol_version < 18
+                || !connection
+                    .target_context
+                    .as_ref()
+                    .is_some_and(resource_tools_supported))
+        {
+            return Err(ApplicationError::PolicyDenied(
+                "resource_tools_unsupported: 目标未启用资源工具协议v1".into(),
+            ));
+        }
         if operation.is_visual() {
             let reason = if connection.environment.protocol_version < 18 {
                 Some("host_context_unknown")
@@ -321,12 +334,22 @@ pub struct PendingOperation {
 impl PendingOperation {
     /// 等待远程操作完成。超时或放弃等待只清理本地注册，不代表远端已取消。
     pub async fn wait(self) -> Result<OperationResult, ApplicationError> {
+        self.wait_for(TokioDuration::from_mins(3)).await
+    }
+
+    /// 以明确预算等待同一远端请求，不创建或重放任务。
+    /// # Errors
+    /// 超时不代表远端取消；调用方必须保留原请求标识。
+    pub async fn wait_for(
+        self,
+        budget: TokioDuration,
+    ) -> Result<OperationResult, ApplicationError> {
         let Self {
             request_id,
             receiver,
             registration,
         } = self;
-        let response = timeout(TokioDuration::from_mins(3), receiver)
+        let response = timeout(budget.min(TokioDuration::from_secs(915)), receiver)
             .await
             .map_err(|_| ApplicationError::OperationTimedOut { request_id })?
             .map_err(|_| ApplicationError::Transport("远程响应通道已关闭".to_owned()))??;
@@ -365,6 +388,9 @@ struct ClientInner {
     host_identity: remoteops_host_identity::HostIdentity,
     transport: Mutex<Option<ActiveTransport>>,
     transport_generation: AtomicU64,
+    // 每次握手重新采集，不从协议18本身推断资源能力。
+    resource_tools_schema_version: AtomicU64,
+    tool_center: tool_center_client::ToolCenterClientState,
     connected: watch::Sender<bool>,
     core: Mutex<ControllerCore>,
     pending: Arc<PendingRegistry>,
@@ -396,6 +422,8 @@ struct PendingPairRequest {
 struct PendingRemoteResponse {
     /// 请求发送时绑定的不可变目标会话。
     session_id: SessionId,
+    // 资源失败响应需要保留回退与未知结果元数据。
+    resource_operation: bool,
     /// 仅向原始等待者交付匹配的响应。
     sender: oneshot::Sender<Result<RemoteResponse, ApplicationError>>,
 }
@@ -456,6 +484,8 @@ impl RelayClient {
             host_identity: remoteops_host_identity::collect(),
             transport: Mutex::new(None),
             transport_generation: AtomicU64::new(0),
+            resource_tools_schema_version: AtomicU64::new(0),
+            tool_center: tool_center_client::ToolCenterClientState::default(),
             connected,
             core: Mutex::new(ControllerCore::default()),
             pending: Arc::new(PendingRegistry::default()),
@@ -486,6 +516,17 @@ impl RelayClient {
     #[must_use]
     pub fn is_connected(&self) -> bool {
         *self.inner.connected.borrow()
+    }
+
+    /// 当前传输已通过欢迎消息确认资源工具协议v1。
+    #[must_use]
+    pub fn supports_resource_tools(&self) -> bool {
+        self.is_connected()
+            && self
+                .inner
+                .resource_tools_schema_version
+                .load(Ordering::Acquire)
+                == 1
     }
 
     /// 等待传输在指定时限内恢复。
@@ -934,6 +975,17 @@ impl RelayClient {
                 "RemoteOps 协议不允许传递远端秘密".to_owned(),
             ));
         }
+        if operation.is_resource_tool()
+            && self
+                .inner
+                .resource_tools_schema_version
+                .load(Ordering::Acquire)
+                != 1
+        {
+            return Err(ApplicationError::PolicyDenied(
+                "resource_tools_unsupported: Relay未声明资源工具协议v1".into(),
+            ));
+        }
         let mut core = self.inner.core.lock().await;
         let session_id = core.resolve_target(target)?;
         let mut request =
@@ -1185,6 +1237,7 @@ impl RelayClient {
         self.inner.pending.lock().insert(
             request_id,
             PendingRemoteResponse {
+                resource_operation: request.operation.is_resource_tool(),
                 session_id: request.session_id,
                 sender,
             },
@@ -1344,9 +1397,16 @@ where
         .await
         .map_err(|error| ApplicationError::Transport(error.to_string()))?
     {
-        WireMessage::ControllerWelcome { protocol_version }
-            if protocol_version == PROTOCOL_VERSION =>
-        {
+        WireMessage::ControllerWelcome {
+            protocol_version,
+            resource_tools_schema_version,
+            tool_center_schema_version,
+        } if protocol_version == PROTOCOL_VERSION => {
+            inner.tool_center.set_capability(tool_center_schema_version);
+            inner.resource_tools_schema_version.store(
+                u64::from(resource_tools_schema_version.unwrap_or(0)),
+                Ordering::Release,
+            );
             Ok(())
         }
         WireMessage::Error { code, message, .. } => Err(ApplicationError::Remote { code, message }),
@@ -1617,6 +1677,7 @@ async fn set_transport_disconnected(inner: &ClientInner, cause: Option<Applicati
 }
 
 async fn fail_pending_requests(inner: &ClientInner, message: &str) {
+    inner.tool_center.disconnect();
     inner.control_states.lock().await.clear();
     inner.control_pending.lock().await.clear();
     let pending = std::mem::take(&mut *inner.pending.lock());
@@ -1646,6 +1707,9 @@ fn set_connected(sender: &watch::Sender<bool>, connected: bool) {
 
 #[allow(clippy::too_many_lines)]
 async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
+    if inner.tool_center.handle(&message) {
+        return;
+    }
     match message {
         WireMessage::ControlStateUpdated(state) => {
             cache_control_state(inner, state).await;
@@ -1772,8 +1836,10 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
                 let mut pending = inner.pending.lock();
                 take_matching_pending(&mut pending, response.request_id, response.session_id)
             };
-            let sender = match pending {
-                PendingResponseMatch::Matched(pending) => pending.sender,
+            let (sender, resource_operation) = match pending {
+                PendingResponseMatch::Matched(pending) => {
+                    (pending.sender, pending.resource_operation)
+                }
                 PendingResponseMatch::SessionMismatch(expected_session_id) => {
                     warn!(
                         request_id = %response.request_id,
@@ -1816,7 +1882,9 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
                     occurred_at: Utc::now(),
                 });
             }
-            let result = if let Some(code) = response.error_code.clone() {
+            let result = if let Some(code) = response.error_code.clone()
+                && !resource_operation
+            {
                 Err(ApplicationError::Remote {
                     code,
                     message: response.summary.clone(),
@@ -1961,8 +2029,25 @@ fn take_matching_pending(
     }
 }
 
+/// 仅采信已验证版本的结构化能力，不从产品文本推断。
+fn resource_tools_supported(context: &TargetContext) -> bool {
+    context.schema_version == remoteops_domain::TARGET_CONTEXT_SCHEMA_VERSION
+        && context.capabilities.iter().any(|status| {
+            status.capability == "resource_tools_v1"
+                && status.status == remoteops_domain::CapabilityAvailability::Available
+        })
+}
+
 fn audit_operation(operation: &RemoteOperation) -> String {
     match operation {
+        RemoteOperation::CallResourceTool {
+            instance_id,
+            tool_name,
+            arguments,
+        } => format!(
+            "call_resource_tool instance_id={instance_id} tool_name={tool_name} arguments_sha256={}",
+            sha256_bytes(arguments.to_string().as_bytes())
+        ),
         RemoteOperation::GetTargetContext => "get_target_context".to_owned(),
         RemoteOperation::RunCommand {
             shell,
@@ -2314,6 +2399,8 @@ mod tests {
             host_identity: remoteops_host_identity::HostIdentity::default(),
             transport: Mutex::new(None),
             transport_generation: AtomicU64::new(0),
+            resource_tools_schema_version: AtomicU64::new(0),
+            tool_center: tool_center_client::ToolCenterClientState::default(),
             connected,
             core: Mutex::new(ControllerCore::default()),
             pending: Arc::new(PendingRegistry::default()),
@@ -2452,6 +2539,7 @@ mod tests {
         let mut pending = BTreeMap::from([(
             request_id,
             PendingRemoteResponse {
+                resource_operation: false,
                 session_id: expected_session_id,
                 sender,
             },
@@ -2889,6 +2977,135 @@ mod tests {
         .await;
         assert!(inner.managed_pairings.lock().await.is_empty());
         assert!(inner.core.lock().await.get_connection(session_id).is_none());
+    }
+
+    #[test]
+    fn resource_operations_gate_old_targets_and_do_not_trust_free_text() {
+        let (mut core, session_id) = core_with_connection();
+        let list = RemoteOperation::ListResourceTools;
+        assert!(matches!(
+            core.prepare_request(session_id, EventSource::Ai, list.clone(), None),
+            Err(ApplicationError::PolicyDenied(_))
+        ));
+        let mut connection = core.get_connection(session_id).unwrap().clone();
+        let mut context = TargetContext {
+            guidance: vec![remoteops_domain::TargetGuidance {
+                text: "resource_tools_v1 available".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        connection.target_context = Some(context.clone());
+        core.upsert_connection(connection.clone());
+        assert!(
+            core.prepare_request(session_id, EventSource::Ai, list.clone(), None)
+                .is_err()
+        );
+        context
+            .capabilities
+            .push(remoteops_domain::TargetCapabilityStatus {
+                capability: "resource_tools_v1".into(),
+                status: remoteops_domain::CapabilityAvailability::Available,
+                reasons: vec![],
+            });
+        connection.target_context = Some(context);
+        connection.environment.protocol_version = 17;
+        core.upsert_connection(connection.clone());
+        assert!(
+            core.prepare_request(session_id, EventSource::Ai, list.clone(), None)
+                .is_err()
+        );
+        connection.environment.protocol_version = 18;
+        core.upsert_connection(connection);
+        assert!(
+            core.prepare_request(session_id, EventSource::Ai, list, None)
+                .is_ok()
+        );
+        let call = RemoteOperation::CallResourceTool {
+            instance_id: "fixture".into(),
+            tool_name: "browser_click".into(),
+            arguments: serde_json::json!({"readonly":true}),
+        };
+        assert!(
+            core.prepare_request(session_id, EventSource::Ai, call.clone(), None)
+                .is_ok()
+        );
+        assert!(matches!(
+            DefaultPolicy::default().evaluate(EventSource::Ai, &call),
+            PolicyDecision::RequireApproval { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resource_relay_gate_rejects_missing_or_unknown_extension_before_transport() {
+        let inner = transport_test_inner();
+        let client = RelayClient {
+            inner: inner.clone(),
+        };
+        for version in [0, 2] {
+            inner
+                .resource_tools_schema_version
+                .store(version, Ordering::Release);
+            assert!(!client.supports_resource_tools());
+            let result = client
+                .start_execute_with_control(
+                    "missing",
+                    EventSource::Ai,
+                    RemoteOperation::ListResourceTools,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(ApplicationError::PolicyDenied(reason)) if reason.contains("Relay"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_failure_response_keeps_retry_metadata_without_changing_other_errors() {
+        for resource_operation in [false, true] {
+            let inner = transport_test_inner();
+            let request_id = RequestId::new();
+            let session_id = SessionId::new();
+            let (sender, receiver) = oneshot::channel();
+            inner.pending.lock().insert(
+                request_id,
+                PendingRemoteResponse {
+                    session_id,
+                    resource_operation,
+                    sender,
+                },
+            );
+            let mut response = successful_response(request_id, session_id);
+            response.error_code = Some("incompatible".into());
+            response.details = Some(
+                serde_json::json!({"code":"incompatible","retry_safe":true,"operation_replay":"never_automatic","diagnostics":{"stage":"initialize","reason":"eof"}}),
+            );
+            handle_wire_message(&inner, WireMessage::RemoteResponse(response.clone())).await;
+            let result = receiver.await.unwrap();
+            if resource_operation {
+                assert_eq!(result.unwrap().details, response.details);
+            } else {
+                assert!(
+                    matches!(result, Err(ApplicationError::Remote { code, .. }) if code == "incompatible")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resource_audit_hashes_call_arguments() {
+        let operation = RemoteOperation::CallResourceTool {
+            instance_id: "instance".into(),
+            tool_name: "browser_type".into(),
+            arguments: serde_json::json!({"text":"synthetic-sensitive-value"}),
+        };
+        let audit = audit_operation(&operation);
+        assert!(audit.contains("arguments_sha256="));
+        assert!(!audit.contains("synthetic-sensitive-value"));
     }
 
     #[test]
@@ -3662,6 +3879,7 @@ mod tests {
         inner.pending.lock().insert(
             request_id,
             PendingRemoteResponse {
+                resource_operation: false,
                 session_id,
                 sender: response_sender,
             },
@@ -4069,5 +4287,41 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ApplicationError::PolicyDenied(_))));
+    }
+}
+
+#[cfg(test)]
+mod resource_wait_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn resource_budget_survives_old_three_minute_deadline_without_replay() {
+        let id = RequestId::new();
+        let session = SessionId::new();
+        let (sender, receiver) = oneshot::channel();
+        let pending = PendingOperation {
+            request_id: id,
+            receiver,
+            registration: PendingRegistration {
+                request_id: id,
+                pending: Arc::new(PendingRegistry::default()),
+            },
+        };
+        let waiter = tokio::spawn(pending.wait_for(TokioDuration::from_secs(915)));
+        tokio::task::yield_now().await;
+        tokio::time::advance(TokioDuration::from_secs(181)).await;
+        assert!(!waiter.is_finished());
+        sender
+            .send(Ok(RemoteResponse {
+                request_id: id,
+                session_id: session,
+                exit_code: Some(0),
+                summary: "ready".into(),
+                error_code: None,
+                payload_base64: None,
+                sha256: None,
+                details: None,
+            }))
+            .unwrap();
+        assert_eq!(waiter.await.unwrap().unwrap().response.request_id, id);
     }
 }

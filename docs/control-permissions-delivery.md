@@ -9,7 +9,7 @@
 - Relay `0.2.0-preview.6`，包含 Windows x64 和 Linux x64 / glibc 2.36 产物。
 - 协议版本 16，三端必须配套；旧组件不能因缺少授权字段获得权限。
 - 批次目录：`artifacts/release/control-permissions-20260929`，内含各平台 `manifest.json`、总 `SHA256SUMS.txt`、`build-info.json` 及依赖许可证清单。
-- 新 GUI 已覆盖 `C:\Users\ywb\Desktop\RemoteOps\remoteops-agent-gui.exe`，复制后 SHA-256 与发布包一致；目录内其余 4 个文件哈希未变。旧 GUI 已另存批次目录 `rollback-local/remoteops-agent-gui.previous.exe`。
+- 新 GUI 已覆盖用户指定交付目录中的 `remoteops-agent-gui.exe`，复制后 SHA-256 与发布包一致；目录内其余 4 个文件哈希未变。旧 GUI 已另存批次目录 `rollback-local/remoteops-agent-gui.previous.exe`。
 
 ## 修改范围
 

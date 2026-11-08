@@ -8,6 +8,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+remoteops-tool-center = { path = "../remoteops-tool-center" }
 anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true

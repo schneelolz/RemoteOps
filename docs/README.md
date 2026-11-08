@@ -27,6 +27,7 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 - [部署与三机验收手册](部署与三机验收手册.md)
 - [远程 Pwsh 链路部署测试](远程Pwsh链路部署测试.md)
 - [发布与产物说明](发布与产物说明.md)
+- [MCP 与 Skill 独立发布规范](mcp-skill-release.md)
 - [安全模型](安全模型.md)
 - [项目结构规范](项目结构规范.md)
 - [文档维护规范](文档维护规范.md)
@@ -53,7 +54,7 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 - Token、密码、私钥、控制码、恢复令牌和客户信息不得进入源码、文档、日志或安装包。
 - Agent 只主动出站连接 Relay，不监听客户公网端口。
 - 同一 Agent Session 只允许一个 `ControllerOwnerId`；Human 和 AI 可以作为同一 Owner 的不同角色协作，不能形成两个互相独立的控制者。
-- MCP 使用本地 STDIO；全新 Agent 默认逐项确认。当前配套协议为 18，现场临时授权和持久默认模式见[控制权限与默认模式](control-permissions.md)。MCP 授权保留一小时空闲 TTL；只读、外部审批及宿主独立授权仍然有效。
+- MCP 使用本地 STDIO；全新 Agent 默认逐项确认。当前配套协议为 19，现场临时授权和持久默认模式见[控制权限与默认模式](control-permissions.md)。MCP 授权保留一小时空闲 TTL；只读、外部审批及宿主独立授权仍然有效。
 - 所有目标操作绑定不可变 `session_id`，不能根据主机名或别名猜测目标。
 - 发布包由 CI 从源码构建，并附带 SHA-256；`artifacts` 只是本地临时目录。
 - `target`、运行状态文件、审计日志、控制码、恢复令牌、TLS 私钥和任何本地 Token 都不属于公开发布内容。
@@ -66,3 +67,17 @@ Agent GUI 现提供公共库入口；产品配置与构建资源分别位于 `re
 
 - [公共底座与产品定制分离交付记录](product-refactor-delivery.md)：实际接口、完整文件清单、验证结果与待完成验收。
 - [定制服务 Agent 公共接口与兼容矩阵](integrations/custom-service-agent.md)、[门户 API v1](integrations/portal-api-v1.md)、[本轮验收记录](integrations/custom-service-delivery.md)、[门户授权管理与资产迁移交付](integrations/portal-admin-delivery.md)。
+
+- [R01—R04 改进实施与交接](RemoteOps改进实施与交接.md)：本轮实现、验证和现场待验收项。
+
+- [中继工具中心交付记录](tool-center-delivery.md)：集中目录、管理权限、执行契约、候选来源及验证边界。
+- [工具中心适配、全局指引与权限验收](tool-center-guide-diagnostics.md)：2026-11-06 本地实现、浏览器回归、截图和未验证边界。
+- [工具中心配套上线与定制交付](tool-guide-jlai11-rollout.md)：Relay `.14`、MCP `.23`、Skill `0.1.4`、定制 `.11` 的实际备份、升级和交付。
+
+- [UI、SSH 与 MCP 合并修复交付记录](ui-ssh-mcp-delivery.md)：定制 `.10`、MCP `.21`、Relay `.13` 的验证、部署与现场边界。
+
+- [浏览器凭据、平台验证与资源准备进度](browser-credentials-progress-jlai13.md)：协议20、单次网页登录凭据、精确平台证据及准备进度。
+
+- [Relay 管理前后端分离与工具中心调整（preview.17）](relay-admin-split-preview17.md)
+
+- [工具中心布局与详情展示（管理前端 0.1.1）](relay-admin-0.1.1.md)

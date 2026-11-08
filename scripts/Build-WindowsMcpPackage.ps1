@@ -1,212 +1,96 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$OutputRoot,
-    [string]$ArtifactDirectory
+    [string]$ArtifactDirectory,
+    [ValidateSet('release', 'release-small')][string]$BuildProfile = 'release-small'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
+. (Join-Path $PSScriptRoot 'RemoteOps-Package.ps1')
 $workspaceRoot = Split-Path -Parent $PSScriptRoot
-$userProfile = [Environment]::GetFolderPath('UserProfile')
-$cargoHome = if ([string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
-    Join-Path $userProfile '.cargo'
-}
-else {
-    [IO.Path]::GetFullPath($env:CARGO_HOME)
-}
-$previousEncodedRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
-$rustFlagSeparator = [char]0x1F
-$releaseRustFlags = [string]::Join($rustFlagSeparator, @(
-    '-Ctarget-feature=+crt-static'
-    '--remap-path-prefix={0}=/remoteops' -f [IO.Path]::GetFullPath($workspaceRoot)
-    '--remap-path-prefix={0}=/cargo' -f $cargoHome
-    '--remap-path-prefix={0}=/user' -f $userProfile
-))
-$env:CARGO_ENCODED_RUSTFLAGS = if ([string]::IsNullOrWhiteSpace($previousEncodedRustFlags)) {
-    $releaseRustFlags
-}
-else {
-    "$previousEncodedRustFlags$rustFlagSeparator$releaseRustFlags"
-}
-$previousCFlags = $env:CFLAGS
-$previousCxxFlags = $env:CXXFLAGS
-$releaseNativeFlags = @(
-    '/pathmap:{0}=/remoteops' -f [IO.Path]::GetFullPath($workspaceRoot)
-    '/pathmap:{0}=/cargo' -f $cargoHome
-    '/pathmap:{0}=/user' -f $userProfile
-) -join ' '
-$env:CFLAGS = [string]::Join(' ', @(
-    @($previousCFlags, $releaseNativeFlags) |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-))
-$env:CXXFLAGS = [string]::Join(' ', @(
-    @($previousCxxFlags, $releaseNativeFlags) |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-))
-$packageId = (& cargo pkgid `
-    --manifest-path (Join-Path $workspaceRoot 'Cargo.toml') `
-    --locked `
-    -p remoteops-controller-mcp 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0) {
-    throw '读取 remoteops-controller-mcp 版本失败。'
-}
-$versionMatch = [regex]::Match(
-    $packageId,
-    '#(?:[^@#]+@)?(?<version>[^#\s]+)$'
-)
-if (-not $versionMatch.Success) {
-    throw '无法确定 remoteops-controller-mcp 版本。'
-}
-$version = $versionMatch.Groups['version'].Value
-$credentialPromptPackageId = (& cargo pkgid `
-    --manifest-path (Join-Path $workspaceRoot 'Cargo.toml') `
-    --locked `
-    -p remoteops-credential-prompt 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0) {
-    throw '读取 remoteops-credential-prompt 版本失败。'
-}
-$credentialPromptVersionMatch = [regex]::Match(
-    $credentialPromptPackageId,
-    '#(?:[^@#]+@)?(?<version>[^#\s]+)$'
-)
-if (-not $credentialPromptVersionMatch.Success) {
-    throw '无法确定 remoteops-credential-prompt 版本。'
-}
-$credentialPromptVersion = $credentialPromptVersionMatch.Groups['version'].Value
-if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
-    $OutputRoot = Join-Path $workspaceRoot "artifacts\release\$version\mcp"
-}
-if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) {
-    $ArtifactDirectory = Join-Path $workspaceRoot "artifacts\release\$version\windows-x64"
-}
-$packageName = "RemoteOps-MCP-Windows-x64-$version"
-$resolvedOutputRoot = [IO.Path]::GetFullPath($OutputRoot)
-$packageDirectory = [IO.Path]::GetFullPath((Join-Path $resolvedOutputRoot $packageName))
-$archivePath = Join-Path $resolvedOutputRoot "$packageName.zip"
-$templateDirectory = Join-Path $workspaceRoot 'deploy\controller-mcp\windows'
-$resolvedArtifactDirectory = [IO.Path]::GetFullPath($ArtifactDirectory)
-$artifactExecutable = Join-Path $resolvedArtifactDirectory 'remoteops-controller-mcp.exe'
-$manifestPath = Join-Path $resolvedArtifactDirectory 'manifest.json'
-
-if (-not $packageDirectory.StartsWith(
-        $resolvedOutputRoot + [IO.Path]::DirectorySeparatorChar,
-        [StringComparison]::OrdinalIgnoreCase
-    )) {
-    throw 'MCP 安装包目录必须位于指定输出目录内。'
-}
-
 Push-Location $workspaceRoot
 try {
-    # 跟随 Cargo 实际缓存目录，避免设置 CARGO_TARGET_DIR 后取到旧程序。
     $metadataJson = (& cargo metadata --locked --no-deps --format-version 1 | Out-String)
-    if ($LASTEXITCODE -ne 0) {
-        throw '读取 Cargo 构建目录失败。'
+    if ($LASTEXITCODE -ne 0) { throw '读取 Cargo 元数据失败。' }
+    $metadata = $metadataJson | ConvertFrom-Json
+    $version = [string]($metadata.packages | Where-Object name -EQ 'remoteops-controller-mcp').version
+    $promptVersion = [string]($metadata.packages | Where-Object name -EQ 'remoteops-credential-prompt').version
+    if (-not $version -or -not $promptVersion) { throw '无法确定组件版本。' }
+    if (-not $OutputRoot) { $OutputRoot = Join-Path $workspaceRoot "artifacts\release\$version\mcp" }
+    if (-not $ArtifactDirectory) { $ArtifactDirectory = Join-Path $workspaceRoot "artifacts\release\$version\windows-x64" }
+    $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
+    $ArtifactDirectory = [IO.Path]::GetFullPath($ArtifactDirectory)
+    $packageName = "RemoteOps-MCP-Windows-x64-$version"
+    $packageDirectory = Join-Path $OutputRoot $packageName
+    $archivePath = Join-Path $OutputRoot "$packageName.zip"
+    if ((Test-Path -LiteralPath $packageDirectory) -or (Test-Path -LiteralPath $archivePath)) {
+        throw '输出已存在；请使用新的输出目录，保留已有发布产物。'
     }
-    $cargoTargetDirectory = [string]($metadataJson | ConvertFrom-Json).target_directory
-    if ([string]::IsNullOrWhiteSpace($cargoTargetDirectory)) {
-        throw 'Cargo metadata 缺少实际构建目录。'
+    New-Item -ItemType Directory -Force -Path $ArtifactDirectory, $OutputRoot | Out-Null
+    # 摘要覆盖编译输入和发布脚本；构建前后再次核对，避免并行改动混入产物。
+    function Get-SourceInputs {
+        $files = @('Cargo.toml', 'Cargo.lock', 'LICENSE', '.gitattributes', '.editorconfig', 'rust-toolchain.toml') | ForEach-Object { $path = Join-Path $workspaceRoot $_; if (Test-Path -LiteralPath $path -PathType Leaf) { Get-Item -LiteralPath $path } }
+        foreach ($directory in @('apps', 'crates', 'build', 'assets', 'deploy', 'scripts', 'examples', 'tests', 'third-party', '.cargo')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $workspaceRoot $directory) -PathType Container)) { continue }
+            $files += @(Get-ChildItem -LiteralPath (Join-Path $workspaceRoot $directory) -Recurse -File |
+                Where-Object { $_.FullName -notmatch '[\\/]__pycache__[\\/]' -and $_.Extension -notin @('.pyc', '.log') })
+        }
+        @($files | Sort-Object FullName | ForEach-Object {
+            [ordered]@{ file=$_.FullName.Substring($workspaceRoot.Length+1).Replace('\','/'); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+        }) | ConvertTo-Json -Depth 5 -Compress
     }
-    $releaseExecutable = Join-Path $cargoTargetDirectory 'release\remoteops-controller-mcp.exe'
-    $credentialPromptExecutable = Join-Path $cargoTargetDirectory 'release\remoteops-credential-prompt.exe'
-    cargo build --release --locked -p remoteops-controller-mcp -p remoteops-credential-prompt
-    if ($LASTEXITCODE -ne 0) {
-        throw 'remoteops-controller-mcp Release 构建失败。'
+    $sourceInputs = Get-SourceInputs
+    $previous = @{}
+    foreach ($name in @('CARGO_ENCODED_RUSTFLAGS', 'CFLAGS', 'CXXFLAGS')) { $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+    $userProfile = [Environment]::GetFolderPath('UserProfile')
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $userProfile '.cargo' }
+    $separator = [char]0x1f
+    $rustFlags = @('-Ctarget-feature=+crt-static', "--remap-path-prefix=$workspaceRoot=/remoteops", "--remap-path-prefix=$cargoHome=/cargo", "--remap-path-prefix=$userProfile=/user") -join $separator
+    $env:CARGO_ENCODED_RUSTFLAGS = if ($previous.CARGO_ENCODED_RUSTFLAGS) { $previous.CARGO_ENCODED_RUSTFLAGS + $separator + $rustFlags } else { $rustFlags }
+    $nativeFlags = "/pathmap:$workspaceRoot=/remoteops /pathmap:$cargoHome=/cargo /pathmap:$userProfile=/user"
+    $env:CFLAGS = "$($previous.CFLAGS) $nativeFlags".Trim()
+    $env:CXXFLAGS = "$($previous.CXXFLAGS) $nativeFlags".Trim()
+    try {
+        & cargo build --profile $BuildProfile --locked -p remoteops-controller-mcp -p remoteops-credential-prompt
+        if ($LASTEXITCODE -ne 0) { throw 'MCP Release 构建失败。' }
     }
-}
-finally {
-    Pop-Location
-    if ($null -eq $previousEncodedRustFlags) {
-        Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
+    finally {
+        foreach ($name in $previous.Keys) { [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process') }
     }
-    else {
-        $env:CARGO_ENCODED_RUSTFLAGS = $previousEncodedRustFlags
+    if ((Get-SourceInputs) -cne $sourceInputs) { throw '构建期间源码发生变化；未生成可发布安装包，请在源码稳定后重新构建。' }
+    $inputsPath = Join-Path $ArtifactDirectory 'source-inputs.json'
+    [IO.File]::WriteAllText($inputsPath, $sourceInputs + "`r`n", [Text.UTF8Encoding]::new($false))
+    $inputsHash = (Get-FileHash -LiteralPath $inputsPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-RemoteOpsJson (Join-Path $ArtifactDirectory 'build-info.json') ([ordered]@{ cargo=(& cargo --version | Out-String).Trim(); rustc=(& rustc --version | Out-String).Trim(); profile=$BuildProfile; source_inputs_sha256=$inputsHash; lockfile_sha256=(Get-FileHash -LiteralPath (Join-Path $workspaceRoot 'Cargo.lock') -Algorithm SHA256).Hash.ToLowerInvariant() })
+    New-Item -ItemType Directory -Path $packageDirectory | Out-Null
+    $templateDirectory = Join-Path $workspaceRoot 'deploy\controller-mcp\windows'
+    foreach ($name in @('remoteops-controller-mcp.exe', 'remoteops-credential-prompt.exe')) {
+        $source = Join-Path $metadata.target_directory "$BuildProfile\$name"
+        Copy-Item -LiteralPath $source -Destination $packageDirectory
+        Copy-Item -LiteralPath $source -Destination $ArtifactDirectory -Force
     }
-    if ($null -eq $previousCFlags) {
-        Remove-Item Env:CFLAGS -ErrorAction SilentlyContinue
+    foreach ($name in @('README.md', 'Install-RemoteOpsMcp.ps1', 'Test-RemoteOpsMcp.ps1')) {
+        Copy-Item -LiteralPath (Join-Path $templateDirectory $name) -Destination $packageDirectory
     }
-    else {
-        $env:CFLAGS = $previousCFlags
+    & (Join-Path $PSScriptRoot 'New-ThirdPartyNotices.ps1') -OutputDirectory $packageDirectory
+    if ($LASTEXITCODE -ne 0) { throw '许可证清单生成失败。' }
+    foreach ($component in @(@('remoteops-controller-mcp.exe', $version), @('remoteops-credential-prompt.exe', $promptVersion))) {
+        $output = (& (Join-Path $packageDirectory $component[0]) --version 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $output.EndsWith(' ' + $component[1])) { throw '实际组件版本不匹配。' }
     }
-    if ($null -eq $previousCxxFlags) {
-        Remove-Item Env:CXXFLAGS -ErrorAction SilentlyContinue
-    }
-    else {
-        $env:CXXFLAGS = $previousCxxFlags
-    }
+    if ((Get-SourceInputs) -cne $sourceInputs) { throw '打包期间源码发生变化；保留本批证据，请在新目录重新构建。' }
+    $manifest = [ordered]@{ schema_version=1; component='remoteops-mcp'; version=$version; credential_prompt_version=$promptVersion; protocol=20; build_profile=$BuildProfile; source_inputs_sha256=$inputsHash; contains_credentials=$false; files=@(Get-RemoteOpsPackageFiles $packageDirectory) }
+    Write-RemoteOpsJson (Join-Path $packageDirectory 'manifest.json') $manifest
+    Write-RemoteOpsChecksums $packageDirectory
+    $null = Test-RemoteOpsComponentPackage $packageDirectory 'remoteops-mcp'
+    & (Join-Path $PSScriptRoot 'Test-ReleaseArtifacts.ps1') -ArtifactRoot $packageDirectory -RequireLegalFiles
+    if ($LASTEXITCODE -ne 0) { throw 'MCP 安装包内容检查失败。' }
+    Compress-Archive -Path (Join-Path $packageDirectory '*') -DestinationPath $archivePath -CompressionLevel Optimal
+    Test-RemoteOpsArchive $packageDirectory $archivePath
+    & (Join-Path $PSScriptRoot 'Test-ReleaseArtifacts.ps1') -ArtifactRoot $packageDirectory -RequireLegalFiles -ReferenceMcpExecutable (Join-Path $ArtifactDirectory 'remoteops-controller-mcp.exe') -McpArchive $archivePath
+    if ($LASTEXITCODE -ne 0) { throw 'MCP ZIP 一致性检查失败。' }
+    Write-Host "MCP 独立包：$archivePath"
+    Write-Host "SHA256：$((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant())"
 }
-
-if (Test-Path -LiteralPath $packageDirectory) {
-    Remove-Item -LiteralPath $packageDirectory -Recurse -Force
-}
-New-Item -ItemType Directory -Force -Path $packageDirectory | Out-Null
-New-Item -ItemType Directory -Force -Path $resolvedArtifactDirectory | Out-Null
-Copy-Item -LiteralPath $releaseExecutable -Destination $artifactExecutable -Force
-Copy-Item -LiteralPath $releaseExecutable -Destination (Join-Path $packageDirectory 'remoteops-controller-mcp.exe')
-Copy-Item -LiteralPath $credentialPromptExecutable -Destination (Join-Path $packageDirectory 'remoteops-credential-prompt.exe')
-Copy-Item -LiteralPath (Join-Path $templateDirectory 'README.md') -Destination $packageDirectory
-Copy-Item -LiteralPath (Join-Path $templateDirectory 'Install-RemoteOpsMcp.ps1') -Destination $packageDirectory
-Copy-Item -LiteralPath (Join-Path $templateDirectory 'Test-RemoteOpsMcp.ps1') -Destination $packageDirectory
-& (Join-Path $PSScriptRoot 'New-ThirdPartyNotices.ps1') -OutputDirectory $packageDirectory
-if ($LASTEXITCODE -ne 0) {
-    throw '生成 MCP 安装包许可证和依赖清单失败。'
-}
-$skillSource = Join-Path $templateDirectory 'skills\remoteops'
-$skillDestination = Join-Path $packageDirectory 'skills\remoteops'
-if (-not (Test-Path -LiteralPath (Join-Path $skillSource 'SKILL.md') -PathType Leaf)) {
-    throw "MCP 安装模板缺少 RemoteOps skill：$skillSource"
-}
-New-Item -ItemType Directory -Force -Path $skillDestination | Out-Null
-Copy-Item -LiteralPath (Join-Path $skillSource 'SKILL.md') -Destination $skillDestination
-if (Test-Path -LiteralPath (Join-Path $skillSource 'agents') -PathType Container) {
-    Copy-Item -LiteralPath (Join-Path $skillSource 'agents') -Destination $skillDestination -Recurse
-}
-
-$actualVersion = (& (Join-Path $packageDirectory 'remoteops-controller-mcp.exe') --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $actualVersion -notmatch [regex]::Escape($version)) {
-    throw "打包程序版本不正确：$actualVersion"
-}
-$promptVersion = (& (Join-Path $packageDirectory 'remoteops-credential-prompt.exe') --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $promptVersion -notmatch [regex]::Escape($credentialPromptVersion)) {
-    throw "凭据安全输入程序版本不正确：$promptVersion"
-}
-
-if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
-    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    $manifestEntry = $manifest | Where-Object { $_.File -eq 'remoteops-controller-mcp.exe' }
-    if ($null -eq $manifestEntry) {
-        throw 'Windows 发布清单缺少 remoteops-controller-mcp.exe。'
-    }
-    $artifactItem = Get-Item -LiteralPath $artifactExecutable
-    $manifestEntry.CargoVersion = $version
-    $manifestEntry.FileVersion = $artifactItem.VersionInfo.FileVersion
-    $manifestEntry.ProductVersion = $artifactItem.VersionInfo.ProductVersion
-    $manifestEntry.Length = $artifactItem.Length
-    $manifestEntry.Sha256 = (Get-FileHash -LiteralPath $artifactExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
-    $manifestJson = $manifest | ConvertTo-Json -Depth 5
-    [IO.File]::WriteAllText($manifestPath, $manifestJson + "`r`n", [Text.UTF8Encoding]::new($false))
-}
-
-if (Test-Path -LiteralPath $archivePath) {
-    Remove-Item -LiteralPath $archivePath -Force
-}
-& (Join-Path $PSScriptRoot 'Test-ReleaseArtifacts.ps1') `
-    -ArtifactRoot $packageDirectory `
-    -RequireLegalFiles
-if ($LASTEXITCODE -ne 0) {
-    throw 'MCP 安装包内容检查失败。'
-}
-Compress-Archive -Path (Join-Path $packageDirectory '*') -DestinationPath $archivePath -CompressionLevel Optimal
-
-& (Join-Path $PSScriptRoot 'Test-ReleaseArtifacts.ps1') `
-    -ArtifactRoot $packageDirectory `
-    -RequireLegalFiles `
-    -ReferenceMcpExecutable $artifactExecutable `
-    -McpArchive $archivePath
-if ($LASTEXITCODE -ne 0) {
-    throw 'MCP 安装包与 Windows 发布目录一致性检查失败。'
-}
-
-$hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
-Write-Host "安装包：$archivePath"
-Write-Host "SHA256：$hash"
+finally { Pop-Location }

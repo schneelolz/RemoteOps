@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-relay"
-version = "0.2.0-preview.10"
+version = "0.2.0-preview.17"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,9 @@ OriginalFilename = "remoteops-relay.exe"
 LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [dependencies]
+base64.workspace = true
+remoteops-resources = { path = "../../crates/remoteops-resources" }
+remoteops-tool-center = { path = "../../crates/remoteops-tool-center" }
 anyhow.workspace = true
 argon2.workspace = true
 axum.workspace = true

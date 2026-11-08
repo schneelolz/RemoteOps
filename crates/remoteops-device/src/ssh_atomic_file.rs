@@ -35,8 +35,13 @@ pub(super) fn publish_new(temporary: &Path, destination: &Path) -> std::io::Resu
     .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
 }
 
-fn copy_existing_dacl(source: PCWSTR, target: PCWSTR) -> Result<(), crate::DeviceError> {
+fn copy_existing_dacl(
+    source: PCWSTR,
+    target: PCWSTR,
+    deadline: Instant,
+) -> Result<(), crate::DeviceError> {
     let failed = || crate::DeviceError::Operation("无法保留 SSH 信任库权限，未替换旧文件".into());
+    check_deadline(deadline)?;
     let mut required = 0;
     // 先获取自相对安全描述符长度；不传入可写缓冲。
     let _ = unsafe {
@@ -48,6 +53,7 @@ fn copy_existing_dacl(source: PCWSTR, target: PCWSTR) -> Result<(), crate::Devic
             &raw mut required,
         )
     };
+    check_deadline(deadline)?;
     if required == 0 || required > 65_536 {
         return Err(failed());
     }
@@ -67,10 +73,12 @@ fn copy_existing_dacl(source: PCWSTR, target: PCWSTR) -> Result<(), crate::Devic
     }
     .ok()
     .map_err(|_| failed())?;
+    check_deadline(deadline)?;
     let mut control = 0;
     let mut revision = 0;
     unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) }
         .map_err(|_| failed())?;
+    check_deadline(deadline)?;
     let inheritance = if control & SE_DACL_PROTECTED.0 != 0 {
         PROTECTED_DACL_SECURITY_INFORMATION
     } else {
@@ -79,10 +87,35 @@ fn copy_existing_dacl(source: PCWSTR, target: PCWSTR) -> Result<(), crate::Devic
     // 只复制 DACL 与其继承保护状态，不改 owner，也不要求 SACL 相关特权。
     unsafe { SetFileSecurityW(target, DACL_SECURITY_INFORMATION | inheritance, descriptor) }
         .ok()
-        .map_err(|_| failed())
+        .map_err(|_| failed())?;
+    check_deadline(deadline)
 }
 
-pub(super) fn replace(temporary: &Path, destination: &Path) -> Result<(), crate::DeviceError> {
+fn check_deadline(deadline: Instant) -> Result<(), crate::DeviceError> {
+    if Instant::now() >= deadline {
+        return Err(crate::DeviceError::Ssh {
+            backend: "trust",
+            category: "timeout",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn replace(temporary: &Path, destination: &Path) -> Result<(), crate::DeviceError> {
+    replace_until(
+        temporary,
+        destination,
+        Instant::now() + Duration::from_secs(2),
+    )
+}
+
+pub(super) fn replace_until(
+    temporary: &Path,
+    destination: &Path,
+    deadline: Instant,
+) -> Result<(), crate::DeviceError> {
+    check_deadline(deadline)?;
     let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
     let target: Vec<u16> = destination
         .as_os_str()
@@ -93,10 +126,12 @@ pub(super) fn replace(temporary: &Path, destination: &Path) -> Result<(), crate:
         .try_exists()
         .map_err(|_| crate::DeviceError::Operation("无法查询 SSH 信任库".into()))?
     {
-        copy_existing_dacl(PCWSTR(target.as_ptr()), PCWSTR(source.as_ptr()))?;
+        check_deadline(deadline)?;
+        copy_existing_dacl(PCWSTR(target.as_ptr()), PCWSTR(source.as_ptr()), deadline)?;
     }
-    let started = Instant::now();
+    let retry_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
     loop {
+        check_deadline(deadline)?;
         // 同目录单次 rename 覆盖；失败保留旧路径。跨进程锁贯穿重读／合并／发布。
         // 缓冲均 NUL 结尾且贯穿调用，不使用 ReplaceFileW 的多步内部替换。
         let result = unsafe {
@@ -111,10 +146,11 @@ pub(super) fn replace(temporary: &Path, destination: &Path) -> Result<(), crate:
             Err(error) => {
                 let code = error.code().0 & 0xffff;
                 // 只重试写侧短暂占用；读侧始终读取一次且不容忍任何缺口。
-                if matches!(code, 5 | 32 | 33) && started.elapsed() < Duration::from_millis(500) {
+                if matches!(code, 5 | 32 | 33) && Instant::now() < retry_deadline {
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
+                check_deadline(deadline)?;
                 #[cfg(test)]
                 eprintln!("trust_atomic_os_error={code}");
                 return Err(crate::DeviceError::Operation(
@@ -162,6 +198,48 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "ACL 校验失败；未输出描述符或路径");
     }
+    #[test]
+    fn expired_or_exhausted_retry_budget_never_replaces_old_trust() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let directory = fixture();
+        let destination = directory.0.join("known_hosts");
+        let temporary = directory.0.join("replacement");
+        std::fs::write(&destination, b"old\n").unwrap();
+        std::fs::write(&temporary, b"new\n").unwrap();
+        assert!(replace_until(&temporary, &destination, Instant::now()).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old\n");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&destination)
+            .unwrap();
+        let started = Instant::now();
+        let result = replace_until(
+            &temporary,
+            &destination,
+            started + Duration::from_millis(30),
+        );
+        assert!(matches!(
+            result,
+            Err(crate::DeviceError::Ssh {
+                backend: "trust",
+                category: "timeout"
+            })
+        ));
+        // 系统 IO 本身可能阻塞；返回后预算已过期时绝不能再次尝试提交。
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old\n");
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"new\n");
+        drop(held);
+        replace_until(
+            &temporary,
+            &destination,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new\n");
+    }
+
     #[test]
     fn atomic_replace_preserves_owner_only_protected_dacl_and_failure_keeps_old_file() {
         let directory = fixture();

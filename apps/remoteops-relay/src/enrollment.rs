@@ -100,6 +100,10 @@ pub(crate) fn router() -> Router<AdminState> {
         .route("/api/admin/mcp/setups/{grant_id}/name", put(rename_setup))
         .route("/api/admin/mcp/clients", get(clients))
         .route(
+            "/api/admin/mcp/clients/{installation_id}/tool-management",
+            put(update_tool_management),
+        )
+        .route(
             "/api/admin/mcp/clients/{installation_id}/name",
             put(rename_client),
         )
@@ -288,6 +292,31 @@ async fn rename_client(
         return Err(error(StatusCode::NOT_FOUND, "MCP client not found"));
     }
     Ok(Json(serde_json::json!({"success": true})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolManagementPermission {
+    enabled: bool,
+}
+
+async fn update_tool_management(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    request: Result<Json<ToolManagementPermission>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    authorize(&state, &headers).await?;
+    let id = parse_id(&id)?;
+    let Json(request) = request.map_err(invalid_json)?;
+    let changed = state
+        .relay
+        .set_mcp_tool_management(id, request.enabled)
+        .await
+        .map_err(store_error)?;
+    Ok(Json(
+        serde_json::json!({"success": true, "changed": changed, "tool_management": request.enabled}),
+    ))
 }
 
 async fn clients(

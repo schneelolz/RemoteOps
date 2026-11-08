@@ -7,20 +7,20 @@ use crate::product::{
 };
 use windows_sys::Win32::{
     Graphics::Gdi::{
-        CreateSolidBrush, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
-        DrawFocusRect, DrawTextW, FillRect, HBRUSH, HDC, InvalidateRect, RDW_ALLCHILDREN,
-        RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, SelectObject,
-        SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
+        CreatePen, CreateSolidBrush, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        DT_WORDBREAK, DrawFocusRect, DrawTextW, Ellipse, FillRect, HBRUSH, HDC, InvalidateRect,
+        PS_SOLID, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+        RedrawWindow, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
     },
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED},
     UI::Shell::{IsUserAnAdmin, ShellExecuteW},
     UI::WindowsAndMessaging::{
         BS_OWNERDRAW, BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, IDYES,
-        MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MessageBoxW, SW_SHOWNORMAL, SWP_FRAMECHANGED,
-        SWP_NOREDRAW, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM,
-        WM_ERASEBKGND, WM_GETFONT, WM_SETREDRAW, WS_CAPTION, WS_DISABLED, WS_MINIMIZEBOX,
-        WS_SYSMENU,
+        IsIconic, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MessageBoxW, SW_SHOWNORMAL,
+        SWP_FRAMECHANGED, SWP_NOREDRAW, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
+        WM_DRAWITEM, WM_ERASEBKGND, WM_GETFONT, WM_SETREDRAW, WS_CAPTION, WS_DISABLED,
+        WS_MINIMIZEBOX, WS_SYSMENU,
     },
 };
 
@@ -62,6 +62,9 @@ const TRUST_CANCEL: i32 = 334;
 const TRUST_ONCE: i32 = 335;
 const TRUST_SAVE: i32 = 336;
 const OBSERVER: i32 = 337;
+const RESOURCE_HELP: i32 = 342;
+const PAUSE_ACTIVITY: i32 = 343;
+const STATUS_DOT: i32 = 344;
 pub(super) const CODE_ID: i32 = CODE;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,6 +97,8 @@ pub(super) struct ProductUi {
     dropped_observations: u64,
     running_count: usize,
     changing_page: bool,
+    activity_view: crate::activity_view::ActivityView,
+    controllers: usize,
 }
 
 impl Default for ProductUi {
@@ -115,6 +120,8 @@ impl Default for ProductUi {
             dropped_observations: 0,
             running_count: 0,
             changing_page: false,
+            activity_view: crate::activity_view::ActivityView::default(),
+            controllers: 0,
         }
     }
 }
@@ -222,7 +229,7 @@ fn mark_rendered_logs(host: &mut ProductHost, unread: usize, rendered: bool) -> 
 }
 
 fn add(app: &App, id: i32, class: &str, text: &str, style: u32) -> Result<(), String> {
-    if !(TITLE..=OBSERVER).contains(&id) {
+    if !(TITLE..=STATUS_DOT).contains(&id) {
         return Err("产品控件ID超过有界缓存范围".to_owned());
     }
     let style = control_style(class, style);
@@ -329,7 +336,8 @@ fn readonly(app: &App, id: i32, text: &str) -> Result<(), String> {
 
 fn page_size(page: Page) -> (i32, i32) {
     match page {
-        Page::Main | Page::Preferences => (500, 375),
+        Page::Main => (500, 375),
+        Page::Preferences => (640, 480),
         Page::Setup => (640, 330),
         Page::Details | Page::Logs | Page::Permissions | Page::Trust => (540, 560),
     }
@@ -357,6 +365,8 @@ fn current_page_controls(app: &App) -> (Page, BTreeMap<i32, HWND>) {
     )
 }
 
+// 集中保留各页面的原生控件坐标，便于 DPI 布局核对。
+#[allow(clippy::too_many_lines)]
 pub(super) fn layout(app: &App, dpi: u32) {
     let _timer = PhaseTimer::new(&app.product_timings.layout);
     if app.main.get().is_null() {
@@ -379,12 +389,15 @@ pub(super) fn layout(app: &App, dpi: u32) {
     place(TITLE, s(24), s(20), width - s(96), s(34));
     place(ERROR, s(24), height - s(101), width - s(48), s(42));
     if page == Page::Main {
+        place(STATUS_DOT, s(24), s(32), s(10), s(10));
+        place(TITLE, s(43), s(20), width - s(115), s(34));
         place(SETTINGS, width - s(58), s(20), s(34), s(32));
         place(CODE_LABEL, s(24), s(86), width - s(48), s(23));
         place(CODE, s(50), s(116), width - s(135), s(58));
         place(COPY, width - s(79), s(126), s(36), s(34));
         place(EXPIRY, s(24), s(183), width - s(48), s(25));
-        place(ACTIVITY, s(24), s(233), width - s(48), s(43));
+        place(ACTIVITY, s(24), s(218), width - s(145), s(66));
+        place(PAUSE_ACTIVITY, width - s(112), s(218), s(88), s(28));
         place(DETAILS, s(24), height - s(54), s(124), s(32));
         place(LOGS, s(159), height - s(54), s(124), s(32));
         place(EXIT, width - s(134), height - s(54), s(110), s(32));
@@ -413,6 +426,7 @@ pub(super) fn layout(app: &App, dpi: u32) {
             }
             place(PERMISSIONS, s(24), s(204), width - s(48), s(34));
             place(CONFIG_PATH, s(24), s(255), width - s(48), s(40));
+            place(RESOURCE_HELP, s(24), s(310), width - s(48), s(62));
         }
         Page::Logs => {
             for (n, id) in [
@@ -598,6 +612,56 @@ pub(super) fn paint(
                 let item = &*(lparam as *const DRAWITEMSTRUCT);
                 if item.CtlID < TITLE as u32 {
                     return None;
+                }
+                if item.CtlID == ACTIVITY as u32 && app.product_ui.borrow().page == Page::Main {
+                    FillRect(item.hDC, &raw const item.rcItem, brush);
+                    let snapshot = app.product.borrow().snapshot();
+                    let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0);
+                    app.product_ui.borrow().activity_view.draw(
+                        item.hDC,
+                        item.rcItem,
+                        font as _,
+                        app.dpi.get(),
+                        snapshot.language,
+                        dark,
+                    );
+                    return Some(1);
+                }
+                if item.CtlID == STATUS_DOT as u32 {
+                    FillRect(item.hDC, &raw const item.rcItem, brush);
+                    let snapshot = app.product.borrow().snapshot();
+                    let color = if snapshot.controllers > 0 {
+                        let color = crate::activity_view::event_color(
+                            remoteops_agent_desktop_host::lifecycle::LifecycleKind::Connected,
+                            dark,
+                        );
+                        crate::activity_view::blend(
+                            color,
+                            background,
+                            app.product_ui
+                                .borrow()
+                                .activity_view
+                                .brightness(snapshot.running_count > 0),
+                        )
+                    } else {
+                        rgb(130, 137, 148)
+                    };
+                    let fill = CreateSolidBrush(color);
+                    let pen = CreatePen(PS_SOLID, 1, color);
+                    let old_fill = SelectObject(item.hDC, fill);
+                    let old_pen = SelectObject(item.hDC, pen);
+                    Ellipse(
+                        item.hDC,
+                        item.rcItem.left,
+                        item.rcItem.top,
+                        item.rcItem.right,
+                        item.rcItem.bottom,
+                    );
+                    SelectObject(item.hDC, old_fill);
+                    SelectObject(item.hDC, old_pen);
+                    DeleteObject(fill);
+                    DeleteObject(pen);
+                    return Some(1);
                 }
                 let selected = item.itemState & ODS_SELECTED != 0;
                 let disabled = item.itemState & ODS_DISABLED != 0;
@@ -811,7 +875,9 @@ fn build_page(
             add(app, CODE, "STATIC", "··· ··· ···", 1)?;
             button(app, COPY, t("复制", "Copy"))?;
             add(app, EXPIRY, "STATIC", "", 1)?;
-            button(app, ACTIVITY, "")?;
+            add(app, ACTIVITY, "STATIC", "", 13_u32)?;
+            add(app, STATUS_DOT, "STATIC", "", 13_u32)?;
+            button(app, PAUSE_ACTIVITY, t("暂停", "Pause"))?;
             button(app, DETAILS, t("查看连接详情", "Connection details"))?;
             button(app, LOGS, t("实时日志", "Logs"))?;
             button(app, EXIT, t("退出 Agent", "Exit Agent"))?;
@@ -856,6 +922,14 @@ fn build_page(
             button(app, THEME_LIGHT, t("浅色", "Light"))?;
             button(app, THEME_DARK, t("深色", "Dark"))?;
             button(app, PERMISSIONS, t("控制权限", "Control permissions"))?;
+            readonly_label(
+                app,
+                RESOURCE_HELP,
+                t(
+                    "工具由已连接中继统一管理。",
+                    "Tools are managed by the connected relay.",
+                ),
+            )?;
             label(
                 app,
                 CONFIG_PATH,
@@ -987,6 +1061,24 @@ fn system_dark() -> bool {
 
 pub(super) fn refresh_tick(app: &App) {
     let changed = poll_clipboard(app);
+    let snapshot = app.product.borrow().snapshot();
+    let visible = unsafe { IsWindowVisible(app.main.get()) != 0 && IsIconic(app.main.get()) == 0 }
+        && app.product_ui.borrow().page == Page::Main;
+    let animate = app
+        .product_ui
+        .borrow_mut()
+        .activity_view
+        .tick(&snapshot, visible);
+    if animate {
+        for id in [ACTIVITY, STATUS_DOT] {
+            let hwnd = control(app, id);
+            if !hwnd.is_null() {
+                unsafe {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+        }
+    }
     let now = Instant::now();
     let due = {
         let ui = app.product_ui.borrow();
@@ -1058,7 +1150,18 @@ fn update(app: &App, snapshot: &ProductSnapshot) {
     let counters_changed = {
         let mut ui = app.product_ui.borrow_mut();
         let changed = ui.dropped_observations != snapshot.dropped_observations
-            || ui.running_count != snapshot.running_count;
+            || ui.running_count != snapshot.running_count
+            || ui.controllers != snapshot.controllers;
+        if ui.controllers != snapshot.controllers {
+            unsafe {
+                InvalidateRect(
+                    ui.controls.get(&STATUS_DOT).copied().unwrap_or(null_mut()),
+                    null(),
+                    0,
+                );
+            }
+        }
+        ui.controllers = snapshot.controllers;
         ui.dropped_observations = snapshot.dropped_observations;
         ui.running_count = snapshot.running_count;
         changed
@@ -1082,7 +1185,7 @@ fn update(app: &App, snapshot: &ProductSnapshot) {
     }
     localize_observer(app, snapshot);
     let title = match page {
-        Page::Main => format!("●  {}", snapshot.status),
+        Page::Main => snapshot.status.clone(),
         Page::Setup => t("首次连接设置", "First connection setup").to_owned(),
         Page::Preferences => t("偏好设置", "Preferences").to_owned(),
         Page::Details => t("连接详情", "Connection details").to_owned(),
@@ -1137,18 +1240,21 @@ fn update(app: &App, snapshot: &ProductSnapshot) {
                     t("复制", "Copy")
                 },
             );
+            let activity = app
+                .product_ui
+                .borrow()
+                .activity_view
+                .text(snapshot.language);
+            write(app, ACTIVITY, &activity);
+            let paused = app.product_ui.borrow().activity_view.paused;
             write(
                 app,
-                ACTIVITY,
-                &format!(
-                    "{}{}",
-                    snapshot.activity,
-                    if snapshot.last_result.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\r\n{}", snapshot.last_result)
-                    }
-                ),
+                PAUSE_ACTIVITY,
+                if paused {
+                    t("继续", "Resume")
+                } else {
+                    t("暂停", "Pause")
+                },
             );
             write(
                 app,
@@ -1484,7 +1590,7 @@ pub(super) fn command(app: &App, id: i32) {
     let next = match id {
         SETTINGS => Some(Page::Preferences),
         DETAILS => Some(Page::Details),
-        LOGS | ACTIVITY => Some(Page::Logs),
+        LOGS => Some(Page::Logs),
         PERMISSIONS => Some(Page::Permissions),
         BACK | 2 if !matches!(page, Page::Main | Page::Setup | Page::Trust) => Some(Page::Main),
         _ => None,
@@ -1497,6 +1603,13 @@ pub(super) fn command(app: &App, id: i32) {
         return;
     }
     match id {
+        PAUSE_ACTIVITY => {
+            let mut ui = app.product_ui.borrow_mut();
+            ui.activity_view.toggle_pause();
+            drop(ui);
+            refresh_tick(app);
+            refresh(app);
+        }
         BACK | 2 if page == Page::Setup => close_command(app),
         EXIT => close_command(app),
         COPY if snapshot.can_copy => copy_code(app, &snapshot),

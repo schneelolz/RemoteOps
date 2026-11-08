@@ -3,7 +3,7 @@ use super::*;
 use crate::product::{
     NativeAppearance, NativeLanguage, ProductAction, ProductHost, ProductPhase, ProductSnapshot,
 };
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LOG_UNITS: usize = 262_144;
@@ -44,8 +44,6 @@ pub(super) struct Business {
     pending_default: bool,
     // 原生控件重建保留尚未保存的 Relay 输入。
     draft_relay: Option<String>,
-    // 只保留少量已通知任务，活动任务不被历史裁剪逐出。
-    announced: BTreeSet<String>,
     copy_error: bool,
     copied_code: Option<String>,
     pub(super) close_text_matches: bool,
@@ -85,7 +83,6 @@ impl Business {
             shown_tls: None,
             pending_default: false,
             draft_relay: None,
-            announced: BTreeSet::new(),
             copy_error: false,
             copied_code: None,
             close_text_matches: false,
@@ -288,7 +285,8 @@ fn perform(app: &App, action: ProductAction) -> bool {
 }
 
 fn save_draft(app: &App) {
-    let draft = visible_panel(app, Kind::Setup).map(|ptr| value(unsafe { &*ptr }.control(502)));
+    let panel = visible_panel(app, Kind::Setup);
+    let draft = panel.map(|ptr| value(unsafe { &*ptr }.control(502)));
     if let Some(business) = app.business.borrow_mut().as_mut() {
         business.draft_relay = draft;
     }
@@ -343,45 +341,15 @@ pub(super) fn poll(app: &App) -> bool {
             business.copy_error = false;
             copy_message = Some(String::new());
         }
-        let mut open_observer = false;
-        for event in &output {
-            if event.new_task
-                && let Some(request) = &event.request
-            {
-                open_observer |= business.announced.insert(request.clone());
-            }
-        }
-        let active: BTreeSet<_> = snapshot
-            .active_operations
-            .iter()
-            .map(|task| task.request.as_str())
-            .collect();
-        while business.announced.len() > 1024 {
-            let removable = business
-                .announced
-                .iter()
-                .find(|request| !active.contains(request.as_str()))
-                .cloned();
-            if let Some(request) = removable {
-                business.announced.remove(&request);
-            } else {
-                break;
-            }
-        }
-        (
-            output,
-            snapshot,
-            copied,
-            copy_message,
-            open_observer,
-            clear_copy,
-        )
+        (output, snapshot, copied, copy_message, clear_copy)
     };
     let host_elapsed = started.elapsed();
     let refresh_started = Instant::now();
-    let (output, snapshot, copied, copy_message, open_observer, clear_copy) = batch;
-    let (appearance_changed, observation_changed) = {
+    let (output, snapshot, copied, copy_message, clear_copy) = batch;
+    let (appearance_changed, observation_changed, connection_changed) = {
         let mut state = app.state.borrow_mut();
+        let connection_changed = state.connected
+            != (snapshot.controllers > 0 || snapshot.phase == ProductPhase::Controlled);
         let appearance_changed = state.english != (snapshot.language == NativeLanguage::English)
             || state.theme != appearance(snapshot.appearance);
         let changed_output = state
@@ -407,7 +375,7 @@ pub(super) fn poll(app: &App) -> bool {
             state.business_error = error;
         }
         assign_snapshot(&mut state, snapshot);
-        (appearance_changed, changed)
+        (appearance_changed, changed, connection_changed)
     };
     if appearance_changed {
         save_draft(app);
@@ -415,12 +383,15 @@ pub(super) fn poll(app: &App) -> bool {
     } else {
         refresh_values(app);
     }
-    if open_observer {
-        app.observer();
-    } else if observation_changed && let Some(ptr) = visible_panel(app, Kind::Observer) {
+    if observation_changed && let Some(ptr) = visible_panel(app, Kind::Observer) {
         sync_output(unsafe { &*ptr }, false);
     }
 
+    if connection_changed {
+        unsafe {
+            InvalidateRect(app.main.get(), null(), 0);
+        }
+    }
     let refresh_elapsed = refresh_started.elapsed();
     let prompt_started = Instant::now();
     let (setup, tls_key) = {
@@ -772,7 +743,7 @@ pub(super) fn text_for(panel: &Panel, id: i32, original: &str) -> String {
         303 => snapshot.code.clone().unwrap_or_else(|| "--- --- ---".into()),
         304 => if state.copied.is_some() { "✓".into() } else { t("复制控制码", "Copy code").into() },
         305 => snapshot.countdown.clone(),
-        306 => format!("●  {}", snapshot.activity),
+        306 => state.activity_view.text(snapshot.language),
         312 | 504 => if state.business_error.is_empty() { snapshot.detail.clone() } else { state.business_error.clone() },
         311 if panel.kind == Kind::Main => logs(snapshot, state.filter),
         410 => state.business_error.clone(),
@@ -1255,6 +1226,7 @@ mod tests {
             (LogLevel::Error, "failed"),
         ] {
             snapshot.record(ProductLog {
+                record_id: None,
                 occurred: "12:00:00".into(),
                 request: "task".into(),
                 source: "CMD".into(),
@@ -1272,6 +1244,7 @@ mod tests {
         let mut snapshot = ProductSnapshot::default();
         for index in 0..100 {
             snapshot.record(ProductLog {
+                record_id: None,
                 occurred: String::new(),
                 request: String::new(),
                 source: String::new(),

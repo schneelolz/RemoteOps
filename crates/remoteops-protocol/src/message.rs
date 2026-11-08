@@ -7,14 +7,17 @@ use remoteops_domain::{
 use serde::{Deserialize, Serialize};
 
 /// 当前线协议版本。
-pub const PROTOCOL_VERSION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 20;
 /// 保留启动边界语义的旧版交互客户协议。
 pub const LEGACY_PROTOCOL_VERSION: u16 = 17;
 
 /// 判断 Relay 是否能够读取该客户端的握手。
 #[must_use]
 pub const fn supports_protocol_version(version: u16) -> bool {
-    version == PROTOCOL_VERSION || version == LEGACY_PROTOCOL_VERSION
+    version == PROTOCOL_VERSION
+        || version == 19
+        || version == 18
+        || version == LEGACY_PROTOCOL_VERSION
 }
 
 /// Agent 控制码签发模式。
@@ -489,6 +492,39 @@ pub struct RemoteResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum WireMessage {
+    /// 工具中心能力声明，仅向协议 19 及以上连接发送。
+    ToolCenterCapabilities { schema_version: u16 },
+    /// 与目标会话无关的工具管理请求，外层执行独立安装权限校验。
+    ToolCenterRequest {
+        request_id: String,
+        request: serde_json::Value,
+    },
+    /// 工具管理确认；请求不会在断线后自动重放。
+    ToolCenterResponse {
+        request_id: String,
+        response: serde_json::Value,
+    },
+    /// 中继权威工具目录及开关快照。
+    ToolCatalog { catalog: serde_json::Value },
+    /// Agent 确认实际应用的目录修订号。
+    ToolCatalogApplied {
+        revision: u64,
+        error: Option<String>,
+    },
+    /// 每次请求一块包；下一个 offset 是对上一块的确认。
+    ToolPackageRequest {
+        request_id: String,
+        sha256: String,
+        offset: u64,
+    },
+    /// 有界包数据，最多 256 KiB；错误说明不得包含外链签名。
+    ToolPackageChunk {
+        request_id: String,
+        offset: u64,
+        data_base64: String,
+        eof: bool,
+        error: Option<String>,
+    },
     /// 查询或变更共享授权。
     ControlStateRequest(crate::ControlStateRequest),
     /// 共享授权查询或变更的确认。
@@ -511,6 +547,12 @@ pub enum WireMessage {
     ControllerWelcome {
         /// Relay 当前协议版本。
         protocol_version: u16,
+        /// 可选资源工具协议版本，缺省表示 Relay 不支持。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource_tools_schema_version: Option<u16>,
+        /// 独立工具中心管理能力；缺省表示需要升级 Relay。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_center_schema_version: Option<u16>,
     },
     /// Controller 请求配对。
     PairRequest(PairRequest),
@@ -615,6 +657,41 @@ mod tests {
             );
             assert_eq!(serde_json::from_str::<WireMessage>(&json).unwrap(), message);
         }
+    }
+
+    #[test]
+    fn resource_welcome_is_optional_for_legacy_controllers() {
+        #[derive(serde::Deserialize)]
+        struct OldWelcome {
+            protocol_version: u16,
+        }
+        let legacy =
+            serde_json::json!({"type":"controller_welcome", "payload":{"protocol_version":18}});
+        let decoded: WireMessage = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            WireMessage::ControllerWelcome {
+                resource_tools_schema_version: None,
+                tool_center_schema_version: None,
+                ..
+            }
+        ));
+        let mut current = legacy;
+        current["payload"]["resource_tools_schema_version"] = 1.into();
+        let decoded: WireMessage = serde_json::from_value(current).unwrap();
+        assert!(matches!(
+            decoded,
+            WireMessage::ControllerWelcome {
+                resource_tools_schema_version: Some(1),
+                tool_center_schema_version: None,
+                ..
+            }
+        ));
+        // 老控制器忽略新增字段，既有事件类型不因资源扩展而变化。
+        let old: OldWelcome =
+            serde_json::from_value(serde_json::to_value(decoded).unwrap()["payload"].clone())
+                .unwrap();
+        assert_eq!(old.protocol_version, 18);
     }
 
     #[test]

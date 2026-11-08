@@ -129,7 +129,7 @@ async function main(){
 
   const checks=[],states=[],pending=new Set(),uiFacts=[],reports=[],qualityFailures=[],hashes={};
 
-  let current='startup',fixture,outputApproved=false,failure=null,agent,stamp,agentReport,expectedHash,envFor,mcp,sid,relay,nativeExe,dirs;
+  let current='startup',fixture,outputApproved=false,failure=null,agent,stamp,agentReport,expectedHash,expectedVersion,envFor,mcp,sid,relay,nativeExe,dirs;
 
   const secret=randomBytes(32).toString('base64url'),redactionSecret=`STYLED_${randomBytes(12).toString('hex')}`,secrets=[secret,redactionSecret];
 
@@ -281,6 +281,8 @@ public static class StyledFixtureProbe{
       stamp,
       '-ExpectedHash',
       expectedHash,
+      '-ExpectedVersion',
+      expectedVersion,
       '-Action',
       action
     ];
@@ -496,6 +498,9 @@ public static class StyledFixtureProbe{
     await fs.copyFile(options.agent,nativeExe);
     if(!noMcp)await fs.copyFile(options.mcp,mcpExe);
     expectedHash=hashes.agent;
+    const versionResult=await command('pwsh.exe',['-NoProfile','-Command',`[Diagnostics.FileVersionInfo]::GetVersionInfo(${ps(nativeExe)}).ProductVersion`],envFor('agent'));
+    expectedVersion=versionResult.stdout.trim();
+    check('candidate_product_version_available',versionResult.code===0&&expectedVersion.length>0);
     if (options.scenario === 'smoke') {
       await startNative(null, path.join(fixture, 'smoke-report.json'), true);
       const first = await waitUi('smoke_product_demo_snapshot', snapshot => Boolean(row(snapshot, 303)));
@@ -578,7 +583,7 @@ public static class StyledFixtureProbe{
     await fs.writeFile(
       promptSource,
       `using System;using System.IO;using System.Text;using System.Collections.Generic;using System.Web.Script.Serialization;
-class FixturePrompt{static int Main(string[] a){try{if(a.Length!=8||a[0]!="--host"||a[1]!="127.0.0.1"||a[2]!="--port"||a[3]!=Environment.GetEnvironmentVariable("REMOTEOPS_TEST_SSH_PORT")||a[4]!="--username"||a[5]!="remoteops-fixture"||a[6]!="--command-sha256"||!System.Text.RegularExpressions.Regex.IsMatch(a[7],"^[0-9a-f]{64}$"))return 3;Console.OutputEncoding=new UTF8Encoding(false);Console.Write(new JavaScriptSerializer().Serialize(new Dictionary<string,object>{{"action","use_once"},{"password",File.ReadAllText(Environment.GetEnvironmentVariable("REMOTEOPS_TEST_PASSWORD_FILE"),new UTF8Encoding(false,true))}}));return 0;}catch{return 2;}}}`
+class FixturePrompt{static int Main(string[] a){try{if(a.Length!=10||a[0]!="--host"||a[1]!="127.0.0.1"||a[2]!="--port"||a[3]!=Environment.GetEnvironmentVariable("REMOTEOPS_TEST_SSH_PORT")||a[4]!="--username"||a[5]!="remoteops-fixture"||a[6]!="--command-sha256"||!System.Text.RegularExpressions.Regex.IsMatch(a[7],"^[0-9a-f]{64}$")||a[8]!="--language"||(a[9]!="zh-CN"&&a[9]!="en-US"))return 3;Console.OutputEncoding=new UTF8Encoding(false);Console.Write(new JavaScriptSerializer().Serialize(new Dictionary<string,object>{{"action","use_once"},{"password",File.ReadAllText(Environment.GetEnvironmentVariable("REMOTEOPS_TEST_PASSWORD_FILE"),new UTF8Encoding(false,true))}}));return 0;}catch{return 2;}}}`
     );
 
     await command(
@@ -935,6 +940,8 @@ class FixturePrompt{static int Main(string[] a){try{if(a.Length!=8||a[0]!="--hos
     }
 
     if(privacyOnly){
+      await ui('Invoke',338);
+      await waitUi('privacy_observer_manually_opened',s=>observer(s)&&row(s,202)?.read_only===true);
       const output=await tool('run_command',{shell:'windows_power_shell',command:`[Console]::Out.WriteLine(('password='+'${redactionSecret.slice(0,10)}'+'${redactionSecret.slice(10)}'));[Console]::Out.WriteLine(('PRIVACY_OUTPUT_'+'READY'))`});
       check('controlled_privacy_command_succeeds',succeeded(output));
       check('authorized_command_result_retains_deliberate_value',output.summary?.includes('password='+redactionSecret));
@@ -975,12 +982,16 @@ class FixturePrompt{static int Main(string[] a){try{if(a.Length!=8||a[0]!="--hos
           firstDone=true;
         }));
 
+    await waitUi('real_task_started_while_observer_hidden',s=>/正在执行操作|Executing operation/.test(text(s,306)));
+    const whileHidden=await ui();
+    check('real_task_does_not_auto_open_observer',!observer(whileHidden));
+    await ui('Invoke',338);
     const visible=await contains('STYLED_REAL_FIRST_FRAME');
     check('real_first_output_before_completion',!firstDone);
-    check('real_observer_auto_readonly',row(visible,202)?.read_only===true);
+    check('real_observer_manually_opened_readonly',row(visible,202)?.read_only===true);
     check(
-      'auto_show_keeps_valid_foreground',
-      before.foreground>0&&before.foreground===visible.foreground&&visible.foreground_metadata?.process_id===before.foreground_metadata.process_id&&visible.foreground_metadata?.class_name!=='RemoteOpsStylePreviewObserver'
+      'hidden_task_keeps_valid_foreground',
+      before.foreground>0&&before.foreground===whileHidden.foreground&&whileHidden.foreground_metadata?.process_id===before.foreground_metadata.process_id&&whileHidden.foreground_metadata?.class_name!=='RemoteOpsStylePreviewObserver'
     );
     check('real_unicode_emoji_preserved',text(visible,202).includes('中文正常🔎')&&!text(visible,202).includes('\ufffd'));
     noSecrets(visible);

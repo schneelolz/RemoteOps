@@ -11,7 +11,6 @@ COPY build ./build
 COPY crates ./crates
 COPY apps ./apps
 COPY tests ./tests
-COPY relay-admin-prototype ./relay-admin-prototype
 
 RUN cargo build --release --locked -p remoteops-relay
 

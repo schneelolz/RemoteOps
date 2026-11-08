@@ -71,7 +71,7 @@ function Assert-Own{
 function Client([string]$Action='Snapshot',[int]$Id=0,[string]$Path){
     Assert-Own;$script:step=$Action+'_'+$Id
     $workerInfo=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'));$workerInfo.UseShellExecute=$false;$workerInfo.CreateNoWindow=$true;$workerInfo.RedirectStandardOutput=$true;$workerInfo.RedirectStandardError=$true;$workerInfo.StandardOutputEncoding=[Text.UTF8Encoding]::new($false)
-    foreach($arg in @('-NoProfile','-STA','-File',$helper,'-Action',$Action,'-ControlId',[string]$Id,'-ProcessId',[string]$app.Id,'-ProcessStartUtc',$identity,'-ExpectedHash',$ExpectedHash)){$workerInfo.ArgumentList.Add($arg)}
+    foreach($arg in @('-NoProfile','-STA','-File',$helper,'-ExpectedVersion',([Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion),'-Action',$Action,'-ControlId',[string]$Id,'-ProcessId',[string]$app.Id,'-ProcessStartUtc',$identity,'-ExpectedHash',$ExpectedHash)){$workerInfo.ArgumentList.Add($arg)}
     if($Action -eq 'Invoke'){$workerInfo.ArgumentList.Add('-FocusBeforeInvoke')};if($Path){$workerInfo.ArgumentList.Add('-OutputPath');$workerInfo.ArgumentList.Add($Path)}
     $worker=[Diagnostics.Process]::Start($workerInfo);$stdout=$worker.StandardOutput.ReadToEndAsync();$stderr=$worker.StandardError.ReadToEndAsync()
     try{if(-not $worker.WaitForExit(12000)){$worker.Kill();$worker.WaitForExit();throw 'UIA worker timeout'};if($worker.ExitCode){$message=$stderr.GetAwaiter().GetResult();[IO.File]::WriteAllText((Join-Path $output 'client-last-error.txt'),$message);throw ('UIA worker failed: '+$message.Trim())};$result=$stdout.GetAwaiter().GetResult()|ConvertFrom-Json;if($Action -eq 'Snapshot'){$script:lastSnapshot=$result};return $result}finally{$worker.Dispose()}

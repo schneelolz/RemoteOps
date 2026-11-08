@@ -27,6 +27,8 @@ pub(crate) fn safe_record(text: &str) -> String {
 /// 已呈现在观察窗中的记录位置；UTF-16 计数包含每行的 CRLF。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderCursor {
+    /// 已有记录被累计次数更新的修订号。
+    pub revision: u64,
     /// 已呈现到的累计行数。
     pub total_lines: u64,
     /// 已从开头移除的累计行数。
@@ -54,6 +56,9 @@ pub struct TextPatch {
 pub struct Transcript {
     // 同时限制行数和 UTF-16 字符数，避免 日志控件随压力输入无限增长。
     lines: VecDeque<String>,
+    // 与文本行一一对应；普通输出没有可更新标识。
+    record_ids: VecDeque<Option<u64>>,
+    revision: u64,
     max_lines: usize,
     max_utf16_units: usize,
     utf16_units: usize,
@@ -76,6 +81,8 @@ impl Transcript {
     pub fn new(max_lines: usize, max_utf16_units: usize) -> Self {
         Self {
             lines: VecDeque::new(),
+            record_ids: VecDeque::new(),
+            revision: 0,
             max_lines: max_lines.max(1),
             max_utf16_units: max_utf16_units.max(4),
             utf16_units: 0,
@@ -117,9 +124,11 @@ impl Transcript {
             let line = truncate_utf16(line, self.max_utf16_units - 2);
             let units = line.encode_utf16().count() + 2;
             self.lines.push_back(line);
+            self.record_ids.push_back(None);
             self.utf16_units += units;
             while self.lines.len() > self.max_lines || self.utf16_units > self.max_utf16_units {
                 if let Some(removed) = self.lines.pop_front() {
+                    self.record_ids.pop_front();
                     let removed_units = removed.encode_utf16().count() + 2;
                     self.utf16_units -= removed_units;
                     self.trimmed_lines = self.trimmed_lines.saturating_add(1);
@@ -127,6 +136,37 @@ impl Transcript {
                         .trimmed_utf16_units
                         .saturating_add(u64::try_from(removed_units).unwrap_or(u64::MAX));
                 }
+            }
+        }
+    }
+
+    /// 更新已脱敏的单行串口记录，暂停后仍可取得最新累计值。
+    pub fn update_record(&mut self, record_id: u64, text: &str) {
+        if let Some(index) = self
+            .record_ids
+            .iter()
+            .position(|value| *value == Some(record_id))
+        {
+            let line = truncate_utf16(&safe_record(text), self.max_utf16_units - 2);
+            self.utf16_units = self.utf16_units - self.lines[index].encode_utf16().count()
+                + line.encode_utf16().count();
+            self.lines[index] = line;
+            self.revision = self.revision.wrapping_add(1);
+            // 更新次数后增加的少量字符仍遵循原有容量预算。
+            while self.utf16_units > self.max_utf16_units {
+                if let Some(removed) = self.lines.pop_front() {
+                    self.record_ids.pop_front();
+                    let units = removed.encode_utf16().count() + 2;
+                    self.utf16_units -= units;
+                    self.trimmed_lines = self.trimmed_lines.saturating_add(1);
+                    self.trimmed_utf16_units =
+                        self.trimmed_utf16_units.saturating_add(units as u64);
+                }
+            }
+        } else {
+            self.append(text);
+            if let Some(last) = self.record_ids.back_mut() {
+                *last = Some(record_id);
             }
         }
     }
@@ -145,6 +185,7 @@ impl Transcript {
     #[must_use]
     pub const fn cursor(&self) -> RenderCursor {
         RenderCursor {
+            revision: self.revision,
             total_lines: self.total_lines,
             trimmed_lines: self.trimmed_lines,
             trimmed_utf16_units: self.trimmed_utf16_units,
@@ -157,7 +198,9 @@ impl Transcript {
     pub fn patch_since(&self, previous: Option<RenderCursor>) -> TextPatch {
         let cursor = self.cursor();
         let incremental = previous.and_then(|previous| {
-            if previous.total_lines < self.trimmed_lines || previous.total_lines > self.total_lines
+            if previous.revision != self.revision
+                || previous.total_lines < self.trimmed_lines
+                || previous.total_lines > self.total_lines
             {
                 return None;
             }
@@ -252,6 +295,23 @@ pub fn sample_line(index: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cumulative_record_update_replaces_existing_line_and_invalidates_old_cursor() {
+        let mut transcript = Transcript::new(3, 100);
+        transcript.update_record(42, "same");
+        let cursor = transcript.cursor();
+        transcript.update_record(42, "same × 10000");
+        assert_eq!(transcript.text(), "same × 10000\r\n");
+        assert_eq!(transcript.retained_lines(), 1);
+        assert!(transcript.patch_since(Some(cursor)).replace_all);
+        transcript.append("other");
+        transcript.update_record(43, "same");
+        assert_eq!(transcript.retained_lines(), 3);
+        transcript.update_record(42, "same × 10001");
+        assert_eq!(transcript.retained_lines(), 3);
+        assert!(transcript.text().starts_with("same × 10001"));
+    }
 
     #[test]
     fn history_is_bounded_by_lines_and_keeps_latest_output() {

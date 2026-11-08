@@ -113,6 +113,24 @@ pub fn seal_credential(
     context: &CredentialEncryptionContext,
     password: &[u8],
 ) -> Result<EncryptedCredentialPayload, CredentialEncryptionError> {
+    seal_with_context(
+        public_key_base64,
+        key_id,
+        context.envelope_id,
+        &context.aad()?,
+        CREDENTIAL_INFO,
+        password,
+    )
+}
+
+fn seal_with_context(
+    public_key_base64: &str,
+    key_id: &str,
+    envelope_id: RequestId,
+    aad: &[u8],
+    info: &[u8],
+    password: &[u8],
+) -> Result<EncryptedCredentialPayload, CredentialEncryptionError> {
     validate_password(password)?;
     let public_key_bytes = BASE64
         .decode(public_key_base64)
@@ -123,20 +141,19 @@ pub fn seal_credential(
     }
     let public_key = CredentialPublicKey::from_bytes(&public_key_bytes)
         .map_err(|_| CredentialEncryptionError::InvalidPublicKey)?;
-    let aad = context.aad()?;
     let (encapped_key, mut sender) = setup_sender::<ChaCha20Poly1305, HkdfSha256, CredentialKem>(
         &OpModeS::Base,
         &public_key,
-        CREDENTIAL_INFO,
+        info,
     )
     .map_err(|_| CredentialEncryptionError::Seal)?;
     let ciphertext = sender
-        .seal(password, &aad)
+        .seal(password, aad)
         .map_err(|_| CredentialEncryptionError::Seal)?;
     Ok(EncryptedCredentialPayload {
         version: CREDENTIAL_PAYLOAD_VERSION,
         key_id: key_id.to_owned(),
-        envelope_id: context.envelope_id,
+        envelope_id,
         encapped_key_base64: BASE64.encode(encapped_key.to_bytes().as_slice()),
         ciphertext_base64: BASE64.encode(ciphertext),
     })
@@ -152,13 +169,29 @@ pub fn open_credential(
     context: &CredentialEncryptionContext,
     payload: &EncryptedCredentialPayload,
 ) -> Result<Zeroizing<String>, CredentialEncryptionError> {
+    open_with_context(
+        key_pair,
+        context.envelope_id,
+        &context.aad()?,
+        CREDENTIAL_INFO,
+        payload,
+    )
+}
+
+fn open_with_context(
+    key_pair: &CredentialEncryptionKeyPair,
+    envelope_id: RequestId,
+    aad: &[u8],
+    info: &[u8],
+    payload: &EncryptedCredentialPayload,
+) -> Result<Zeroizing<String>, CredentialEncryptionError> {
     if payload.version != CREDENTIAL_PAYLOAD_VERSION {
         return Err(CredentialEncryptionError::InvalidPayload);
     }
     if payload.key_id != key_pair.key_id {
         return Err(CredentialEncryptionError::KeyMismatch);
     }
-    if payload.envelope_id != context.envelope_id {
+    if payload.envelope_id != envelope_id {
         return Err(CredentialEncryptionError::ContextMismatch);
     }
     let encapped_key_bytes = BASE64
@@ -172,23 +205,79 @@ pub fn open_credential(
     if ciphertext.len() > MAX_CREDENTIAL_BYTES + 64 {
         return Err(CredentialEncryptionError::TooLarge);
     }
-    let aad = context.aad()?;
     let mut receiver = setup_receiver::<ChaCha20Poly1305, HkdfSha256, CredentialKem>(
         &OpModeR::Base,
         &key_pair.private_key,
         &encapped_key,
-        CREDENTIAL_INFO,
+        info,
     )
     .map_err(|_| CredentialEncryptionError::Open)?;
     let plaintext = Zeroizing::new(
         receiver
-            .open(&ciphertext, &aad)
+            .open(&ciphertext, aad)
             .map_err(|_| CredentialEncryptionError::Open)?,
     );
     validate_password(&plaintext)?;
     String::from_utf8(plaintext.to_vec())
         .map(Zeroizing::new)
         .map_err(|_| CredentialEncryptionError::InvalidUtf8)
+}
+
+/// 绑定网页目标的独立加密上下文；不复用 SSH 密文用途。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BrowserCredentialContext {
+    /// 协议版本。
+    pub protocol_version: u16,
+    /// Agent 当前进程身份。
+    pub agent_instance_id: AgentInstanceId,
+    /// 已确认会话。
+    pub session_id: SessionId,
+    /// 加密请求唯一标识。
+    pub envelope_id: RequestId,
+    /// 会话内资源实例。
+    pub instance_id: String,
+    /// Agent 核验并签发的单次目标绑定。
+    pub binding_id: String,
+}
+
+/// 使用网页专用用途加密单次密码。
+/// # Errors
+/// 拒绝无效公钥、上下文及超限密码。
+pub fn seal_browser_credential(
+    public_key: &str,
+    key_id: &str,
+    context: &BrowserCredentialContext,
+    password: &[u8],
+) -> Result<EncryptedCredentialPayload, CredentialEncryptionError> {
+    let aad = serde_json::to_vec(context)
+        .map_err(|e| CredentialEncryptionError::Encoding(e.to_string()))?;
+    seal_with_context(
+        public_key,
+        key_id,
+        context.envelope_id,
+        &aad,
+        b"remoteops/browser-credential/hpke-v1",
+        password,
+    )
+}
+
+/// 使用网页专用用途解密并核验单次密码。
+/// # Errors
+/// 拒绝错误绑定、跨用途密文及篡改。
+pub fn open_browser_credential(
+    key_pair: &CredentialEncryptionKeyPair,
+    context: &BrowserCredentialContext,
+    payload: &EncryptedCredentialPayload,
+) -> Result<Zeroizing<String>, CredentialEncryptionError> {
+    let aad = serde_json::to_vec(context)
+        .map_err(|e| CredentialEncryptionError::Encoding(e.to_string()))?;
+    open_with_context(
+        key_pair,
+        context.envelope_id,
+        &aad,
+        b"remoteops/browser-credential/hpke-v1",
+        payload,
+    )
 }
 
 fn validate_password(password: &[u8]) -> Result<(), CredentialEncryptionError> {
@@ -253,5 +342,58 @@ mod tests {
 
         let other_key = CredentialEncryptionKeyPair::generate();
         assert!(open_credential(&other_key, &context, &payload).is_err());
+    }
+}
+
+#[cfg(test)]
+mod browser_tests {
+    use super::*;
+    #[test]
+    fn browser_envelope_is_bound_to_purpose_instance_target_and_session() {
+        let pair = CredentialEncryptionKeyPair::generate();
+        let context = BrowserCredentialContext {
+            protocol_version: 20,
+            agent_instance_id: AgentInstanceId::new(),
+            session_id: SessionId::new(),
+            envelope_id: RequestId::new(),
+            instance_id: "instance".into(),
+            binding_id: "single-target".into(),
+        };
+        let sealed = seal_browser_credential(
+            pair.public_key_base64(),
+            pair.key_id(),
+            &context,
+            b"isolated-fixture-password",
+        )
+        .unwrap();
+        assert_eq!(
+            open_browser_credential(&pair, &context, &sealed)
+                .unwrap()
+                .as_str(),
+            "isolated-fixture-password"
+        );
+        let mut changed = context.clone();
+        changed.binding_id = "other".into();
+        assert!(open_browser_credential(&pair, &changed, &sealed).is_err());
+        changed = context.clone();
+        changed.instance_id = "other-instance".into();
+        assert!(open_browser_credential(&pair, &changed, &sealed).is_err());
+        changed = context.clone();
+        changed.session_id = SessionId::new();
+        assert!(open_browser_credential(&pair, &changed, &sealed).is_err());
+        let ssh = CredentialEncryptionContext {
+            protocol_version: 20,
+            agent_instance_id: context.agent_instance_id,
+            session_id: context.session_id,
+            envelope_id: context.envelope_id,
+            host: "site".into(),
+            port: 80,
+            username: "admin".into(),
+            command_sha256: "a".repeat(64),
+        };
+        assert!(open_credential(&pair, &ssh, &sealed).is_err());
+        let mut corrupt = sealed;
+        corrupt.ciphertext_base64 = "AAAA".into();
+        assert!(open_browser_credential(&pair, &context, &corrupt).is_err());
     }
 }

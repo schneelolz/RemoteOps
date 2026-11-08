@@ -142,6 +142,7 @@ struct State {
     copied: Option<Instant>,
     paused: bool,
     observer_demo: ObserverData,
+    activity_view: crate::activity_view::ActivityView,
     product: Option<remoteops_agent_desktop_host::ProductSnapshot>,
     business_error: String,
     demo_tick: Option<Instant>,
@@ -165,6 +166,7 @@ impl Default for State {
             copied: None,
             paused: false,
             observer_demo: ObserverData::default(),
+            activity_view: crate::activity_view::ActivityView::default(),
             product: None,
             business_error: String::new(),
             demo_tick: None,
@@ -539,7 +541,7 @@ fn size(kind: Kind) -> (i32, i32) {
         Kind::Permissions => (420, 340),
         Kind::Grant => (440, 245),
         Kind::Exit => (440, 300),
-        Kind::Setup => (640, 330),
+        Kind::Setup => (640, 420),
         Kind::Tls => (560, 330),
         Kind::Observer => (800, 470),
         Kind::About => (400, 248),
@@ -728,7 +730,7 @@ fn create_panel(app: &App, kind: Kind, owner: HWND) -> HWND {
         build(&*ptr);
         if kind == Kind::Main {
             let interval = if app.business.borrow().is_some() {
-                100
+                33
             } else {
                 250
             };
@@ -967,7 +969,11 @@ fn label(
         y,
         w,
         h,
-        (if center { SS_CENTER } else { SS_LEFT }) | if id == 300 { SS_CENTERIMAGE } else { 0 },
+        if id == 306 {
+            13_u32
+        } else {
+            (if center { SS_CENTER } else { SS_LEFT }) | if id == 300 { SS_CENTERIMAGE } else { 0 }
+        },
         font,
     );
 }
@@ -1165,7 +1171,7 @@ fn build(panel: &Panel) {
                 false,
             );
             if state.connected {
-                panel.text(300, t("工程师已连接", "Engineer connected"));
+                panel.text(300, t("AI工程师已连接", "AI engineer connected"));
             } else if !state.configured {
                 panel.text(300, t("尚未配置 Relay", "Relay is not configured"));
             }
@@ -1220,41 +1226,21 @@ fn build(panel: &Panel) {
                 3,
                 true,
             );
-            label(
+            label(panel, 306, "", 23, 232, 358, 66, 3, false);
+            button(
                 panel,
-                306,
-                if state.connected {
-                    t(
-                        "●  正在处理远程操作（演示）",
-                        "●  Remote operation in progress (demo)",
-                    )
+                313,
+                if state.activity_view.paused {
+                    t("继续", "Resume")
                 } else {
-                    t(
-                        "●  系统就绪 · 等待操作",
-                        "●  Ready · waiting for operations",
-                    )
+                    t("暂停", "Pause")
                 },
-                23,
-                246,
-                454,
-                20,
-                3,
-                false,
+                389,
+                232,
+                87,
+                28,
             );
-            label(
-                panel,
-                312,
-                t(
-                    "远程操作会显示在只读观察窗中",
-                    "Operations appear in the read-only observer",
-                ),
-                23,
-                270,
-                454,
-                20,
-                3,
-                false,
-            );
+            label(panel, 312, "", 23, 298, 454, 16, 3, false);
             button(panel, 307, t("连接详情", "Details"), 24, 315, 107, 37);
             button(panel, 308, t("实时日志", "Logs"), 139, 315, 107, 37);
             button(
@@ -1607,16 +1593,30 @@ fn build(panel: &Panel) {
                 0,
                 false,
             );
-            label(panel, 504, "", 32, 214, 576, 24, 3, false);
-            button(panel, 507, "中文", 32, 264, 72, 36);
-            button(panel, 508, "English", 114, 264, 90, 36);
-            button(panel, 505, t("取消", "Cancel"), 344, 264, 100, 38);
+            label(
+                panel,
+                509,
+                t(
+                    "工具由已连接中继统一管理。",
+                    "Tools are managed by the connected relay.",
+                ),
+                32,
+                232,
+                576,
+                62,
+                0,
+                false,
+            );
+            label(panel, 504, "", 32, 315, 576, 34, 3, false);
+            button(panel, 507, "中文", 32, 364, 72, 36);
+            button(panel, 508, "English", 114, 364, 90, 36);
+            button(panel, 505, t("取消", "Cancel"), 344, 364, 100, 38);
             button(
                 panel,
                 506,
                 t("模拟连接", "Preview connection"),
                 458,
-                264,
+                364,
                 150,
                 38,
             );
@@ -2003,7 +2003,7 @@ fn menu(panel: &Panel) {
         } else {
             for (id, text) in [
                 (5030, t("等待工程师连接", "Waiting for engineer")),
-                (5031, t("工程师已连接", "Engineer connected")),
+                (5031, t("AI工程师已连接", "AI engineer connected")),
                 (5032, t("未配置状态", "Unconfigured")),
                 (5033, t("首次配置窗口", "First setup")),
                 (5034, t("证书确认窗口", "Certificate confirmation")),
@@ -2171,6 +2171,21 @@ fn license_page_text(state: &State) -> &str {
         .unwrap_or("")
 }
 fn command(panel: &Panel, id: i32) {
+    if id == 313 {
+        let paused = {
+            let mut state = panel.app().state.borrow_mut();
+            state.activity_view.toggle_pause()
+        };
+        panel.text(
+            313,
+            panel.app().t(
+                if paused { "继续" } else { "暂停" },
+                if paused { "Resume" } else { "Pause" },
+            ),
+        );
+        activity_tick(panel);
+        return;
+    }
     if business::command(panel, id) {
         return;
     }
@@ -2535,9 +2550,39 @@ fn loading_feedback(panel: &Panel) {
         panel.text(305, &text);
     }
 }
+fn activity_tick(panel: &Panel) {
+    let app = panel.app();
+    let visible =
+        unsafe { IsWindowVisible(panel.hwnd.get()) != 0 && IsIconic(panel.hwnd.get()) == 0 }
+            && !app.state.borrow().logs;
+    let repaint = {
+        let mut state = app.state.borrow_mut();
+        let State {
+            product,
+            activity_view,
+            ..
+        } = &mut *state;
+        product
+            .as_ref()
+            .is_some_and(|snapshot| activity_view.tick(snapshot, visible))
+    };
+    if repaint {
+        unsafe {
+            InvalidateRect(panel.control(306), null(), 0);
+            let dot = RECT {
+                left: panel.px(22),
+                top: panel.px(37),
+                right: panel.px(34),
+                bottom: panel.px(49),
+            };
+            InvalidateRect(panel.hwnd.get(), &raw const dot, 0);
+        }
+    }
+}
 fn tick(panel: &Panel) {
     let app = panel.app();
     if business::poll(app) {
+        activity_tick(panel);
         loading_feedback(panel);
         return;
     }
@@ -2857,10 +2902,20 @@ fn paint(panel: &Panel) {
                     c.border,
                 );
             }
-            let color = if panel.app().state.borrow().connected {
-                c.success
-            } else {
-                c.secondary
+            let color = {
+                let state = panel.app().state.borrow();
+                if state.connected {
+                    let running = state.product.as_ref().is_some_and(|snapshot| {
+                        snapshot.running_count > 0 && snapshot.controllers > 0
+                    });
+                    crate::activity_view::blend(
+                        c.success,
+                        c.bg,
+                        state.activity_view.brightness(running),
+                    )
+                } else {
+                    c.secondary
+                }
             };
             let b = CreateSolidBrush(color);
             let old = SelectObject(hdc, b);
@@ -2956,6 +3011,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 if current != previous && app.state.borrow().theme == Theme::System {
                     app.refresh();
                 }
+                activity_tick(panel);
                 DefWindowProcW(hwnd, msg, w, l)
             }
             WM_COMMAND => {
@@ -3001,7 +3057,29 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
             WM_ERASEBKGND => 1,
             WM_DRAWITEM => {
                 if l != 0 {
-                    draw_button(panel, &*(l as *const DRAWITEMSTRUCT));
+                    let item = &*(l as *const DRAWITEMSTRUCT);
+                    if item.CtlID == 306
+                        && panel.kind == Kind::Main
+                        && !panel.app().state.borrow().logs
+                    {
+                        let app = panel.app();
+                        let state = app.state.borrow();
+                        fill(item.hDC, &item.rcItem, app.colors().bg);
+                        state.activity_view.draw(
+                            item.hDC,
+                            item.rcItem,
+                            panel.fonts.borrow()[3],
+                            panel.dpi.get(),
+                            if state.english {
+                                remoteops_agent_desktop_host::NativeLanguage::English
+                            } else {
+                                remoteops_agent_desktop_host::NativeLanguage::Chinese
+                            },
+                            app.colors().bg == palette(true).bg,
+                        );
+                    } else {
+                        draw_button(panel, item);
+                    }
                 }
                 1
             }
@@ -3457,6 +3535,41 @@ mod tests {
         };
         assert_eq!(visible_origin(1900, 1020, 800, 500, work), (1120, 540));
         assert_eq!(visible_origin(100, 100, 2200, 2000, work), (0, 0));
+    }
+
+    #[test]
+    fn paused_serial_updates_resume_with_latest_cumulative_total() {
+        let mut state = State {
+            observer_demo: super::ObserverData::live(),
+            ..State::default()
+        };
+        let record = |total| remoteops_agent_desktop_host::Observation {
+            repetition: Some(remoteops_agent_desktop_host::ObservationRepetition {
+                record_id: 77,
+                total,
+            }),
+            text: if total == 1 {
+                "same".into()
+            } else {
+                format!("same × {total}")
+            },
+            role: remoteops_agent_desktop_host::ObservationRole::Output,
+            category: remoteops_agent_desktop_host::ObservationCategory::Serial,
+            request: Some("serial-fixture".into()),
+            new_task: false,
+        };
+        state.observer_demo.ingest(vec![record(1)], &[]);
+        let previous = observer_text(&state);
+        state.paused = true;
+        state.observer_demo.ingest(vec![record(10_000)], &[]);
+        assert_eq!(
+            observer_rebuild_text(&state, Some(&previous), false),
+            previous
+        );
+        state.paused = false;
+        let latest = observer_rebuild_text(&state, Some(&previous), false);
+        assert!(latest.contains("same × 10000"));
+        assert_eq!(state.observer_demo.total_count(), 1);
     }
 
     #[test]

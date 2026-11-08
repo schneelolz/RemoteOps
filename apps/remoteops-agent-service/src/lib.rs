@@ -239,6 +239,7 @@ fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: Agen
         // 操作日志不改变服务状态，避免按输出行重复写入状态文件。
         AgentEvent::OperationLog(_)
         | AgentEvent::OperationPresentation { .. }
+        | AgentEvent::OperationOutputUpdate { .. }
         | AgentEvent::OperationContext { .. }
         | AgentEvent::OperationStateChanged { .. }
         | AgentEvent::ConnectionEpoch(_)
@@ -624,6 +625,7 @@ mod operation_log_tests {
             &path,
             &mut status,
             AgentEvent::OperationLog(AgentOperationLog {
+                repetition: None,
                 request_id: None,
                 occurred_at: Utc::now(),
                 level: AgentLogLevel::Info,

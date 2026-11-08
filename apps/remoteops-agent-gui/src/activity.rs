@@ -10,7 +10,9 @@ const RECENT_TERMINAL_COUNT: usize = 16;
 #[derive(Clone, Debug)]
 pub struct Summary {
     pub text: String,
-    pub repetitions: usize,
+    pub repetitions: u64,
+    // 串口累计记录使用生产方稳定标识；普通摘要不按此字段合并。
+    record_id: Option<u64>,
     pub terminal: Option<AgentOperationState>,
 }
 #[derive(Default)]
@@ -66,13 +68,41 @@ impl ActivityModel {
                     }
                 }
             }
-            AgentEvent::OperationLog(log) if self.connected => self.push(&log.message, None),
+            AgentEvent::OperationLog(log) if self.connected && log.repetition.is_none() => {
+                self.push(&log.message, None);
+            }
+            AgentEvent::OperationOutputUpdate {
+                text, repetition, ..
+            } if self.connected => {
+                self.push_repetition(text, None, Some(*repetition));
+            }
             _ => {}
         }
     }
     fn push(&mut self, text: &str, terminal: Option<AgentOperationState>) {
+        self.push_repetition(text, terminal, None);
+    }
+    fn push_repetition(
+        &mut self,
+        text: &str,
+        terminal: Option<AgentOperationState>,
+        repetition: Option<remoteops_agent::AgentOutputRepetition>,
+    ) {
+        // 正文来自结构化输出更新，与计数分开保存，避免解析已格式化日志。
         let text: String = text.chars().take(180).collect();
-        if let Some(last) = self.summaries.back_mut()
+        if let Some(repetition) = repetition
+            && let Some(existing) = self
+                .summaries
+                .iter_mut()
+                .find(|summary| summary.record_id == Some(repetition.record_id))
+        {
+            existing.text = text;
+            existing.repetitions = repetition.total;
+            return;
+        }
+        if repetition.is_none()
+            && let Some(last) = self.summaries.back_mut()
+            && last.record_id.is_none()
             && last.text == text
             && last.terminal == terminal
         {
@@ -98,7 +128,8 @@ impl ActivityModel {
         self.summaries.push_back(Summary {
             text,
             terminal,
-            repetitions: 1,
+            repetitions: repetition.map_or(1, |value| value.total),
+            record_id: repetition.map(|value| value.record_id),
         });
     }
     pub fn render(&self, ui: &mut egui::Ui, language: Language) {
@@ -143,14 +174,19 @@ impl ActivityModel {
                     let text = row
                         .terminal
                         .map_or(row.text.as_str(), |state| terminal_text(state, zh));
-                    let text = if row.repetitions > 1 {
-                        format!("{text} ×{}", row.repetitions)
-                    } else {
-                        text.to_owned()
-                    };
-                    ui.add_sized(
+                    // 计数先占右侧空间，长正文省略时仍可看到总次数。
+                    ui.allocate_ui_with_layout(
                         egui::vec2(ui.available_width(), 20.0),
-                        egui::Label::new(text).truncate(),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if row.repetitions > 1 {
+                                ui.label(format!("× {}", row.repetitions));
+                            }
+                            ui.add_sized(
+                                egui::vec2(ui.available_width(), 20.0),
+                                egui::Label::new(text).truncate(),
+                            );
+                        },
                     );
                 }
             });
@@ -184,6 +220,73 @@ fn terminal_text(state: AgentOperationState, zh: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn serial_update(model: &mut ActivityModel, id: u64, text: &str, total: u64) {
+        let request_id = RequestId::new();
+        let repetition = remoteops_agent::AgentOutputRepetition {
+            record_id: id,
+            total,
+        };
+        // 真实生产方同时发送日志与结构化更新，摘要只能计一条。
+        model.observe(&AgentEvent::OperationLog(
+            remoteops_agent::AgentOperationLog {
+                request_id: Some(request_id),
+                occurred_at: chrono::Utc::now(),
+                level: remoteops_agent::AgentLogLevel::Info,
+                message: if total > 1 {
+                    format!("{text} × {total}")
+                } else {
+                    text.to_owned()
+                },
+                repetition: Some(repetition),
+            },
+        ));
+        model.observe(&AgentEvent::OperationOutputUpdate {
+            request_id,
+            text: text.to_owned(),
+            repetition,
+        });
+    }
+
+    #[test]
+    fn serial_summary_uses_cumulative_counts_without_adding_rows() {
+        let mut model = ActivityModel::default();
+        model.observe(&AgentEvent::ControllerCountChanged {
+            active_connections: 1,
+        });
+        for total in [1, 128, 10_000] {
+            serial_update(&mut model, 1, "重复消息", total);
+            assert_eq!(model.summaries.len(), 1);
+            assert_eq!(model.summaries[0].text, "重复消息");
+            assert_eq!(model.summaries[0].repetitions, total);
+        }
+        serial_update(&mut model, 2, "其他消息", 1);
+        serial_update(&mut model, 3, "重复消息", 1);
+        assert_eq!(model.summaries.len(), 3);
+        assert_eq!(model.summaries[2].repetitions, 1);
+    }
+
+    #[test]
+    fn serial_summary_keeps_count_after_truncation_and_missing_first_update() {
+        let mut model = ActivityModel::default();
+        model.observe(&AgentEvent::ControllerCountChanged {
+            active_connections: 1,
+        });
+        serial_update(&mut model, 9, &"界".repeat(200), 10_000);
+        assert_eq!(model.summaries.len(), 1);
+        assert_eq!(model.summaries[0].text.chars().count(), 180);
+        assert_eq!(model.summaries[0].repetitions, 10_000);
+        // 即使正文相同，另一个资源或来源产生的新稳定标识仍是新记录。
+        serial_update(&mut model, 10, &"界".repeat(200), 1);
+        assert_eq!(model.summaries.len(), 2);
+        model.disconnect();
+        model.observe(&AgentEvent::ControllerCountChanged {
+            active_connections: 1,
+        });
+        serial_update(&mut model, 11, "new epoch", 1);
+        assert_eq!(model.summaries.len(), 1);
+        assert_eq!(model.summaries[0].record_id, Some(11));
+    }
+
     #[test]
     fn concurrent_terminal_and_disconnect() {
         let mut model = ActivityModel::default();
@@ -236,6 +339,7 @@ mod tests {
             });
             model.observe(&AgentEvent::OperationLog(
                 remoteops_agent::AgentOperationLog {
+                    repetition: None,
                     request_id: Some(request_id),
                     occurred_at: chrono::Utc::now(),
                     level: remoteops_agent::AgentLogLevel::Running,
@@ -261,6 +365,7 @@ mod tests {
             let message = format!("新任务输出 {index}");
             model.observe(&AgentEvent::OperationLog(
                 remoteops_agent::AgentOperationLog {
+                    repetition: None,
                     request_id: Some(next_request),
                     occurred_at: chrono::Utc::now(),
                     level: remoteops_agent::AgentLogLevel::Running,

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "remoteops",
+  "version": "0.1.6",
+  "minimum_mcp_version": "0.2.0-preview.25",
+  "protocol": 20,
+  "required_tools": [
+    "pair_connection",
+    "list_connections",
+    "get_target_info",
+    "get_control_mode",
+    "run_ssh",
+    "manage_relay_tools",
+    "upload_relay_tool_package",
+    "fill_browser_password",
+    "get_resource_tool_status"
+  ]
+}

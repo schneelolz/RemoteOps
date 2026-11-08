@@ -1,13 +1,62 @@
 # RemoteOps MCP Windows x64 安装说明
 
-> 当前安装规则：新版安装器只支持设置码/设置文件，不再支持 Token 安装。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](../../../docs/mcp-one-time-setup.md)。
+> 当前安装规则：新安装只支持设置码/设置文件，不再支持 Token 安装；已有安装使用 `-UpgradeExisting` 保留身份和凭据。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](../../../docs/mcp-one-time-setup.md)。
 
-- 版本：`0.2.0-preview.17`
+- 版本：`0.2.0-preview.25`
 - 适用系统：Windows x64
 - Codex MCP 名称：`remoteops`
 - 许可证：`AGPL-3.0-only`
 
 本安装包把 Codex 接入你自行部署或获准使用的 RemoteOps Relay。安装包不包含默认 Relay、Token、服务器密码、控制码、私钥或证书。
+
+## MCP 与 Skill 分开安装和更新
+
+自本版起，MCP 与 Skill 使用独立版本和独立压缩包：
+
+| 组件 | 当前版本 | 内容与更新范围 |
+| --- | --- | --- |
+| MCP | `0.2.0-preview.25` | MCP EXE、密码辅助程序 `.6`、安装/自检脚本及许可证；不含 Skill |
+| Skill | `0.1.6` | 操作流程、交换机 SSH 排障和工具中心指引；最低 MCP 为 `.25`，协议 20 |
+
+首次部署建议下载完整安装包，或分别解压 `RemoteOps-MCP-Windows-x64-0.2.0-preview.25.zip`
+与 `RemoteOps-Skill-0.1.6.zip`。先按本文安装 MCP，再进入 Skill 包执行其独立安装器。
+完整包中的两个目录为 `MCP` 与 `Skill`；在 `MCP` 目录完成安装后可执行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ..\Skill\Install-RemoteOpsSkill.ps1
+```
+
+使用自定义 `-CodexHome` 时，两个安装器必须使用同一目标目录。pi 的 Skill 加载路径按
+独立 Skill 包文档配置，MCP 安装器不会改写 pi 配置。组件兼容范围见 Skill 的
+`skills/remoteops/skill.json`；升级 Skill 前核对最低 MCP 版本及所需工具。完整工具中心 Schema 和字段级本地诊断需要 MCP `.22`。
+
+仅更新使用指引时，只下载安装 Skill 包，无需更新 EXE、连接配置、凭据、Agent 或
+Relay；宿主何时重新读取 Skill 取决于其加载机制，新会话或重载后核对已加载内容。
+MCP 单独安装、自检或卸载不要求存在 Skill，也不会覆盖更新版本或本地修改的 Skill。
+卸载 Skill 使用其独立卸载器。MCP 程序升级仍需重开 Codex，pi 重开或 `/reload`。
+
+## 升级已有安装
+
+已有可用安装不需要重新签发设置码。使用同一 Windows 用户运行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.ps1 -UpgradeExisting
+```
+
+升级使用 MCP `0.2.0-preview.25` 和密码安全输入程序 `0.2.0-preview.7`，安装到
+`<CodexHome>/remoteops/candidates/protocol20-preview25-<程序摘要>-<包内容摘要>`。
+两个摘要均取 SHA-256 前 12 位，准确路径由安装器输出；同一 EXE 的配套脚本或文档变化
+也会生成独立目录。两个程序、安装/自检脚本和随包许可并排保留；独立 Skill 不复制、
+不覆盖，现有 Codex/pi 进程及旧文件不受影响。
+升级不兑换设置、不登记新身份、不更改 `controller-config.json` 或 Windows Credential
+Manager，仅通过 TOML 解析器更新现有 `mcp_servers.remoteops.command`，原参数、
+认证配置、命令模式、审批、超时、其他 MCP 和全局设置保持。变更前由程序自动备份
+Codex 配置。`-UpgradeExisting` 不能与设置输入、`-ConfirmEnrollment` 或 `-CommandMode`
+混用；凭据缺失时应先排查原安装，不能用重新登记作为默认修复。
+
+升级后按“旁路安装检查”提供此目录及构建记录中的两个 SHA-256。完全重开 Codex 后
+生效；pi 共用此程序时，需要维护者另外结构化修改 pi 的 `remoteops` 程序路径，保留
+认证、命令模式与超时，然后重开 pi 或执行 `/reload`。单独 reconnect 不会重载 pi 配置。
 
 ## 使用一次性设置安装
 
@@ -60,13 +109,11 @@ Credential Manager 条目和原设置文件，再运行相同安装命令。此�
 安装内容：
 
 ```text
-%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.17.exe
+%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.25.exe
 %USERPROFILE%\.codex\remoteops\remoteops-credential-prompt.exe
 %USERPROFILE%\.codex\remoteops\controller-config.json
 %USERPROFILE%\.codex\remoteops\setup-state.json
 %USERPROFILE%\.codex\config.toml
-%USERPROFILE%\.agents\skills\remoteops\SKILL.md
-%USERPROFILE%\.codex\skills\remoteops\SKILL.md
 ```
 
 覆盖安装成功后会删除 `%USERPROFILE%\.codex\remoteops` 中旧版本的
@@ -90,7 +137,7 @@ codex mcp list
 ```
 
 在有交互桌面的 Windows 会话中，可额外运行可取消的凭据窗口烟测；脚本会启动窗口，
-请在 60 秒内点击 Cancel：
+请在 60 秒内点击“取消／Cancel”：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-RemoteOpsMcp.ps1 -CredentialPromptSmokeTest
@@ -119,6 +166,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-RemoteOpsMcp.ps1 
 `<CodexHome>/remoteops/controller-config.json`，不会复制或修改凭据、配置或运行中的进程。
 `CodexHome` 和候选目录应使用一致的路径别名；系统自有的 Codex 用户目录联接不受影响。
 
+若同目录存在 `manifest.json`，自检还会验证其组件、版本、协议、文件大小及摘要，
+且清单必须包含两个 EXE；清单本身不能代替外部可信构建摘要。
+
 该功能只检查本地安装及固定包版本，不查询或下载最新发布版本；缺少候选目录或任一
 可信哈希时不能通过旁路检查。`-SkipNetwork` 只跳过 TCP 探测，不跳过路径、哈希和版本校验。
 
@@ -140,6 +190,21 @@ Codex 应自动通过 RemoteOps 配对并使用远程工具。若当前任务没
 `-CommandMode agent-controlled` 是推荐默认模式：未获有效授权时逐项确认。MCP 可通过 `set_control_mode` 授权，也可由现场在 Agent“控制权限”中授权；Relay 确认后无需重复 RemoteOps 审批。MCP 授权空闲一小时到期，现场授权到连接结束或撤销失效。Agent 默认 `default_full_control=false`；默认完全控制为新绑定自动授权，现场切回逐项确认会抑制本次运行的自动授权。`readonly`、`approval` 仍是权限上限，协议 16 的 `full-access` 不会自动授权。详见[控制权限说明](../../../docs/control-permissions.md)。
 
 全新 Agent 首次运行只需填写 Relay 地址并等待九位控制码，不需要让 Codex 生成入网码，也不需要部署级 Agent 注册 Token。新版 MCP 使用设置兑换的独立凭据完成自身认证，再使用 Agent 控制码配对。
+
+## 工具中心管理
+
+工具中心需要协议 20 Relay、Agent 和本 MCP。Relay 管理员须单独为当前安装授予
+`tool_management`；完全控制或旧共享 Token 不能代替这项权限。生产升级只授予当前
+共用身份管理权时，不应自动为其他安装授权、上传现有工具包或开启工具运行。
+
+- `manage_relay_tools` 的 `snapshot` 用于读取目录、策略和修订；每次管理请求使用稳定
+  `request_id` 和当前 `expected_revision`。修订冲突后重新读取，未知结果不自动重放。
+- `upload_relay_tool_package` 只接受本机 transfer-root 内的 ZIP 相对路径；先实际测试并
+  整理用途、说明、示例及执行定义，再上传或导入并登记真实环境与结果。
+- 上传回执仅证明 ZIP 安全检查和摘要一致。上传、登记、平台测试、单工具启用及全局
+  运行开关彼此独立；全局及新工具默认关闭，必须按用户明确指令启用。
+- Agent 工具由已连接中继统一管理；旧本地资源站配置不再是运行入口。目录同步只能
+  按实际确认状态报告，失联、停用或无法确认的在途结果按 `result_unknown` 处理。
 
 ## 第一次只读测试
 

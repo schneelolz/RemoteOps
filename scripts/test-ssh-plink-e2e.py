@@ -35,7 +35,8 @@ USERNAME = "remoteops-fixture"
 FIRST = "FIXTURE-FIRST 中文 😀\n".encode()
 FINAL = b"FIXTURE-FINAL\n"
 STDERR = b"FIXTURE-STDERR\n"
-COMMANDS = {b"fixture-stream", b"fixture-reject", b"fixture-timeout"}
+READONLY_OUTPUTS = {b"hostname": b"fixture-linux\n", b"whoami": b"remoteops-fixture\n", b"uname -a": b"Linux fixture-linux 6.1 fixture x86_64 GNU/Linux\n"}
+COMMANDS = {b"fixture-stream", b"fixture-reject", b"fixture-timeout", *READONLY_OUTPUTS}
 logging.getLogger("paramiko").addHandler(logging.NullHandler())
 logging.getLogger("paramiko").propagate = False
 
@@ -109,6 +110,17 @@ class FixtureServer:
         try:
             connection.settimeout(10)
             transport = paramiko.Transport(connection)
+            # Paramiko 回调返回后才发送 exec-success；必须等该回复发出后再运行短查询。
+            # 固定 4.0.0 的处理表在此实例复制，不修改其他 Transport 的类级行为。
+            request_handler = transport._channel_handler_table[paramiko.common.MSG_CHANNEL_REQUEST]
+            def request_then_output(channel, message):
+                request_handler(channel, message)
+                command = getattr(channel, "_fixture_pending_command", None)
+                if command is not None:
+                    del channel._fixture_pending_command
+                    threading.Thread(target=self.output, args=(channel, command), daemon=True).start()
+            transport._channel_handler_table = dict(transport._channel_handler_table)
+            transport._channel_handler_table[paramiko.common.MSG_CHANNEL_REQUEST] = request_then_output
             transport.banner_timeout = 5
             transport.auth_timeout = 5
             with self.lock:
@@ -135,6 +147,12 @@ class FixtureServer:
 
     def output(self, channel: paramiko.Channel, command: bytes) -> None:
         try:
+            if command in READONLY_OUTPUTS:
+                channel.sendall(READONLY_OUTPUTS[command])
+                channel.send_exit_status(0)
+                channel.shutdown_write()
+                self.count("streams_completed")
+                return
             channel.sendall(FIRST)
             if command == b"fixture-timeout":
                 while channel.get_transport().is_active() and not channel.closed and not self.stopping.wait(0.05):
@@ -185,7 +203,7 @@ class FixtureInterface(paramiko.ServerInterface):
             self.fixture.count("exec_rejected")
             return False
         self.fixture.count("exec_accepted")
-        threading.Thread(target=self.fixture.output, args=(channel, command), daemon=True).start()
+        channel._fixture_pending_command = command
         return True
 
     def check_channel_shell_request(self, channel):

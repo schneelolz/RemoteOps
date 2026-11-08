@@ -35,7 +35,7 @@ start "" /wait "remoteops-agent-gui.exe" --cli
 定制版使用自己的 EXE 名称，例如：
 
 ```cmd
-start "" /wait "精灵AI-Agent-Release.exe" --cli
+start "" /wait "remoteops-agent-gui.exe" --cli
 ```
 
 PowerShell 中可使用：

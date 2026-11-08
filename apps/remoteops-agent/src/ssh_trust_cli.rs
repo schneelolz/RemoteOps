@@ -6,14 +6,29 @@ use std::ffi::OsString;
 /// # Errors
 /// 目标、端口、指纹格式错误，或扫描／核对／保存失败时返回脱敏原因。
 pub async fn handle_ssh_trust_cli(args: &[OsString]) -> Option<anyhow::Result<serde_json::Value>> {
+    handle_ssh_trust_cli_with_tools(args, None).await
+}
+
+/// 使用可信产品内置扫描组件处理同一 SSH 核对命令。
+///
+/// # Errors
+/// 目标、指纹、扫描组件或信任保存校验失败时返回脱敏原因。
+pub async fn handle_ssh_trust_cli_with_tools(
+    args: &[OsString],
+    tools: Option<&remoteops_device::BundledTools>,
+) -> Option<anyhow::Result<serde_json::Value>> {
     let action = args.get(1)?.to_str()?;
     if !matches!(action, "--ssh-key-scan" | "--ssh-key-trust") {
         return None;
     }
-    Some(run(action, &args[2..]).await)
+    Some(run(action, &args[2..], tools).await)
 }
 
-async fn run(action: &str, args: &[OsString]) -> anyhow::Result<serde_json::Value> {
+async fn run(
+    action: &str,
+    args: &[OsString],
+    tools: Option<&remoteops_device::BundledTools>,
+) -> anyhow::Result<serde_json::Value> {
     anyhow::ensure!(
         if action == "--ssh-key-scan" {
             args.len() == 2
@@ -31,10 +46,10 @@ async fn run(action: &str, args: &[OsString]) -> anyhow::Result<serde_json::Valu
         .parse()?;
     anyhow::ensure!(port != 0, "SSH 端口必须大于零");
     if action == "--ssh-key-scan" {
-        let scan = remoteops_device::scan_ssh_host_keys_async(host, port, 15).await?;
+        let scan = remoteops_device::scan_ssh_host_keys_with_tools(host, port, 15, tools).await?;
         return Ok(serde_json::json!({
             "status":"scanned_unverified", "host":scan.host, "port":scan.port,
-            "fingerprints":scan.fingerprints, "trusted":false,
+            "fingerprints":scan.fingerprints, "trusted":false, "diagnostics":scan.diagnostics,
             "instruction":"请通过可信渠道核对全部指纹；扫描成功不代表目标可信，禁止自动确认。"
         }));
     }
@@ -43,8 +58,14 @@ async fn run(action: &str, args: &[OsString]) -> anyhow::Result<serde_json::Valu
         !fingerprints.is_empty() && fingerprints.len() <= 16,
         "SSH 指纹数量不合法"
     );
-    let path =
-        remoteops_device::trust_ssh_host_keys_verified(host, port, &fingerprints, 15).await?;
+    let path = remoteops_device::trust_ssh_host_keys_verified_with_tools(
+        host,
+        port,
+        &fingerprints,
+        15,
+        tools,
+    )
+    .await?;
     Ok(
         serde_json::json!({"status":"trusted", "host":host, "port":port, "known_hosts_file":path, "fingerprints":fingerprints}),
     )

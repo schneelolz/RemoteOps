@@ -23,6 +23,8 @@ struct Shared {
 /// 有界表现层事件发布端；输出满时淘汰日志，关键事件保留次序。
 pub struct BoundedAgentEventSender {
     shared: Arc<Shared>,
+    // 宿主可按事件唤醒界面；回调只在队列锁释放后调用。
+    wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 /// 供单个表现层排空的有界事件订阅。
 pub struct BoundedAgentEventReceiver {
@@ -48,17 +50,34 @@ pub fn bounded_agent_events(
     (
         BoundedAgentEventSender {
             shared: shared.clone(),
+            wakeup: None,
         },
         BoundedAgentEventReceiver { shared },
     )
 }
 fn is_log(event: &AgentEvent) -> bool {
     match event {
-        AgentEvent::OperationLog(_) | AgentEvent::OperationPresentation { .. } => true,
+        AgentEvent::OperationLog(_)
+        | AgentEvent::OperationPresentation { .. }
+        | AgentEvent::OperationOutputUpdate { .. } => true,
         AgentEvent::ScopedOperation { event, .. } => is_log(event),
         _ => false,
     }
 }
+// 相同稳定记录只保留最新累计值；诊断日志与观察显示分别更新，连接代次不能混合。
+fn update_key(event: &AgentEvent) -> Option<(Option<u64>, bool, u64)> {
+    match event {
+        AgentEvent::OperationLog(log) => log.repetition.map(|value| (None, false, value.record_id)),
+        AgentEvent::OperationOutputUpdate { repetition, .. } => {
+            Some((None, true, repetition.record_id))
+        }
+        AgentEvent::ScopedOperation { epoch, event } => {
+            update_key(event).map(|(_, kind, id)| (Some(*epoch), kind, id))
+        }
+        _ => None,
+    }
+}
+
 impl Clone for BoundedAgentEventSender {
     fn clone(&self) -> Self {
         self.shared
@@ -68,6 +87,7 @@ impl Clone for BoundedAgentEventSender {
             .senders += 1;
         Self {
             shared: self.shared.clone(),
+            wakeup: self.wakeup.clone(),
         }
     }
 }
@@ -89,7 +109,22 @@ impl BoundedAgentEventSender {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .shutdown = Some(shutdown);
     }
-    pub(crate) fn send(&self, event: AgentEvent) {
+    /// 为此发布端及其后续克隆绑定界面唤醒回调，不另建无界事件转发通道。
+    #[must_use]
+    pub fn with_wakeup(mut self, wakeup: impl Fn() + Send + Sync + 'static) -> Self {
+        self.wakeup = Some(Arc::new(wakeup));
+        self
+    }
+
+    /// 发布本地事件；关键状态会背压，宿主退出前应关闭订阅解除等待。
+    pub fn send(&self, event: AgentEvent) {
+        self.enqueue(event);
+        if let Some(wakeup) = &self.wakeup {
+            wakeup();
+        }
+    }
+
+    fn enqueue(&self, event: AgentEvent) {
         let mut state = self
             .shared
             .state
@@ -102,6 +137,15 @@ impl BoundedAgentEventSender {
                     .as_ref()
                     .is_some_and(|shutdown| *shutdown.borrow())
             {
+                return;
+            }
+            if let Some(key) = update_key(&event)
+                && let Some(existing) = state
+                    .events
+                    .iter_mut()
+                    .find(|queued| update_key(queued) == Some(key))
+            {
+                *existing = event;
                 return;
             }
             if state.events.len() < self.shared.capacity {
@@ -187,11 +231,29 @@ mod tests {
     use crate::{AgentLogLevel, AgentOperationLog};
     fn line(index: usize) -> AgentEvent {
         AgentEvent::OperationLog(AgentOperationLog {
+            repetition: None,
             request_id: None,
             occurred_at: chrono::Utc::now(),
             level: AgentLogLevel::Info,
             message: index.to_string(),
         })
+    }
+    #[test]
+    fn wakeup_runs_outside_queue_lock_and_survives_sender_clone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (sender, receiver) = bounded_agent_events(4);
+        let receiver = Arc::new(receiver);
+        let wakeups = Arc::new(AtomicUsize::new(0));
+        let callback_receiver = receiver.clone();
+        let callback_wakeups = wakeups.clone();
+        let sender = sender.with_wakeup(move || {
+            assert!(callback_receiver.try_recv().is_ok());
+            callback_wakeups.fetch_add(1, Ordering::Relaxed);
+        });
+        sender.send(line(1));
+        sender.clone().send(line(2));
+        assert_eq!(wakeups.load(Ordering::Relaxed), 2);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
     }
     #[test]
     fn queue_is_bounded_and_keeps_critical_states() {

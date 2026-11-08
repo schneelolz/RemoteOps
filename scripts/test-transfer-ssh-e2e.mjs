@@ -10,6 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
+import { isDeepStrictEqual } from 'node:util';
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const plinkHash = '50479953865b30775056441b10fdcb984126ba4f98af4f64756902a807b453e7';
@@ -95,7 +96,7 @@ class Mcp {
 }
 
 function parseOptions() {
-  const options = { agent: '', relay: '', mcp: '', python: '', native: '', askpass: '',
+  const options = { agent: '', relay: '', mcp: '', python: '', native: '', askpass: '', scanner: '',
     plink: 'D:\\Tools\\putty\\PLINK.EXE', output: '' };
   for (let index = 2; index < process.argv.length; index += 2) {
     const key = process.argv[index].replace(/^--/, '');
@@ -251,11 +252,20 @@ async function main(options) {
     await fs.copyFile(options.mcp, mcpExe);
     await command('pwsh.exe', ['-NoProfile', '-File', path.join(repository, 'scripts/Copy-BundledPlink.ps1'),
       '-SourcePath', options.plink, '-DestinationDirectory', directories['agent-package 中文'], '-AskpassPath', options.askpass]);
+    if (options.scanner) {
+      const scannerDestination = path.join(directories['agent-package 中文'], 'tools/ssh-scanner');
+      await fs.mkdir(scannerDestination);
+      for (const name of ['ssh-keyscan.exe', 'libcrypto.dll', 'LICENSE.txt', 'NOTICE.txt', 'scanner-manifest.json']) {
+        await fs.copyFile(path.join(options.scanner, name), path.join(scannerDestination, name));
+      }
+      check('actual_packaged_scanner_official_manifest', JSON.parse(await fs.readFile(path.join(scannerDestination, 'scanner-manifest.json'), 'utf8')).archive_sha256
+        === 'b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957');
+    }
     check('actual_packaged_plink_hash', sha256(await fs.readFile(path.join(directories['agent-package 中文'], 'tools/plink.exe'))) === plinkHash);
     const helperSource = path.join(directories['mcp-package'], 'FixturePrompt.cs');
     await fs.writeFile(helperSource, `using System; using System.IO; using System.Text; using System.Collections.Generic; using System.Web.Script.Serialization;
 class FixturePrompt { static int Main(string[] a) { try {
- if(a.Length!=8 || a[0]!="--host" || a[1]!="127.0.0.1" || a[2]!="--port" || a[3]!=Environment.GetEnvironmentVariable("REMOTEOPS_TEST_SSH_PORT") || a[4]!="--username" || a[5]!="remoteops-fixture" || a[6]!="--command-sha256" || !System.Text.RegularExpressions.Regex.IsMatch(a[7],"^[0-9a-f]{64}$")) return 3;
+ if(a.Length!=10 || a[0]!="--host" || a[1]!="127.0.0.1" || a[2]!="--port" || a[3]!=Environment.GetEnvironmentVariable("REMOTEOPS_TEST_SSH_PORT") || a[4]!="--username" || a[5]!="remoteops-fixture" || a[6]!="--command-sha256" || !System.Text.RegularExpressions.Regex.IsMatch(a[7],"^[0-9a-f]{64}$")||a[8]!="--language"||(a[9]!="zh-CN"&&a[9]!="en-US")) return 3;
  string p=Environment.GetEnvironmentVariable("REMOTEOPS_TEST_PASSWORD_FILE"); string n=Environment.GetEnvironmentVariable("REMOTEOPS_TEST_PROMPT_COUNT_FILE");
  string value=File.ReadAllText(p,new UTF8Encoding(false,true)); int count=File.Exists(n)?Int32.Parse(File.ReadAllText(n)):0; File.WriteAllText(n,(count+1).ToString());
  Console.OutputEncoding=new UTF8Encoding(false); Console.Write(new JavaScriptSerializer().Serialize(new Dictionary<string,object>{{"action","use_once"},{"password",value}})); return 0;
@@ -424,9 +434,53 @@ class FixturePrompt { static int Main(string[] a) { try {
     await readEvents();
     const chunks = streamedEvents.filter(event => event.request_id === streamResult.request_id && event.payload?.type === 'output_chunk');
     const sshPreparation = '[RemoteOps SSH 准备] 后端=Plink；已找到随包组件与精确固定密钥；模式=exec/无PTY，尚未确认连接。\n';
+    const actualStdout = chunks.filter(event => !event.payload.stderr).map(event => event.payload.text).join('');
+    const actualStderr = chunks.filter(event => event.payload.stderr).map(event => event.payload.text).join('');
+    numbers.stream_succeeded = succeeded(streamResult);
+    numbers.stream_exit_code = streamResult.exit_code ?? null;
+    numbers.stream_stdout_length = actualStdout.length;
+    numbers.stream_stderr_length = actualStderr.length;
+    const executionMetadata = { ssh_execution: {
+      backend: 'plink', error_category: null, execution_mode: 'exec_no_pty',
+      selection_reason: 'bundled_plink_exact_pinned_keys',
+    } };
+    const metadataText = JSON.stringify(executionMetadata);
+    // Agent 既有响应契约把 details 另发为一帧 JSON，不能混作远端 stdout 或忽略任意前缀。
+    const metadataChunks = chunks.filter(event => !event.payload.stderr && event.payload.text === metadataText);
+    const remoteChunks = chunks.filter(event => !metadataChunks.includes(event));
+    numbers.stream_metadata_chunks = metadataChunks.length;
+    check('actual_runssh_structured_metadata_event_matches_response', metadataChunks.length === 1
+      && isDeepStrictEqual(streamResult.details?.ssh_execution, executionMetadata.ssh_execution)
+      && chunks.at(-1) === metadataChunks[0]);
     check('actual_runssh_exact_unicode_stdout_and_stderr', succeeded(streamResult)
-      && chunks.filter(event => !event.payload.stderr).map(event => event.payload.text).join('') === sshPreparation + 'FIXTURE-FIRST 中文 😀\nFIXTURE-FINAL\n'
-      && chunks.filter(event => event.payload.stderr).map(event => event.payload.text).join('') === 'FIXTURE-STDERR\n');
+      && remoteChunks.filter(event => !event.payload.stderr).map(event => event.payload.text).join('') === sshPreparation + 'FIXTURE-FIRST 中文 😀\nFIXTURE-FINAL\n'
+      && remoteChunks.filter(event => event.payload.stderr).map(event => event.payload.text).join('') === 'FIXTURE-STDERR\n');
+    check('actual_runssh_backend_and_exec_mode_reported', streamResult.details?.ssh_execution?.backend === 'plink'
+      && streamResult.details.ssh_execution.selection_reason === 'bundled_plink_exact_pinned_keys'
+      && streamResult.details.ssh_execution.execution_mode === 'exec_no_pty'
+      && streamResult.details.ssh_execution.error_category === null);
+    for (const [query, expected] of [['hostname', 'fixture-linux\n'], ['whoami', 'remoteops-fixture\n'], ['uname -a', 'Linux fixture-linux 6.1 fixture x86_64 GNU/Linux\n']]) {
+      const queried = await tool('run_ssh', { ...sshArgs(query), readonly: true });
+      await readEvents();
+      const queryChunks = streamedEvents.filter(event => event.request_id === queried.request_id && event.payload?.type === 'output_chunk');
+      const expectedMetadata = JSON.stringify(executionMetadata);
+      const queryMetadata = queryChunks.filter(event => !event.payload.stderr && event.payload.text === expectedMetadata);
+      const queryStdout = queryChunks.filter(event => !event.payload.stderr && !queryMetadata.includes(event)).map(event => event.payload.text).join('');
+      numbers[`linux_${query.split(' ')[0]}_succeeded`] = succeeded(queried);
+      numbers[`linux_${query.split(' ')[0]}_exit_code`] = queried.exit_code ?? null;
+      numbers[`linux_${query.split(' ')[0]}_stdout_exact`] = queryStdout === sshPreparation + expected;
+      check(`linux_readonly_${query.replaceAll(' ', '_')}_actual_execution`, succeeded(queried)
+        && queried.exit_code === 0 && queryStdout === sshPreparation + expected
+        && queryMetadata.length === 1
+        && queryChunks.every(event => !event.payload.stderr)
+        && isDeepStrictEqual(queried.details?.ssh_execution, executionMetadata.ssh_execution));
+    }
+    const beforeInjection = (await server.request('stats')).stats.exec_accepted;
+    for (const query of ['hostname\nwhoami', 'whoami;hostname', 'uname -a >file', '$(whoami)', 'Hostname', 'hostname extra']) {
+      const refused = await tool('run_ssh', { ...sshArgs(query), readonly: true });
+      check('ssh_readonly_unsafe_or_unlisted_query_refused', !succeeded(refused));
+    }
+    check('ssh_readonly_rejections_do_not_reach_exec', (await server.request('stats')).stats.exec_accepted === beforeInjection);
     const promptsBeforeWrong = Number(await fs.readFile(promptCount, 'utf8'));
     secret = randomBytes(32).toString('base64url');
     syntheticSecrets.push(secret);

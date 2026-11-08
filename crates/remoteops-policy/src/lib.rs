@@ -209,7 +209,7 @@ impl DefaultPolicy {
                 readonly: true,
                 command,
                 ..
-            } if !is_network_device_readonly_command(command)
+            } if !is_ssh_readonly_command(command)
         ) {
             return PolicyDecision::Deny {
                 reason: "SSH 命令未匹配结构化只读白名单，已拒绝执行".to_owned(),
@@ -264,6 +264,8 @@ impl DefaultPolicy {
                 self.classify_command(Some(*shell), command)
             }
             RemoteOperation::GetTargetContext
+            | RemoteOperation::ListResourceTools
+            | RemoteOperation::StopResourceTool { .. }
             | RemoteOperation::OpenShell { .. }
             | RemoteOperation::CloseShell { .. }
             | RemoteOperation::TestPort { .. }
@@ -287,11 +289,16 @@ impl DefaultPolicy {
             RemoteOperation::VisualInvoke { .. } | RemoteOperation::VisualTypeText { .. } => {
                 RiskLevel::Mutating
             }
-            RemoteOperation::VisualSendInput { .. } => RiskLevel::High,
+            RemoteOperation::VisualSendInput { .. }
+            | RemoteOperation::StartResourceTool { .. }
+            | RemoteOperation::CallResourceTool { .. }
+            | RemoteOperation::ValidateResourceTool { .. }
+            | RemoteOperation::PrepareBrowserPassword { .. }
+            | RemoteOperation::FillBrowserPassword { .. } => RiskLevel::High,
             RemoteOperation::RunSsh {
                 command, readonly, ..
             } => {
-                let risk = if is_network_device_readonly_command(command) {
+                let risk = if is_ssh_readonly_command(command) {
                     RiskLevel::ReadOnly
                 } else {
                     RiskLevel::High
@@ -819,13 +826,13 @@ fn is_posix_ss_readonly(command: &str) -> bool {
 /// 该门禁供 Agent 在旧 Relay 尚未识别设备命令时执行最终本地校验，不改变协议风险分类。
 #[must_use]
 pub fn is_network_device_readonly_command(command: &str) -> bool {
-    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty()
-        || normalized.len() > 512
-        || normalized.contains(['\r', '\n', ';', '|', '&', '>', '<', '`'])
-    {
+    if !is_safe_ssh_query_text(command) {
         return false;
     }
+    let normalized = command
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let lower = normalized.to_ascii_lowercase();
     matches!(
         lower.as_str(),
@@ -853,6 +860,24 @@ pub fn is_network_device_readonly_command(command: &str) -> bool {
             | "show arp"
             | "show clock"
     )
+}
+
+/// 判断 SSH 命令是否为明确允许的单条只读查询；只分类，不改写原始命令。
+#[must_use]
+pub fn is_ssh_readonly_command(command: &str) -> bool {
+    if !is_safe_ssh_query_text(command) {
+        return false;
+    }
+    let words = command.split_ascii_whitespace().collect::<Vec<_>>();
+    matches!(words.as_slice(), ["hostname" | "whoami"] | ["uname", "-a"])
+        || is_network_device_readonly_command(command)
+}
+
+fn is_safe_ssh_query_text(command: &str) -> bool {
+    !command.is_empty()
+        && command.len() <= 512
+        && !command.chars().any(char::is_control)
+        && !command.contains([';', '|', '&', '>', '<', '`', '$', '(', ')', '\\'])
 }
 
 fn compile_patterns(patterns: &[&str]) -> Vec<Regex> {
@@ -950,6 +975,45 @@ impl ApprovalStore {
             self.records.remove(&approval_id);
         }
         Some(record)
+    }
+}
+
+#[cfg(test)]
+mod resource_policy_tests {
+    use super::*;
+    #[test]
+    fn resource_execution_is_always_high_risk_even_for_readonly_arguments() {
+        let policy = DefaultPolicy::default();
+        for operation in [
+            RemoteOperation::StartResourceTool {
+                tool_id: "fixture".into(),
+                version: "1".into(),
+                sha256: "a".repeat(64),
+            },
+            RemoteOperation::CallResourceTool {
+                instance_id: "fixture".into(),
+                tool_name: "readonly_query".into(),
+                arguments: serde_json::json!({"readonly":true}),
+            },
+        ] {
+            assert_eq!(policy.classify(&operation), RiskLevel::High);
+            assert!(matches!(
+                policy.evaluate(EventSource::Ai, &operation),
+                PolicyDecision::RequireApproval { .. }
+            ));
+            assert!(matches!(
+                policy.evaluate_with_mode(PermissionMode::ReadOnly, EventSource::Ai, &operation),
+                PolicyDecision::Deny { .. }
+            ));
+            assert!(matches!(
+                policy.evaluate_with_mode(
+                    PermissionMode::ControllerApproved,
+                    EventSource::Ai,
+                    &operation
+                ),
+                PolicyDecision::Allow
+            ));
+        }
     }
 }
 
@@ -1616,11 +1680,54 @@ mod tests {
     }
 
     #[test]
+    fn ssh_readonly_queries_preserve_case_and_reject_raw_injection() {
+        for command in [
+            "hostname",
+            "whoami",
+            "uname -a",
+            "  uname   -a  ",
+            "display version",
+        ] {
+            assert!(is_ssh_readonly_command(command), "{command:?}");
+        }
+        for command in [
+            "Hostname",
+            "WHOAMI",
+            "UNAME -a",
+            "uname -A",
+            "uname",
+            "hostname -f",
+            "whoami /all",
+            "uname -a -r",
+            "hostname\n",
+            "display\nversion",
+            "display\rversion",
+            "display\tversion",
+            "hostname;whoami",
+            "hostname && whoami",
+            "hostname | whoami",
+            "hostname > file",
+            "hostname $(whoami)",
+            "hostname `whoami`",
+            "hostname\0",
+            "hostname\u{1b}",
+            "uname\u{a0}-a",
+        ] {
+            assert!(!is_ssh_readonly_command(command), "{command:?}");
+        }
+        assert!(!is_ssh_readonly_command(&format!(
+            "{}hostname",
+            " ".repeat(513)
+        )));
+        assert!(!is_network_device_readonly_command("display\nversion"));
+    }
+
+    #[test]
     fn ssh_policy_uses_only_network_device_readonly_allowlist() {
         let policy = DefaultPolicy::default();
         for (command, expected) in [
             ("display version", RiskLevel::ReadOnly),
-            ("hostname", RiskLevel::High),
+            ("hostname", RiskLevel::ReadOnly),
             ("ip route", RiskLevel::High),
             ("ip link set eth0 down", RiskLevel::High),
         ] {

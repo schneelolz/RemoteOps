@@ -85,7 +85,7 @@
 - 新增 `apps/remoteops-agent-native-prototype/src/style_preview.rs`，沿旧 GUI 当前 500×375 紧凑主窗及精确浅深色，提供齿轮菜单、中英文、详情、权限、首次配置、TLS、退出确认、完整日志页及独立只读观察窗。使用系统字体、GDI 线性图标、标准 BUTTON / EDIT；不引入另一套 GUI 框架。
 - `--style-demo` 为显式样式入口；专用 `--no-default-features --features style-preview` 构建双击默认显示样式，不含 Agent 运行时。主程序实际 311,808 字节（304.5 KiB）；这不是最终业务版本体积。
 - 所有代码、控制码、权限和连接结果均为合成演示。复制仅模拟对勾反馈；保存、连接、SSH 和串口不执行真实行为，不读写旧配置或剪贴板，不建立远端连接。观察样例最多 200 行。
-- 构建：`scripts/Build-NativeStylePreview.ps1 -OutputDirectory <不存在的新目录>`，显式使用 C 盘 CARGO_TARGET_DIR。窗口验证：`scripts/Test-NativeStylePreview.ps1 -Executable <EXE> -ExpectedHash <SHA256> -OutputDirectory <不存在的C盘TEMP目录>`。生成物和实测截图见 `artifacts/native-style-preview-0.3.1-20261031`。
+- 构建：`scripts/Build-NativeStylePreview.ps1 -OutputDirectory <不存在的新目录>`，显式使用 C 盘 CARGO_TARGET_DIR。窗口验证：`scripts/Test-NativeStylePreview.ps1 -Executable <EXE> -ExpectedHash <SHA256> -ExpectedVersion <产品版本> -OutputDirectory <不存在的C盘TEMP目录>`。生成物和实测截图见 `artifacts/native-style-preview-0.3.1-20261031`。
 - 样式演示单测 30 项、严格 Clippy、格式检查通过；候选窗口/UIA检查 20 项及浅深色、中英文和各弹窗截图已实际复核。最终交付以同目录证据及 manifest 绑定的 SHA-256 为准。
 - 失败历史保留：首次 UIA 夹具把 owner 的 owned 对话框重复纳入 Descendants，已按实际 GA_ROOT 过滤；首次标题/资源图标缺失已修正；变量重命名误改 CRLF 转义导致多行文本出现 ect，已修复、补两项真实拼接入口回归并重新截图，不能只用 UIA 内容检查代替视觉检查。
 
@@ -125,7 +125,7 @@
 - 主窗底部四按钮统一为 107×37 DIP，间距 8 DIP，左右各 24 DIP；主窗仍为 500×375。按实际字体字宽将 17 DIP 图标、6 DIP 图文间隙和文字作为一组居中。键盘焦点框围整按钮；观察窗已打开时使用正常前景文字和蓝色边框，改善暗色文字辨认。
 - 最终 EXE：`artifacts/native-style-preview-0.3.4-20261031/delivery/RemoteOps-Win32-StylePreview.exe`，314,880 字节（307.5 KiB），与 0.3.3 同体积；SHA-256：`28b64e4cc8921d5f52aa95371a63dfb7c70b6c62f98950b077ab57a4f206c8d0`。`candidate-pre-contrast` 仅为调整已打开按钮文字颜色前的候选，正式本轮入口为 `delivery`。
 - `cargo test --offline --locked -p remoteops-agent-native-prototype --no-default-features --features style-preview`：31 项通过。`cargo clippy --offline --locked -p remoteops-agent-native-prototype --no-default-features --features style-preview --all-targets -- -D warnings`、`cargo fmt -p remoteops-agent-native-prototype -p remoteops-agent-desktop-host -- --check` 通过。
-- `scripts/Test-NativeStylePreview.ps1 -Executable <最终EXE> -ExpectedHash <上述SHA256> -OutputDirectory <全新的C盘TEMP子目录>`：最终 EXE 52 项窗口回归通过、退出 0。覆盖四按钮绝对尺寸／相同宽高／等间距、中文和英文含 Hide viewer 状态下的文字容纳、观察窗显隐／内容／焦点、日志四条无额外空段落、错误筛选、恢复全部、清空后仍只读，以及此前输入框和弹窗回归。
+- `scripts/Test-NativeStylePreview.ps1 -Executable <最终EXE> -ExpectedHash <上述SHA256> -ExpectedVersion <产品版本> -OutputDirectory <全新的C盘TEMP子目录>`：最终 EXE 52 项窗口回归通过、退出 0。覆盖四按钮绝对尺寸／相同宽高／等间距、中文和英文含 Hide viewer 状态下的文字容纳、观察窗显隐／内容／焦点、日志四条无额外空段落、错误筛选、恢复全部、清空后仍只读，以及此前输入框和弹窗回归。
 - 独立旧版 0.3.3 对照复现额外空段落，保留 4 条非空记录，按钮宽度分别 116／88／108／118；原始文本与尺寸见 `evidence/old-033-comparison.json`。只操作新启动的对照进程，未关闭用户的旧版预览。
 - 本轮定向提供主窗、日志页亮暗 4 图，另附暗色英文观察窗打开状态图：[本轮亮暗对照](../artifacts/native-style-preview-0.3.4-20261031/gallery/index.html)。未重拍所有 24 张；相册明确链接 0.3.3 的完整窗体对照。截图均为原始 PNG，不改色；摘要见同目录 `index.json`。
 - 中间失败保留：初次 Clippy 发现 UTF-16 长度转换风险，改用有界 `try_from`；首轮 UIA 字宽测量直接复用另一进程的 HFONT 导致默认字体测量偏大，夹具现读取实际 LOGFONT、在测试进程创建并释放副本。初次报告、错误测量快照和 Clippy 日志保留在 `evidence`；修正后尺寸与文字检查通过。独立只读代码复核已完成，补上其建议的绝对尺寸断言。
@@ -155,7 +155,7 @@
 - `scripts/Test-NativeStyleScrollbars.ps1 -Executable <EXE> -ExpectedHash <上述SHA256> -OutputDirectory <全新的C盘TEMP目录>`：84 项通过、退出 0。覆盖亮暗三类短文本无多余滚动条、10001 条合成记录／579615 个 UTF-16 字符、横纵真实拖拽、按住期间的实际屏幕像素、松手位置不回跳、滚轮／键盘／选择、返回最新、原生 UIA ScrollPattern 及轨道 Thumb/RangeValue 实际驱动正文。四个命中点 `WindowFromPoint` 均为原 EDIT；GDI 31→32，USER 66→66。极长首行被 EDIT 内部格式化成多个显示行，不能用显示行数冒充原始记录数。
 - `scripts/Test-NativeStyleTextCopy.ps1` 同口径精确 EXE 测试：7 项通过，实际原生复制中文选区且正文不变；测试前备份、测试后校验恢复原剪贴板的 4 种格式，不在证据中记录个人剪贴板正文。遇无法安全复制的格式或外部改写会中止或保留外部改写。
 - `scripts/Test-NativeStyleExitBackground.ps1 ... -Surface Neutral`：19 项通过、退出 0；亮暗、打开中切主题、正文背景像素一致、取消／X 恢复 owner、正常退出。历史粉色对照复验需显式 `-Surface Tinted`，不能用新版中性预期套旧版。
-- `scripts/Test-NativeStylePreview.ps1 -Executable <EXE> -ExpectedHash <上述SHA256> -OutputDirectory <全新的C盘TEMP目录>`：最终完整 52 项通过、退出 0；主窗和详情两个入口的观察窗打开前／即时后／稍后快照句柄完全一致，原始取样均保存。另以 `-ClearBackOnly` 独立 3 项通过，覆盖清空后仍只读、返回主界面、取消退出及最终退出；未以此 3 项替代完整套件。桌面门禁纯决策矩阵 14 项通过，未人为锁屏或切换安全桌面。
+- `scripts/Test-NativeStylePreview.ps1 -Executable <EXE> -ExpectedHash <上述SHA256> -ExpectedVersion <产品版本> -OutputDirectory <全新的C盘TEMP目录>`：最终完整 52 项通过、退出 0；主窗和详情两个入口的观察窗打开前／即时后／稍后快照句柄完全一致，原始取样均保存。另以 `-ClearBackOnly` 独立 3 项通过，覆盖清空后仍只读、返回主界面、取消退出及最终退出；未以此 3 项替代完整套件。桌面门禁纯决策矩阵 14 项通过，未人为锁屏或切换安全桌面。
 
 中间失败如实保留：仅覆盖 EDIT 非客户区绘制时，Windows 在按住原生滑块的追踪循环中仍会画回白轨道；`candidate-failure` 留存实际截图及像素失败，最终通过透明装饰层解决。早期测试另暴露超长文本创建、窗口初始越界及原生拖拽时回跳检查要求，已修复后重验。锁屏时停止 GUI 验证，用户解锁后继续；两次整轮回归在清空后的快照阶段被旧桌面门禁拦截，第二次现场进程仍响应，没有可用快照，不能据此断言程序卡死。第三次诊断明确记录前台为 0，但线程桌面与输入桌面均 UOI_IO=true，证实严格前台门禁误拦合法失活转场。夹具现对门禁失败输出安全原因和桌面输入状态，原样归为环境不可用，不再伪报控件缺失；随后依据线程与输入桌面的输入状态和内部身份匹配处理前台为空的情况，未知状态及明确 LockApp／LogonUI 仍拒绝，实际 SendInput 的精确前台／命中校验保持不变。目标 GUI worker 另核对同一会话。三次门禁失败报告保留；第四次在主窗首次打开观察窗的焦点取样不一致，未保存当时完整前后句柄，不能确定原因。测试现增加该入口的完整前后句柄和快照记录，不放宽原有相等断言；该失败原始报告也保留。
 
@@ -256,42 +256,42 @@ TLS保存后同文件重启已实际验证，新00e8c866候选的完整本机回
 
 继续当前分支，旧版保留。观察窗改为无Win32 owner的任务栏工作窗口；首次仍按主窗定位，自动显示不激活并尊重最小化，主动入口可还原聚焦，关闭只隐藏，应用退出统一销毁。主题/布局重建保留首可见行、水平位置和UTF-16选区，按原先底部/暂停状态判断追尾；补齐隐藏滚动条返回默认范围时的底部识别。
 
-最终源码103项原生单测、严格Clippy、无运行时样式编译通过。JLAI独立候选0.4.0-jlai.3的98项无窗口检查、8项产品单测通过；最终摘要52e996d61f9f20e9c5150ae8575470e8156ee4792c960e3a32774251be6b7ea5，单EXE6593024字节。新脚本Test-NativeProductObserverWindow.ps1在自启离线演示中47项功能检查通过，实际任务栏2→1→2，最小化/还原/隐藏/取消退出/确认退出无残留。
+最终源码103项原生单测、严格Clippy、无运行时样式编译通过。独立候选的98项无窗口检查、8项产品单测通过。新脚本Test-NativeProductObserverWindow.ps1在自启离线演示中47项功能检查通过，实际任务栏2→1→2，最小化/还原/隐藏/取消退出/确认退出无残留。
 
 总质量报告仍失败：最终页面重建1269ms超原有100ms门槛，轮询峰值1ms，后台及原生清理正常，Exit1与性能报告一致。前三轮的前台锁、脚本取跨进程文本/计数问题，以及无滚动条实际边界均保留原始证据；不重写成单轮全绿。暂停合成夹具不代表真实持续日志性能。后续优先不弹窗分析重建耗时；正式迁移、真实设备、个人剪贴板、RDP/缩放仍不据此验收。
 
-### 2026-11-02 页面重建性能优化（jlai.4）
+### 2026-11-02 页面重建性能优化
 
 已在当前分支改为按声明差异复用Win32控件，保留只读EDIT、测宽缓存及选区；按需更新正文/字体/位置、合并只读布局，旧字体延期释放，重入合并。主题/尺寸变化同时保留暂停或选中时的实际正文。新增单帧微秒级分阶段计时与真实插桩绘制统计，原100ms门槛不变、首次构建不豁免。
 
 原生118项、候选8项单测和严格Clippy、无运行时样式编译、最终EXE98项无窗口检查通过。首轮因前台变为其他应用而中止，原始失败保留；用户找到主窗并确认前台后，最终64项离线界面检查全部通过、脚本与应用Exit0。30帧页面构建峰值40.6ms、复用峰值39.0ms、111次插桩绘制峰值33.6ms，轮询5ms；12个无尺寸变化的观察窗复用帧峰值1.07ms且没有创建/销毁/赋字体/重写正文。18组原生控件身份均保持，主题阅读状态、最小化/还原/隐藏/退出联动及任务栏2→1→2通过。全部测试窗已关闭。
 
-独立JLAI单EXE 0.4.0-jlai.4，6618112字节，SHA256 cd53ab0224f8b6bc9389e5e2707067a1a5e8b3594e54bd50218fc2d0818e60b4。交付桌面/Z盘全新j4子目录；8项旧版及正式产品基线保持。证据见相邻JLAI项目 docs/JLAI-Win32页面重建优化验收-0.4.0-jlai.4.md 和 artifacts/win32-single/0.4.0-jlai.4-20261102/archive。仅本轮离线页面/绘制性能通过，不冒充真实业务全套、语言/日志页/许可页全部差异清理或持续大量日志吞吐通过；真实设备、RDP和缩放等仍按原计划待验/暂缓，不自动正式迁移。
+仅本轮离线页面/绘制性能通过，不冒充真实业务全套、语言/日志页/许可页全部差异清理或持续大量日志吞吐通过；真实设备、RDP和缩放等仍按原计划待验/暂缓，不自动正式迁移。
 
-### 2026-11-02 jlai.4现场功能复验
+### 2026-11-02 现场功能复验
 
-CafeCenterNode01实际运行EXE的版本/大小/摘要与j4交付一致。13项有界检查通过：三种Windows命令入口中文、持久Shell、66字节中文上传/回读/清理、上传事件中的绝对路径、分类和执行中1→0、红绿结果、5000行编号完整回传及观察窗末尾保留、只读属性、大量输出后的最大化/还原，以及Plink0.83/helper隔离释放校验启动和清理。Agent与控制连接保留，观察窗切回全部，未改业务代码/系统设置。
+现场测试主机实际运行EXE的版本/大小/摘要与本轮交付一致。13项有界检查通过：三种Windows命令入口中文、持久Shell、66字节中文上传/回读/清理、上传事件中的绝对路径、分类和执行中1→0、红绿结果、5000行编号完整回传及观察窗末尾保留、只读属性、大量输出后的最大化/还原，以及Plink0.83/helper隔离释放校验启动和清理。Agent与控制连接保留，观察窗切回全部，未改业务代码/系统设置。
 
-实际远端接收目录是 C:\Users\Administrator\AppData\Local\RemoteOps-JLAI\transfer；历史transfers目录不是本次路径。上传MCP直接返回仍缺少直观绝对路径（事件回执已有），持久Shell内部JSON/标识仍混入观察窗，列为后续改进，尚未修复。
+实际远端接收目录已核对；历史 `transfers` 目录不是本次接收目录。上传MCP直接返回仍缺少直观绝对路径（事件回执已有），持久Shell内部JSON/标识仍混入观察窗，列为后续改进，尚未修复。
 
-当前MCP把两个命令顺序执行，不能据此证明真正并发；现场100ms逐帧报告未取，不沿用本机40.6ms充数。5000行不替代长期吞吐；串口枚举0个，真实交换机SSH仍缺目标。RDP断开重连/缩放继续暂缓，主题/语言/许可页/退出等现场全套未重做，不自动正式迁移。诊断探针的白名单/参数/目录假设/ValuePattern失败及纠正均保留；证据在相邻JLAI项目 docs/JLAI-Win32现场功能复验-0.4.0-jlai.4.md 及 artifacts/win32-single/0.4.0-jlai.4-20261102/archive/validation/onsite-20261102-jlai4。
+当前MCP把两个命令顺序执行，不能据此证明真正并发；现场100ms逐帧报告未取，不沿用本机40.6ms充数。5000行不替代长期吞吐；串口枚举0个，真实交换机SSH仍缺目标。RDP断开重连/缩放继续暂缓，主题/语言/许可页/退出等现场全套未重做，不自动正式迁移。诊断探针的白名单/参数/目录假设/ValuePattern失败及纠正均保留。
 
-### 2026-11-02 上传回执与Shell可读状态（jlai.5）
+### 2026-11-02 上传回执与Shell可读状态
 
-当前运行MCP实际preview.14，源码preview.17已有上传最终回执的保留/合并，现场工具缺路径为旧服务未更新。新构建进一步明确跨平台绝对路径有效性、旧Agent未知路径状态、嵌套SHA冲突；summary直接显示Agent实际绝对路径，永不拿MCP本机根拼出Agent位置。观察窗按明确标注的响应事件隐藏Shell内部JSON，Open/Close/命令结束呈现易读状态，真实stdout JSON、分片无换行、脱敏、stderr/退出码、原wire字段保持。
+该次现场运行的旧版MCP尚未包含上传最终回执的保留/合并，现场工具缺路径为旧服务未更新。新构建进一步明确跨平台绝对路径有效性、旧Agent未知路径状态、嵌套SHA冲突；summary直接显示Agent实际绝对路径，永不拿MCP本机根拼出Agent位置。观察窗按明确标注的响应事件隐藏Shell内部JSON，Open/Close/命令结束呈现易读状态，真实stdout JSON、分片无换行、脱敏、stderr/退出码、原wire字段保持。
 
-无弹窗：MCP69通过/2原生凭据库测试忽略，观察投影39、隐藏Shell真实wire集成1、Host36、Native118、候选8及严格Clippy通过。新脚本真实debug与最终发布CLI Agent/Relay/MCP各24项上传检查通过；最终j5 EXE98项无窗口检查通过。原始CMD夹具提示符/函数lint和发布MCP子系统预检失败均保留，修正后复验不放宽业务断言。最终Agent6632448字节，8099ac144ae1d8fb452478e2b45498bc3f604c017c45bda58fa3431632fe5ca2；MCP17摘要edab4ea10f26b07c2994d21ca6d20cca68147e3647465f7a028b5a5ec05c5f23。
+无弹窗：MCP69通过/2原生凭据库测试忽略，观察投影39、隐藏Shell真实wire集成1、Host36、Native118、候选8及严格Clippy通过。新脚本真实debug与最终发布CLI Agent/Relay/MCP各24项上传检查通过；最终候选EXE98项无窗口检查通过。原始CMD夹具提示符/函数lint和发布MCP子系统预检失败均保留，修正后复验不放宽业务断言。
 
-新Agent单EXE及独立配套MCP zip交付桌面/Z盘，旧10项产品/二进制及正在运行MCP14保留。未弹窗、未操作现场、未切换MCP/Relay。依JLAI AGENTS，服务启用/替换/重载另行授权；新文本可见验收、启用后的现场回执待复验。RDP/缩放、真实设备、长期吞吐等继续暂缓/待验，不自动正式迁移。完整文件清单、命令与证据见相邻JLAI docs/JLAI-上传回执与Shell观察窗验收-0.4.0-jlai.5.md 与 artifacts/win32-single/0.4.0-jlai.5-20261102/archive。
+未弹窗、未操作现场、未切换MCP/Relay。新文本可见验收、启用后的现场回执待复验。RDP/缩放、真实设备、长期吞吐等继续暂缓/待验，不自动正式迁移。
 
 ## 2026-11-02 提交前整理与仍待验事项
 
 用户确认整理本轮改动并推送当前候选分支。公共实现与定制产品分别提交到各自仓库；不合并 main，不把测试包、运行配置、凭据和原始日志提交到公共仓库。第三方 Plink 仅保留许可与固定摘要/打包规则，二进制不进入源码提交。Slint 试验源码及依赖不再参与活动构建，历史比较报告保留。
 
-审查补齐 MCP preview.17 的安装器、验证脚本和 README 版本；独立 MCP 打包从 Cargo metadata.target_directory 取程序，跟随 CARGO_TARGET_DIR，避免误用工作区旧 target/release。未重新构建或重标已交付的 j5 内容哈希生成物。
+审查补齐 MCP preview.17 的安装器、验证脚本和 README 版本；独立 MCP 打包从 Cargo metadata.target_directory 取程序，跟随 CARGO_TARGET_DIR，避免误用工作区旧 target/release。未重新构建或重标已交付的定制候选内容哈希生成物。
 
-本轮只执行无弹窗验证。RDP、100%→150%→200%→100% 缩放、真实交换机/物理串口、j5 可见文案与现场性能门槛继续待验；并排安装后的 MCP 版本和现场连接复验不计入本轮。保持旧版和现有进程，未操作 Relay。
+本轮只执行无弹窗验证。RDP、100%→150%→200%→100% 缩放、真实交换机/物理串口、定制候选可见文案与现场性能门槛继续待验；并排安装后的 MCP 版本和现场连接复验不计入本轮。保持旧版和现有进程，未操作 Relay。
 
-提交前新增核验：`cargo fmt --all -- --check`、host/native/MCP/operation_log 共 262 项测试通过（MCP 两项凭据存储测试保持 ignored）；Node 支持测试 27 项、公共 PowerShell 语法 30 文件、Node 语法 7 文件、Python AST 1 文件、定制产品 PowerShell 语法 3 文件、正式产品固定底座校验及已交付 j5 EXE 的 98 项无窗口检查通过。实际 Cargo metadata 确认 CARGO_TARGET_DIR 指向 C 盘。不据此声称完整标准发布重构建、新安装登记、可见界面或现场功能已重验。
+提交前新增核验：`cargo fmt --all -- --check`、host/native/MCP/operation_log 共 262 项测试通过（MCP 两项凭据存储测试保持 ignored）；Node 支持测试 27 项、公共 PowerShell 语法 30 文件、Node 语法 7 文件、Python AST 1 文件、定制产品 PowerShell 语法 3 文件、正式产品固定底座校验及已交付定制候选 EXE 的 98 项无窗口检查通过。实际 Cargo metadata 确认 CARGO_TARGET_DIR 指向 C 盘。不据此声称完整标准发布重构建、新安装登记、可见界面或现场功能已重验。
 
 PuTTY LICENCE.txt 使用 Git `-text` 属性保留上游原始字节，避免 core.autocrlf 改写后破坏 Copy-BundledPlink 的固定摘要校验；暂存区 blob 另行核验官方 SHA-256。

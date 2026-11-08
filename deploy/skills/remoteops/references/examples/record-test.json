@@ -1,0 +1,21 @@
+{
+  "request_id": "example-record-test-001",
+  "expected_revision": 1,
+  "command": {
+    "action": "record_test",
+    "tool_id": "sample-stdio-mcp",
+    "version": "1.0.0",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "record": {
+      "os": "windows",
+      "arch": "x86_64",
+      "environment": "待替换为真实操作系统、Windows build、运行模式和依赖环境",
+      "desktop": false,
+      "windows_build": null,
+      "status": "pending",
+      "result": "尚未实际测试；执行后替换为真实步骤、退出状态和观察结果",
+      "tested_at": "2026-11-05T00:00:00Z",
+      "recorded_by": ""
+    }
+  }
+}

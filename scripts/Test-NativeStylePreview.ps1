@@ -4,6 +4,7 @@
 param(
     [string]$Executable,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ExpectedHash,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedVersion,
     [string]$OutputDirectory,
     [switch]$ClearBackOnly,
     [switch]$FocusBeforeInvoke,
@@ -25,7 +26,7 @@ if($Action -ne 'Validate'){
     if($process.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId){throw 'Preview session mismatch'}
     if($process.StartTime.ToUniversalTime().ToString('o') -cne $ProcessStartUtc -or
         (Get-FileHash -LiteralPath $process.MainModule.FileName).Hash -ine $ExpectedHash -or
-        [Diagnostics.FileVersionInfo]::GetVersionInfo($process.MainModule.FileName).ProductVersion -notin @('0.3.1','0.3.2','0.3.3','0.3.4','0.3.5','0.3.6','0.3.7','0.3.8','0.4.0','0.4.0-jlai.2','0.4.0-jlai.3','0.4.0-jlai.4','0.4.0-jlai.5')){throw 'Preview identity mismatch'}
+        [Diagnostics.FileVersionInfo]::GetVersionInfo($process.MainModule.FileName).ProductVersion -cne $ExpectedVersion){throw 'Preview identity mismatch'}
     & (Join-Path $PSScriptRoot '../crates/remoteops-visual/src/windows_uia_initialize.ps1')|Out-Null
     Add-Type -TypeDefinition @'
 using System;using System.Collections.Generic;using System.Runtime.InteropServices;using System.Text;
@@ -176,7 +177,7 @@ $temporary=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('Loca
 $output=[IO.Path]::GetFullPath($OutputDirectory)
 if(-not $temporary.StartsWith('C:\',[StringComparison]::OrdinalIgnoreCase) -or -not $output.StartsWith($temporary.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase) -or (Test-Path -LiteralPath $output)){throw 'Require new C-temp output'}
 $exe=(Resolve-Path -LiteralPath $Executable).Path
-if((Get-FileHash -LiteralPath $exe).Hash -ine $ExpectedHash){throw 'Preview hash mismatch'}
+if((Get-FileHash -LiteralPath $exe).Hash -ine $ExpectedHash -or [Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion -cne $ExpectedVersion){throw 'Preview hash or version mismatch'}
 New-Item -ItemType Directory -Path $output|Out-Null
 $start=[Diagnostics.ProcessStartInfo]::new($exe);$start.UseShellExecute=$false;$start.WorkingDirectory=$output;$start.RedirectStandardError=$true
 foreach($key in @('APPDATA','LOCALAPPDATA','TEMP','TMP')){$directory=Join-Path $output $key.ToLowerInvariant();New-Item -ItemType Directory -Path $directory|Out-Null;$start.Environment[$key]=$directory}
@@ -187,7 +188,7 @@ function Client([string]$Operation='Snapshot',[int]$Id=0,[string]$Text,[string]$
     $script:step=$Operation+'_'+$Id
     $client=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'));$client.UseShellExecute=$false;$client.CreateNoWindow=$true;$client.RedirectStandardOutput=$true;$client.RedirectStandardError=$true
     $client.StandardOutputEncoding=[Text.UTF8Encoding]::new($false)
-    foreach($arg in @('-NoProfile','-STA','-File',$PSCommandPath,'-ExpectedHash',$ExpectedHash,'-Action',$Operation,'-ProcessId',[string]$app.Id,'-ProcessStartUtc',$identity,'-ControlId',[string]$Id)){$client.ArgumentList.Add($arg)}
+    foreach($arg in @('-NoProfile','-STA','-File',$PSCommandPath,'-ExpectedHash',$ExpectedHash,'-ExpectedVersion',$ExpectedVersion,'-Action',$Operation,'-ProcessId',[string]$app.Id,'-ProcessStartUtc',$identity,'-ControlId',[string]$Id)){$client.ArgumentList.Add($arg)}
     if($PSBoundParameters.ContainsKey('Text')){$client.ArgumentList.Add('-Value');$client.ArgumentList.Add($Text)}
     if($Capture){$client.ArgumentList.Add('-OutputPath');$client.ArgumentList.Add($Capture)}
     $child=[Diagnostics.Process]::Start($client);$stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync()
@@ -268,7 +269,7 @@ try{
     Check 'setup_long_unicode_value_is_preserved' ((Row $s 502).text -ceq $longAddress)
     $null=Client 'Invoke' 505
     $null=Client 'Command' 5021;$s=Wait-Control 541;Capture 'about-light-zh' 541
-    Check 'about_version_is_separate_from_description' ((Row $s 543).text -match 'v0.4.0' -and (Row $s 542).text -notmatch 'v0.4.0')
+    Check 'about_version_is_separate_from_description' ((Row $s 543).text.Contains("v$ExpectedVersion") -and -not (Row $s 542).text.Contains("v$ExpectedVersion"))
     Check 'about_button_has_native_invoke' ((Row $s 541).invoke)
     $null=Client 'Invoke' 541;$s=Wait-Control 303
     Check 'about_close_restores_main' (@($s.windows|Where-Object class -eq 'RemoteOpsStylePreviewMain')[0].enabled)
@@ -315,7 +316,7 @@ try{
 }catch{$failure=[pscustomobject]@{step=$step;category=if($_.Exception.Message -match 'desktop_'){'environment_unavailable'}else{'style_preview_or_fixture_failure'};detail=$_.Exception.Message}}
 finally{
     if(-not $app.HasExited){try{$null=Client 'Close';$null=Wait-Control 463;$null=Client 'Invoke' 463;$null=$app.WaitForExit(5000)}catch{};if(-not $app.HasExited){$app.Kill();$app.WaitForExit();$failure??=[pscustomobject]@{step='cleanup';category='preview_forced_exit'}}}
-    $applicationExit=if($app.HasExited){$app.ExitCode}else{$null};if($applicationError.IsCompleted -and -not [string]::IsNullOrWhiteSpace($applicationError.Result)){[IO.File]::WriteAllText((Join-Path $output 'application-error.txt'),$applicationError.Result)};$app.Dispose();$record=[pscustomobject]@{passed=$null -eq $failure;executable_sha256=$ExpectedHash.ToLowerInvariant();checks=@($checks);failure=$failure;application_exit_code=$applicationExit;clear_back_only=[bool]$ClearBackOnly;demo_only=$true;real_business_verified=$false;rdp_dpi_verified=$false}
+    $applicationExit=if($app.HasExited){$app.ExitCode}else{$null};if($applicationError.IsCompleted -and -not [string]::IsNullOrWhiteSpace($applicationError.Result)){[IO.File]::WriteAllText((Join-Path $output 'application-error.txt'),$applicationError.Result)};$app.Dispose();$record=[pscustomobject]@{passed=$null -eq $failure;executable_sha256=$ExpectedHash.ToLowerInvariant();product_version=$ExpectedVersion;checks=@($checks);failure=$failure;application_exit_code=$applicationExit;clear_back_only=[bool]$ClearBackOnly;demo_only=$true;real_business_verified=$false;rdp_dpi_verified=$false}
     [IO.File]::WriteAllText((Join-Path $output 'report.json'),($record|ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
 }
 $record|ConvertTo-Json -Depth 6
