@@ -38,7 +38,7 @@
 | 最终真实输出并行 | operations 场景 39/39，内含独立保存的 24/24 剪贴板并行子检查；实际输出序号 108→1910，最后标记到达；复制期间最大 Invoke 56ms |
 | 最终呈现与退出 | 最大 tick 27ms、页转场 51ms，不超过 100ms；退出前 pending=0、实际观察文本与模型一致，正常退出码 0 |
 
-最终 EXE 的 SHA-256 为 `0256527a1e8ab29fa3a93a17a63a3c37ad586742690a555b9e0c3a0aab9cd79e`。交付与真实并行结果见[运行说明](../artifacts/native-ui-clipboard-0.2.2-20261031/delivery/README.md)和[结构化清单](../artifacts/native-ui-clipboard-0.2.2-20261031/comparison.json)。
+最终 EXE 的 SHA-256 为 `0256527a1e8ab29fa3a93a17a63a3c37ad586742690a555b9e0c3a0aab9cd79e`。交付与真实并行结果见运行说明（本机归档 `artifacts/native-ui-clipboard-0.2.2-20261031/delivery/README.md`）和结构化清单（本机归档 `artifacts/native-ui-clipboard-0.2.2-20261031/comparison.json`）。
 
 ## 失败历史和剩余项
 

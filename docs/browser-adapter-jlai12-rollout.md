@@ -22,7 +22,7 @@
 - 独立 Skill 安装与旧布局兼容：23 项通过。
 - 隔离真实后台验证全局说明、权限交互和适配提示；桌面 1440×900、手机 390×844 四张适配截图已实际查看，无文档横向溢出。旧目录示例只注入隔离页面用于展示，管理约束另由真实工具中心测试覆盖。
 
-截图：[桌面警告](../output/playwright/browser-adapter/desktop-adapter-warning.png)、[手机警告](../output/playwright/browser-adapter/mobile-adapter-warning.png)、[桌面编辑](../output/playwright/browser-adapter/desktop-adapter-editor.png)、[手机编辑](../output/playwright/browser-adapter/mobile-adapter-editor.png)。
+截图：桌面警告（本机归档 `output/playwright/browser-adapter/desktop-adapter-warning.png`）、手机警告（本机归档 `output/playwright/browser-adapter/mobile-adapter-warning.png`）、桌面编辑（本机归档 `output/playwright/browser-adapter/desktop-adapter-editor.png`）、手机编辑（本机归档 `output/playwright/browser-adapter/mobile-adapter-editor.png`）。
 
 ## 构建与部署
 

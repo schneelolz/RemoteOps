@@ -96,7 +96,7 @@
 
 - 系统标题缩短，版本移至版本信息；状态标题减轻字重，标题、圆点、齿轮纵向对齐。暗色调用系统 DWM 标题栏接口，不引入新的 GUI 框架。
 - 主窗底部为“连接详情 / 实时日志 / 操作实况 / 退出 Agent”。操作实况按钮按真实可见状态显示或隐藏同一个观察窗；关闭和再次打开保留内容，打开不抢前台焦点。详情中的观察窗入口继续保留。
-- 12 类窗体／状态各拍亮暗两张，共 24 张原生实拍：等待连接、设置菜单、连接详情、连接演示、权限、权限二次确认、退出、首次设置、TLS、日志、观察窗、版本信息。相册：[逐窗体亮暗对照](../artifacts/native-style-preview-0.3.2-20261031/gallery/index.html)。原生设置菜单仍跟随 Windows 系统颜色；未改色截图。全部实际 96 DPI，不代表高 DPI 验收。
+- 12 类窗体／状态各拍亮暗两张，共 24 张原生实拍：等待连接、设置菜单、连接详情、连接演示、权限、权限二次确认、退出、首次设置、TLS、日志、观察窗、版本信息。相册：逐窗体亮暗对照（本机归档 `artifacts/native-style-preview-0.3.2-20261031/gallery/index.html`）。原生设置菜单仍跟随 Windows 系统颜色；未改色截图。全部实际 96 DPI，不代表高 DPI 验收。
 - 最终独立生成物：`artifacts/native-style-preview-0.3.2-20261031/delivery/RemoteOps-Win32-StylePreview.exe`，313,856 字节（306.5 KiB），比 0.3.1 增加 2,048 字节；SHA-256：`cb8b034599af128037195d5080f5bc0ce4c92e2dbf2c1daab2059a17a633e2b2`。仍不含 Agent 运行时，不能作为正式产品体积。
 - 验证：`cargo test --offline --locked -p remoteops-agent-native-prototype --no-default-features --features style-preview` 30 项通过；对应 Clippy `--all-targets -- -D warnings`、原生与共享宿主格式检查通过。
 - `scripts/Test-NativeStylePreview.ps1` 30 项窗口回归通过，包含入口显隐、关闭重开、同 HWND / 内容保持、只读及不抢焦点；进程正常退出 0。`scripts/Capture-NativeStyleWindows.ps1` 独立截图流程 64 项通过，24 个文件摘要核验一致，两个主题测试进程均正常退出 0。候选和最终交付 EXE 的 SHA-256 完全一致，证据位于该交付目录 `evidence` 和 `gallery/index.json`。
@@ -116,7 +116,7 @@
 
 另保留两次相册夹具失败：一次菜单未收起、一次后台菜单未出现。截图客户端现先通过 UIA 聚焦本次进程的齿轮，再打开原生菜单；选择后向该主窗发送 WM_CANCELMODE 收起。独立菜单探针实测打开 1 个、收起后 0 个、正常退出，未改产品菜单实现；超时夹具新增最后快照记录。
 
-最终相册入口：[逐窗体亮暗对照](../artifacts/native-style-preview-0.3.3-20261031/gallery/index.html)。截图实际数量、DPI、窗口边界、文件摘要及逐项检查见同目录 `index.json`；未进行 RDP、屏幕缩放、真实 SSH 或物理串口测试。正式业务绑定继续等待样式确认。
+最终相册入口：逐窗体亮暗对照（本机归档 `artifacts/native-style-preview-0.3.3-20261031/gallery/index.html`）。截图实际数量、DPI、窗口边界、文件摘要及逐项检查见同目录 `index.json`；未进行 RDP、屏幕缩放、真实 SSH 或物理串口测试。正式业务绑定继续等待样式确认。
 ## 0.3.4 日志紧凑排列与主窗按钮统一
 
 2026-10-31 用户确认继续，并授权同区域的小幅合理修整。当前分支不变；旧 GUI、此前核心及 0.3.1／0.3.2／0.3.3 样式生成物保留，9 项基线摘要一致。仅修改样式模块、相关测试和构建版本，不接入业务，不改 RDP 或缩放。
@@ -127,7 +127,7 @@
 - `cargo test --offline --locked -p remoteops-agent-native-prototype --no-default-features --features style-preview`：31 项通过。`cargo clippy --offline --locked -p remoteops-agent-native-prototype --no-default-features --features style-preview --all-targets -- -D warnings`、`cargo fmt -p remoteops-agent-native-prototype -p remoteops-agent-desktop-host -- --check` 通过。
 - `scripts/Test-NativeStylePreview.ps1 -Executable <最终EXE> -ExpectedHash <上述SHA256> -ExpectedVersion <产品版本> -OutputDirectory <全新的C盘TEMP子目录>`：最终 EXE 52 项窗口回归通过、退出 0。覆盖四按钮绝对尺寸／相同宽高／等间距、中文和英文含 Hide viewer 状态下的文字容纳、观察窗显隐／内容／焦点、日志四条无额外空段落、错误筛选、恢复全部、清空后仍只读，以及此前输入框和弹窗回归。
 - 独立旧版 0.3.3 对照复现额外空段落，保留 4 条非空记录，按钮宽度分别 116／88／108／118；原始文本与尺寸见 `evidence/old-033-comparison.json`。只操作新启动的对照进程，未关闭用户的旧版预览。
-- 本轮定向提供主窗、日志页亮暗 4 图，另附暗色英文观察窗打开状态图：[本轮亮暗对照](../artifacts/native-style-preview-0.3.4-20261031/gallery/index.html)。未重拍所有 24 张；相册明确链接 0.3.3 的完整窗体对照。截图均为原始 PNG，不改色；摘要见同目录 `index.json`。
+- 本轮定向提供主窗、日志页亮暗 4 图，另附暗色英文观察窗打开状态图：本轮亮暗对照（本机归档 `artifacts/native-style-preview-0.3.4-20261031/gallery/index.html`）。未重拍所有 24 张；相册明确链接 0.3.3 的完整窗体对照。截图均为原始 PNG，不改色；摘要见同目录 `index.json`。
 - 中间失败保留：初次 Clippy 发现 UTF-16 长度转换风险，改用有界 `try_from`；首轮 UIA 字宽测量直接复用另一进程的 HFONT 导致默认字体测量偏大，夹具现读取实际 LOGFONT、在测试进程创建并释放副本。初次报告、错误测量快照和 Clippy 日志保留在 `evidence`；修正后尺寸与文字检查通过。独立只读代码复核已完成，补上其建议的绝对尺寸断言。
 
 本轮仍是合成数据的纯样式预览；未验证真实业务、RDP 断开重连、高 DPI 往返、真实交换机或物理串口。既有待验事项不变，未决定正式迁移。
@@ -140,7 +140,7 @@
 - `cargo test --offline --locked -p remoteops-agent-native-prototype --no-default-features --features style-preview` 31 项通过；`cargo clippy --offline --locked -p remoteops-agent-native-prototype --no-default-features --features style-preview --all-targets -- -D warnings`、`cargo fmt -p remoteops-agent-native-prototype -p remoteops-agent-desktop-host -- --check` 通过。
 - 新增实际截图像素回归：`scripts/Test-NativeStyleExitBackground.ps1 -Executable <EXE> -ExpectedHash <SHA256> -OutputDirectory <全新的C盘TEMP目录>`。修复版 19 项通过，包括浅色、弹窗打开时切换深色／浅色、深色重新打开；每帧比较正文 3 个空白点、父卡片和外部普通底色，验证颜色一致且外部不受影响。另验证 owner 禁用、取消和关闭恢复主窗、正常退出 0。
 - 对精确 0.3.4 EXE 以 `-ExpectMismatch` 运行同脚本，19 项负对照通过，四帧正文均与父卡片不同色，复现用户截图；不是把旧版当作修复通过。两次原始报告分别保留在 `evidence/exit-final` 和 `evidence/exit-old-negative`。
-- 本轮实际 DPI 96；[修复后亮色](../artifacts/native-style-preview-0.3.5-20261031/evidence/exit-final/exit-light.png)、[修复后暗色](../artifacts/native-style-preview-0.3.5-20261031/evidence/exit-final/exit-dark-reopened.png) 已逐张查看，另外两张主题切换原图与 SHA 在同目录。只进行退出窗口定向回归，没有重跑 52 项完整窗口套件或重拍全部 24 图。
+- 本轮实际 DPI 96；修复后亮色（本机归档 `artifacts/native-style-preview-0.3.5-20261031/evidence/exit-final/exit-light.png`）、修复后暗色（本机归档 `artifacts/native-style-preview-0.3.5-20261031/evidence/exit-final/exit-dark-reopened.png`） 已逐张查看，另外两张主题切换原图与 SHA 在同目录。只进行退出窗口定向回归，没有重跑 52 项完整窗口套件或重拍全部 24 图。
 
 仍为独立样式预览；真实业务、RDP、屏幕缩放和真实设备联调待验。本轮没有更改系统主题、缩放或远端连接。
 
@@ -161,7 +161,7 @@
 
 Windows 实现依据：[分层子窗兼容要求](https://learn.microsoft.com/en-us/windows/win32/winmsg/using-windows#using-layered-windows)、[透明分层窗口命中行为](https://learn.microsoft.com/en-us/windows/win32/winmsg/window-features#layered-windows)、[GetScrollBarInfo](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getscrollbarinfo)。GetForegroundWindow 在失活转换时可以合法返回 NULL，单凭空值不可判定真实锁屏，参见[微软说明](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getforegroundwindow)。
 
-本轮[亮暗实拍相册](../artifacts/native-style-preview-0.3.6-20261101/gallery/index.html)包含主窗、退出、日志、TLS、观察窗共 5 对／10 张原始 PNG，另附 4 张按住原生滑块时的真实屏幕图及返回最新图；并非重拍全部 24 张。原图摘要见同目录 `index.json`；交付证据汇总为 `evidence/verification.json`，中间失败未覆盖。实际为本机 96 DPI。未调整系统主题／显示缩放、未操作 RDP、未连接交换机或物理串口。正式业务绑定、真实设备、RDP 断开重连和高 DPI 往返继续待验，未决定正式迁移。
+本轮亮暗实拍相册（本机归档 `artifacts/native-style-preview-0.3.6-20261101/gallery/index.html`）包含主窗、退出、日志、TLS、观察窗共 5 对／10 张原始 PNG，另附 4 张按住原生滑块时的真实屏幕图及返回最新图；并非重拍全部 24 张。原图摘要见同目录 `index.json`；交付证据汇总为 `evidence/verification.json`，中间失败未覆盖。实际为本机 96 DPI。未调整系统主题／显示缩放、未操作 RDP、未连接交换机或物理串口。正式业务绑定、真实设备、RDP 断开重连和高 DPI 往返继续待验，未决定正式迁移。
 
 ## 0.3.7 观察窗分类筛选与并发状态演示
 
@@ -184,7 +184,7 @@ Windows 实现依据：[分层子窗兼容要求](https://learn.microsoft.com/en
 
 中间问题和证据保留：只读代码审查发现隐藏重开／菜单结束可能残留旧状态，已补主动同步；发现暂停中主题重建会推进正文，已保留旧正文并补单测。首次 GUI 夹具错误要求多行原生 EDIT 的 UIA ControlType 必须是 Edit；本机实际为 Document，已改为允许这两种系统映射，并独立核验真实窗口类 EDIT、ES_READONLY 和只读模式，未改产品控件。另有两次后台 UIA Invoke 没有产生预期按钮动作（第二轮暂停、首次打开观察窗），进程正常退出；现场不足以认定产品死锁。夹具新增显式 `-FocusBeforeInvoke`，只对核验后的本次按钮调用 UIA SetFocus，再单次 Invoke 并等待实际状态；默认行为不变，自动显示不抢焦点需单独以无聚焦的 Command 验证，不以“先聚焦”冒充无焦点验收。该调整与[微软关于非活动对话框 BM_CLICK 可能失败的说明](https://learn.microsoft.com/en-us/windows/win32/controls/bm-click)一致，但未声称已证明本机 UIA 内部具体消息实现。聚焦短探针 13 项通过；一次后续整轮因前台 HWND 在 PID 查询前已失效（错误 1400）而被桌面门禁中断，当时输入桌面有效，并非已确认锁屏。夹具对已确证销毁的前台句柄增加最多 11 次／约 500ms 有界重采，未知活窗口仍拒绝，并继续使用输入桌面身份校验；旧 14 项与新增 19 项纯决策矩阵通过。随后诊断确认前台曾指向本次小样的 Button，排除 worker 临时窗口猜测，但未唯一归因至 UIA 内部调用；尝试顶层 UIA SetFocus 被系统明确拒绝，已保留失败并恢复经过两次 13 项探针验证的原生按钮聚焦路径，不引入额外激活手段。相关失败与诊断保留。最终 GUI 结果与原始截图存交付目录 evidence，不将初次夹具失败当作产品失败或最终通过。
 
-本轮[观察窗分类／并发亮暗相册](../artifacts/native-style-preview-0.3.7-20261101/gallery/index.html)提供 3 组亮暗对照与 3 张阶段图，共 9 张原始 PNG，图片摘要与尺寸见同目录 `index.json`。完整通过报告、未完成的复制复验、旧失败和 12 份旧版摘要统一保留在 `evidence`。
+本轮观察窗分类／并发亮暗相册（本机归档 `artifacts/native-style-preview-0.3.7-20261101/gallery/index.html`）提供 3 组亮暗对照与 3 张阶段图，共 9 张原始 PNG，图片摘要与尺寸见同目录 `index.json`。完整通过报告、未完成的复制复验、旧失败和 12 份旧版摘要统一保留在 `evidence`。
 
 本轮仍为合成状态和合成输出；没有执行截图内的命令、没有读取真实凭据、没有连接设备。真实业务绑定、真实交换机／物理串口、RDP 断开重连、高 DPI 往返继续待验；不据此决定正式迁移。
 
@@ -197,7 +197,7 @@ Windows 实现依据：[分层子窗兼容要求](https://learn.microsoft.com/en
 - 最终独立交付：`artifacts/native-style-preview-0.3.8-20261101/delivery/RemoteOps-Win32-StylePreview.exe`，355328 字节（347 KiB），与 0.3.7 同体积，SHA-256：`27373496b7bdd85e26b284c926ebfe26e2eecfc809044ed80876edf41e81b777`。13 项旧生成物摘要一致，旧版保留，未替换安装。
 - `cargo test --offline --locked -p remoteops-agent-native-prototype --no-default-features --features style-preview`：53 项通过；同特性 `cargo clippy ... --all-targets -- -D warnings` 与 `cargo fmt -p remoteops-agent-native-prototype -p remoteops-agent-desktop-host -- --check` 通过。
 
-- `pwsh -NoProfile -STA -File scripts/Test-NativeStyleObserverWindow.ps1 -Executable <最终EXE> -ExpectedHash <上述SHA256> -OutputDirectory <新C盘Temp目录>`：最终 37/37 通过，退出 0，8 次最大化／还原均实际使用系统 UIA WindowPattern，没有走原生后备。亮暗正常／最大化／还原共 6 张原图摘要核验一致；三种 client 尺寸、分类保持、最大化隐藏重开仍最大化、最小化重开恢复普通、同 HWND、自动显示有效前台不变均实际验证。[窗口亮暗实拍](../artifacts/native-style-preview-0.3.8-20261101/gallery/index.html)，完整报告为 `evidence/window-final/report.json`。
+- `pwsh -NoProfile -STA -File scripts/Test-NativeStyleObserverWindow.ps1 -Executable <最终EXE> -ExpectedHash <上述SHA256> -OutputDirectory <新C盘Temp目录>`：最终 37/37 通过，退出 0，8 次最大化／还原均实际使用系统 UIA WindowPattern，没有走原生后备。亮暗正常／最大化／还原共 6 张原图摘要核验一致；三种 client 尺寸、分类保持、最大化隐藏重开仍最大化、最小化重开恢复普通、同 HWND、自动显示有效前台不变均实际验证。窗口亮暗实拍（本机归档 `artifacts/native-style-preview-0.3.8-20261101/gallery/index.html`），完整报告为 `evidence/window-final/report.json`。
 
 初次定向实测在前 29 项通过后发现最大化隐藏再重开会恢复为普通大小；原因是重复使用 `SW_SHOWNOACTIVATE`。已修正现有窗口显示方式，原始失败、6 张截图和正常退出记录保留在 `evidence/window-first-failure`。最终实际窗口测试结果单独保留，不引用首轮失败当作完成。
 

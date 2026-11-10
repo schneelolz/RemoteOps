@@ -4,6 +4,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = readFileSync(new URL('../relay-admin-prototype/app.js', import.meta.url), 'utf8');
+const toolsSource = readFileSync(new URL('../relay-admin-prototype/tools.js', import.meta.url), 'utf8');
 
 // 在隔离的浏览器环境运行真实业务函数，不连接实际 Relay 或关闭节点。
 function harness({ preference, dark = false } = {}) {
@@ -64,6 +65,7 @@ function harness({ preference, dark = false } = {}) {
     },
   });
   vm.runInContext(source, context, { filename: 'relay-admin-prototype/app.js' });
+  vm.runInContext(toolsSource, context, { filename: 'relay-admin-prototype/tools.js' });
   vm.runInContext(`
     globalThis.realRenderModal = renderModal;
     renderApp = () => {};

@@ -26,12 +26,12 @@
 
 已实际打开并检查桌面 1440×900、手机 390×844 截图。全局说明按源文展示，编辑区及按钮正常换行；客户端权限在手机端纵向排列，无文档横向溢出。长内容在原后台内容区滚动。
 
-- [桌面说明](../output/playwright/tool-center-guide/desktop-guide.png)
-- [桌面编辑](../output/playwright/tool-center-guide/desktop-guide-editor.png)
-- [手机说明内容](../output/playwright/tool-center-guide/mobile-guide-content.png)
-- [手机编辑及操作](../output/playwright/tool-center-guide/mobile-guide-editor-actions.png)
-- [桌面权限](../output/playwright/tool-center-guide/desktop-permission.png)
-- [手机权限](../output/playwright/tool-center-guide/mobile-permission.png)
+- 桌面说明（本机归档 `output/playwright/tool-center-guide/desktop-guide.png`）
+- 桌面编辑（本机归档 `output/playwright/tool-center-guide/desktop-guide-editor.png`）
+- 手机说明内容（本机归档 `output/playwright/tool-center-guide/mobile-guide-content.png`）
+- 手机编辑及操作（本机归档 `output/playwright/tool-center-guide/mobile-guide-editor-actions.png`）
+- 桌面权限（本机归档 `output/playwright/tool-center-guide/desktop-permission.png`）
+- 手机权限（本机归档 `output/playwright/tool-center-guide/mobile-permission.png`）
 
 ## 审查与剩余边界
 

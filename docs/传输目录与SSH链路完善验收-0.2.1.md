@@ -34,7 +34,7 @@ SSH 随包使用固定官方 x64 Plink 0.83，不内嵌源码，不自动下载�
 
 ## 验证与证据
 
-独立交付与哈希见[交付目录](../artifacts/native-ui-transfer-ssh-0.2.1-20261031/delivery/README.md)和[结构化清单](../artifacts/native-ui-transfer-ssh-0.2.1-20261031/comparison.json)。版本为 native 0.2.1、Agent preview.30、MCP preview.17；本轮没有新增 wire 操作，协议仍为 18，可选上下文字段兼容旧组件。
+独立交付与哈希见交付目录（本机归档 `artifacts/native-ui-transfer-ssh-0.2.1-20261031/delivery/README.md`）和结构化清单（本机归档 `artifacts/native-ui-transfer-ssh-0.2.1-20261031/comparison.json`）。版本为 native 0.2.1、Agent preview.30、MCP preview.17；本轮没有新增 wire 操作，协议仍为 18，可选上下文字段兼容旧组件。
 
 | 验证 | 结果 |
 |---|---|

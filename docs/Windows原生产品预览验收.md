@@ -31,7 +31,7 @@
 
 2026-10-31 最终本机验收完成；所有以下 GUI 结果对应同一 EXE：SHA-256 `2a91c3063f6d6aa5a8c4b43ec0115bbf7dec66b41afa283bbae45bac782f248f`。
 
-交付：[运行说明](../artifacts/native-ui-product-preview-20261031/delivery/README.md)、[结构化汇总与验证命令](../artifacts/native-ui-product-preview-20261031/comparison.json)。主程序 6,345,728 字节（6.05 MiB），较保留旧 GUI 的 17,380,352 字节减少 63.5%；包含 Plink、askpass、许可和说明的整目录为 7,658,652 字节（7.30 MiB）。这不是单 EXE 总大小。
+交付：运行说明（本机归档 `artifacts/native-ui-product-preview-20261031/delivery/README.md`）、结构化汇总与验证命令（本机归档 `artifacts/native-ui-product-preview-20261031/comparison.json`）。主程序 6,345,728 字节（6.05 MiB），较保留旧 GUI 的 17,380,352 字节减少 63.5%；包含 Plink、askpass、许可和说明的整目录为 7,658,652 字节（7.30 MiB）。这不是单 EXE 总大小。
 
 | 验证 | 实际结果 |
 |---|---|
