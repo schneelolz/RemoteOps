@@ -1705,6 +1705,7 @@ impl process_wrap::tokio::CommandWrapper for SharedJob {
     }
 }
 
+#[cfg(windows)]
 fn cli_schemas() -> Vec<CallToolSchema> {
     [
         ("browser_open", "打开 URL", json!({"url":{"type":"string"}}), vec!["url"]),

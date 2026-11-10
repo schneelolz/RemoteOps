@@ -36,12 +36,12 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Test Relay admin setup flows
         run: node scripts/test-relay-admin.mjs
-      - name: Test isolated macOS and Windows setup installer flows
-        run: python3 scripts/Test-McpSetupInstallers.py --platform all
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Test isolated macOS and Windows setup installer flows
+        run: python3 scripts/Test-McpSetupInstallers.py --platform all
       - name: Test permission lifecycle on isolated loopback Relay
         run: python3 scripts/Test-ControlPermissions.py
       - name: Build standalone external product

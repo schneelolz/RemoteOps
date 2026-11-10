@@ -629,12 +629,12 @@ pub(crate) fn prepare_root(root: &Path) -> Result<()> {
 
 fn reject_link(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
-    let mut link = metadata.file_type().is_symlink();
+    let link = metadata.file_type().is_symlink();
     #[cfg(windows)]
-    {
+    let link = {
         use std::os::windows::fs::MetadataExt as _;
-        link |= metadata.file_attributes() & 0x400 != 0;
-    }
+        link || metadata.file_attributes() & 0x400 != 0
+    };
     if link {
         return Err(ResourceError::before(
             "unsafe_cache",
