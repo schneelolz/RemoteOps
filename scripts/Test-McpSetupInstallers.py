@@ -187,6 +187,18 @@ def fixture_process_alive(pid):
 class InstallerVersionTests(unittest.TestCase):
     targets = ("windows", "macos")
 
+    def test_windows_sources_preserve_utf8_bom_for_powershell_51(self):
+        for name in ("Install-RemoteOpsMcp.ps1", "Test-RemoteOpsMcp.ps1"):
+            path = ROOT / "deploy/controller-mcp/windows" / name
+            with self.subTest(script=name):
+                self.assertTrue(path.read_bytes().startswith(b"\xef\xbb\xbf"))
+
+    def test_macos_shell_variables_have_boundaries_before_non_ascii_text(self):
+        for path in (ROOT / "deploy/controller-mcp/macos").glob("*.sh"):
+            with self.subTest(script=path.name):
+                self.assertIsNone(re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]",
+                                            path.read_text(encoding="utf-8")))
+
     def test_templates_match_mcp_manifest(self):
         declarations = {
             "windows/Install-RemoteOpsMcp.ps1": r"^\$mcpVersion = '([^']+)'$",

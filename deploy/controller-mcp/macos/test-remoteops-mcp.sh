@@ -102,9 +102,9 @@ else
 fi
 for skill_path in "$HOME/.agents/skills/remoteops/SKILL.md" "$CODEX_HOME/skills/remoteops/SKILL.md"; do
   if [[ -f "$skill_path" ]]; then
-    echo "[信息] 发现独立 RemoteOps Skill：$skill_path；版本与完整性请使用 Skill 安装包核验。"
+    echo "[信息] 发现独立 RemoteOps Skill：${skill_path}；版本与完整性请使用 Skill 安装包核验。"
   else
-    echo "[信息] 未安装独立 RemoteOps Skill：$skill_path；不影响 MCP 自检。"
+    echo "[信息] 未安装独立 RemoteOps Skill：${skill_path}；不影响 MCP 自检。"
   fi
 done
 

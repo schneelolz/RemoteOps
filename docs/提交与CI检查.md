@@ -43,3 +43,5 @@ CI validate阶段将格式、check、严格Clippy与工作区测试安排在安�
 Linux真实CI暴露诊断夹具在读取初始化前退出的竞态，EOF场景可能变成写管道失败。将夹具的exit和invalid-json模式调整为先读取请求再产生预期故障，保持stage、reason、exit code和脱敏的精确断言。
 
 示例产品是独立workspace。公共依赖版本或依赖图变化时，同时用现有锁文件进行offline metadata核对并提交两个示例Cargo.lock，再执行locked消费者检查。Windows PE验收版本应由该产品Cargo metadata取得，保持产品名称、描述、版本和图标的实际校验。
+
+macOS原生CI发现系统Bash 3.2会将紧邻中文标点的未加花括号变量误识别为变量名。Shell变量后接中文时使用显式花括号边界，并在安装器版本预检中扫描此类写法；保留真实macOS安装、Keychain和发布包检查。
