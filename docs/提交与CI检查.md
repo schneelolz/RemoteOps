@@ -41,3 +41,5 @@
 CI validate阶段将格式、check、严格Clippy与工作区测试安排在安装器模拟流程之前，保留全部原有检查。这样可以在较早阶段发现格式、工具链和代码告警，减少安装器helper编译完成后才暴露静态问题的等待。Linux专属的可变绑定和Windows专属函数编译范围一并修正，后续仍以跨平台CI结果验收。
 
 Linux真实CI暴露诊断夹具在读取初始化前退出的竞态，EOF场景可能变成写管道失败。将夹具的exit和invalid-json模式调整为先读取请求再产生预期故障，保持stage、reason、exit code和脱敏的精确断言。
+
+示例产品是独立workspace。公共依赖版本或依赖图变化时，同时用现有锁文件进行offline metadata核对并提交两个示例Cargo.lock，再执行locked消费者检查。Windows PE验收版本应由该产品Cargo metadata取得，保持产品名称、描述、版本和图标的实际校验。

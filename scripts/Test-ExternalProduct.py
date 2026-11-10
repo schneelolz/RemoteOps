@@ -38,6 +38,10 @@ def main():
         for action in ('check', 'test', 'build'):
             run(['cargo', action, '--locked'], root, env)
         metadata = json.loads(run(['cargo', 'metadata', '--format-version', '1', '--locked'], root, env, True))
+        product_version = next(
+            package['version'] for package in metadata['packages']
+            if package['id'] == metadata['resolve']['root']
+        )
         assert Path(metadata['workspace_root']).resolve() == root
         for name in ('remoteops-agent-gui', 'remoteops-agent', 'remoteops-protocol', 'remoteops-domain', 'egui'):
             assert sum(p['name'] == name for p in metadata['packages']) == 1, name
@@ -55,7 +59,7 @@ def main():
         if os.name == 'nt':
             script = '''$ErrorActionPreference='Stop'
 $v = (Get-Item -LiteralPath $env:EXAMPLE_BINARY).VersionInfo
-if ($v.ProductName -ne 'Example Assist' -or $v.FileDescription -ne 'Example Assist field assistance' -or $v.ProductVersion -ne '1.0.0') { throw 'Incorrect product resources' }
+if ($v.ProductName -ne 'Example Assist' -or $v.FileDescription -ne 'Example Assist field assistance' -or $v.ProductVersion -ne $env:EXAMPLE_PRODUCT_VERSION) { throw 'Incorrect product resources' }
 Add-Type -AssemblyName System.Drawing
 $icon = [Drawing.Icon]::ExtractAssociatedIcon($env:EXAMPLE_BINARY)
 if ($null -eq $icon) { throw 'Missing executable icon' }
@@ -65,7 +69,7 @@ if ($pixel.R -ne 24 -or $pixel.G -ne 103 -or $pixel.B -ne 125) { throw 'Wrong pr
 $bitmap.Dispose()
 $icon.Dispose()
 '''
-            run(['pwsh', '-NoProfile', '-Command', script], root, dict(env, EXAMPLE_BINARY=str(binary)))
+            run(['pwsh', '-NoProfile', '-Command', script], root, dict(env, EXAMPLE_BINARY=str(binary), EXAMPLE_PRODUCT_VERSION=product_version))
             native = 'passed'
         report = {'external_workspace': str(root), 'build_info': info,
                   'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
