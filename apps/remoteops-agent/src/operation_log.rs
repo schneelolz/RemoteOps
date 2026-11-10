@@ -2268,7 +2268,7 @@ mod tests {
         );
         assert_eq!(
             states(&receiver),
-            [] as [(remoteops_domain::RequestId, AgentOperationState); 0]
+            Vec::<(remoteops_domain::RequestId, AgentOperationState)>::new()
         );
     }
 
@@ -2344,11 +2344,11 @@ mod tests {
         );
         assert_eq!(
             buffer.push("more material\n-----END PRIVATE KEY-----\n", &redactor),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
         assert_eq!(
             buffer.push(&"界".repeat(MAX_LINE_BYTES), &redactor),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
         assert!(buffer.pending.len() <= MAX_LINE_BYTES);
         assert_eq!(buffer.push("\n", &redactor), ["[单行输出过长，内容已隐藏]"]);
@@ -2365,11 +2365,11 @@ mod tests {
         );
         assert_eq!(
             buffer.push(&oversized_marker, &redactor),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
         assert_eq!(
             buffer.push("secret material\n", &redactor),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
         assert_eq!(
             buffer.push("-----END PRIVATE KEY-----\nvisible\n", &redactor),
@@ -2384,16 +2384,16 @@ mod tests {
         let mut buffer = OutputBuffer::default();
         assert_eq!(
             buffer.push("-----BEGIN PRIVATE ", &redactor),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
         let oversized_tail = format!("KEY-----{}\n", "x".repeat(MAX_LINE_BYTES));
         assert_eq!(
             buffer.push(&oversized_tail, &redactor),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
         assert_eq!(
             buffer.push("secret material\n", &redactor),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
         assert_eq!(
             buffer.push("-----END PRIVATE KEY-----\nnext\n", &redactor),
@@ -2407,18 +2407,15 @@ mod tests {
         let mut buffer = OutputBuffer::default();
         assert_eq!(
             buffer.push(&"x".repeat(MAX_LINE_BYTES + 1), &redactor),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
-        assert_eq!(
-            buffer.push("-----BEGIN ", &redactor),
-            [] as [std::string::String; 0]
-        );
+        assert_eq!(buffer.push("-----BEGIN ", &redactor), Vec::<String>::new());
         assert_eq!(
             buffer.push(
                 "PRIVATE KEY-----\nsecret material\n-----END PRIVATE KEY-----\n",
                 &redactor,
             ),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
         assert_eq!(buffer.push("next\n", &redactor), ["next"]);
     }
@@ -2429,18 +2426,15 @@ mod tests {
         let mut buffer = OutputBuffer::default();
         assert_eq!(
             buffer.push(&"x".repeat(MAX_LINE_BYTES), &redactor),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
-        assert_eq!(
-            buffer.push("-----BEGIN ", &redactor),
-            [] as [std::string::String; 0]
-        );
+        assert_eq!(buffer.push("-----BEGIN ", &redactor), Vec::<String>::new());
         assert_eq!(
             buffer.push(
                 "PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
                 &redactor,
             ),
-            [] as [std::string::String; 0]
+            Vec::<String>::new()
         );
         assert_eq!(buffer.push("visible\n", &redactor), ["visible"]);
     }
@@ -3094,11 +3088,11 @@ mod tests {
             .unwrap()
             .remember_hidden("nearby-private-value");
         observer.serial_output(session, resource, b"nearby-private-value Pass");
-        assert!(messages(&receiver).is_empty());
+        assert_eq!(messages(&receiver), Vec::<String>::new());
         observer.serial_output(session, resource, b"word:");
         assert_eq!(messages(&receiver), ["设备等待身份认证输入，输入隐藏"]);
         observer.serial_output(session, resource, b" ");
-        assert!(messages(&receiver).is_empty());
+        assert_eq!(messages(&receiver), Vec::<String>::new());
         observer.serial_output(session, resource, b"\r\nrouter");
         let lines = messages(&receiver);
         assert!(
@@ -3109,7 +3103,7 @@ mod tests {
         observer.serial_output(session, resource, b"#");
         assert_eq!(messages(&receiver), ["设备已返回命令提示符"]);
         observer.serial_output(session, resource, b" ");
-        assert!(messages(&receiver).is_empty());
+        assert_eq!(messages(&receiver), Vec::<String>::new());
         observer.serial_output(session, resource, b"\r\nUsername:");
         let lines = messages(&receiver);
         assert_eq!(
@@ -3130,7 +3124,7 @@ mod tests {
         observer.serial_output(session, resource, b"-----BEGIN PRIVATE KEY-----\n");
         messages(&receiver);
         observer.serial_output(session, resource, b"private-material Password:");
-        assert!(messages(&receiver).is_empty());
+        assert_eq!(messages(&receiver), Vec::<String>::new());
         observer.serial_output(session, resource, b"\n-----END PRIVATE KEY-----\nrouter#");
         let lines = messages(&receiver);
         assert_eq!(lines, ["设备已返回命令提示符"]);
@@ -3182,7 +3176,7 @@ mod tests {
         assert_eq!(messages(&receiver), ["real serial output"]);
         observer.close_serial(session, resource);
         observe(&mut observer, session, request, output("late wire copy\n"));
-        assert!(messages(&receiver).is_empty());
+        assert_eq!(messages(&receiver), Vec::<String>::new());
         observe(
             &mut observer,
             SessionId::new(),

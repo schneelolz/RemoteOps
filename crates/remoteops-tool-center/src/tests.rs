@@ -232,7 +232,10 @@ async fn upload_register_restart_and_enable_are_separate_facts() {
         snapshot.tools[0].versions[0].packages[0].tool.platforms[0].status,
         "pending"
     );
-    assert!(center.catalog().unwrap().tools.is_empty());
+    assert_eq!(
+        center.catalog().unwrap().tools,
+        Vec::<remoteops_resources::ResourceTool>::new()
+    );
     run(
         &center,
         ToolCenterCommand::SetToolEnabled {
@@ -248,7 +251,10 @@ async fn upload_register_restart_and_enable_are_separate_facts() {
     assert!(center.snapshot().unwrap().enabled);
     assert_eq!(center.catalog().unwrap().tools.len(), 1);
     run(&center, ToolCenterCommand::SetPolicy { enabled: false }).await;
-    assert!(center.catalog().unwrap().tools.is_empty());
+    assert_eq!(
+        center.catalog().unwrap().tools,
+        Vec::<remoteops_resources::ResourceTool>::new()
+    );
 }
 
 #[tokio::test]
@@ -825,7 +831,10 @@ async fn edit_execution_definition_invalidates_previous_platform_evidence() {
         snapshot.tools[0].versions[0].packages[0].tool.platforms[0].status,
         "pending"
     );
-    assert!(snapshot.tools[0].versions[0].packages[0].tests.is_empty());
+    assert_eq!(
+        snapshot.tools[0].versions[0].packages[0].tests,
+        Vec::<model::PlatformTest>::new()
+    );
 }
 
 #[tokio::test]
@@ -926,9 +935,12 @@ async fn register_contract_example(center: &ToolCenter, example: &str, receipt: 
     assert!(!snapshot.tools[0].enabled);
     let package = &snapshot.tools[0].versions[0].packages[0];
     assert!(package.file_verified);
-    assert!(package.tests.is_empty());
+    assert_eq!(package.tests, Vec::<model::PlatformTest>::new());
     assert_eq!(package.tool.platforms[0].status, "pending");
-    assert!(center.catalog().unwrap().tools.is_empty());
+    assert_eq!(
+        center.catalog().unwrap().tools,
+        Vec::<remoteops_resources::ResourceTool>::new()
+    );
 
     let mut input: Value = serde_json::from_str(include_str!(
         "../../../deploy/skills/remoteops/references/examples/record-test.json"
@@ -948,7 +960,10 @@ async fn register_contract_example(center: &ToolCenter, example: &str, receipt: 
     assert_eq!(package.tests[0].recorded_by, "admin:contract-fixture");
     assert_eq!(package.tests[0].status, "pending");
     assert_eq!(package.tool.platforms[0].status, "pending");
-    assert!(center.catalog().unwrap().tools.is_empty());
+    assert_eq!(
+        center.catalog().unwrap().tools,
+        Vec::<remoteops_resources::ResourceTool>::new()
+    );
 }
 
 #[tokio::test]

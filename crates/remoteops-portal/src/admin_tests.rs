@@ -119,7 +119,7 @@ fn acl_append_keeps_token_and_existing_connection_and_replays_original_snapshot(
         .store
         .update_principal_assets(pid, request.clone(), "admin_session:127.0.0.1")
         .unwrap();
-    assert!(operation.affected_target_ids.is_empty());
+    assert_eq!(operation.affected_target_ids, Vec::<String>::new());
     assert_eq!(operation.previous_principal.as_ref().unwrap().revision, 1);
     assert_eq!(operation.principal.as_ref().unwrap().revision, 2);
     assert!(
@@ -232,13 +232,9 @@ fn acl_remove_all_revokes_only_owned_targets_and_keeps_bound_agent_identity() {
         operation.affected_target_ids,
         vec![f.asset.asset.target_id.clone()]
     );
-    assert!(
-        operation
-            .principal
-            .as_ref()
-            .unwrap()
-            .allowed_assets
-            .is_empty()
+    assert_eq!(
+        operation.principal.as_ref().unwrap().allowed_assets,
+        Vec::<String>::new()
     );
     let relay_status = f
         .store
@@ -329,7 +325,10 @@ fn acl_remove_all_revokes_only_owned_targets_and_keeps_bound_agent_identity() {
             .len(),
         2
     );
-    assert!(event.principal.as_ref().unwrap().allowed_assets.is_empty());
+    assert_eq!(
+        event.principal.as_ref().unwrap().allowed_assets,
+        Vec::<String>::new()
+    );
 }
 
 #[test]

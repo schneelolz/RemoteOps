@@ -1505,7 +1505,7 @@ mod tests {
             &mut output,
         );
         assert!(output.is_empty());
-        assert!(state.active_operations.is_empty());
+        assert_eq!(state.active_operations, Vec::<ActiveOperation>::new());
     }
 
     #[test]
@@ -1561,7 +1561,7 @@ mod tests {
         );
         assert_eq!(state.running_count, 1);
         assert_eq!(output[0].role, ObservationRole::Command);
-        assert!(output[1].text.is_empty());
+        assert_eq!(output[1].text, "");
         assert!(output[1].new_task);
         assert_eq!(output[2].role, ObservationRole::Output);
         assert_eq!(output[2].text, r#"{"error":"ordinary data"}"#);
@@ -1743,7 +1743,7 @@ mod tests {
             host.apply(operation_state(id, terminal), &mut state, &mut output);
             assert!(!output.last().unwrap().new_task);
             assert_eq!(state.running_count, 0);
-            assert!(state.active_operations.is_empty());
+            assert_eq!(state.active_operations, Vec::<ActiveOperation>::new());
         }
     }
 
@@ -1774,7 +1774,7 @@ mod tests {
             &mut output,
         );
         assert_eq!(state.running_count, 0);
-        assert!(state.active_operations.is_empty());
+        assert_eq!(state.active_operations, Vec::<ActiveOperation>::new());
         assert!(output.is_empty());
         assert!(
             state
@@ -1854,7 +1854,7 @@ mod tests {
         assert_eq!(state.running_count, 1);
         host.apply(AgentEvent::ConnectionEpoch(2), &mut state, &mut output);
         assert_eq!(state.running_count, 0);
-        assert!(state.active_operations.is_empty());
+        assert_eq!(state.active_operations, Vec::<ActiveOperation>::new());
         output.clear();
         host.apply(
             AgentEvent::ScopedOperation {
@@ -1878,7 +1878,7 @@ mod tests {
             &mut state,
             &mut output,
         );
-        assert!(state.active_operations.is_empty());
+        assert_eq!(state.active_operations, Vec::<ActiveOperation>::new());
         assert_eq!(state.running_count, 0);
         output.clear();
         host.apply(
@@ -1890,7 +1890,7 @@ mod tests {
             &mut output,
         );
         assert!(output.is_empty());
-        assert!(state.active_operations.is_empty());
+        assert_eq!(state.active_operations, Vec::<ActiveOperation>::new());
     }
 
     #[test]
@@ -1952,7 +1952,7 @@ mod tests {
             &mut state,
             &mut output,
         );
-        assert!(state.active_operations.is_empty());
+        assert_eq!(state.active_operations, Vec::<ActiveOperation>::new());
         assert_eq!(state.running_count, 0);
     }
 
@@ -2235,7 +2235,7 @@ mod tests {
         assert!(state.setup_needed);
         assert_eq!(state.phase, ProductPhase::Setup);
         assert!(host.worker.is_none());
-        assert!(!state.detail.is_empty());
+        assert_ne!(state.detail, "");
         assert!(host.config.clone().normalize_and_validate().is_ok());
     }
 
@@ -2516,7 +2516,7 @@ mod tests {
         host.tick(&mut state);
         assert_eq!(state.phase, ProductPhase::Connecting);
         assert!(host.trust_events.is_some());
-        assert!(state.detail.is_empty());
+        assert_eq!(state.detail, "");
     }
 
     #[test]
@@ -2532,10 +2532,10 @@ mod tests {
         host.tick(&mut state);
         assert_eq!(state.phase, ProductPhase::Controlled);
         assert!(host.trust_events.is_none());
-        assert!(state.detail.is_empty());
+        assert_eq!(state.detail, "");
         host.apply(AgentEvent::Stopped, &mut state, &mut Vec::new());
         assert_eq!(state.phase, ProductPhase::Stopped);
-        assert!(state.detail.is_empty());
+        assert_eq!(state.detail, "");
     }
 
     #[test]

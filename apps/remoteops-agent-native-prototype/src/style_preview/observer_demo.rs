@@ -509,7 +509,7 @@ mod tests {
     fn empty_filter_does_not_invent_output_or_activity() {
         let mut model = DemoModel::default();
         model.select(Some(Category::PowerShell));
-        assert!(model.rows().is_empty());
+        assert_eq!(model.rows(), Vec::<String>::new());
         assert_eq!(model.visible_count(), 0);
         assert_eq!(model.running_count(model.selected()), 0);
     }

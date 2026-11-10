@@ -4221,7 +4221,7 @@ mod tests {
             assert!(result.stdout.contains("CMD_QUOTED_STREAM_OK"));
             assert!(result.stdout.contains(r#""STREAM & LITERAL""#));
             assert_eq!(streamed, result.stdout);
-            assert!(result.stderr.is_empty());
+            assert_eq!(result.stderr, "");
         }
     }
 
@@ -4278,7 +4278,7 @@ mod tests {
             },
             "中文"
         );
-        assert_eq!(pending, [] as [u8; 0]);
+        assert_eq!(pending, Vec::<u8>::new());
     }
 
     #[cfg(windows)]

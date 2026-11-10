@@ -113,7 +113,7 @@ mod tests {
         let units: Vec<u16> = "中文🔎".encode_utf16().collect();
         assert_eq!(chunk_end(&units, units.len(), 1, 1), units.len());
         assert_eq!(chunk_end(&units, usize::MAX, 1, 1), units.len());
-        assert!(check_chunks("", 0, 0).is_empty());
+        assert_eq!(check_chunks("", 0, 0), Vec::<Vec<u16>>::new());
     }
 
     #[test]

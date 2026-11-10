@@ -117,8 +117,11 @@ mod tests {
         let text = format!("example,alias ssh-rsa {k}\n[example]:2222 ssh-rsa {k}");
         assert_eq!(fingerprints(&text, "example").len(), 1);
         assert_eq!(fingerprints(&text, "[example]:2222").len(), 1);
-        assert!(fingerprints(&text, "[example]:22").is_empty());
-        assert!(fingerprints(&format!("example ssh-ed25519 {k}"), "example").is_empty());
+        assert_eq!(fingerprints(&text, "[example]:22"), Vec::<String>::new());
+        assert_eq!(
+            fingerprints(&format!("example ssh-ed25519 {k}"), "example"),
+            Vec::<String>::new()
+        );
     }
     #[test]
     fn revocation_and_unsupported_rules_fall_back_without_accepting_any_key() {
@@ -129,7 +132,7 @@ mod tests {
             format!("|1|hash|hash ssh-rsa {k}"),
             "example ssh-rsa invalid".to_owned(),
         ] {
-            assert!(fingerprints(&text, "example").is_empty());
+            assert_eq!(fingerprints(&text, "example"), Vec::<String>::new());
         }
     }
 

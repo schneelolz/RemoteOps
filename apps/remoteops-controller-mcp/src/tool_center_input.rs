@@ -587,9 +587,12 @@ mod tests {
             unreachable!()
         };
         assert!(!tool.enabled);
-        assert!(tool.examples.is_empty());
-        assert!(tool.dependencies.is_empty());
+        assert_eq!(tool.examples, Vec::<String>::new());
+        assert_eq!(tool.dependencies, Vec::<String>::new());
         assert!(!tool.versions[0].packages[0].file_verified);
-        assert!(tool.versions[0].packages[0].tests.is_empty());
+        assert_eq!(
+            tool.versions[0].packages[0].tests,
+            Vec::<remoteops_tool_center::PlatformTest>::new()
+        );
     }
 }

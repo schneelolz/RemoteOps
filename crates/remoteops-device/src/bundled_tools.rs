@@ -449,6 +449,24 @@ fn verified_digest(
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(1);
     }
+    #[cfg(windows)]
+    let mut file = {
+        // 原子发布期间可能短暂保留写句柄，仍以只读独占写入的方式核验。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match options.open(&path) {
+                Ok(file) => break file,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(32 | 33))
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => return Err(operation(&error)),
+            }
+        }
+    };
+    #[cfg(not(windows))]
     let mut file = options.open(&path).map_err(|error| operation(&error))?;
     let metadata = file.metadata().map_err(|error| operation(&error))?;
     reject_link(&metadata)?;
@@ -670,6 +688,30 @@ mod tests {
                 2
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_cache_waits_for_a_short_lived_writer_before_locking() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = Directory::new();
+        let tools = bundle(&root.0);
+        let paths = tools.prepare_all().unwrap();
+        let writer = OpenOptions::new()
+            .write(true)
+            .share_mode(3)
+            .open(&paths.plink)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(writer);
+        });
+        let prepared = tools.prepare_plink();
+        release.join().unwrap();
+        let prepared = prepared.unwrap();
+        assert_eq!(std::fs::read(prepared.path()).unwrap(), b"plink-fixture");
+        assert!(std::fs::write(prepared.path(), b"tampered").is_err());
     }
 
     #[cfg(windows)]

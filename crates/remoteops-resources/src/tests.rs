@@ -827,7 +827,7 @@ async fn explicit_mcp_adapters_and_failure_diagnostics_are_observable() {
         let context = diagnostic.launch_context.as_ref().unwrap();
         assert_eq!(context.browser_adapter.as_deref(), Some("none"));
         assert_eq!(context.adapter_source, "explicit");
-        assert!(context.injected_args.is_empty());
+        assert_eq!(context.injected_args, Vec::<String>::new());
         assert_eq!(diagnostic.reason, reason, "{mode}");
         assert_eq!(diagnostic.last_sent.unwrap()["method"], "initialize");
         if mode == "exit" {

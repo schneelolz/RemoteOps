@@ -399,7 +399,7 @@ mod tests {
         let unchanged = transcript.patch_since(cursor);
         assert!(!unchanged.replace_all);
         assert_eq!(unchanged.remove_utf16_units, 0);
-        assert!(unchanged.append.is_empty());
+        assert_eq!(unchanged.append, "");
     }
 
     #[test]

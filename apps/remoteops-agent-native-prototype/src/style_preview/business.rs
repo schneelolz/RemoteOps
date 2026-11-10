@@ -1170,7 +1170,7 @@ mod tests {
         });
         let state = initial_state(&business);
         assert!(state.product.is_some());
-        assert!(state.observer_demo.rows().is_empty());
+        assert_eq!(state.observer_demo.rows(), Vec::<String>::new());
         assert_eq!(state.observer_demo.total_running(), 0);
         assert!(!state.relay.contains("example.test"));
     }
@@ -1213,7 +1213,7 @@ mod tests {
         remember_setup_input(None, &mut relay, None);
         assert_eq!(relay, "演示 Relay 中文 空格");
         remember_setup_input(None, &mut relay, Some(String::new()));
-        assert!(relay.is_empty());
+        assert_eq!(relay, "");
     }
 
     #[test]

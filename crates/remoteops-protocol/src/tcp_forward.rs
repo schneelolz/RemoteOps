@@ -307,7 +307,7 @@ impl TcpForwardBudget {
     pub fn account(&self, size: usize) -> Result<(), String> {
         let size = size as u64;
         self.bytes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
                 old.checked_add(size).filter(|total| *total <= TOTAL_BYTES)
             })
             .map(|_| ())

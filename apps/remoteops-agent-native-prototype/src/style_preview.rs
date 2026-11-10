@@ -3412,7 +3412,7 @@ mod tests {
         ] {
             let pages = license_page_offsets(&text);
             let chunks: Vec<_> = pages.windows(2).map(|p| &text[p[0]..p[1]]).collect();
-            assert!(!chunks.is_empty());
+            assert_ne!(chunks, Vec::<&str>::new());
             assert_eq!(chunks.concat(), text);
             assert!(chunks.iter().all(|chunk| !chunk.ends_with('\r')));
             assert!(chunks.iter().skip(1).all(|chunk| !chunk.starts_with('\n')));

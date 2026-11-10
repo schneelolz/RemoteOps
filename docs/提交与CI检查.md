@@ -7,7 +7,7 @@
 1. 分别记录仓库分支、HEAD、工作区差异、已有暂存内容和未跟踪文件。只暂存已审查的本次文件，保护配置、凭据、交付和用户改动。
 2. 读取 `.github/workflows/ci.yml`、`docs.yml` 及本次相关工作流，按文件范围运行适用检查。文档改动执行 `scripts/Test-Documentation.ps1` 和 `git diff --check`。
 3. 按Git已跟踪文件清单或干净检出校验文档链接，避免本机存在的忽略产物掩盖CI缺失。检查文档中的本机绝对路径链接。仓库内链接使用相对路径，跨仓库资料使用已推送提交的URL，私有本机运行手册使用文字名称。
-4. Rust实现先运行相关测试、格式和严格Clippy，再按影响运行工作区及跨平台CI。Windows本机通过后仍需核对Linux、macOS与MSRV结果。
+4. Rust实现先核对CI当前rustc/Clippy版本并在本机显式选择同版工具链，运行相关测试、格式和严格Clippy，再按影响运行工作区及跨平台CI。Windows本机通过后仍需核对Linux、macOS与MSRV结果。
 5. 发布构建与占用同一EXE的浏览器、TCP夹具、Agent进程串行安排，避免Windows文件占用造成重复构建。长临时路径检查使用短根目录，并按测试实际退出码及结构化报告判断结果。
 
 ## 推送与CI确认
@@ -31,3 +31,9 @@
 此前公共提交 `d6b7b03` 在工作分支推送后未命中自动CI过滤，检查记录为零。本地构建与测试结论已记录，远端CI步骤遗漏。此次补充提交SHA级触发与等待要求，并修复公共和定制文档中的本机绝对路径链接。
 
 此次首轮实际CI还暴露两类检查差异。文档中的artifacts/output验收材料保存在本机归档，原可点击链接在干净检出缺失，调整为明确的归档路径文字。旧后台测试夹具只加载app.js，页面已经按app.js、tools.js拆分，修复夹具加载真实模块后49项测试通过。首轮失败记录见 [Documentation](https://github.com/schneelolz/RemoteOps/actions/runs/42788260928) 与 [CI](https://github.com/schneelolz/RemoteOps/actions/runs/42788251675)，后续结果按最终提交SHA复核。
+
+后续复核发现本机默认Rust/Clippy为1.97.1，CI stable为1.99.0。统一使用1.99.0预检后，修正新增空集合断言规则并采用MSRV已支持的原子更新API名称。Windows PowerShell 5.1需要UTF-8 BOM识别中文安装脚本，两个源脚本补齐BOM后50项安装测试通过、3项环境跳过。
+
+清理时305份截图、日志和浏览器快照已归档至本机 `artifacts/acceptance/local-cleanup-20261110` 并逐项验证SHA-256。Microsoft目录核实为PowerShell分析缓存，另有6个Python缓存文件，均移入同一可恢复归档。自动安全审查拒绝物理删除，返回blocked by policy，实际采用移动归档；正式交付、源码和当前编译缓存保留。
+
+同版全量预检另复现Windows内置工具原子发布后短暂写句柄占用，核验阶段立即打开读句柄会收到共享冲突。新增短暂写句柄的确定性回归在旧实现失败；修复仅对Windows共享冲突执行最长500毫秒的等待，保留只读句柄禁止写入/删除、拒绝链接、长度与SHA-256校验。11项内置工具测试通过，包括并发发布和损坏缓存拒绝。

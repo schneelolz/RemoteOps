@@ -877,7 +877,7 @@ mod tests {
         assert!(host.tick().is_empty());
         let snapshot = host.snapshot();
         assert_eq!(snapshot.running_count, 0);
-        assert!(snapshot.active_operations.is_empty());
+        assert_eq!(snapshot.active_operations, Vec::<ActiveOperation>::new());
         assert_eq!(snapshot.logs.len(), before);
         assert!(!path.exists());
         #[cfg(feature = "agent-runtime")]

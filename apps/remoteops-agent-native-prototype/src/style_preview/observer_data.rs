@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(model.total_received(), 1);
         assert_eq!(model.total_count(), 1);
         model.select(Some(Category::Cmd));
-        assert!(model.rows().is_empty());
+        assert_eq!(model.rows(), Vec::<String>::new());
         model.select(Some(Category::Serial));
         assert_eq!(model.rows(), ["same × 10000"]);
     }
@@ -478,7 +478,10 @@ mod tests {
         model.select(Some(Category::PowerShell));
         assert_eq!(model.line_roles(), vec![ObservationRole::Success]);
         model.select(Some(Category::Shell));
-        assert!(model.line_roles().is_empty());
+        assert_eq!(
+            model.line_roles(),
+            Vec::<remoteops_agent_desktop_host::ObservationRole>::new()
+        );
     }
 
     fn active(request: &str, category: ObservationCategory) -> ActiveOperation {
@@ -491,7 +494,7 @@ mod tests {
     #[test]
     fn live_starts_empty_and_never_invents_demo_output() {
         let mut model = ObserverData::live();
-        assert!(model.rows().is_empty());
+        assert_eq!(model.rows(), Vec::<String>::new());
         assert_eq!(model.total_count(), 0);
         assert_eq!(model.total_running(), 0);
         assert_eq!(model.status(false), "尚未执行操作");
@@ -500,7 +503,7 @@ mod tests {
         model.finish_all();
         model.replace_large_demo(vec!["synthetic".into()]);
         assert!(!model.tick());
-        assert!(model.rows().is_empty());
+        assert_eq!(model.rows(), Vec::<String>::new());
         assert_eq!(model.total_received(), 0);
     }
 
@@ -613,7 +616,7 @@ mod tests {
         assert_eq!(model.total_running(), 1);
         assert_eq!(model.running_count(Some(Category::Cmd)), 0);
         model.select(Some(Category::Cmd));
-        assert!(model.rows().is_empty());
+        assert_eq!(model.rows(), Vec::<String>::new());
         model.select(None);
         assert_eq!(model.rows(), vec!["CMD PowerShell"]);
     }
