@@ -87,3 +87,7 @@ Agent GUI 现提供公共库入口；产品配置与构建资源分别位于 `re
 - [TCP 多连接交付记录](tcp16-delivery-20261110.md)
 
 - [TCP刷新白屏修复交付](tcp-close-race-fix-20261110.md)
+
+- [TCP 转发下一版需求](tcp-forward-next-version.md)
+
+- [提交与CI检查约定](提交与CI检查.md)

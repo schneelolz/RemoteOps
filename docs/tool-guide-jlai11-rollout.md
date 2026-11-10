@@ -17,7 +17,7 @@ Linux Relay 目标 `x86_64-unknown-linux-gnu.2.36`，SHA-256 `9da7f46b9f45787faf
 
 ## 中继更新
 
-按 [remoteops-relay-admin 技能](C:/Users/ywb/.agents/skills/remoteops-relay-admin/SKILL.md) 和私有运行手册，经固定主机密钥 SSH 更新。镜像 `remoteops-relay:0.2.0-preview.14-p19-jlai11-20261106`，ID `sha256:b7421077c9e9f16c8d99729dad2c33d7f5cb25fe77d0747af16f3e8c62657290`。
+按 `remoteops-relay-admin` 私有运维技能 和私有运行手册，经固定主机密钥 SSH 更新。镜像 `remoteops-relay:0.2.0-preview.14-p19-jlai11-20261106`，ID `sha256:b7421077c9e9f16c8d99729dad2c33d7f5cb25fe77d0747af16f3e8c62657290`。
 
 停服后完整备份 Compose、环境和数据卷，包括 JSON、SQLite、WAL；仅留服务器 `/opt/remoteops/backups/remoteops-before-preview14-p19-jlai11-20261106`，目录 700、机密及 data.tar 为 600。先在无网络、无发布端口的数据副本上验证迁移，再仅重建 Relay。回滚脚本恢复完整旧数据和镜像配置，不删除数据卷，保留故障材料。
 
