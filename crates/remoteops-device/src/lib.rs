@@ -4650,7 +4650,18 @@ mod tests {
         let expected = path_for_child_process(device.transfer_root());
         #[cfg(windows)]
         let commands = [
-            (ShellKind::Cmd, "echo %CD%&echo %REMOTEOPS_TRANSFER_ROOT%"),
+            // CMD先展开变量，再用UTF-8输出，避免OEM代码页丢失中文路径。
+            (
+                ShellKind::Cmd,
+                concat!(
+                    r#"set "REMOTEOPS_TEST_CMD_CWD=%CD%"&"#,
+                    r#"set "REMOTEOPS_TEST_CMD_ROOT=%REMOTEOPS_TRANSFER_ROOT%"&"#,
+                    r#"powershell.exe -NoLogo -NoProfile -NonInteractive -Command ""#,
+                    "[Console]::OutputEncoding = [Text.Encoding]::UTF8; ",
+                    "[Console]::WriteLine($env:REMOTEOPS_TEST_CMD_CWD); ",
+                    r#"[Console]::WriteLine($env:REMOTEOPS_TEST_CMD_ROOT)""#
+                ),
+            ),
             (
                 ShellKind::WindowsPowerShell,
                 "[Console]::WriteLine((Get-Location).Path); [Console]::WriteLine($env:REMOTEOPS_TRANSFER_ROOT)",

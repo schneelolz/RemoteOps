@@ -45,3 +45,5 @@ Linux真实CI暴露诊断夹具在读取初始化前退出的竞态，EOF场景�
 示例产品是独立workspace。公共依赖版本或依赖图变化时，同时用现有锁文件进行offline metadata核对并提交两个示例Cargo.lock，再执行locked消费者检查。Windows PE验收版本应由该产品Cargo metadata取得，保持产品名称、描述、版本和图标的实际校验。
 
 macOS原生CI发现系统Bash 3.2会将紧邻中文标点的未加花括号变量误识别为变量名。Shell变量后接中文时使用显式花括号边界，并在安装器版本预检中扫描此类写法；保留真实macOS安装、Keychain和发布包检查。
+
+Windows原生CI的英文OEM代码页无法输出中文目录，原工作目录夹具用CMD echo造成问号替换。夹具改为由CMD展开CD和交换目录环境变量，再经UTF-8输出，继续精确比较完整中文路径。命令传递、工作目录和环境变量的断言保留，后续跨平台检查须覆盖英文Windows环境。
