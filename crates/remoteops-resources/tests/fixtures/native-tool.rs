@@ -8,15 +8,6 @@ fn main() {
         std::process::exit(7);
     }
     match args.first().map(String::as_str) {
-        Some("exit") => {
-            eprintln!("fixture startup failed C:\\private\\tool.exe");
-            eprintln!("token=must-not-leak");
-            std::process::exit(23);
-        }
-        Some("invalid-json") => {
-            println!("not JSON: must-not-leak");
-            return;
-        }
         Some("timeout") => std::thread::sleep(std::time::Duration::from_secs(20)),
         Some("stderr-flood") => {
             for _ in 0..20000 { eprintln!("fixture diagnostic line"); }
@@ -26,11 +17,24 @@ fn main() {
             assert_eq!(args.len(), 1, "unexpected browser flags");
             assert_eq!(std::env::var_os("AGENT_BROWSER_EXECUTABLE_PATH"), Some(std::env::current_exe().unwrap().into_os_string()));
         }
-        Some("upstream-error") | None => {},
+        Some("exit" | "invalid-json" | "upstream-error") | None => {},
         _ => std::process::exit(91),
     }
     for line in io::stdin().lock().lines() {
         let line = line.unwrap();
+        // 先读初始化请求，固定断开阶段，避免与控制端写入发生竞态。
+        match args.first().map(String::as_str) {
+            Some("exit") => {
+                eprintln!("fixture startup failed C:\\private\\tool.exe");
+                eprintln!("token=must-not-leak");
+                std::process::exit(23);
+            }
+            Some("invalid-json") => {
+                println!("not JSON: must-not-leak");
+                return;
+            }
+            _ => {}
+        }
         let Some(start) = line.find("\"id\":") else { continue };
         let id: String = line[start + 5..].chars().take_while(char::is_ascii_digit).collect();
         if args.first().map(String::as_str) == Some("upstream-error") {
