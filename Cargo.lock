@@ -3919,7 +3919,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.36"
+version = "0.2.0-preview.41"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4156,7 +4156,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-mcp"
-version = "0.2.0-preview.25"
+version = "0.2.0-preview.30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4380,7 +4380,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-relay"
-version = "0.2.0-preview.17"
+version = "0.2.0-preview.22"
 dependencies = [
  "anyhow",
  "argon2",

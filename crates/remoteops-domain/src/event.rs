@@ -358,6 +358,15 @@ pub enum RemoteOperation {
         /// Agent 文件路径。
         remote_path: String,
     },
+    /// 为一个固定目标创建持续 TCP 监听，生命周期绑定当前控制授权。
+    CreateTcpForward {
+        /// 现场可访问的固定主机。
+        host: String,
+        /// 固定端口。
+        port: u16,
+        /// 操作者本机的实际回环监听地址。
+        local_address: String,
+    },
     /// 向用户明确指定的单个 TCP 目标发送并接收有界数据。
     TcpExchange {
         /// 目标主机。

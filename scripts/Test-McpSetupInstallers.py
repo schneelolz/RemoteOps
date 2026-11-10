@@ -440,7 +440,7 @@ class InstallerTests(unittest.TestCase):
         after_document = tomllib.loads(after_bytes.decode("utf-8"))
         before = before_document["mcp_servers"]["remoteops"]["command"]
         after = after_document["mcp_servers"]["remoteops"]["command"]
-        self.assertIn("protocol20-preview25-", after)
+        self.assertIn("protocol20-preview30-", after)
         after_document["mcp_servers"]["remoteops"]["command"] = before
         self.assertEqual(after_document, before_document)
         def mask_command_line(content, expected_command):

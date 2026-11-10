@@ -1501,6 +1501,7 @@ fn operation_label(operation: &RemoteOperation) -> &'static str {
         | RemoteOperation::DownloadFileChunk { .. } => "文件下载",
         RemoteOperation::GetFileMetadata { .. } => "文件信息查询",
         RemoteOperation::MoveFile { .. } | RemoteOperation::DeleteFile { .. } => "文件管理",
+        RemoteOperation::CreateTcpForward { .. } => "创建持续 TCP 转发",
         RemoteOperation::TcpExchange { .. } => "TCP 通信",
         RemoteOperation::ListProcesses | RemoteOperation::TerminateProcess { .. } => "进程管理",
         RemoteOperation::ListServices | RemoteOperation::ControlService { .. } => "服务管理",

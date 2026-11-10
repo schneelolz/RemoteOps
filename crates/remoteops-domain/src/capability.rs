@@ -22,6 +22,8 @@ pub enum Capability {
     PortProbe,
     /// 指定目标 TCP 受控收发能力。
     TcpExchange,
+    /// 持续 TCP 端口转发能力，独立于单次收发。
+    TcpForward,
     /// 进程、服务和系统电源操作能力。
     SystemOperations,
     /// 交互式 Windows 桌面图形能力。

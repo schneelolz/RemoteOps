@@ -256,6 +256,16 @@ impl RuntimeBoundary {
                 },
             });
         }
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "control_initialization_v1".into(),
+            status: CapabilityAvailability::Available,
+            reasons: Vec::new(),
+        });
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "tcp_forward_v2".into(),
+            status: CapabilityAvailability::Available,
+            reasons: Vec::new(),
+        });
         if let Some(reason) = self.hard_visual_reason() {
             set_visual_status(&mut context, Some(reason));
         } else if context.facts.interactive_desktop != CapabilityAvailability::Available {

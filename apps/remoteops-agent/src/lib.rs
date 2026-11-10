@@ -21,6 +21,7 @@ pub use observation::{BoundedAgentEventReceiver, BoundedAgentEventSender, bounde
 mod product;
 mod runtime;
 mod ssh_trust_cli;
+mod tcp_forward;
 mod tool_transport;
 pub use console::{run_product_console, run_product_console_with_tools};
 pub use remoteops_device::{BundledToolPaths, BundledTools, EmbeddedTool};
@@ -1612,6 +1613,7 @@ where
     let expected_target = managed_enrollment
         .as_ref()
         .map(|enrollment| enrollment.target_id.clone());
+    let tcp_enabled = capabilities.contains(Capability::TcpForward);
     let hello = WireMessage::Hello(ClientHello::Agent(AgentHello {
         protocol_version: PROTOCOL_VERSION,
         agent_instance_id,
@@ -1682,6 +1684,7 @@ where
     }
     let (reader, mut writer) = tokio::io::split(stream);
     let (sender, mut receiver) = mpsc::unbounded_channel::<WireMessage>();
+    let (tcp_sender, mut tcp_receiver) = mpsc::channel(32);
     let tool_transport =
         tool_transport::AgentToolTransport::attach(boundary.resources.clone(), sender.clone());
     let _ = sender.send(WireMessage::AgentPermissionModeChanged(
@@ -1698,7 +1701,12 @@ where
     ));
     let writer_logs = log_observer.clone();
     let writer_task = tokio::spawn(async move {
-        while let Some(message) = receiver.recv().await {
+        loop {
+            let message = tokio::select! {
+                Some(message) = receiver.recv() => message,
+                Some(frame) = tcp_receiver.recv() => WireMessage::TcpForwardV2(frame),
+                else => break,
+            };
             if let Ok(mut logs) = writer_logs.lock() {
                 logs.observe(&message);
             }
@@ -1717,6 +1725,9 @@ where
     let file_uploads = Arc::new(Mutex::new(
         BTreeMap::<FileTransferId, FileUploadRuntime>::new(),
     ));
+    let tcp_forwards =
+        tcp_forward::Manager::new(sender.clone(), tcp_sender, agent_instance_id, tcp_enabled);
+    let mut tcp_cleanup = interval(Duration::from_secs(1));
     let mut controller_bindings = BTreeMap::<ControllerInstanceId, ControllerBinding>::new();
     let mut default_queries = BTreeMap::<RequestId, (SessionControlState, Instant)>::new();
     let execution_bindings = Arc::new(RwLock::new(controller_bindings.clone()));
@@ -1747,7 +1758,9 @@ where
     // 本地事件只能暂停读取，不能丢弃已经消费了部分帧的 future。
     let mut incoming_future = Box::pin(read_agent_frame(reader));
     let connection_error = loop {
+        tcp_forwards.prune(&local_permission_policy, &controller_bindings);
         let incoming = tokio::select! {
+            _ = tcp_cleanup.tick() => { continue; },
             result = &mut incoming_future => Some(result),
             request = control_requests.recv() => {
                 if let Ok(mut request) = request {
@@ -1840,6 +1853,14 @@ where
                     default_queries
                         .retain(|_, (_, started)| started.elapsed() < Duration::from_secs(5));
                     default_queries.insert(request_id, (state.clone(), Instant::now()));
+                } else if let Some(state) = binding
+                    .control_state
+                    .as_ref()
+                    .filter(|state| state.initialization_pending)
+                {
+                    let _ = sender.send(WireMessage::ControlInitializationComplete {
+                        state: state.clone(),
+                    });
                 }
                 if let Some(state) = &binding.control_state {
                     observe_control_transition(
@@ -1878,6 +1899,8 @@ where
                 );
             }
             Ok(WireMessage::ControlStateResult(result)) => {
+                let default_query = default_queries.contains_key(&result.request_id);
+                let mut default_requested = false;
                 if let Some(state) = &result.state {
                     observe_control_transition(
                         &controller_bindings,
@@ -1914,6 +1937,7 @@ where
                     )
                 {
                     let request_id = RequestId::new();
+                    default_requested = true;
                     let _ = sender.send(WireMessage::ControlStateRequest(ControlStateRequest {
                         request_id,
                         session_id: state.session_id,
@@ -1922,6 +1946,17 @@ where
                         source: Some(ControlSource::LocalDefault),
                     }));
                     emit_agent_event(event_sender, AgentEvent::ControlStatePending(request_id));
+                }
+                if default_query
+                    && !default_requested
+                    && let Some(state) = result
+                        .state
+                        .as_ref()
+                        .filter(|state| state.initialization_pending)
+                {
+                    let _ = sender.send(WireMessage::ControlInitializationComplete {
+                        state: state.clone(),
+                    });
                 }
                 emit_agent_event(event_sender, AgentEvent::ControlStateResult(result));
             }
@@ -1996,6 +2031,53 @@ where
                 ));
                 graceful_shutdown = true;
                 break None;
+            }
+            Ok(WireMessage::TcpForwardV2(frame)) => {
+                tcp_forwards.handle(frame, &local_permission_policy, &controller_bindings);
+            }
+            Ok(WireMessage::TcpForwardAuthorized { authorized, rules }) => {
+                let request = authorized.request.clone();
+                let result = verify_authorized_request(
+                    &policy,
+                    &local_permission_policy,
+                    &controller_bindings,
+                    authorized.clone(),
+                )
+                .and_then(|_| boundary.check_for_dispatch(&request.operation))
+                .and_then(|()| {
+                    tcp_forwards
+                        .register(authorized, rules)
+                        .map_err(anyhow::Error::msg)
+                });
+                let error = result.err().map(|error| error.to_string());
+                if error.is_none() {
+                    if let Ok(mut observer) = log_observer.lock() {
+                        observer.record_request(&request, None);
+                    }
+                    send_event(
+                        &sender,
+                        &sequence,
+                        &request,
+                        EventPayload::OperationRequested {
+                            operation: request.operation.clone(),
+                        },
+                    );
+                    send_event(
+                        &sender,
+                        &sequence,
+                        &request,
+                        EventPayload::OperationCompleted {
+                            exit_code: Some(0),
+                            summary: "已建立固定目标 TCP 转发授权，等待本地连接".into(),
+                        },
+                    );
+                }
+                let _=sender.send(WireMessage::RemoteResponse(RemoteResponse {
+                    request_id:request.request_id,session_id:request.session_id,exit_code:error.is_none().then_some(0),
+                    summary:error.clone().unwrap_or_else(||"Agent 已验证固定目标转发授权，等待本地连接".into()),
+                    error_code:error.as_ref().map(|_|"tcp_forward_rejected".into()),payload_base64:None,sha256:None,
+                    details:Some(serde_json::json!({"forward_id":request.request_id.to_string(),"extension_version":2})),
+                }));
             }
             Ok(WireMessage::AuthorizedRemoteRequest(authorized)) => {
                 let request_id = authorized.request.request_id;
@@ -2271,6 +2353,7 @@ where
             }
         }
     };
+    drop(tcp_forwards);
     tool_transport.close().await;
     heartbeat_task.abort();
     if graceful_shutdown {
@@ -2384,6 +2467,9 @@ fn verify_control_proof(
         .control_state
         .as_ref()
         .ok_or_else(|| anyhow!("控制状态尚未同步"))?;
+    if current.initialization_pending {
+        bail!("现场权限仍在初始化");
+    }
     if local_permission_policy
         .permission_control
         .locally_revoked
@@ -2856,6 +2942,9 @@ async fn execute_operation(
         details: None,
     };
     match &request.operation {
+        RemoteOperation::CreateTcpForward { .. } => {
+            bail!("TCP 创建必须通过带固定目标规则的授权扩展执行");
+        }
         RemoteOperation::ListResourceTools => {
             let resources = runtime_state
                 .boundary
@@ -4616,6 +4705,7 @@ fn capabilities_from_environment(
     let mut capabilities = vec![
         Capability::PortProbe,
         Capability::TcpExchange,
+        Capability::TcpForward,
         Capability::FileTransfer,
         Capability::Serial,
         Capability::SystemOperations,
@@ -6538,6 +6628,7 @@ mod tests {
         controller_id: ControllerInstanceId,
     ) -> SessionControlState {
         SessionControlState {
+            initialization_pending: false,
             session_id,
             controller_id,
             agent_generation: 1,

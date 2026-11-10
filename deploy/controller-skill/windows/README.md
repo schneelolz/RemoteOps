@@ -2,7 +2,7 @@
 
 Skill 是 AI 使用 RemoteOps 的操作指引，包含交换机 SSH、主机指纹核验、权限和结果验收流程；MCP 程序提供实际工具。两者独立版本、独立更新。本包不包含 MCP EXE、Controller 配置或凭据，不会重新登记安装身份。
 
-本包的 `skills/remoteops/skill.json` 是 Skill 版本与兼容要求的事实来源，`manifest.json` 和 `SHA256SUMS.txt` 记录包内文件摘要。Skill `0.1.2` 要求 MCP 至少为 `0.2.0-preview.21`、协议 19，并使用元数据列出的工具。本次仅有真实 Windows/H3C 交换机验收证据，不能推断 Linux 或所有网络设备已通过。
+本包的 `skills/remoteops/skill.json` 是 Skill 版本与兼容要求的事实来源，`manifest.json` 和 `SHA256SUMS.txt` 记录包内文件摘要。Skill `0.1.9` 要求 MCP 至少为 `0.2.0-preview.28`、协议 20，并使用元数据列出的工具。本次仅有真实 Windows/H3C 交换机验收证据，不能推断 Linux 或所有网络设备已通过。
 
 ## Windows 安装与更新
 

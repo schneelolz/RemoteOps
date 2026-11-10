@@ -330,6 +330,7 @@ mod tests {
 
     fn binding() -> SessionControlState {
         SessionControlState {
+            initialization_pending: false,
             session_id: SessionId::new(),
             agent_generation: 2,
             controller_id: ControllerInstanceId::new(),

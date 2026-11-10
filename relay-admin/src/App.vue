@@ -2,12 +2,15 @@
 import { nextTick, onMounted, onBeforeUnmount, watch, ref } from "vue";
 import { useRoute, RouterLink, RouterView } from "vue-router";
 import { router } from "./router";
+import { version as frontendVersion } from "../package.json";
 import {
   LayoutDashboard,
   Radio,
   Monitor,
   Plug,
   Boxes,
+  FileText,
+  Network,
   KeyRound,
   ShieldCheck,
   ScrollText,
@@ -26,6 +29,8 @@ const menus = [
   ["agents", "Agent 节点"],
   ["mcp", "MCP 客户端接入"],
   ["tools", "工具中心"],
+  ["global-guide", "RemoteOps 全局指引"],
+  ["tcp-forward", "TCP 转发策略"],
   ["identity", "Relay 身份凭据"],
   ["settings", "安全设置"],
   ["audit", "审计日志"],
@@ -36,6 +41,8 @@ const icons = [
   Monitor,
   Plug,
   Boxes,
+  FileText,
+  Network,
   KeyRound,
   ShieldCheck,
   ScrollText,
@@ -147,7 +154,7 @@ onBeforeUnmount(() => {
           :class="c.state.api.connected ? 'badge-online' : 'badge-danger'"
           >{{ c.state.api.connected ? "Relay 运行正常" : "连接异常" }}</span
         >
-        <p class="mcp-note">后端 {{ c.relayInfo.version }} · 前端 0.1.1</p>
+        <p class="mcp-note">后端 {{ c.relayInfo.version }} · 前端 {{ frontendVersion }}</p>
       </footer>
     </aside>
     <div class="main-wrapper">

@@ -81,3 +81,9 @@ Agent GUI 现提供公共库入口；产品配置与构建资源分别位于 `re
 - [Relay 管理前后端分离与工具中心调整（preview.17）](relay-admin-split-preview17.md)
 
 - [工具中心布局与详情展示（管理前端 0.1.1）](relay-admin-0.1.1.md)
+
+- [TCP 转发反馈修复与交付](tcp-feedback-fix-delivery-20261109.md)
+
+- [TCP 多连接交付记录](tcp16-delivery-20261110.md)
+
+- [TCP刷新白屏修复交付](tcp-close-race-fix-20261110.md)

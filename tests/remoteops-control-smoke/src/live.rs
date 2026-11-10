@@ -3,6 +3,7 @@ mod managed_portal_live;
 mod pair_result_proxy;
 mod process_lifecycle;
 mod target_context_live;
+mod tcp_forward_live;
 
 use anyhow::{Context, Result, bail, ensure};
 use remoteops_agent::{
@@ -157,7 +158,11 @@ async fn agent_state(
                     && let Some(state) = bindings
                         .into_iter()
                         .filter_map(|binding| binding.control_state)
-                        .find(|state| state.mode == mode && state.source == source)
+                        .find(|state| {
+                            !state.initialization_pending
+                                && state.mode == mode
+                                && state.source == source
+                        })
                 {
                     return Ok(state);
                 }
@@ -433,6 +438,9 @@ async fn main() -> Result<()> {
     let managed_root = workspace.0.join("managed-portal");
     std::fs::create_dir(&managed_root)?;
     managed_portal_live::run(&managed_root, &address, &cert).await?;
+    let tcp_root = workspace.0.join("tcp-forward");
+    std::fs::create_dir(&tcp_root)?;
+    tcp_forward_live::run(&tcp_root, &address, &cert).await?;
     println!("真实 MCP + Agent 控制授权端到端验收通过");
     Ok(())
 }

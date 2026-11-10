@@ -1,3 +1,5 @@
+#[path = "relay_tcp_admin.rs"]
+mod tcp;
 #[path = "relay_tools_admin.rs"]
 mod tools;
 
@@ -240,8 +242,16 @@ pub(crate) async fn serve(
             post(shutdown_agent),
         )
         .route("/api/admin/audit", get(audit))
-        .layer(DefaultBodyLimit::max(8 * 1024))
+        .route(
+            "/api/admin/global-guide",
+            get(global_guide)
+                .put(update_global_guide)
+                .layer(DefaultBodyLimit::max(40 * 1024))
+                .layer(axum::middleware::from_fn(tools::no_store)),
+        )
+        .layer(DefaultBodyLimit::max(40 * 1024))
         .merge(tools::router())
+        .merge(tcp::router())
         .merge(crate::enrollment::router())
         .merge(crate::portal::router())
         .with_state(state);
@@ -251,6 +261,60 @@ pub(crate) async fn serve(
     )
     .await
     .context("管理 HTTP 服务已停止")
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobalGuideUpdate {
+    markdown: String,
+    expected_revision: u64,
+}
+
+async fn global_guide(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<remoteops_protocol::GlobalGuide>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers).await?;
+    Ok(Json(state.relay.global_guide().await))
+}
+
+async fn update_global_guide(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    ExtractJson(request): ExtractJson<GlobalGuideUpdate>,
+) -> Result<Json<remoteops_protocol::GlobalGuide>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers).await?;
+    if request.markdown.len() > 32 * 1024 || request.markdown.contains('\0') {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse {
+                error: "全局操作指引最多 32 KiB，且不能包含 NUL 字符".to_owned(),
+            }),
+        ));
+    }
+    state
+        .relay
+        .admin_set_global_guide(
+            state
+                .username
+                .as_deref()
+                .map_or("admin:token", |value| value),
+            request.markdown,
+            request.expected_revision,
+        )
+        .await
+        .map(Json)
+        .map_err(|error| {
+            (
+                if error.to_string().starts_with("global_guide_conflict") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+        })
 }
 
 async fn login(

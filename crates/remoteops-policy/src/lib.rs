@@ -294,6 +294,9 @@ impl DefaultPolicy {
             | RemoteOperation::CallResourceTool { .. }
             | RemoteOperation::ValidateResourceTool { .. }
             | RemoteOperation::PrepareBrowserPassword { .. }
+            | RemoteOperation::CreateTcpForward { .. }
+            | RemoteOperation::ControlService { .. }
+            | RemoteOperation::PowerControl { .. }
             | RemoteOperation::FillBrowserPassword { .. } => RiskLevel::High,
             RemoteOperation::RunSsh {
                 command, readonly, ..
@@ -342,9 +345,6 @@ impl DefaultPolicy {
             | RemoteOperation::TcpExchange { .. }
             | RemoteOperation::TerminateProcess { .. }
             | RemoteOperation::WriteSerial { .. } => RiskLevel::Mutating,
-            RemoteOperation::ControlService { .. } | RemoteOperation::PowerControl { .. } => {
-                RiskLevel::High
-            }
             RemoteOperation::RunSerialQuery {
                 command, profile, ..
             } => match classify_serial_query(*profile, command) {

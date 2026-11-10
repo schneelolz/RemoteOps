@@ -22,7 +22,7 @@ pub(super) fn router() -> Router<AdminState> {
         .layer(middleware::from_fn(no_store))
 }
 
-async fn no_store(request: Request, next: Next) -> Response {
+pub(super) async fn no_store(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     response
         .headers_mut()

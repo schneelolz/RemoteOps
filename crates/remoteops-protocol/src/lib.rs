@@ -8,6 +8,7 @@ pub use control::{
 };
 mod credential;
 mod message;
+pub mod tcp_forward;
 mod tls;
 
 pub use codec::{FrameError, MAX_FRAME_SIZE, read_frame, write_frame};
@@ -21,9 +22,10 @@ pub use message::{
     AgentResumeCommitted, AgentShutdownRequest, AgentShutdownResult, AgentWelcome, AgentWelcomeAck,
     ApprovalDecision, ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest, ClientHello,
     ControllerBinding, ControllerControlMode, ControllerControlModeUpdate, ControllerHello,
-    ControllerKind, LEGACY_PROTOCOL_VERSION, ManagedAgentEnrollment, PROTOCOL_VERSION, PairRequest,
-    PairResult, PairingErrorCode, PairingMode, RelayAuthorization, ReleaseSessionRequest,
-    ReleaseSessionResult, RemoteRequest, RemoteResponse, WireMessage, supports_protocol_version,
+    ControllerKind, GlobalGuide, LEGACY_PROTOCOL_VERSION, ManagedAgentEnrollment, PROTOCOL_VERSION,
+    PairRequest, PairResult, PairingErrorCode, PairingMode, RelayAuthorization,
+    ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest, RemoteResponse, WireMessage,
+    supports_protocol_version,
 };
 pub use tls::{
     TlsCertificateProbe, TlsError, TlsServerConfig, accept_tls, connect_tls, load_client_config,

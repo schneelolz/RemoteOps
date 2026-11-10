@@ -2037,6 +2037,7 @@ mod tests {
     fn binding() -> AgentControllerBinding {
         AgentControllerBinding {
             control_state: Some(SessionControlState {
+                initialization_pending: false,
                 session_id: remoteops_domain::SessionId::new(),
                 agent_generation: 1,
                 controller_id: remoteops_domain::ControllerInstanceId::new(),

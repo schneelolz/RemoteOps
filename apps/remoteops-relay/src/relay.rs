@@ -2,6 +2,8 @@
 mod control;
 #[path = "relay_portal.rs"]
 mod portal_access;
+#[path = "relay_tcp_forward.rs"]
+mod tcp;
 #[path = "relay_tools.rs"]
 mod tools;
 use control::{broadcast_control_state, refresh_control_state};
@@ -33,9 +35,9 @@ use remoteops_protocol::{
     AgentHello, AgentLeaseRenewed, AgentResumeCommitted, AgentWelcome, ApprovalDecision,
     ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest, ClientHello, ControllerBinding,
     ControllerControlMode, ControllerControlModeUpdate, ControllerHello, ControllerKind,
-    PROTOCOL_VERSION, PairRequest, PairResult, PairingErrorCode, PairingMode, RelayAuthorization,
-    ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest, WireMessage, read_frame,
-    write_frame,
+    GlobalGuide, PROTOCOL_VERSION, PairRequest, PairResult, PairingErrorCode, PairingMode,
+    RelayAuthorization, ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest, WireMessage,
+    read_frame, write_frame,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -333,6 +335,8 @@ struct AgentRegistration {
 
 #[derive(Default)]
 struct RelayState {
+    tcp: tcp::TcpState,
+    global_guide: GlobalGuide,
     tool_state: tools::ToolRelayState,
     agents: BTreeMap<AgentInstanceId, AgentRecord>,
     pairing_index: BTreeMap<PairingCode, AgentInstanceId>,
@@ -397,6 +401,8 @@ struct PersistedAgent {
 /// Relay 状态文件格式。
 #[derive(Debug, Deserialize, Serialize)]
 struct PersistedRelayState {
+    #[serde(default)]
+    tcp_forward_policy: remoteops_protocol::tcp_forward::TcpForwardPolicy,
     /// 当前状态文件格式版本。
     version: u16,
     /// 已登记的 Agent。
@@ -405,6 +411,8 @@ struct PersistedRelayState {
     audit_log: Vec<AdminAuditEvent>,
     #[serde(default)]
     admin_password_hash: Option<AdminPasswordHash>,
+    #[serde(default)]
+    global_guide: GlobalGuide,
 }
 
 /// Relay 的并发安全业务入口。
@@ -437,6 +445,55 @@ pub struct Relay {
 }
 
 impl Relay {
+    /// 返回当前 `RemoteOps` 全局操作指引的只读快照。
+    pub async fn global_guide(&self) -> GlobalGuide {
+        self.state.lock().await.global_guide.clone()
+    }
+
+    /// 管理员更新 `RemoteOps` 全局操作指引，并以独立修订号发布。
+    pub async fn admin_set_global_guide(
+        &self,
+        actor: &str,
+        markdown: String,
+        expected_revision: u64,
+    ) -> anyhow::Result<GlobalGuide> {
+        let mut state = self.state.lock().await;
+        let mut guide = state.global_guide.clone();
+        if expected_revision != guide.revision {
+            bail!("global_guide_conflict：指引已更新，请重新读取并合并");
+        }
+        if markdown == guide.markdown {
+            return Ok(guide);
+        }
+        guide.revision = guide
+            .revision
+            .checked_add(1)
+            .context("全局指引修订号耗尽")?;
+        guide.markdown = markdown;
+        guide.updated_at = Some(Utc::now());
+        validate_global_guide(&guide)?;
+        let previous = std::mem::replace(&mut state.global_guide, guide.clone());
+        let previous_audit = state.audit_log.clone();
+        append_audit(
+            &mut state,
+            "global_guide_update",
+            None,
+            true,
+            actor,
+            if guide.markdown.is_empty() {
+                "已清空 RemoteOps 全局操作指引"
+            } else {
+                "已更新 RemoteOps 全局操作指引"
+            },
+        );
+        if let Err(error) = self.persist_state_locked(&state) {
+            state.global_guide = previous;
+            state.audit_log = previous_audit;
+            return Err(error);
+        }
+        Ok(guide)
+    }
+
     /// 创建 Relay。
     #[must_use]
     pub fn new(
@@ -1466,6 +1523,10 @@ impl Relay {
                     )
                     .await;
                 }
+                Ok(WireMessage::ControlInitializationComplete { state }) => {
+                    self.complete_control_initialization(agent_id, connection_generation, state)
+                        .await;
+                }
                 Ok(WireMessage::ToolCatalogApplied { revision, error }) if central_tools => {
                     self.record_catalog_applied(agent_id, connection_generation, revision, error)
                         .await;
@@ -1484,6 +1545,10 @@ impl Relay {
                         sender.clone(),
                         package_busy.clone(),
                     );
+                }
+                Ok(WireMessage::TcpForwardV2(frame)) => {
+                    self.tcp_from_agent(agent_id, connection_generation, frame)
+                        .await;
                 }
                 Ok(WireMessage::AgentPermissionModeChanged(update)) => {
                     self.update_agent_permission_mode(
@@ -1579,9 +1644,11 @@ impl Relay {
         }
         if sender
             .send(WireMessage::ControllerWelcome {
+                tcp_forward_version: Some(remoteops_protocol::tcp_forward::TCP_FORWARD_VERSION),
                 resource_tools_schema_version: Some(1),
                 tool_center_schema_version: (hello.protocol_version >= 19).then_some(1),
                 protocol_version: hello.protocol_version,
+                global_guide: Some(self.global_guide().await),
             })
             .is_err()
         {
@@ -1615,6 +1682,31 @@ impl Relay {
                 break;
             }
             match message {
+                Ok(WireMessage::GlobalGuideRequest { request_id }) => {
+                    let guide = self.global_guide().await;
+                    let _ = sender.send(WireMessage::GlobalGuideResponse {
+                        request_id,
+                        guide: Some(guide),
+                        error: None,
+                    });
+                }
+                Ok(WireMessage::TcpForwardPolicyRequest {
+                    request_id,
+                    session_id,
+                }) => {
+                    self.query_tcp_policy(
+                        controller_id,
+                        connection_generation,
+                        request_id,
+                        session_id,
+                        &sender,
+                    )
+                    .await;
+                }
+                Ok(WireMessage::TcpForwardV2(frame)) => {
+                    self.tcp_from_controller(controller_id, connection_generation, frame)
+                        .await;
+                }
                 Ok(WireMessage::ToolCenterRequest {
                     request_id,
                     request,
@@ -1643,6 +1735,23 @@ impl Relay {
                         .pair_controller(controller_id, connection_generation, request)
                         .await;
                     let _ = sender.send(WireMessage::PairResult(result));
+                }
+                Ok(WireMessage::TcpForwardOpen {
+                    request_id,
+                    session_id,
+                    target_host,
+                    target_port,
+                    ..
+                }) => {
+                    let _ = sender.send(WireMessage::TcpForwardOpened {
+                        request_id,
+                        forward_id: request_id,
+                        connection_id: None,
+                        session_id,
+                        target_host,
+                        target_port,
+                        error: Some("旧 TCP 扩展已停用，请更新 MCP/Agent 使用授权转发 v2".into()),
+                    });
                 }
                 Ok(WireMessage::ReleaseSessionRequest(request)) => {
                     let result = self
@@ -2628,6 +2737,14 @@ impl Relay {
                 error: Some("ControllerApproved 只允许已认证 AI Controller 使用".to_owned()),
             };
         }
+        let initializes_control = state.agents.get(&agent_id).is_some_and(|agent| {
+            agent.hello.target_context.as_ref().is_some_and(|context| {
+                context.capabilities.iter().any(|capability| {
+                    capability.capability == "control_initialization_v1"
+                        && capability.status == remoteops_domain::CapabilityAvailability::Available
+                })
+            })
+        });
         let (binding_messages, replaced_binding) = {
             let bindings = state.session_bindings.entry(session_id).or_default();
             if managed_connection_id.is_some() {
@@ -2677,7 +2794,8 @@ impl Relay {
                     existing.controller_generation,
                 );
             }
-            if bindings.get(controller_kind).is_none() {
+            let new_binding = bindings.get(controller_kind).is_none();
+            if new_binding {
                 bindings.insert(SessionBinding {
                     controller_id,
                     owner_id,
@@ -2693,6 +2811,16 @@ impl Relay {
             }
 
             control::initialize_binding_state(bindings, session_id, agent_generation);
+            if new_binding
+                && initializes_control
+                && controller_kind == ControllerKind::Ai
+                && let Some(current) = bindings
+                    .ai
+                    .as_mut()
+                    .and_then(|binding| binding.control_state.as_mut())
+            {
+                current.initialization_pending = true;
+            }
             (
                 bindings
                     .all()
@@ -3451,7 +3579,24 @@ impl Relay {
                 permission_mode,
             ))]
         };
-        let request_message = WireMessage::AuthorizedRemoteRequest(AuthorizedRemoteRequest {
+        let tcp_rules = if matches!(request.operation, RemoteOperation::CreateTcpForward { .. }) {
+            match Self::register_tcp_forward(
+                &mut state,
+                controller_id,
+                controller_generation,
+                &request,
+            ) {
+                Ok(rules) => Some(rules),
+                Err(error) => {
+                    state.in_flight.remove(&request.request_id);
+                    send_request_error(controller_sender, &request, "tcp_forward_rejected", &error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let authorized = AuthorizedRemoteRequest {
             request: request.clone(),
             authorization: RelayAuthorization {
                 controller_instance_id: controller_id,
@@ -3461,11 +3606,19 @@ impl Relay {
                 binding_token: binding.binding_token,
                 approval,
             },
-        });
+        };
+        let request_message = tcp_rules.map_or_else(
+            || WireMessage::AuthorizedRemoteRequest(authorized.clone()),
+            |rules| WireMessage::TcpForwardAuthorized {
+                authorized: authorized.clone(),
+                rules,
+            },
+        );
         let binding_failed = binding_messages
             .into_iter()
             .any(|message| agent_sender.send(message).is_err());
         if binding_failed || agent_sender.send(request_message).is_err() {
+            tcp::close(&mut state, request.request_id, "Agent 转发授权发送失败");
             state.in_flight.remove(&request.request_id);
             if let Some(previous_takeover) = previous_takeover {
                 state
@@ -3552,6 +3705,11 @@ impl Relay {
                 return;
             }
             tools::track_tool_response(&mut state.tool_state, &message);
+            if matches!(&message, WireMessage::Error { .. })
+                || matches!(&message,WireMessage::RemoteResponse(response) if response.error_code.is_some() || response.exit_code!=Some(0))
+            {
+                tcp::close(&mut state, request_id, "Agent 未成功建立转发授权");
+            }
             let original_binding_active = in_flight_binding_is_active(&state, &in_flight);
             let mut senders = Vec::new();
             if original_binding_active
@@ -3757,6 +3915,7 @@ impl Relay {
     #[allow(clippy::too_many_lines)]
     async fn cleanup_expired(&self) {
         self.cleanup_stale_controllers().await;
+        self.prune_tcp_locked(&mut *self.state.lock().await);
         let now = Utc::now();
         let (notifications, failures) = {
             let mut state = self.state.lock().await;
@@ -4026,6 +4185,13 @@ fn legacy_agent_was_paired() -> bool {
     true
 }
 
+fn validate_global_guide(guide: &GlobalGuide) -> anyhow::Result<()> {
+    if guide.markdown.len() > 32 * 1024 || guide.markdown.contains('\0') {
+        bail!("RemoteOps 全局操作指引最多 32 KiB，且不能包含 NUL 字符");
+    }
+    Ok(())
+}
+
 // 旧磁盘格式的迁移只作用于状态快照，不放宽在线 AgentHello 的必填字段。
 fn decode_persisted_state(contents: &str) -> anyhow::Result<PersistedRelayState> {
     let mut value: serde_json::Value = serde_json::from_str(contents)?;
@@ -4086,6 +4252,13 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
     let now = Utc::now();
     state.audit_log = persisted.audit_log;
     state.admin_password_hash = persisted.admin_password_hash;
+    state.global_guide = persisted.global_guide;
+    persisted
+        .tcp_forward_policy
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+    state.tcp.policy = persisted.tcp_forward_policy;
+    validate_global_guide(&state.global_guide)?;
     let mut session_ids = BTreeSet::new();
     ensure_agent_capacity(persisted.agents.len().saturating_sub(1))?;
     for persisted_agent in persisted.agents {
@@ -4183,10 +4356,12 @@ fn save_persisted_state(path: &Path, state: &RelayState) -> anyhow::Result<()> {
         })
         .collect::<Vec<_>>();
     let contents = serde_json::to_vec_pretty(&PersistedRelayState {
+        tcp_forward_policy: state.tcp.policy.clone(),
         version: PERSISTED_STATE_VERSION,
         agents,
         audit_log: state.audit_log.clone(),
         admin_password_hash: state.admin_password_hash.clone(),
+        global_guide: state.global_guide.clone(),
     })?;
     let file_name = path
         .file_name()
@@ -4519,6 +4694,7 @@ fn new_secret_token() -> String {
 #[cfg(test)]
 mod tests {
     include!("relay_control_tests.rs");
+    include!("relay_tcp_tests.rs");
     include!("relay_enrollment_tests.rs");
     include!("relay_tool_tests.rs");
     include!("relay_tool_transfer_tests.rs");

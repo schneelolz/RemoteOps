@@ -45,6 +45,7 @@ pub(super) fn initialize_binding_state(
     });
     if stale {
         binding.control_state = Some(SessionControlState {
+            initialization_pending: false,
             session_id,
             agent_generation,
             controller_id: binding.controller_id,
@@ -130,6 +131,45 @@ enum RequestOrigin {
 }
 
 impl Relay {
+    pub(super) async fn complete_control_initialization(
+        &self,
+        agent_id: AgentInstanceId,
+        generation: u64,
+        expected: SessionControlState,
+    ) {
+        let mut state = self.state.lock().await;
+        if !state.agents.get(&agent_id).is_some_and(|agent| {
+            agent.ready
+                && agent.connection_generation == generation
+                && agent.session_id == expected.session_id
+        }) {
+            return;
+        }
+        let Some(current) = state
+            .session_bindings
+            .get_mut(&expected.session_id)
+            .and_then(|bindings| bindings.ai.as_mut())
+            .and_then(|binding| binding.control_state.as_mut())
+        else {
+            return;
+        };
+        if !current.initialization_pending || !control_versions_match(current, &expected) {
+            return;
+        }
+        current.initialization_pending = false;
+        current.revision = next_revision();
+        let current = current.clone();
+        super::append_audit(
+            &mut state,
+            "control_initialized",
+            Some(expected.session_id.to_string()),
+            true,
+            "agent",
+            "现场默认权限核对完成，保持当前权限上限",
+        );
+        broadcast_control_state(&state, &current);
+        let _ = self.persist_state_locked(&state);
+    }
     /// 按当前 Agent 连接身份补发授权快照，不从心跳恢复授权。
     pub(super) async fn sync_agent_control_state(
         &self,
@@ -283,6 +323,7 @@ impl Relay {
                         return;
                     }
                     latest.mode = mode;
+                    latest.initialization_pending = false;
                     latest.revision = next_revision();
                     latest.source = (mode == ControllerControlMode::FullAccess)
                         .then_some(request.source)
@@ -297,6 +338,28 @@ impl Relay {
         } else {
             current.is_none().then(|| "当前没有在线 AI 绑定".to_owned())
         };
+        if request.mode.is_some() && error.is_none() {
+            let summary = current.as_ref().map_or_else(String::new, |current| {
+                format!(
+                    "mode={:?} source={:?} revision={}",
+                    current.mode, current.source, current.revision
+                )
+            });
+            super::append_audit(
+                &mut state,
+                "control_mode_changed",
+                Some(request.session_id.to_string()),
+                true,
+                match origin {
+                    RequestOrigin::Agent(..) => "agent",
+                    RequestOrigin::Controller(..) => "controller",
+                },
+                &summary,
+            );
+            if let Err(error) = self.persist_state_locked(&state) {
+                tracing::warn!(%error, "控制权限审计持久化失败");
+            }
+        }
         let _ = sender.send(WireMessage::ControlStateResult(ControlStateResult {
             request_id: request.request_id,
             state: current.clone(),
@@ -331,6 +394,9 @@ pub(super) fn validate_control_proof(
         .control_state
         .as_ref()
         .ok_or("当前连接没有有效授权状态")?;
+    if current.initialization_pending {
+        return Err("现场权限仍在初始化，请等待核对完成");
+    }
     if !control_versions_match(current, &proof.state) {
         return Err("审批对应的控制授权已经变化，拒绝旧请求");
     }

@@ -134,6 +134,20 @@ pub struct ControllerHello {
     pub mac_address: Option<String>,
 }
 
+/// Relay 维护的 `RemoteOps` 全局操作指引。内容仅提供模型上下文，不授予权限。
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalGuide {
+    /// 内容修订号，空内容也有稳定修订号。
+    #[serde(default)]
+    pub revision: u64,
+    /// UTF-8 Markdown 正文，最多由 Relay 侧限制为 32 KiB。
+    #[serde(default)]
+    pub markdown: String,
+    /// 最近一次成功更新的时间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 /// 客户端发出的第一条消息。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
@@ -492,6 +506,65 @@ pub struct RemoteResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum WireMessage {
+    /// 已协商的 v2 数据和生命周期帧。
+    TcpForwardV2(crate::tcp_forward::TcpForwardFrame),
+    /// 当前绑定的只读 TCP 策略查询。
+    TcpForwardPolicyRequest {
+        request_id: RequestId,
+        session_id: SessionId,
+    },
+    /// 仅返回本绑定可见的策略和申请步骤。
+    TcpForwardPolicyResponse {
+        request_id: RequestId,
+        snapshot: Option<crate::tcp_forward::TcpForwardPolicySnapshot>,
+        error: Option<String>,
+    },
+    /// Relay 向 Agent 传递已校验操作及固定目标规则。
+    TcpForwardAuthorized {
+        authorized: AuthorizedRemoteRequest,
+        rules: Vec<crate::tcp_forward::TcpForwardRule>,
+    },
+    /// Agent 确认已完成本次绑定的本地默认权限核对。
+    ControlInitializationComplete { state: crate::SessionControlState },
+    /// Controller 请求创建一个固定目标的持续 TCP 转发。
+    TcpForwardOpen {
+        request_id: RequestId,
+        session_id: SessionId,
+        target_host: String,
+        target_port: u16,
+        max_connections: u16,
+    },
+    /// Relay/Agent 返回持续转发创建结果。
+    TcpForwardOpened {
+        request_id: RequestId,
+        forward_id: RequestId,
+        connection_id: Option<RequestId>,
+        session_id: SessionId,
+        target_host: String,
+        target_port: u16,
+        error: Option<String>,
+    },
+    /// 持续转发的数据帧。数据大小由各端在解码前限制。
+    TcpForwardData {
+        forward_id: RequestId,
+        connection_id: RequestId,
+        data_base64: String,
+        eof: bool,
+    },
+    /// 关闭转发或其中一个本地连接。
+    TcpForwardClose {
+        forward_id: RequestId,
+        connection_id: Option<RequestId>,
+        reason: String,
+    },
+    /// Controller 请求重新读取 Relay 侧的全局操作指引。
+    GlobalGuideRequest { request_id: RequestId },
+    /// Relay 返回全局操作指引或脱敏错误。
+    GlobalGuideResponse {
+        request_id: RequestId,
+        guide: Option<GlobalGuide>,
+        error: Option<String>,
+    },
     /// 工具中心能力声明，仅向协议 19 及以上连接发送。
     ToolCenterCapabilities { schema_version: u16 },
     /// 与目标会话无关的工具管理请求，外层执行独立安装权限校验。
@@ -545,6 +618,9 @@ pub enum WireMessage {
     AgentLeaseRenewed(AgentLeaseRenewed),
     /// Controller 连接就绪。
     ControllerWelcome {
+        /// 持续转发扩展版本，缺省时禁止发送新转发消息。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tcp_forward_version: Option<u16>,
         /// Relay 当前协议版本。
         protocol_version: u16,
         /// 可选资源工具协议版本，缺省表示 Relay 不支持。
@@ -553,6 +629,9 @@ pub enum WireMessage {
         /// 独立工具中心管理能力；缺省表示需要升级 Relay。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_center_schema_version: Option<u16>,
+        /// Relay 维护的产品级操作指引，旧客户端可忽略。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        global_guide: Option<GlobalGuide>,
     },
     /// Controller 请求配对。
     PairRequest(PairRequest),
@@ -692,6 +771,39 @@ mod tests {
             serde_json::from_value(serde_json::to_value(decoded).unwrap()["payload"].clone())
                 .unwrap();
         assert_eq!(old.protocol_version, 18);
+    }
+
+    #[test]
+    fn global_guide_round_trips_and_old_welcome_defaults_to_empty() {
+        let guide = GlobalGuide {
+            revision: 3,
+            markdown: "# RemoteOps\n按 Relay 指引执行".into(),
+            updated_at: Some(chrono::Utc::now()),
+        };
+        let message = WireMessage::ControllerWelcome {
+            tcp_forward_version: Some(2),
+            protocol_version: PROTOCOL_VERSION,
+            resource_tools_schema_version: Some(1),
+            tool_center_schema_version: Some(1),
+            global_guide: Some(guide.clone()),
+        };
+        let decoded: WireMessage =
+            serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, WireMessage::ControllerWelcome { global_guide: Some(value), .. } if value == guide)
+        );
+        let legacy = serde_json::json!({
+            "type": "controller_welcome",
+            "payload": {"protocol_version": PROTOCOL_VERSION}
+        });
+        let decoded: WireMessage = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            WireMessage::ControllerWelcome {
+                global_guide: None,
+                ..
+            }
+        ));
     }
 
     #[test]

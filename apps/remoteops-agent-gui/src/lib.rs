@@ -2969,6 +2969,7 @@ fn demo_controller_binding() -> AgentControllerBinding {
         permission_mode: remoteops_domain::PermissionMode::ApprovalRequired,
         controller_control_mode: Some(ControllerControlMode::FullAccess),
         control_state: Some(SessionControlState {
+            initialization_pending: false,
             session_id: remoteops_domain::SessionId::new(),
             controller_id: remoteops_domain::ControllerInstanceId::new(),
             agent_generation: 1,

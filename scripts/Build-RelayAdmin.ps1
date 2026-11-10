@@ -19,7 +19,7 @@ try {
     & node (Join-Path $PSScriptRoot 'collect-relay-admin-licenses.mjs') $OutputDirectory
     if ($LASTEXITCODE -ne 0) { throw '前端许可证归档失败。' }
     $utf8 = [Text.UTF8Encoding]::new($false)
-    $release = @{component='remoteops-relay-admin';version=$version;backend_minimum='0.2.0-preview.17';built_at=[DateTime]::UtcNow.ToString('o');lock_sha256=(Get-FileHash 'package-lock.json').Hash.ToLowerInvariant()}
+    $release = @{component='remoteops-relay-admin';version=$version;backend_minimum='0.2.0-preview.19';built_at=[DateTime]::UtcNow.ToString('o');lock_sha256=(Get-FileHash 'package-lock.json').Hash.ToLowerInvariant()}
     [IO.File]::WriteAllText((Join-Path $OutputDirectory 'dist\release.json'), ($release | ConvertTo-Json), $utf8)
     $resolved = (Resolve-Path -LiteralPath $OutputDirectory).Path
     $entries = @(Get-ChildItem -LiteralPath $resolved -File -Recurse | Sort-Object FullName | ForEach-Object {

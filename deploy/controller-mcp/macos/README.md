@@ -2,7 +2,7 @@
 
 > 当前安装规则：新版安装器只支持设置码/设置文件，不再支持 Token 安装。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](../../../docs/mcp-one-time-setup.md)。
 
-- 版本：`0.2.0-preview.25`
+- 版本：`0.2.0-preview.30`
 - 适用系统：macOS 13 或更高版本，Apple Silicon（arm64）
 - Codex MCP 名称：`remoteops`
 
@@ -10,8 +10,8 @@
 
 ## MCP 与 Skill 分开安装和更新
 
-MCP `0.2.0-preview.25` 随附密码辅助程序 `0.2.0-preview.7`，不再包含或强制安装
-Skill。Skill `0.1.6` 使用独立的 `RemoteOps-Skill-0.1.6.zip`，最低 MCP 为 `.25`、
+MCP `0.2.0-preview.30` 随附密码辅助程序 `0.2.0-preview.7`，不再包含或强制安装
+Skill。Skill `0.1.9` 使用独立的 `RemoteOps-Skill-0.1.9.zip`，最低 MCP 为 `.28`、
 协议 20。先按本文安装 MCP，再进入解压后的 Skill 包执行：
 
 ```bash
@@ -80,7 +80,7 @@ Keychain，不使用旧 Token 启动脚本，也不改写旧 Token。登记成�
 安装位置：
 
 ```text
-~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.25
+~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.30
 ~/.codex/remoteops/remoteops-credential-prompt
 ~/.codex/remoteops/controller-config.json
 ~/.codex/remoteops/setup-state.json

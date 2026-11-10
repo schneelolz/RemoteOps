@@ -31,6 +31,34 @@ async function main(){
     const go=async hash=>{await page.goto(origin+'/#/'+hash);await page.waitForTimeout(200);};
     await go('tools/settings');await page.getByRole('button',{name:'编辑说明',exact:true}).click();const guide='# 工具选择\n安全显示 <img src="https://invalid.example/leak" onerror="alert(1)">\n未验证不等于不兼容。';await page.getByLabel('全局说明',{exact:true}).fill(guide);await page.getByRole('button',{name:'保存说明',exact:true}).click();await page.locator('.tools-guide-text').waitFor();assert.equal(await page.locator('.tools-guide-text').textContent(),guide);assert.equal(await page.locator('.tools-guide img').count(),0);await page.reload();await page.locator('.tools-guide-text').waitFor();assert.equal(await page.locator('.tools-guide-text').textContent(),guide);checks+=3;
     await page.getByRole('button',{name:'编辑说明',exact:true}).click();await page.getByLabel('全局说明',{exact:true}).fill('中'.repeat(10923));await page.getByRole('button',{name:'保存说明',exact:true}).click();await page.locator('#tool-guide-error').waitFor();assert.equal((await page.getByLabel('全局说明',{exact:true}).inputValue()).length,10923);await page.getByRole('button',{name:'取消',exact:true}).click();checks++;
+    // 产品级指引与 TCP 目标策略使用真实隔离后端，校验在线保存和冲突草稿保护。
+    await go('global-guide');
+    await page.getByLabel('RemoteOps 全局指引正文').fill('现场排查时先核对目标和权限。');
+    await page.getByRole('button',{name:'保存全局指引',exact:true}).click();
+    await page.getByText('已保存。新 MCP 初始化或显式刷新时会读取该版本。',{exact:true}).waitFor();
+    const globalGuide=await (await page.request.get(origin+'/api/admin/global-guide')).json();
+    assert.equal(globalGuide.markdown,'现场排查时先核对目标和权限。');
+    const guideResponse=await page.request.get(origin+'/api/admin/global-guide');
+    assert.equal(guideResponse.headers()['cache-control'],'no-store');checks+=2;
+    await go('tcp-forward');
+    await page.getByText('当前没有已批准目标，所有新 TCP 转发都会被拒绝。添加一条规则后保存即可批准访问。',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'添加目标规则',exact:true}).click();
+    await page.getByLabel('目标主机或网段',{exact:true}).fill('192.168.10.254');
+    await page.getByLabel('目标端口',{exact:true}).fill('80');
+    await page.getByLabel('用途',{exact:true}).fill('隔离策略页面验收');
+    await page.getByRole('button',{name:'保存并立即生效',exact:true}).click();
+    await page.getByText('策略已生效。撤销或到期的目标转发会关闭，其余会话继续运行。',{exact:true}).waitFor();
+    const tcpResponse=await page.request.get(origin+'/api/admin/tcp-forward-policy');
+    assert.equal(tcpResponse.headers()['cache-control'],'no-store');
+    const tcpPolicy=await tcpResponse.json();assert.equal(tcpPolicy.rules[0].host,'192.168.10.254');
+    const external={...tcpPolicy,approval_contact:'隔离管理员修订了申请说明'};
+    assert.equal((await page.request.put(origin+'/api/admin/tcp-forward-policy',{data:{expected_revision:tcpPolicy.revision,policy:external}})).status(),200);
+    await page.getByLabel('用途',{exact:true}).fill('并发冲突保留的草稿');
+    await page.getByRole('button',{name:'保存并立即生效',exact:true}).click();
+    await page.getByRole('alert').filter({hasText:'tcp_policy_conflict'}).waitFor();
+    assert.equal(await page.getByLabel('用途',{exact:true}).inputValue(),'并发冲突保留的草稿');checks+=5;
+    await page.getByRole('button',{name:'重新读取并替换草稿',exact:true}).click();
+    await page.getByLabel('用途',{exact:true}).fill('隔离策略页面验收');
     // 真实 ZIP 上传、摘要校验及目录登记，包内只有文本，不启动任何工具。
     const zip=path.join(work,'safe.zip');const result=spawnSync('python',['-c','import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],"w"); z.writestr("tool.txt","isolated UI verification"); z.close()',zip],{windowsHide:true});assert.equal(result.status,0);
     await go('tools/list');await page.getByRole('button',{name:'上传 / 导入包',exact:true}).click();await page.getByLabel('ZIP 文件（最大 1 GiB）').setInputFiles(zip);await page.getByRole('button',{name:'校验并保存包',exact:true}).click();await page.getByRole('button',{name:'使用此包新增工具',exact:true}).waitFor();await page.getByRole('button',{name:'使用此包新增工具',exact:true}).click();await page.getByLabel('工具标识',{exact:true}).fill('ui-test');await page.getByLabel('工具名称',{exact:true}).fill('浏览器工具验收');await page.getByLabel('用途',{exact:true}).fill('验证工具中心独立前端布局');await page.getByLabel('使用说明',{exact:true}).fill('仅使用隔离测试包；不运行任何远程工具。');await page.getByRole('tab',{name:'版本与平台包',exact:true}).click();await page.getByRole('heading',{name:'版本 1.0.0'}).waitFor();await page.getByRole('tab',{name:'基本资料',exact:true}).click();assert.equal(await page.getByLabel('工具名称',{exact:true}).inputValue(),'浏览器工具验收');await page.getByRole('button',{name:'保存工具资料',exact:true}).click();await page.getByText('浏览器工具验收',{exact:true}).waitFor();checks+=3;
@@ -61,7 +89,7 @@ async function main(){
       await page.setViewportSize(viewport);
       for(const theme of ['dark','light']){
         await page.getByLabel('界面主题').selectOption(theme);
-        for(const view of ['overview','sessions','agents','mcp','tools/list','tools/settings','tools/sync','identity','settings','audit']){
+        for(const view of ['overview','sessions','agents','mcp','tools/list','tools/settings','tools/sync','global-guide','tcp-forward','identity','settings','audit']){
           await go(view);await page.screenshot({path:path.join(artifacts,`${device}-${theme}-${view.replace('/','-')}.png`),fullPage:true});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,view+' horizontal overflow');checks++;
         }
         await go('tools/list');await page.getByRole('button',{name:'编辑',exact:true}).click();for(const tab of ['基本资料','版本与平台包','高级定义']){await page.getByRole('tab',{name:tab,exact:true}).click();await page.screenshot({path:path.join(artifacts,`${device}-${theme}-editor-${tab}.png`),fullPage:true});const footer=await page.locator('.modal-footer').boundingBox();assert(footer&&footer.y+footer.height<=viewport.height+1,'fixed footer visible');checks++;}await page.keyboard.press('Escape');assert.equal(await page.getByRole('dialog').count(),0);

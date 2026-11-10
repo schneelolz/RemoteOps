@@ -19,6 +19,9 @@ pub enum ControlSource {
 /// Relay 确认的授权快照，修订号仅在相同绑定内比较。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionControlState {
+    /// Agent 正在核对现场默认授权，完成前禁止提交修改操作。
+    #[serde(default)]
+    pub initialization_pending: bool,
     /// 目标会话。
     pub session_id: SessionId,
     /// Agent 传输连接代次。
@@ -92,6 +95,7 @@ mod tests {
     #[test]
     fn control_messages_round_trip_with_binding_and_revision() {
         let state = SessionControlState {
+            initialization_pending: false,
             session_id: SessionId::new(),
             agent_generation: 2,
             controller_id: ControllerInstanceId::new(),

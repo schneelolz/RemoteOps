@@ -16,6 +16,7 @@ use std::{
     },
 };
 
+use base64::Engine as _;
 use chrono::Utc;
 use remoteops_audit::{JsonlAuditStore, sha256_bytes};
 use remoteops_domain::{
@@ -28,10 +29,10 @@ pub use remoteops_protocol::ControllerKind;
 use remoteops_protocol::{
     ApprovalDecision, ApprovalRequest, ApprovalResult, ClientHello, ControlProof,
     ControlStateRequest, ControlStateResult, ControllerControlModeUpdate, ControllerHello,
-    PROTOCOL_VERSION, PairResult, PairingErrorCode, ReleaseSessionRequest, ReleaseSessionResult,
-    RemoteRequest, RemoteResponse, SessionControlState, WireMessage, connect_tls,
-    load_client_config, load_native_client_config, load_pinned_client_config, read_frame,
-    write_frame,
+    GlobalGuide, PROTOCOL_VERSION, PairResult, PairingErrorCode, ReleaseSessionRequest,
+    ReleaseSessionResult, RemoteRequest, RemoteResponse, SessionControlState, WireMessage,
+    connect_tls, load_client_config, load_native_client_config, load_pinned_client_config,
+    read_frame, write_frame,
 };
 use remoteops_session::ConnectionRegistry;
 use thiserror::Error;
@@ -382,6 +383,8 @@ impl Drop for PendingRegistration {
 }
 
 struct ClientInner {
+    guide_supported: std::sync::atomic::AtomicBool,
+    tcp_forward_version: AtomicU64,
     config: RelayClientConfig,
     tls_config: Arc<ClientConfig>,
     controller_instance_id: remoteops_domain::ControllerInstanceId,
@@ -391,6 +394,12 @@ struct ClientInner {
     // 每次握手重新采集，不从协议18本身推断资源能力。
     resource_tools_schema_version: AtomicU64,
     tool_center: tool_center_client::ToolCenterClientState,
+    global_guide: Arc<std::sync::RwLock<GlobalGuide>>,
+    guide_pending:
+        Mutex<BTreeMap<RequestId, oneshot::Sender<Result<GlobalGuide, ApplicationError>>>>,
+    tcp_open_pending:
+        Mutex<BTreeMap<RequestId, oneshot::Sender<Result<WireMessage, ApplicationError>>>>,
+    tcp_events: broadcast::Sender<WireMessage>,
     connected: watch::Sender<bool>,
     core: Mutex<ControllerCore>,
     pending: Arc<PendingRegistry>,
@@ -438,6 +447,7 @@ enum PendingResponseMatch {
 struct ActiveTransport {
     generation: u64,
     sender: mpsc::UnboundedSender<WireMessage>,
+    tcp_sender: mpsc::Sender<WireMessage>,
 }
 
 /// Controller Core 的真实 Relay 客户端。
@@ -478,6 +488,8 @@ impl RelayClient {
             .map(JsonlAuditStore::new)
             .map(Arc::new);
         let inner = Arc::new(ClientInner {
+            guide_supported: std::sync::atomic::AtomicBool::new(false),
+            tcp_forward_version: AtomicU64::new(0),
             config,
             tls_config,
             controller_instance_id,
@@ -486,6 +498,10 @@ impl RelayClient {
             transport_generation: AtomicU64::new(0),
             resource_tools_schema_version: AtomicU64::new(0),
             tool_center: tool_center_client::ToolCenterClientState::default(),
+            global_guide: Arc::new(std::sync::RwLock::new(GlobalGuide::default())),
+            guide_pending: Mutex::new(BTreeMap::new()),
+            tcp_open_pending: Mutex::new(BTreeMap::new()),
+            tcp_events: broadcast::channel(256).0,
             connected,
             core: Mutex::new(ControllerCore::default()),
             pending: Arc::new(PendingRegistry::default()),
@@ -516,6 +532,204 @@ impl RelayClient {
     #[must_use]
     pub fn is_connected(&self) -> bool {
         *self.inner.connected.borrow()
+    }
+
+    /// 返回最近一次由 Relay 确认的全局操作指引。
+    #[must_use]
+    pub fn global_guide(&self) -> GlobalGuide {
+        self.inner
+            .global_guide
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 当前 Relay 欢迎消息是否提供全局指引。
+    #[must_use]
+    pub fn supports_global_guide(&self) -> bool {
+        self.inner.guide_supported.load(Ordering::Acquire)
+    }
+
+    /// 显式从 Relay 重新读取全局操作指引，不重启传输或重放远程请求。
+    pub async fn refresh_global_guide(&self) -> Result<GlobalGuide, ApplicationError> {
+        if self.is_connected() && !self.supports_global_guide() {
+            return Err(ApplicationError::Remote {
+                code: "global_guide_unsupported".into(),
+                message: "当前 Relay 未声明全局指引接口，请更新 Relay".into(),
+            });
+        }
+        let request_id = RequestId::new();
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .guide_pending
+            .lock()
+            .await
+            .insert(request_id, sender);
+        if let Err(error) = self
+            .send_wire(WireMessage::GlobalGuideRequest { request_id })
+            .await
+        {
+            self.inner.guide_pending.lock().await.remove(&request_id);
+            return Err(error);
+        }
+        match timeout(TokioDuration::from_secs(15), receiver).await {
+            Ok(Ok(Ok(guide))) => Ok(guide),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(_)) => Err(ApplicationError::Transport(
+                "Relay 指引响应通道已关闭".into(),
+            )),
+            Err(_) => {
+                self.inner.guide_pending.lock().await.remove(&request_id);
+                Err(ApplicationError::Transport("Relay 全局指引刷新超时".into()))
+            }
+        }
+    }
+
+    /// 订阅持续 TCP 转发的入站数据和关闭事件。
+    #[must_use]
+    pub fn subscribe_tcp_events(&self) -> broadcast::Receiver<WireMessage> {
+        self.inner.tcp_events.subscribe()
+    }
+    /// 当前 Relay 已确认支持授权转发 v2。
+    #[must_use]
+    pub fn supports_tcp_forward(&self) -> bool {
+        self.is_connected() && self.inner.tcp_forward_version.load(Ordering::Acquire) == 2
+    }
+
+    /// 发送有界转发数据或生命周期帧，不建立或重放远端操作。
+    pub async fn send_tcp_frame(
+        &self,
+        frame: remoteops_protocol::tcp_forward::TcpForwardFrame,
+    ) -> Result<(), ApplicationError> {
+        if !self.supports_tcp_forward() {
+            return Err(ApplicationError::Transport(
+                "Relay 未连接或不支持 TCP 转发 v2".into(),
+            ));
+        }
+        let transport = self
+            .inner
+            .transport
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| ApplicationError::Transport("Relay TCP 传输已经断开".into()))?;
+        transport
+            .tcp_sender
+            .send(WireMessage::TcpForwardV2(frame))
+            .await
+            .map_err(|_| ApplicationError::Transport("Relay TCP 发送通道已经关闭".into()))
+    }
+
+    /// 读取当前绑定的目标策略及管理员申请步骤。
+    pub async fn tcp_forward_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<remoteops_protocol::tcp_forward::TcpForwardPolicySnapshot, ApplicationError> {
+        if !self.supports_tcp_forward() {
+            return Err(ApplicationError::Transport(
+                "Relay 不支持在线 TCP 策略查询，请升级 Relay".into(),
+            ));
+        }
+        let request_id = RequestId::new();
+        let mut events = self.subscribe_tcp_events();
+        self.send_wire(WireMessage::TcpForwardPolicyRequest {
+            request_id,
+            session_id,
+        })
+        .await?;
+        timeout(TokioDuration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(WireMessage::TcpForwardPolicyResponse {
+                        request_id: reply,
+                        snapshot,
+                        error,
+                    }) if reply == request_id => {
+                        return snapshot.ok_or_else(|| ApplicationError::Remote {
+                            code: "tcp_policy_denied".into(),
+                            message: error.unwrap_or_else(|| "TCP 策略不可用".into()),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        return Err(ApplicationError::Transport("TCP 策略响应通道中断".into()));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| ApplicationError::Transport("TCP 策略查询超时".into()))?
+    }
+
+    /// 请求 Relay/Agent 创建一条固定目标的持续 TCP 转发。
+    pub async fn open_tcp_forward(
+        &self,
+        session_id: SessionId,
+        target_host: String,
+        target_port: u16,
+        max_connections: u16,
+    ) -> Result<WireMessage, ApplicationError> {
+        let request_id = RequestId::new();
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .tcp_open_pending
+            .lock()
+            .await
+            .insert(request_id, sender);
+        if let Err(error) = self
+            .send_wire(WireMessage::TcpForwardOpen {
+                request_id,
+                session_id,
+                target_host,
+                target_port,
+                max_connections,
+            })
+            .await
+        {
+            self.inner.tcp_open_pending.lock().await.remove(&request_id);
+            return Err(error);
+        }
+        timeout(TokioDuration::from_secs(15), receiver)
+            .await
+            .map_err(|_| ApplicationError::Transport("TCP 转发创建超时".into()))?
+            .map_err(|_| ApplicationError::Transport("TCP 转发响应通道已关闭".into()))?
+    }
+
+    /// 向已创建的持续 TCP 转发写入一个有界数据块。
+    pub async fn send_tcp_forward_data(
+        &self,
+        forward_id: RequestId,
+        connection_id: RequestId,
+        data: &[u8],
+        eof: bool,
+    ) -> Result<(), ApplicationError> {
+        if data.len() > 64 * 1024 {
+            return Err(ApplicationError::Transport(
+                "TCP 转发数据块超过 64 KiB".into(),
+            ));
+        }
+        self.send_wire(WireMessage::TcpForwardData {
+            forward_id,
+            connection_id,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+            eof,
+        })
+        .await
+    }
+
+    /// 关闭持续 TCP 转发或其中一个连接。
+    pub async fn close_tcp_forward(
+        &self,
+        forward_id: RequestId,
+        connection_id: Option<RequestId>,
+        reason: String,
+    ) -> Result<(), ApplicationError> {
+        self.send_wire(WireMessage::TcpForwardClose {
+            forward_id,
+            connection_id,
+            reason,
+        })
+        .await
     }
 
     /// 当前传输已通过欢迎消息确认资源工具协议v1。
@@ -1398,15 +1612,30 @@ where
         .map_err(|error| ApplicationError::Transport(error.to_string()))?
     {
         WireMessage::ControllerWelcome {
+            tcp_forward_version,
             protocol_version,
             resource_tools_schema_version,
             tool_center_schema_version,
+            global_guide,
         } if protocol_version == PROTOCOL_VERSION => {
+            inner
+                .guide_supported
+                .store(global_guide.is_some(), Ordering::Release);
+            inner.tcp_forward_version.store(
+                u64::from(tcp_forward_version.unwrap_or(0)),
+                Ordering::Release,
+            );
             inner.tool_center.set_capability(tool_center_schema_version);
             inner.resource_tools_schema_version.store(
                 u64::from(resource_tools_schema_version.unwrap_or(0)),
                 Ordering::Release,
             );
+            if let Some(guide) = global_guide {
+                *inner
+                    .global_guide
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = guide;
+            }
             Ok(())
         }
         WireMessage::Error { code, message, .. } => Err(ApplicationError::Remote { code, message }),
@@ -1422,6 +1651,7 @@ async fn run_transport(
     initial_sender: Option<oneshot::Sender<Result<(), ApplicationError>>>,
 ) -> Result<(), ApplicationError> {
     let (sender, receiver) = mpsc::unbounded_channel();
+    let (tcp_sender, tcp_receiver) = mpsc::channel(32);
     let generation = {
         // 与运行事实缓存提交共用 core 边界，跳代不能发生在最后核验和提交之间。
         let _core = inner.core.lock().await;
@@ -1433,6 +1663,7 @@ async fn run_transport(
         *transport = Some(ActiveTransport {
             generation,
             sender: sender.clone(),
+            tcp_sender,
         });
         generation
     };
@@ -1494,7 +1725,7 @@ async fn run_transport(
     });
 
     let (reader, writer) = tokio::io::split(stream);
-    let result = run_transport_io(inner, reader, writer, receiver).await;
+    let result = run_transport_io(inner, reader, writer, receiver, tcp_receiver).await;
     heartbeat_task.abort();
     pairing_recovery_task.abort();
     result
@@ -1589,13 +1820,14 @@ async fn run_transport_io<R, W>(
     reader: R,
     writer: W,
     receiver: mpsc::UnboundedReceiver<WireMessage>,
+    tcp_receiver: mpsc::Receiver<WireMessage>,
 ) -> Result<(), ApplicationError>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut reader_task = tokio::spawn(read_transport_messages(inner, reader));
-    let mut writer_task = tokio::spawn(write_transport_messages(writer, receiver));
+    let mut writer_task = tokio::spawn(write_transport_messages(writer, receiver, tcp_receiver));
 
     tokio::select! {
         result = &mut reader_task => {
@@ -1637,11 +1869,17 @@ where
 async fn write_transport_messages<W>(
     mut writer: W,
     mut receiver: mpsc::UnboundedReceiver<WireMessage>,
+    mut tcp_receiver: mpsc::Receiver<WireMessage>,
 ) -> Result<(), ApplicationError>
 where
     W: AsyncWrite + Unpin,
 {
-    while let Some(message) = receiver.recv().await {
+    loop {
+        let message = tokio::select! {
+            Some(message) = receiver.recv() => message,
+            Some(message) = tcp_receiver.recv() => message,
+            else => break,
+        };
         write_frame(&mut writer, &message)
             .await
             .map_err(|error| ApplicationError::Transport(error.to_string()))?;
@@ -1678,6 +1916,14 @@ async fn set_transport_disconnected(inner: &ClientInner, cause: Option<Applicati
 
 async fn fail_pending_requests(inner: &ClientInner, message: &str) {
     inner.tool_center.disconnect();
+    let guide_pending = std::mem::take(&mut *inner.guide_pending.lock().await);
+    for (_, sender) in guide_pending {
+        let _ = sender.send(Err(ApplicationError::Transport(message.to_owned())));
+    }
+    let tcp_pending = std::mem::take(&mut *inner.tcp_open_pending.lock().await);
+    for (_, sender) in tcp_pending {
+        let _ = sender.send(Err(ApplicationError::Transport(message.to_owned())));
+    }
     inner.control_states.lock().await.clear();
     inner.control_pending.lock().await.clear();
     let pending = std::mem::take(&mut *inner.pending.lock());
@@ -1711,6 +1957,55 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
         return;
     }
     match message {
+        message @ (WireMessage::TcpForwardV2(_)
+        | WireMessage::TcpForwardPolicyResponse { .. }
+        | WireMessage::TcpForwardData { .. }
+        | WireMessage::TcpForwardClose { .. }) => {
+            let _ = inner.tcp_events.send(message);
+        }
+        message @ WireMessage::TcpForwardOpened { request_id, .. } => {
+            let _ = inner.tcp_events.send(message.clone());
+            if let Some(sender) = inner.tcp_open_pending.lock().await.remove(&request_id) {
+                match &message {
+                    WireMessage::TcpForwardOpened {
+                        error: Some(error), ..
+                    } => {
+                        let _ = sender.send(Err(ApplicationError::Remote {
+                            code: "tcp_forward_open_failed".into(),
+                            message: error.clone(),
+                        }));
+                    }
+                    _ => {
+                        let _ = sender.send(Ok(message));
+                    }
+                }
+            }
+        }
+        WireMessage::GlobalGuideResponse {
+            request_id,
+            guide,
+            error,
+        } => {
+            let result = match (guide, error) {
+                (Some(guide), None) => {
+                    *inner
+                        .global_guide
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = guide.clone();
+                    Ok(guide)
+                }
+                (_, Some(error)) => Err(ApplicationError::Remote {
+                    code: "global_guide_unavailable".into(),
+                    message: error,
+                }),
+                _ => Err(ApplicationError::Transport(
+                    "Relay 返回空的全局指引响应".into(),
+                )),
+            };
+            if let Some(sender) = inner.guide_pending.lock().await.remove(&request_id) {
+                let _ = sender.send(result);
+            }
+        }
         WireMessage::ControlStateUpdated(state) => {
             cache_control_state(inner, state).await;
         }
@@ -2382,6 +2677,8 @@ mod tests {
         let (connected, _) = watch::channel(false);
         let (events, _) = broadcast::channel(16);
         Arc::new(ClientInner {
+            guide_supported: std::sync::atomic::AtomicBool::new(false),
+            tcp_forward_version: AtomicU64::new(0),
             config: RelayClientConfig {
                 relay_address: "127.0.0.1:7443".to_owned(),
                 server_name: "localhost".to_owned(),
@@ -2401,6 +2698,10 @@ mod tests {
             transport_generation: AtomicU64::new(0),
             resource_tools_schema_version: AtomicU64::new(0),
             tool_center: tool_center_client::ToolCenterClientState::default(),
+            global_guide: Arc::new(std::sync::RwLock::new(GlobalGuide::default())),
+            guide_pending: Mutex::new(BTreeMap::new()),
+            tcp_open_pending: Mutex::new(BTreeMap::new()),
+            tcp_events: broadcast::channel(16).0,
             connected,
             core: Mutex::new(ControllerCore::default()),
             pending: Arc::new(PendingRegistry::default()),
@@ -2441,6 +2742,7 @@ mod tests {
 
     fn control_fixture() -> SessionControlState {
         SessionControlState {
+            initialization_pending: false,
             session_id: SessionId::new(),
             agent_generation: 2,
             controller_id: remoteops_domain::ControllerInstanceId::new(),
@@ -2623,6 +2925,7 @@ mod tests {
         );
         let (sender, mut second_transport) = mpsc::unbounded_channel();
         *inner.transport.lock().await = Some(ActiveTransport {
+            tcp_sender: mpsc::channel(32).0,
             generation: 2,
             sender: sender.clone(),
         });
@@ -2694,6 +2997,7 @@ mod tests {
             inner.core.lock().await.upsert_connection(connection);
             let (sender, mut receiver) = mpsc::unbounded_channel();
             *inner.transport.lock().await = Some(ActiveTransport {
+                tcp_sender: mpsc::channel(32).0,
                 generation: 1,
                 sender,
             });
@@ -2715,6 +3019,7 @@ mod tests {
             inner.core.lock().await.upsert_connection(connection);
             let (sender, mut outgoing) = mpsc::unbounded_channel();
             *inner.transport.lock().await = Some(ActiveTransport {
+                tcp_sender: mpsc::channel(32).0,
                 generation: 1,
                 sender,
             });
@@ -2789,6 +3094,7 @@ mod tests {
             cache_control_state(&inner, initial_state.clone()).await;
             let (sender, mut outgoing) = mpsc::unbounded_channel();
             *inner.transport.lock().await = Some(ActiveTransport {
+                tcp_sender: mpsc::channel(32).0,
                 generation: 1,
                 sender,
             });
@@ -3597,6 +3903,7 @@ mod tests {
             .insert(session_id, "test-managed-resume".to_owned());
         let (sender, mut receiver) = mpsc::unbounded_channel();
         *inner.transport.lock().await = Some(ActiveTransport {
+            tcp_sender: mpsc::channel(32).0,
             generation: 1,
             sender,
         });
@@ -3657,6 +3964,7 @@ mod tests {
         drop(core);
         let (sender, mut outgoing) = mpsc::unbounded_channel();
         *inner.transport.lock().await = Some(ActiveTransport {
+            tcp_sender: mpsc::channel(32).0,
             generation: 1,
             sender,
         });
@@ -3747,6 +4055,7 @@ mod tests {
         }
         let (sender, mut receiver) = mpsc::unbounded_channel();
         *inner.transport.lock().await = Some(ActiveTransport {
+            tcp_sender: mpsc::channel(32).0,
             generation: 1,
             sender,
         });
@@ -3958,8 +4267,13 @@ mod tests {
         let (controller_stream, mut relay_stream) = duplex(4096);
         let (reader, writer) = tokio::io::split(controller_stream);
         let (outgoing_sender, outgoing_receiver) = mpsc::unbounded_channel();
-        let transport_task =
-            tokio::spawn(run_transport_io(inner, reader, writer, outgoing_receiver));
+        let transport_task = tokio::spawn(run_transport_io(
+            inner,
+            reader,
+            writer,
+            outgoing_receiver,
+            mpsc::channel(32).1,
+        ));
 
         relay_stream
             .write_all(&frame[..2])
@@ -3996,6 +4310,27 @@ mod tests {
         transport_task.abort();
     }
 
+    #[tokio::test]
+    async fn tcp_writer_keeps_backpressure_when_transport_stops_reading() {
+        let (writer, _peer) = duplex(1);
+        let (_sender, receiver) = mpsc::unbounded_channel();
+        let (tcp_sender, tcp_receiver) = mpsc::channel(1);
+        let task = tokio::spawn(write_transport_messages(writer, receiver, tcp_receiver));
+        let message = WireMessage::Heartbeat {
+            sent_at: Utc::now(),
+            controller_modes: Vec::new(),
+        };
+        tcp_sender.send(message.clone()).await.unwrap();
+        tcp_sender.send(message.clone()).await.unwrap();
+        assert!(
+            timeout(TokioDuration::from_millis(50), tcp_sender.send(message))
+                .await
+                .is_err()
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
     async fn queue_test_operation(
         inner: &Arc<ClientInner>,
     ) -> (
@@ -4005,6 +4340,7 @@ mod tests {
     ) {
         let (sender, receiver) = mpsc::unbounded_channel();
         *inner.transport.lock().await = Some(ActiveTransport {
+            tcp_sender: mpsc::channel(32).0,
             generation: 1,
             sender,
         });
@@ -4191,7 +4527,7 @@ mod tests {
         peer.write_all(&[0, 0]).await.unwrap();
         let (reader, writer) = tokio::io::split(stream);
         let (_sender, receiver) = mpsc::unbounded_channel();
-        let cause = run_transport_io(inner.clone(), reader, writer, receiver)
+        let cause = run_transport_io(inner.clone(), reader, writer, receiver, mpsc::channel(32).1)
             .await
             .err();
         assert!(

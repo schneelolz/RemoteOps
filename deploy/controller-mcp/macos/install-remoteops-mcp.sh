@@ -3,7 +3,7 @@ set +x
 set -euo pipefail
 umask 077
 
-MCP_PACKAGE_VERSION="0.2.0-preview.25"
+MCP_PACKAGE_VERSION="0.2.0-preview.30"
 CREDENTIAL_PROMPT_VERSION="0.2.0-preview.7"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 COMMAND_MODE="agent-controlled"

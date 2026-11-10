@@ -886,9 +886,11 @@ mod tests {
             write_frame(
                 &mut stream,
                 &WireMessage::ControllerWelcome {
+                    tcp_forward_version: None,
                     resource_tools_schema_version: None,
                     tool_center_schema_version: None,
                     protocol_version: PROTOCOL_VERSION,
+                    global_guide: None,
                 },
             )
             .await

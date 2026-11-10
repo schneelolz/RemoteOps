@@ -2,7 +2,7 @@
 
 > 当前安装规则：新安装只支持设置码/设置文件，不再支持 Token 安装；已有安装使用 `-UpgradeExisting` 保留身份和凭据。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](../../../docs/mcp-one-time-setup.md)。
 
-- 版本：`0.2.0-preview.25`
+- 版本：`0.2.0-preview.30`
 - 适用系统：Windows x64
 - Codex MCP 名称：`remoteops`
 - 许可证：`AGPL-3.0-only`
@@ -15,11 +15,11 @@
 
 | 组件 | 当前版本 | 内容与更新范围 |
 | --- | --- | --- |
-| MCP | `0.2.0-preview.25` | MCP EXE、密码辅助程序 `.6`、安装/自检脚本及许可证；不含 Skill |
-| Skill | `0.1.6` | 操作流程、交换机 SSH 排障和工具中心指引；最低 MCP 为 `.25`，协议 20 |
+| MCP | `0.2.0-preview.30` | MCP EXE、密码辅助程序 `.7`、安装/自检脚本及许可证；不含 Skill |
+| Skill | `0.1.9` | 操作流程、交换机 SSH 排障和工具中心指引；最低 MCP 为 `.28`，协议 20 |
 
-首次部署建议下载完整安装包，或分别解压 `RemoteOps-MCP-Windows-x64-0.2.0-preview.25.zip`
-与 `RemoteOps-Skill-0.1.6.zip`。先按本文安装 MCP，再进入 Skill 包执行其独立安装器。
+首次部署建议下载完整安装包，或分别解压 `RemoteOps-MCP-Windows-x64-0.2.0-preview.30.zip`
+与 `RemoteOps-Skill-0.1.9.zip`。先按本文安装 MCP，再进入 Skill 包执行其独立安装器。
 完整包中的两个目录为 `MCP` 与 `Skill`；在 `MCP` 目录完成安装后可执行：
 
 ```powershell
@@ -43,8 +43,8 @@ MCP 单独安装、自检或卸载不要求存在 Skill，也不会覆盖更新�
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-RemoteOpsMcp.ps1 -UpgradeExisting
 ```
 
-升级使用 MCP `0.2.0-preview.25` 和密码安全输入程序 `0.2.0-preview.7`，安装到
-`<CodexHome>/remoteops/candidates/protocol20-preview25-<程序摘要>-<包内容摘要>`。
+升级使用 MCP `0.2.0-preview.30` 和密码安全输入程序 `0.2.0-preview.7`，安装到
+`<CodexHome>/remoteops/candidates/protocol20-preview30-<程序摘要>-<包内容摘要>`。
 两个摘要均取 SHA-256 前 12 位，准确路径由安装器输出；同一 EXE 的配套脚本或文档变化
 也会生成独立目录。两个程序、安装/自检脚本和随包许可并排保留；独立 Skill 不复制、
 不覆盖，现有 Codex/pi 进程及旧文件不受影响。
@@ -109,7 +109,7 @@ Credential Manager 条目和原设置文件，再运行相同安装命令。此�
 安装内容：
 
 ```text
-%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.25.exe
+%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.30.exe
 %USERPROFILE%\.codex\remoteops\remoteops-credential-prompt.exe
 %USERPROFILE%\.codex\remoteops\controller-config.json
 %USERPROFILE%\.codex\remoteops\setup-state.json

@@ -37,7 +37,7 @@ if (-not $setupMode -and -not $UpgradeExisting) {
     throw '新安装必须提供 SetupFile、SetupCode 或 SetupStdin；已有安装请使用 UpgradeExisting。'
 }
 
-$mcpVersion = '0.2.0-preview.25'
+$mcpVersion = '0.2.0-preview.30'
 $credentialPromptVersion = '0.2.0-preview.7'
 $sourceExecutable = Join-Path $PSScriptRoot 'remoteops-controller-mcp.exe'
 $sourceCredentialPrompt = Join-Path $PSScriptRoot 'remoteops-credential-prompt.exe'
@@ -240,7 +240,7 @@ if ($UpgradeExisting) {
     }
     finally { $packageHasher.Dispose() }
     $candidateDirectory = Join-Path $candidateRoot (
-        "protocol20-preview25-" + $sourceHash.Substring(0, 12) + '-' + $packageHash.Substring(0, 12)
+        "protocol20-preview30-" + $sourceHash.Substring(0, 12) + '-' + $packageHash.Substring(0, 12)
     )
     foreach ($directory in @($installDirectory, $candidateRoot, $candidateDirectory)) {
         if ((Test-Path -LiteralPath $directory) -and

@@ -42,9 +42,19 @@ export const router = createRouter({
       component: () => import("./views/ToolsView.vue"),
     },
     {
+      path: "/global-guide",
+      name: "global-guide",
+      component: () => import("./views/GlobalGuideView.vue"),
+    },
+    {
       path: "/identity",
       name: "identity",
       component: () => import("./views/IdentityView.vue"),
+    },
+    {
+      path: "/tcp-forward",
+      name: "tcp-forward",
+      component: () => import("./views/TcpForwardView.vue"),
     },
     {
       path: "/settings",
