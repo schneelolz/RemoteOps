@@ -119,6 +119,7 @@ mod tests {
     #[test]
     fn legacy_agent_hello_defaults_mac_address() {
         let mut value = serde_json::to_value(ClientHello::Agent(AgentHello {
+            test_key_fingerprint: None,
             protocol_version: PROTOCOL_VERSION,
             agent_instance_id: AgentInstanceId::new(),
             boot_id: remoteops_domain::AgentBootId::new(),

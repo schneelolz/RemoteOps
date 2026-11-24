@@ -20,6 +20,7 @@ async fn control_fixture(
                 ai_id,
                 generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -311,6 +312,7 @@ async fn control_state_revokes_on_reconnect_and_repair_and_ignores_old_proofs() 
             ai,
             generation,
             PairRequest {
+                expected_agent_id: None,
                 connection_resume_token: None,
                 expected_session_id: None,
                 request_id: RequestId::new(),

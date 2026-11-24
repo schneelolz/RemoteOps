@@ -1,0 +1,50 @@
+<Window xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:local="using:RemoteOps.Desktop" Icon="/Assets/remoteops.ico" x:Class="RemoteOps.Desktop.MainWindow" Title="RemoteOps · 人工控制端" Width="950" Height="650" MinWidth="650" MinHeight="440">
+  <Grid RowDefinitions="58,*">
+    <Border Background="{DynamicResource DeskBar}" Padding="22,0"><Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+      <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+        <Image Width="30" Height="30" Source="/Assets/remoteops.png"/>
+        <TextBlock Text="RemoteOps" FontSize="21" FontWeight="SemiBold" Foreground="{DynamicResource DeskInk}" VerticalAlignment="Center"/>
+      </StackPanel>
+      <local:AppearanceButton Grid.Column="1" VerticalAlignment="Center"/>
+      <Button Grid.Column="2" Name="SettingsButton" Content="连接设置" VerticalAlignment="Center"/>
+    </Grid></Border>
+    <Grid Grid.Row="1" ColumnDefinitions="210,*">
+      <Border Background="{DynamicResource DeskSide}" BorderBrush="{DynamicResource DeskRule}" BorderThickness="0,0,1,0" Padding="16,21,16,14">
+        <Grid RowDefinitions="Auto,*,Auto">
+          <TextBlock Text="已配对设备" FontSize="16" FontWeight="SemiBold" Margin="4,0,0,12"/>
+          <ListBox Grid.Row="1" Name="Devices" Background="Transparent" BorderThickness="0"/>
+          <Button Grid.Row="2" Name="Refresh" Content="刷新设备" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"/>
+        </Grid>
+      </Border>
+      <ScrollViewer Grid.Column="1" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="28,24" Spacing="14">
+          <TextBlock Text="连接远程设备" FontSize="29" FontWeight="SemiBold"/>
+          <TextBlock Text="输入现场 Agent 显示的控制码" Classes="muted"/>
+          <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+            <TextBox Name="Code" Watermark="控制码" MaxLength="16" AutomationProperties.Name="现场控制码"/>
+            <Button Name="Pair" Grid.Column="1" Classes="primary" Content="连接"/>
+          </Grid>
+          <Border BorderBrush="{DynamicResource DeskRule}" BorderThickness="0,1,0,0" Margin="0,6,0,0"/>
+          <TextBlock Name="Target" FontSize="21" FontWeight="SemiBold" Text="尚未选择设备" TextWrapping="Wrap"/>
+          <TextBlock Name="Status" Classes="muted" Text="正在连接 Relay"/>
+          <WrapPanel>
+            <Button Name="OpenDesktop" Classes="primary" Content="打开实时桌面" Margin="0,0,8,6"/>
+            <Button Name="ToolsButton" Content="人工工具" Margin="0,0,8,6"/>
+            <Button Name="Disconnect" Content="断开整个会话" Margin="0,0,0,6"/>
+          </WrapPanel>
+          <StackPanel Name="Pending" Spacing="6"/>
+          <StackPanel Name="ToolsPanel" IsVisible="False" Spacing="10">
+            <TextBlock Text="人工命令" FontSize="16" FontWeight="SemiBold"/>
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8"><TextBox Name="Command" Watermark="Windows PowerShell 命令"/><Button Grid.Column="1" Name="Run" Content="执行"/></Grid>
+            <TextBlock Text="串口" FontSize="16" FontWeight="SemiBold"/>
+            <WrapPanel><Button Name="ListPorts" Content="列出串口" Margin="0,0,8,4"/><TextBox Name="Port" Width="92" Watermark="COM3" Margin="0,0,8,4"/><TextBox Name="Baud" Width="86" Text="9600" AutomationProperties.Name="波特率" Margin="0,0,8,4"/><CheckBox Name="Writable" Content="允许发送" Margin="0,0,8,4"/><Button Name="OpenPort" Content="打开串口"/></WrapPanel>
+            <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="6"><TextBox Name="SerialText" Watermark="串口文本（发送时追加回车）"/><Button Grid.Column="1" Name="WritePort" Content="发送"/><Button Grid.Column="2" Name="ClosePort" Content="关闭串口"/></Grid>
+          </StackPanel>
+          <Expander Name="LogPanel" Header="操作记录" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+            <TextBox Name="Log" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" Height="132"/>
+          </Expander>
+        </StackPanel>
+      </ScrollViewer>
+    </Grid>
+  </Grid>
+</Window>

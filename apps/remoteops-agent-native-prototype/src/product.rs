@@ -21,6 +21,8 @@ impl ProductHost {
                 product_profile: options.product_profile.clone(),
                 #[cfg(feature = "agent-runtime")]
                 bundled_tools: options.bundled_tools.clone(),
+                #[cfg(feature = "agent-runtime")]
+                test_key_fingerprint: options.test_key_fingerprint.clone(),
             },
         ))
     }

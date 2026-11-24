@@ -1,0 +1,11 @@
+{
+  "protocolVersion": 1,
+  "role": "grclient",
+  "instanceId": "demo-client-01",
+  "relay": "127.0.0.1:7443",
+  "serverName": "localhost",
+  "dataRoot": "C:\\RemoteOpsBridge-Demo",
+  "caCert": null,
+  "tlsFingerprint": null,
+  "allowedCapabilities": ["host_business", "cmd", "windows_power_shell"]
+}

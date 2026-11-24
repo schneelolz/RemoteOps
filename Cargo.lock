@@ -3919,7 +3919,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.41"
+version = "0.2.0-preview.42"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3928,6 +3928,7 @@ dependencies = [
  "clap",
  "remoteops-audit",
  "remoteops-build",
+ "remoteops-desktop-media",
  "remoteops-device",
  "remoteops-domain",
  "remoteops-host-identity",
@@ -3938,19 +3939,21 @@ dependencies = [
  "remoteops-resources",
  "remoteops-serial",
  "remoteops-visual",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "winresource",
  "zeroize",
 ]
 
 [[package]]
 name = "remoteops-agent-desktop-host"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "chrono",
  "remoteops-agent",
@@ -3965,7 +3968,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.34"
+version = "0.2.0-preview.35"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3994,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-native-prototype"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "remoteops-agent",
@@ -4015,7 +4018,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-service"
-version = "0.2.0-preview.16"
+version = "0.2.0-preview.17"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4046,7 +4049,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-application"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4080,6 +4083,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "remoteops-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "remoteops-agent",
+ "remoteops-bridge-protocol",
+ "remoteops-build",
+ "remoteops-device",
+ "remoteops-domain",
+ "remoteops-product",
+ "remoteops-protocol",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "winresource",
+]
+
+[[package]]
+name = "remoteops-bridge-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "remoteops-build"
 version = "0.1.0"
 dependencies = [
@@ -4104,7 +4137,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-cli"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4123,7 +4156,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-gui"
-version = "0.2.0-preview.7"
+version = "0.2.0-preview.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4139,6 +4172,7 @@ dependencies = [
  "remoteops-application",
  "remoteops-audit",
  "remoteops-build",
+ "remoteops-desktop-media",
  "remoteops-domain",
  "remoteops-i18n",
  "remoteops-protocol",
@@ -4156,7 +4190,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-controller-mcp"
-version = "0.2.0-preview.30"
+version = "0.2.0-preview.33"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4210,8 +4244,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "remoteops-desktop-media"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "remoteops-device"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4231,7 +4272,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-domain"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.6"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4286,6 +4327,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "remoteops-human-controller"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "remoteops-application",
+ "remoteops-audit",
+ "remoteops-desktop-media",
+ "remoteops-domain",
+ "remoteops-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "remoteops-i18n"
 version = "0.2.0-preview.5"
 dependencies = [
@@ -4318,7 +4375,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-policy"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.6"
 dependencies = [
  "chrono",
  "regex",
@@ -4350,19 +4407,20 @@ dependencies = [
 
 [[package]]
 name = "remoteops-product"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "remoteops-protocol"
-version = "0.2.0-preview.9"
+version = "0.2.0-preview.10"
 dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
  "hpke",
+ "network-interface",
  "rcgen",
  "remoteops-domain",
  "rustls",
@@ -4374,13 +4432,14 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
+ "uuid",
  "x509-parser",
  "zeroize",
 ]
 
 [[package]]
 name = "remoteops-relay"
-version = "0.2.0-preview.22"
+version = "0.2.0-preview.28"
 dependencies = [
  "anyhow",
  "argon2",

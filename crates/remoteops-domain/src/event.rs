@@ -178,6 +178,19 @@ pub enum PowerAction {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RemoteOperation {
+    /// 读取宿主服务身份及只读业务能力清单。
+    DescribeHostCapabilities,
+    /// 查询宿主登记的只读业务能力；执行端核验实例和能力元数据。
+    QueryHostCapability {
+        /// 发现时返回的宿主进程实例。
+        instance_id: String,
+        /// 宿主能力标识。
+        capability_id: String,
+        /// 精确能力版本。
+        version: String,
+        /// 结构化业务参数。
+        arguments: serde_json::Value,
+    },
     /// 读取当前目标上下文与宿主事实，不启动图形 Provider。
     GetTargetContext,
     /// 列出本地显式启用的公开资源工具候选。

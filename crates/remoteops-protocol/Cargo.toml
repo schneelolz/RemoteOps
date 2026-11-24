@@ -1,13 +1,18 @@
 [package]
 name = "remoteops-protocol"
-version = "0.2.0-preview.9"
+version = "0.2.0-preview.10"
 publish = false
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+desktop-lan = ["dep:network-interface", "dep:rcgen"]
+
 [dependencies]
+network-interface = { workspace = true, optional = true }
+rcgen = { version = "0.14", optional = true }
 base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -24,6 +29,7 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 x509-parser = "0.18"
 zeroize.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 rcgen = "0.14"

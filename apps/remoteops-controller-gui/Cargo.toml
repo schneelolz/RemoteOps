@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-controller-gui"
-version = "0.2.0-preview.7"
+version = "0.2.0-preview.10"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -40,6 +40,7 @@ toml = "1.1"
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+remoteops-desktop-media = { path = "../../crates/remoteops-desktop-media" }
 # Windows 仅编译 DX12；OpenGL 兼容回退由独立 Glow 提供。
 wgpu = { workspace = true, features = ["dx12", "parking_lot"] }
 keyring = "4.1"

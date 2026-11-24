@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/remoteops-bridge-protocol",
+    "apps/remoteops-bridge",
     "crates/remoteops-product",
     "crates/remoteops-build",
     "crates/remoteops-domain",
@@ -22,6 +24,8 @@ members = [
     "crates/remoteops-agent-desktop-host",
     "crates/remoteops-portal",
     "crates/remoteops-visual",
+    "crates/remoteops-desktop-media",
+    "crates/remoteops-human-controller",
     "apps/remoteops-relay",
     "apps/remoteops-agent",
     "apps/remoteops-agent-service",

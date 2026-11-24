@@ -263,7 +263,9 @@ impl DefaultPolicy {
             RemoteOperation::RunCommand { shell, command, .. } => {
                 self.classify_command(Some(*shell), command)
             }
-            RemoteOperation::GetTargetContext
+            RemoteOperation::DescribeHostCapabilities
+            | RemoteOperation::QueryHostCapability { .. }
+            | RemoteOperation::GetTargetContext
             | RemoteOperation::ListResourceTools
             | RemoteOperation::StopResourceTool { .. }
             | RemoteOperation::OpenShell { .. }

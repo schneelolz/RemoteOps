@@ -25,6 +25,8 @@ use windows_sys::Win32::{
 };
 
 mod business;
+#[cfg(feature = "agent-runtime")]
+mod test_key;
 use crate::win32::clipboard;
 mod line_measure_cache;
 mod observer_data;
@@ -119,6 +121,8 @@ enum Kind {
     Observer,
     About,
     Licenses,
+    #[cfg(feature = "agent-runtime")]
+    TestKey,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Theme {
@@ -252,6 +256,8 @@ struct App {
     observer: Cell<HWND>,
     state: RefCell<State>,
     business: RefCell<Option<business::Business>>,
+    #[cfg(feature = "agent-runtime")]
+    test_key: Option<test_key::Dialog>,
     #[allow(clippy::vec_box)] // GWLP_USERDATA 要求 Box 地址不随 Vec 扩容移动。
     windows: RefCell<Vec<Box<Panel>>>,
     quitting: Cell<bool>,
@@ -342,6 +348,16 @@ impl Panel {
     }
 }
 impl App {
+    fn is_test_key(&self) -> bool {
+        #[cfg(feature = "agent-runtime")]
+        {
+            self.test_key.is_some()
+        }
+        #[cfg(not(feature = "agent-runtime"))]
+        {
+            false
+        }
+    }
     fn snapshot(&self) -> State {
         self.state.borrow().clone()
     }
@@ -546,6 +562,8 @@ fn size(kind: Kind) -> (i32, i32) {
         Kind::Observer => (800, 470),
         Kind::About => (400, 248),
         Kind::Licenses => (680, 430),
+        #[cfg(feature = "agent-runtime")]
+        Kind::TestKey => (448, 172),
     }
 }
 fn window_title(app: &App, kind: Kind) -> String {
@@ -560,6 +578,8 @@ fn window_title(app: &App, kind: Kind) -> String {
             Kind::Tls => snapshot.t("证书确认", "Certificate confirmation").into(),
             Kind::Observer => snapshot.t("操作实况", "Operation observer").into(),
             Kind::Licenses => snapshot.t("组件与许可", "Components and licenses").into(),
+            #[cfg(feature = "agent-runtime")]
+            Kind::TestKey => unreachable!("GUID 窗口不初始化业务宿主"),
             Kind::About => format!("{} {}", snapshot.t("关于", "About"), snapshot.product_name),
         };
     }
@@ -573,6 +593,8 @@ fn window_title(app: &App, kind: Kind) -> String {
         Kind::Tls => app.t("证书确认 · 预览", "Certificate · Preview"),
         Kind::Observer => app.t("操作实况 · 预览", "Observer · Preview"),
         Kind::Licenses => app.t("组件与许可", "Components and licenses"),
+        #[cfg(feature = "agent-runtime")]
+        Kind::TestKey => return test_key::title(app),
         Kind::About => app.t("关于 RemoteOps · 预览", "About RemoteOps · Preview"),
     }
     .into()
@@ -736,6 +758,10 @@ fn create_panel(app: &App, kind: Kind, owner: HWND) -> HWND {
             };
             SetTimer(hwnd, TIMER, interval, None);
         }
+        #[cfg(feature = "agent-runtime")]
+        if kind == Kind::TestKey {
+            SetTimer(hwnd, TIMER, 40, None);
+        }
         // 初始鼠标操作不显示传统虚线框；Tab 等键盘操作仍由系统恢复焦点提示。
         SendMessageW(
             hwnd,
@@ -758,6 +784,12 @@ fn create_panel(app: &App, kind: Kind, owner: HWND) -> HWND {
                 .iter()
                 .find(|(id, _)| matches!(**id, 301 | 409 | 425 | 442 | 462 | 502 | 521 | 541))
                 .map(|(_, h)| *h);
+            #[cfg(feature = "agent-runtime")]
+            let first = if kind == Kind::TestKey {
+                Some((&*ptr).control(test_key::COPY))
+            } else {
+                first
+            };
             if let Some(h) = first {
                 SetFocus(h);
             }
@@ -1158,6 +1190,8 @@ fn build(panel: &Panel) {
     let controls_started = Instant::now();
     let t = |zh, en| if state.english { en } else { zh };
     match panel.kind {
+        #[cfg(feature = "agent-runtime")]
+        Kind::TestKey => test_key::build(panel),
         Kind::Main if !state.logs => {
             label(
                 panel,
@@ -2171,6 +2205,11 @@ fn license_page_text(state: &State) -> &str {
         .unwrap_or("")
 }
 fn command(panel: &Panel, id: i32) {
+    #[cfg(feature = "agent-runtime")]
+    if panel.kind == Kind::TestKey {
+        test_key::command(panel, id);
+        return;
+    }
     if id == 313 {
         let paused = {
             let mut state = panel.app().state.borrow_mut();
@@ -2580,6 +2619,11 @@ fn activity_tick(panel: &Panel) {
     }
 }
 fn tick(panel: &Panel) {
+    #[cfg(feature = "agent-runtime")]
+    if panel.kind == Kind::TestKey {
+        test_key::poll(panel);
+        return;
+    }
     let app = panel.app();
     if business::poll(app) {
         activity_tick(panel);
@@ -2765,7 +2809,7 @@ fn draw_button(panel: &Panel, di: &DRAWITEMSTRUCT) {
         let c = app.colors();
         let id = i32::try_from(di.CtlID).unwrap_or(0);
         let danger = matches!(id, 309 | 463);
-        let primary = matches!(id, 304 | 443 | 506 | 523);
+        let primary = matches!(id, 102 | 304 | 443 | 506 | 523);
         let viewer_open = id == 338 && app.observer_visible();
         let (category_selected, category_running) = if (210..=215).contains(&id) {
             let state = app.state.borrow();
@@ -2889,6 +2933,10 @@ fn paint(panel: &Panel) {
         GetClientRect(panel.hwnd.get(), &raw mut rect);
         let c = panel.app().colors();
         fill(hdc, &rect, c.bg);
+        #[cfg(feature = "agent-runtime")]
+        if panel.kind == Kind::TestKey {
+            test_key::paint(panel, hdc, c);
+        }
         if panel.kind == Kind::Main && !panel.app().state.borrow().logs {
             for y in [226, 298] {
                 fill(
@@ -3004,7 +3052,9 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 build(panel);
                 0
             }
-            WM_SETTINGCHANGE | WM_THEMECHANGED if panel.kind == Kind::Main => {
+            WM_SETTINGCHANGE | WM_THEMECHANGED
+                if panel.kind == Kind::Main || panel.app().is_test_key() =>
+            {
                 let app = panel.app();
                 let current = system_prefers_dark();
                 let previous = app.system_dark.replace(current);
@@ -3088,11 +3138,8 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 let hdc = w as HDC;
                 let id = GetDlgCtrlID(l as HWND);
                 let text_view = readonly_view::contains(l as HWND);
-                let bg = if text_view || id == 223 {
-                    c.content
-                } else {
-                    c.bg
-                };
+                let content = text_view || matches!(id, 101 | 223);
+                let bg = if content { c.content } else { c.bg };
                 SetBkMode(hdc, TRANSPARENT.cast_signed());
                 SetBkColor(hdc, bg);
                 SetTextColor(
@@ -3123,7 +3170,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                         c.text
                     },
                 );
-                if text_view || id == 223 {
+                if content {
                     // 内容区画刷使用系统 DC_BRUSH，不为重绘额外分配对象。
                     SetDCBrushColor(hdc, bg);
                     GetStockObject(DC_BRUSH) as isize
@@ -3187,7 +3234,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 0
             }
             WM_DESTROY => {
-                if panel.kind == Kind::Main {
+                if panel.kind == Kind::Main || panel.app().is_test_key() {
                     KillTimer(hwnd, TIMER);
                     PostQuitMessage(0);
                 }
@@ -3210,7 +3257,11 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
 }
 /// 启动独立样式预览；不创建真实 Agent 或读写产品配置。
 pub(super) fn run() -> Result<(), String> {
-    let report = run_impl(None)?;
+    let report = run_impl(
+        None,
+        #[cfg(feature = "agent-runtime")]
+        None,
+    )?;
     if report.passed {
         Ok(())
     } else {
@@ -3219,9 +3270,29 @@ pub(super) fn run() -> Result<(), String> {
 }
 /// 使用已确认的窗口样式启动现有共享产品宿主。
 pub(super) fn run_product(options: &crate::Options) -> Result<crate::Report, String> {
-    run_impl(Some(business::Business::new(options)))
+    run_impl(
+        Some(business::Business::new(options)),
+        #[cfg(feature = "agent-runtime")]
+        None,
+    )
 }
-fn run_impl(product: Option<business::Business>) -> Result<crate::Report, String> {
+/// 显示离线生成结果，复用产品窗口但不创建 Agent 业务宿主。
+#[cfg(feature = "agent-runtime")]
+pub(super) fn run_test_key(
+    guid: String,
+    profile: &remoteops_product::ProductProfile,
+) -> Result<(), String> {
+    if run_impl(None, Some(test_key::Dialog::new(guid, profile)))?.passed {
+        Ok(())
+    } else {
+        Err("GUID 窗口未正常关闭".into())
+    }
+}
+
+fn run_impl(
+    product: Option<business::Business>,
+    #[cfg(feature = "agent-runtime")] test_key: Option<test_key::Dialog>,
+) -> Result<crate::Report, String> {
     NATIVE_FAILURE.with(|failure| failure.set(None));
     render_plan::reset_paint_metrics();
     unsafe {
@@ -3249,6 +3320,10 @@ fn run_impl(product: Option<business::Business>) -> Result<crate::Report, String
         let initial_state = product
             .as_ref()
             .map_or_else(State::default, business::initial_state);
+        #[cfg(feature = "agent-runtime")]
+        let initial_state = test_key
+            .as_ref()
+            .map_or(initial_state, test_key::Dialog::state);
         let app = Box::new(App {
             loading_started: Cell::new(None),
             instance,
@@ -3256,13 +3331,21 @@ fn run_impl(product: Option<business::Business>) -> Result<crate::Report, String
             observer: Cell::new(null_mut()),
             state: RefCell::new(initial_state),
             business: RefCell::new(product),
+            #[cfg(feature = "agent-runtime")]
+            test_key,
             windows: RefCell::new(vec![]),
             quitting: Cell::new(false),
             system_dark: Cell::new(system_prefers_dark()),
             light: CreateSolidBrush(palette(false).bg),
             dark: CreateSolidBrush(palette(true).bg),
         });
-        let hwnd = create_panel(&app, Kind::Main, null_mut());
+        #[allow(unused_mut)]
+        let mut initial_window = Kind::Main;
+        #[cfg(feature = "agent-runtime")]
+        if app.is_test_key() {
+            initial_window = Kind::TestKey;
+        }
+        let hwnd = create_panel(&app, initial_window, null_mut());
         if hwnd.is_null() {
             return Err("无法创建样式预览窗口。".into());
         }
@@ -3291,6 +3374,13 @@ fn run_impl(product: Option<business::Business>) -> Result<crate::Report, String
                 } else {
                     close_panel(&*panel);
                 }
+                continue;
+            }
+            #[cfg(feature = "agent-runtime")]
+            if let Some(panel) = panel_ptr
+                && (*panel).kind == Kind::TestKey
+                && test_key::handle_key(&*panel, &msg)
+            {
                 continue;
             }
             if !root.is_null() && IsDialogMessageW(root, &raw const msg) != 0 {

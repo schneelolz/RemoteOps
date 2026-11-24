@@ -1619,7 +1619,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.41"
+version = "0.2.0-preview.42"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1644,13 +1644,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "winresource",
  "zeroize",
 ]
 
 [[package]]
 name = "remoteops-agent-service"
-version = "0.2.0-preview.16"
+version = "0.2.0-preview.17"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1687,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-device"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.6"
 dependencies = [
  "async-trait",
  "base64",
@@ -1707,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-domain"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.6"
 dependencies = [
  "base64",
  "chrono",
@@ -1735,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-policy"
-version = "0.2.0-preview.5"
+version = "0.2.0-preview.6"
 dependencies = [
  "chrono",
  "regex",
@@ -1746,14 +1747,14 @@ dependencies = [
 
 [[package]]
 name = "remoteops-product"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "remoteops-protocol"
-version = "0.2.0-preview.9"
+version = "0.2.0-preview.10"
 dependencies = [
  "base64",
  "bytes",

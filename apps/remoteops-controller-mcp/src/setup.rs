@@ -517,6 +517,7 @@ async fn check_relay(response: &RedeemResponse, path: &Path, secret: &str) -> an
         .await?;
         match read_frame::<WireMessage, _>(&mut stream).await? {
             WireMessage::ControllerWelcome {
+                test_pairing_supported: false,
                 protocol_version: PROTOCOL_VERSION,
                 ..
             } => Ok(()),
@@ -886,7 +887,10 @@ mod tests {
             write_frame(
                 &mut stream,
                 &WireMessage::ControllerWelcome {
+                    test_pairing_supported: false,
+                    bridge_protocol_version: None,
                     tcp_forward_version: None,
+                    desktop_version: None,
                     resource_tools_schema_version: None,
                     tool_center_schema_version: None,
                     protocol_version: PROTOCOL_VERSION,

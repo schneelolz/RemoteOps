@@ -39,6 +39,9 @@ pub struct HostOptions {
     /// 产品提供的受信任工具资源；普通配置和环境变量不能替换。
     #[cfg(feature = "agent-runtime")]
     pub bundled_tools: Option<remoteops_agent::BundledTools>,
+    /// 本次启动指定的测试密钥摘要。
+    #[cfg(feature = "agent-runtime")]
+    pub test_key_fingerprint: Option<String>,
 }
 impl Default for HostOptions {
     fn default() -> Self {
@@ -53,6 +56,8 @@ impl Default for HostOptions {
             product_profile: None,
             #[cfg(feature = "agent-runtime")]
             bundled_tools: None,
+            #[cfg(feature = "agent-runtime")]
+            test_key_fingerprint: None,
         }
     }
 }
@@ -84,7 +89,9 @@ impl UiFlavor {
         }
     }
     #[cfg(feature = "agent-runtime")]
-    fn preferences_filename(self) -> &'static str {
+    /// 返回对应原生窗口偏好文件名。
+    #[must_use]
+    pub fn preferences_filename(self) -> &'static str {
         match self {
             Self::Win32 => "native-gui-preferences.json",
         }

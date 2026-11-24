@@ -40,14 +40,35 @@ pub struct AgentCapabilityPolicy {
     visual_disabled: bool,
     // 仅允许由公共策略重新计算为只读的操作。
     read_only: bool,
+    // 宿主能力位图，None 保留现有产品的默认能力。
+    allowed: Option<u64>,
 }
 impl AgentCapabilityPolicy {
+    /// 设置能力上限；重复设置只能收紧。
+    /// # Errors
+    /// 未知能力名称返回配置错误。
+    pub fn with_allowed_capabilities(mut self, names: &[String]) -> Result<Self> {
+        let mut bits = 0;
+        for name in names {
+            bits |= capability_bit(name).ok_or_else(|| anyhow::anyhow!("未知宿主能力: {name}"))?;
+        }
+        self.allowed = Some(self.allowed.map_or(bits, |current| current & bits));
+        Ok(self)
+    }
+
+    /// 判断宿主是否开放该能力。
+    #[must_use]
+    pub fn allows(self, name: &str) -> bool {
+        self.allowed
+            .is_none_or(|allowed| capability_bit(name).is_some_and(|bit| allowed & bit != 0))
+    }
     /// 创建强制无图形产品上限。
     #[must_use]
     pub const fn headless() -> Self {
         Self {
             visual_disabled: true,
             read_only: false,
+            allowed: None,
         }
     }
     /// 进一步限制为只读产品。
@@ -56,16 +77,43 @@ impl AgentCapabilityPolicy {
         self.read_only = true;
         self
     }
+    /// 关闭桌面能力并保留其他已有约束。
+    #[must_use]
+    pub const fn without_visual(mut self) -> Self {
+        self.visual_disabled = true;
+        self
+    }
     /// 产品是否允许图形操作。
     #[must_use]
-    pub const fn visual_allowed(self) -> bool {
-        !self.visual_disabled
+    pub fn visual_allowed(self) -> bool {
+        !self.visual_disabled && self.allows("visual")
     }
     /// 产品是否仅允许只读操作。
     #[must_use]
     pub const fn read_only(self) -> bool {
         self.read_only
     }
+}
+
+fn capability_bit(name: &str) -> Option<u64> {
+    [
+        "cmd",
+        "windows_power_shell",
+        "power_shell",
+        "ssh",
+        "serial",
+        "file_transfer",
+        "port_probe",
+        "tcp_exchange",
+        "tcp_forward",
+        "system_operations",
+        "visual",
+        "resource_tools",
+        "host_business",
+    ]
+    .iter()
+    .position(|candidate| *candidate == name)
+    .map(|index| 1_u64 << index)
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +222,23 @@ impl ProductPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn host_allowlist_can_only_shrink() {
+        let policy = AgentCapabilityPolicy::headless()
+            .with_read_only()
+            .with_allowed_capabilities(&["cmd".into(), "host_business".into()])
+            .unwrap();
+        assert!(policy.allows("cmd"));
+        assert!(!policy.visual_allowed());
+        assert!(!policy.allows("file_transfer"));
+        let smaller = policy
+            .with_allowed_capabilities(&["cmd".into(), "ssh".into()])
+            .unwrap();
+        assert!(smaller.allows("cmd"));
+        assert!(!smaller.allows("ssh"));
+        assert!(smaller.without_visual().read_only());
+        assert!(policy.with_allowed_capabilities(&["typo".into()]).is_err());
+    }
     #[test]
     fn defaults_and_paths() {
         let a = ProductProfile::default();

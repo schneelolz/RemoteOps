@@ -1479,6 +1479,8 @@ fn safe_text(redactor: &Redactor, message: &str) -> String {
 /// 将核心操作映射为现场人员可理解的类型名称。
 fn operation_label(operation: &RemoteOperation) -> &'static str {
     match operation {
+        RemoteOperation::DescribeHostCapabilities => "发现宿主业务能力",
+        RemoteOperation::QueryHostCapability { .. } => "查询宿主业务数据",
         RemoteOperation::GetTargetContext => "读取目标上下文",
         RemoteOperation::ValidateResourceTool { .. } => "受控验证资源工具",
         RemoteOperation::PrepareBrowserPassword { .. } => "核验网页密码目标",

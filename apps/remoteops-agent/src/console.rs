@@ -34,6 +34,20 @@ pub async fn run_product_console_with_tools(
     config: AgentConfig,
     tools: Option<super::BundledTools>,
 ) -> anyhow::Result<()> {
+    run_product_console_with_test_key(profile, config, tools, None).await
+}
+
+/// 使用产品控制台和本次启动指定的测试密钥摘要运行 Agent。
+///
+/// # Errors
+///
+/// 配置、Agent 生命周期或信号监听失败时返回错误。
+pub async fn run_product_console_with_test_key(
+    profile: ProductProfile,
+    config: AgentConfig,
+    tools: Option<super::BundledTools>,
+    test_key_fingerprint: Option<String>,
+) -> anyhow::Result<()> {
     profile.validate()?;
     initialize_tracing();
     println!("{} {} · CLI 无图形模式", profile.name, profile.version);
@@ -42,7 +56,8 @@ pub async fn run_product_console_with_tools(
     let permission = AgentPermissionControl::from_config(&config);
     let (events, receiver) = std_mpsc::channel();
     let (shutdown, shutdown_receiver) = watch::channel(false);
-    let options = AgentRuntimeOptions::console(profile.clone()).with_bundled_tools(tools);
+    let mut options = AgentRuntimeOptions::console(profile.clone()).with_bundled_tools(tools);
+    options.test_key_fingerprint = test_key_fingerprint;
     let mut task = tokio::spawn(run_agent_with_options(
         config,
         Some(events),

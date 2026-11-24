@@ -214,6 +214,8 @@ fn refresh_values(app: &App) {
             Kind::Tls => &[526],
             Kind::About => &[542, 543],
             Kind::Observer | Kind::Licenses => &[],
+            #[cfg(feature = "agent-runtime")]
+            Kind::TestKey => &[],
         };
         for id in ids {
             if *id == 305
@@ -848,6 +850,8 @@ fn page_kind_name(kind: Kind) -> &'static str {
         Kind::Observer => "observer",
         Kind::About => "about",
         Kind::Licenses => "licenses",
+        #[cfg(feature = "agent-runtime")]
+        Kind::TestKey => "test_key",
     }
 }
 

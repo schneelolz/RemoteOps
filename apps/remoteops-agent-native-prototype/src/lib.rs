@@ -53,13 +53,11 @@ struct Options {
     bundled_tools: Option<remoteops_agent::BundledTools>,
     #[cfg(feature = "agent-runtime")]
     product_profile: Option<remoteops_product::ProductProfile>,
+    #[cfg(feature = "agent-runtime")]
+    test_key_fingerprint: Option<String>,
 }
 
 impl Options {
-    fn parse() -> Result<Self, String> {
-        Self::parse_from(std::env::args_os().skip(1))
-    }
-
     fn parse_from(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<Self, String> {
         let mut result = Self {
             stress_lines: 100_000,
@@ -218,6 +216,20 @@ type CustomProfile = Option<remoteops_product::ProductProfile>;
 #[cfg(not(feature = "agent-runtime"))]
 type CustomProfile = Option<()>;
 
+#[cfg(feature = "agent-runtime")]
+fn report_test_key_error(cli: bool, message: &str) {
+    if cli {
+        let _ = remoteops_native_host::ensure_console();
+    }
+    #[cfg(windows)]
+    if !cli {
+        remoteops_native_host::show_startup_error(message);
+        return;
+    }
+    eprintln!("{message}");
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_impl(profile: CustomProfile, product_options: ProductOptions) -> ExitCode {
     let args: Vec<_> = std::env::args_os().collect();
     #[cfg(all(feature = "agent-runtime", not(feature = "style-preview")))]
@@ -225,15 +237,56 @@ fn run_impl(profile: CustomProfile, product_options: ProductOptions) -> ExitCode
         return result;
     }
     #[cfg(feature = "agent-runtime")]
-    if args.iter().skip(1).any(|arg| arg == "--cli") {
-        return console::run(
-            profile.unwrap_or_else(|| {
-                remoteops_agent_desktop_host::UiFlavor::Win32.profile(env!("CARGO_PKG_VERSION"))
-            }),
-            &args,
-            product_options.bundled_tools,
-        );
-    }
+    let (args, test_key_fingerprint) = {
+        let cli = args.iter().skip(1).any(|arg| arg == "--cli");
+        let (args, action) = match remoteops_agent::split_test_key_args(args) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                report_test_key_error(cli, &error.to_string());
+                return ExitCode::FAILURE;
+            }
+        };
+        let fingerprint = match action {
+            remoteops_agent::TestKeyAction::Normal => None,
+            remoteops_agent::TestKeyAction::Use(fingerprint) => Some(fingerprint),
+            remoteops_agent::TestKeyAction::Generate => {
+                let guid = remoteops_agent::generate_test_key();
+                if cli {
+                    if let Err(error) = remoteops_native_host::ensure_console() {
+                        eprintln!("无法初始化控制台：{error}");
+                        return ExitCode::FAILURE;
+                    }
+                    println!("{guid}");
+                    return ExitCode::SUCCESS;
+                }
+                #[cfg(windows)]
+                {
+                    let profile = profile.unwrap_or_else(|| {
+                        remoteops_agent_desktop_host::UiFlavor::Win32
+                            .profile(env!("CARGO_PKG_VERSION"))
+                    });
+                    match style_preview::run_test_key(guid, &profile) {
+                        Ok(()) => return ExitCode::SUCCESS,
+                        Err(error) => report_test_key_error(false, &error),
+                    }
+                }
+                #[cfg(not(windows))]
+                report_test_key_error(false, "此平台请使用 --cli 生成 GUID");
+                return ExitCode::FAILURE;
+            }
+        };
+        if cli {
+            return console::run_with_key(
+                profile.unwrap_or_else(|| {
+                    remoteops_agent_desktop_host::UiFlavor::Win32.profile(env!("CARGO_PKG_VERSION"))
+                }),
+                &args,
+                product_options.bundled_tools,
+                fingerprint,
+            );
+        }
+        (args, fingerprint)
+    };
     if args.iter().any(|arg| arg == "--help" || arg == "--version") {
         println!(
             "RemoteOps Windows 原生界面小样 {}\n--style-demo 只展示旧版样式、各小窗口和只读观察窗，不连接现场。\n专用 style-preview 构建默认进入样式预览。\n普通构建默认启动独立原生产品；首次使用需要配置 Relay。\n--product-demo 仅演示产品界面；--demo 保留旧诊断按钮。\n--self-test --report PATH [--stress-lines 100000] [--exit-after-ms 100]\n--visible --preview-dpi 144；布局预览不改变系统缩放。",
@@ -241,13 +294,20 @@ fn run_impl(profile: CustomProfile, product_options: ProductOptions) -> ExitCode
         );
         return ExitCode::SUCCESS;
     }
-    let options = match Options::parse() {
+    let options = match Options::parse_from(args.into_iter().skip(1)) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
+    #[cfg(feature = "agent-runtime")]
+    if test_key_fingerprint.is_some()
+        && (options.demo || options.self_test || options.style_demo || options.product_demo)
+    {
+        report_test_key_error(false, "演示或自测模式不接受测试密钥");
+        return ExitCode::FAILURE;
+    }
     #[cfg(feature = "agent-runtime")]
     if profile.is_some()
         && let Err(error) = options.validate_custom_product()
@@ -262,6 +322,7 @@ fn run_impl(profile: CustomProfile, product_options: ProductOptions) -> ExitCode
     #[cfg(feature = "agent-runtime")]
     let options = Options {
         product_profile: profile,
+        test_key_fingerprint,
         bundled_tools: product_options.bundled_tools,
         ..options
     };

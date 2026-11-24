@@ -77,6 +77,10 @@ pub(crate) fn router() -> Router<AdminState> {
             "/api/portal/v1/assets/{asset_id}/remote-access",
             get(status),
         )
+        .route(
+            "/api/portal/v1/assets/{asset_id}/managed-enrollment",
+            post(prepare_managed_enrollment),
+        )
         .route("/api/portal/v1/assets/{asset_id}/invitations", post(issue))
         .route(
             "/api/portal/v1/invitations/{invitation_id}",
@@ -360,6 +364,26 @@ async fn status(
         .map(Json)
         .map_err(error)
 }
+async fn prepare_managed_enrollment(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(asset_id): Path<String>,
+) -> ApiResult<CreatedAsset> {
+    rate_limit(peer.ip())?;
+    let credential = bearer(&headers)?;
+    let delegated = std::env::var("REMOTEOPS_PORTAL_MANAGED_PROVISION_PRINCIPAL")
+        .ok()
+        .and_then(|value| Uuid::parse_str(value.trim()).ok())
+        .ok_or_else(|| error(PortalError::Forbidden))?;
+    state
+        .relay
+        .portal_prepare_managed_enrollment(credential, delegated, &asset_id)
+        .await
+        .map(Json)
+        .map_err(error)
+}
+
 async fn issue(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,

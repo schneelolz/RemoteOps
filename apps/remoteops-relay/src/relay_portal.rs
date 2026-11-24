@@ -86,6 +86,22 @@ fn consumer(
     }
 }
 
+fn check_expected_agent(
+    request: &PairRequest,
+    agent_id: remoteops_domain::AgentInstanceId,
+) -> Result<(), (PairingErrorCode, String)> {
+    if request
+        .expected_agent_id
+        .is_some_and(|expected| expected != agent_id)
+    {
+        return Err((
+            PairingErrorCode::Rejected,
+            "控制码与预期 Agent 身份不匹配".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn reject_pair(
     state: &mut RelayState,
     controller_id: ControllerInstanceId,
@@ -314,6 +330,11 @@ impl Relay {
         if hello.pairing_mode == PairingMode::Unknown {
             bail!("Agent 配对模式未知");
         }
+        if hello.pairing_mode == PairingMode::LongPerBoot
+            && hello.protocol_version != remoteops_protocol::BRIDGE_PROTOCOL_VERSION
+        {
+            bail!("长授权码要求协议 22");
+        }
         if let Some(context) = &hello.target_context {
             context.validate().map_err(anyhow::Error::msg)?;
         }
@@ -380,6 +401,19 @@ impl Relay {
             && let Some(code) = &request.pairing_code
             && let Some(agent_id) = state.pairing_index.get(code)
         {
+            check_expected_agent(request, *agent_id)?;
+            if state.agents.get(agent_id).is_some_and(|agent| {
+                agent.hello.test_key_fingerprint.is_some()
+                    && agent
+                        .test_pairing
+                        .as_ref()
+                        .is_none_or(|test| test.expires_at <= now)
+            }) {
+                return Err((
+                    PairingErrorCode::UnknownOrExpired,
+                    "测试控制码租约已经过期".into(),
+                ));
+            }
             return Ok((*agent_id, None, None));
         }
         if controller.protocol_version != PROTOCOL_VERSION || controller.kind != ControllerKind::Ai
@@ -424,6 +458,7 @@ impl Relay {
                 portal_pair_error(error)
             }
         })?;
+        check_expected_agent(request, saved.agent_id)?;
         let agent = state
             .agents
             .get(&saved.agent_id)
@@ -519,6 +554,17 @@ impl Relay {
         let _state = self.state.lock().await;
         self.portal_store()?.create_asset(request)
     }
+    pub(crate) async fn portal_prepare_managed_enrollment(
+        &self,
+        bearer: &str,
+        delegated_principal: Uuid,
+        asset_id: &str,
+    ) -> PortalResult<CreatedAsset> {
+        let _state = self.state.lock().await;
+        self.portal_store()?
+            .prepare_managed_enrollment(bearer, delegated_principal, asset_id)
+    }
+
     pub(crate) async fn portal_status(
         &self,
         bearer: &str,
@@ -553,9 +599,17 @@ impl Relay {
             return Err(PortalError::Conflict);
         }
         let snapshot = target(agent);
+        let now = Utc::now();
+        super::reclaim_expired_test_codes(&mut state, now);
         let reserved = state
             .pairing_index
             .keys()
+            .chain(
+                state
+                    .agents
+                    .values()
+                    .filter_map(|a| a.test_pairing.as_ref().map(|t| &t.code)),
+            )
             .map(|code| code.as_str().to_owned())
             .collect::<Vec<_>>();
         let issued = store.issue(

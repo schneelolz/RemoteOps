@@ -16,7 +16,12 @@ pub(super) fn run(args: &Args, profile: ProductProfile) -> std::process::ExitCod
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(remoteops_agent::run_product_console(profile, config))
+        runtime.block_on(remoteops_agent::run_product_console_with_test_key(
+            profile,
+            config,
+            None,
+            args.test_key_fingerprint.clone(),
+        ))
     })();
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

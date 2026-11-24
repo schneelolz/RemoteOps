@@ -2,7 +2,7 @@
 name: remoteops
 description: 仅在用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，使用 RemoteOps MCP 连接和诊断现场 Agent。普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不触发本 Skill；看不到 RemoteOps MCP 工具时必须报告当前任务未加载 RemoteOps MCP，禁止改用 Computer Use 或声称已操作远端。
 metadata:
-  version: "0.1.9"
+  version: "0.1.10"
 ---
 
 # RemoteOps 远程诊断
@@ -26,6 +26,12 @@ metadata:
 9. 如果 MCP 返回逐项确认不可用、确认界面不存在、超时或确认未完成，必须将本次操作视为未执行并停止；不得把确认通道故障解释为操作失败后自动切换完全控制，也不得声称已修改或重启。只有用户明确要求完全控制时，才调用 `set_control_mode(full_access)`，并以该工具的独立授权作为唯一确认。
 10. SSH 密码不得写入对话、提示词或 MCP 工具参数。需要密码认证时调用 `run_ssh` 并设置 `use_password=true`，由控制端本机安全窗口直接向用户获取；用户说“忘记该 SSH 密码”时调用 `clear_ssh_credential_cache`。
 
+## 测试机重启后重新配对
+
+- 首次配对成功后，在当前测试任务的上下文记住返回的 `agent_instance_id`，以及用户给出的九位测试控制码。`agent_instance_id` 标识设备，`session_id` 只标识本次会话。不要把控制码写入长期记忆、Skill、配置或日志。
+- 测试 Agent 使用同一个 GUID 启动且仍在两小时保留期内时，等设备重新上线，显式调用 `pair_connection`，将原九位码填入 `pairing_code`，将首次配对返回的 `agent_instance_id` 原样填入 `expected_agent_id`。只使用配对后返回的新 `session_id`。
+- 离线时有限重试，确认 Relay 不支持目标校验、目标不匹配、租约已失效或当前任务缺少原设备 ID 时停止并报告。不得去掉 `expected_agent_id` 重试，也不得按别名或主机名猜目标。新会话重新核对有效权限和授权，不重放上次会话未确认完成的写入或重启。
+
 ## 交换机与网络设备 SSH
 
 - 先确认用户指定的目标、端口和用户名。`test_port` 成功只证明 TCP 可达；PuTTY 手动登录成功只证明该客户端的认证和交互会话可用，不能代替 MCP 的远程命令验收。密码仍只走 `run_ssh(use_password=true)` 的本机安全窗口。
@@ -40,7 +46,7 @@ metadata:
 
 ## 扫描、Linux 查询与分阶段排障
 
-- 本版 Skill 最低要求 MCP `0.2.0-preview.28`，协议为 20。先核对实际运行程序、Agent 与协商协议；配置文件中的路径更新不证明当前宿主已加载新版。工具发现失败时运行 MCP `--check-tool-schemas`，保留失败工具和 Schema 路径；该入口离线运行，不需登记凭据或安装 Node。
+- 本版 Skill 最低要求 MCP `0.2.0-preview.31`，协议为 20。先核对实际运行程序、Agent 与协商协议；配置文件中的路径更新不证明当前宿主已加载新版。工具发现失败时运行 MCP `--check-tool-schemas`，保留失败工具和 Schema 路径；该入口离线运行，不需登记凭据或安装 Node。
 - Windows 正式候选的扫描使用随包微软 OpenSSH `10.4.0.0p1-Preview`，密码执行继续优先随包 Plink `0.83`。不得临时改 PATH、替换系统 OpenSSH 或添加包装程序把旧版扫描成功当作正式修复通过；扫描组件缺失或校验失败时报告准备失败。Preview 与 Server 2016 兼容性只按实际测试记录。
 - 扫描与信任默认总预算 15 秒，扫描器内部 5 秒，进程及输出回收最多 12 秒，锁等待最多 2 秒且共享总截止时间。超时、取消或输出为空属于扫描／信任阶段；不把它当作密码错误，不自动接受不完整指纹集合，也不在结果未知时重放信任写入。
 - Linux 的短小只读验收可使用 `hostname`、`whoami`、`uname -a`，设置 `readonly=true`。白名单区分大小写且不接受额外参数、换行、连接符、重定向或替换表达式；不要改写用户命令来绕过分类。H3C／华为继续使用设备支持的 `display version` 等查询。
@@ -60,7 +66,7 @@ metadata:
 
 ## 工具中心管理（协议 20）
 
-完整字段、默认值、服务端维护字段、CLI 参数映射及 external／hosted 登记示例见 [工具中心请求契约](references/tool-center-contract.md)。Skill `0.1.9` 最低兼容 MCP `0.2.0-preview.28`；显式浏览器适配与 RemoteOps 全局指引需配套新版 Relay／Agent，详见契约中的兼容要求。
+完整字段、默认值、服务端维护字段、CLI 参数映射及 external／hosted 登记示例见 [工具中心请求契约](references/tool-center-contract.md)。Skill `0.1.10` 最低兼容 MCP `0.2.0-preview.31`；显式浏览器适配与 RemoteOps 全局指引需配套新版 Relay／Agent，详见契约中的兼容要求。
 
 - 工具管理与现场 Agent 会话独立；先调用 `manage_relay_tools` 的 `snapshot` 核对实际目录、策略和修订。Relay 必须为当前安装身份单独授予 `tool_management`，完全控制或旧共享 Token 不能代替该权限。无权限时报告拒绝，不切换控制模式绕过。
 - 每个管理请求使用稳定 `request_id` 和当前 `expected_revision`。修订冲突先重新读取；断线或回执未知时报告未知，不自动重新上传或重放变更。
@@ -69,7 +75,7 @@ metadata:
 - 全局功能及新工具默认关闭。只有用户明确要求启用时才修改相应开关；升级接入或授予管理权限不包含上传现有包、自动启用或执行工具。
 - Agent 工具由已连接中继统一管理；旧本地资源站不是运行入口。按真实确认状态报告目录同步；停用、断线或无法确认的在途执行结果保留 `result_unknown`，不自动重放。
 - 已安装 MCP 升级复用原 `controller-config.json` 和凭据，不重新登记。Codex 须完全退出后重开；pi 须重开或 `/reload`，单独 reconnect 不会重新读取 MCP 程序路径。
-- Skill `0.1.9` 最低 MCP 为 `0.2.0-preview.28`。连接后优先调用 `refresh_global_guide` 获取 Relay 维护的 RemoteOps 全局操作指引。该指引只提供建议，不能授予权限或改变安全策略。更新程序不自动修正旧登记；浏览器启动前按 [浏览器启动契约](references/browser-startup.md) 核对显式适配模式和目录同步。工具中心的 `guide_markdown` 仍只用于工具选择，管理者通过 `set_guide{guide_markdown}` 更新工具中心说明，最多 32 KiB UTF-8。
+- Skill `0.1.10` 最低 MCP 为 `0.2.0-preview.31`。连接后优先调用 `refresh_global_guide` 获取 Relay 维护的 RemoteOps 全局操作指引。该指引只提供建议，不能授予权限或改变安全策略。更新程序不自动修正旧登记；浏览器启动前按 [浏览器启动契约](references/browser-startup.md) 核对显式适配模式和目录同步。工具中心的 `guide_markdown` 仍只用于工具选择，管理者通过 `set_guide{guide_markdown}` 更新工具中心说明，最多 32 KiB UTF-8。
 - 持续 TCP 转发需要 MCP preview.28、Relay preview.20、Agent preview.39 及转发扩展 v2。先用 `get_remoteops_info` 核对本机版本，再用 `get_tcp_forward_policy(session_id)` 读取当前现场和安装身份适用的目标规则、申请入口及字段。目标未批准时按返回的管理员入口申请，不能反复重试或绕过策略。管理员在后台“TCP 转发策略”在线保存后立即生效，无需重启 Relay。临时规则应限制现场、安装身份和有效期，验收后移除。
 - 获准后使用 `create_tcp_forward` 创建回环监听，通过 `list_tcp_forwards` 查看状态和流量，结束时调用 `close_tcp_forward`。本地客户端访问返回的地址。浏览器的 Host、重定向和证书名称，SSH 主机密钥，RDP 的证书及 NLA 结果分别验证。该能力仅连通固定目标，不修改路由表。
 - 配对返回 `sync_status=initializing` 时等待现场默认权限同步，并重新读取 `get_control_mode`。只有 `synced` 才按有效模式继续。`local_default` 表示现场保存的默认授权，返回消息会明确告知。只读命令 `run_readonly_command` 必须传 `shell`，使用已有持久 Shell 时另外传 `shell_id` 并确保类型匹配。

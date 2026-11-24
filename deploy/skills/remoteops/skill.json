@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "name": "remoteops",
-  "version": "0.1.9",
-  "minimum_mcp_version": "0.2.0-preview.28",
+  "version": "0.1.10",
+  "minimum_mcp_version": "0.2.0-preview.31",
   "protocol": 20,
   "required_tools": [
     "pair_connection",

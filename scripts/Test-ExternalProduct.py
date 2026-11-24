@@ -33,7 +33,7 @@ def main():
             text = text.replace('../../' + relative, (repo / relative).as_posix())
         manifest.write_text(text)
         if args.update_lock:
-            run(['cargo', 'generate-lockfile'], root, env)
+            run(['cargo', 'check', '--offline'], root, env)
             shutil.copy2(root / 'Cargo.lock', repo / 'examples/example-assist/Cargo.lock')
         for action in ('check', 'test', 'build'):
             run(['cargo', action, '--locked'], root, env)

@@ -8,6 +8,7 @@ pub use control::{
 };
 mod credential;
 mod message;
+pub mod desktop;
 pub mod tcp_forward;
 mod tls;
 
@@ -20,15 +21,16 @@ pub use credential::{
 pub use message::{
     AgentHello, AgentLeaseRenewed, AgentPermissionModeChanged, AgentResumeCommitAck,
     AgentResumeCommitted, AgentShutdownRequest, AgentShutdownResult, AgentWelcome, AgentWelcomeAck,
-    ApprovalDecision, ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest, ClientHello,
-    ControllerBinding, ControllerControlMode, ControllerControlModeUpdate, ControllerHello,
-    ControllerKind, GlobalGuide, LEGACY_PROTOCOL_VERSION, ManagedAgentEnrollment, PROTOCOL_VERSION,
-    PairRequest, PairResult, PairingErrorCode, PairingMode, RelayAuthorization,
-    ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest, RemoteResponse, WireMessage,
+    ApprovalDecision, ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest,
+    BRIDGE_PROTOCOL_VERSION, ClientHello, ControllerBinding, ControllerControlMode,
+    ControllerControlModeUpdate, ControllerHello, ControllerKind, GlobalGuide,
+    LEGACY_PROTOCOL_VERSION, ManagedAgentEnrollment, PROTOCOL_VERSION, PairRequest, PairResult,
+    PairingErrorCode, PairingMode, RelayAuthorization, ReleaseSessionRequest, ReleaseSessionResult,
+    RemoteRequest, RemoteResponse, TEST_PAIRING_AGENT_PROTOCOL_VERSION, WireMessage,
     supports_protocol_version,
 };
 pub use tls::{
     TlsCertificateProbe, TlsError, TlsServerConfig, accept_tls, connect_tls, load_client_config,
     load_native_client_config, load_pinned_client_config, load_server_config,
-    normalize_certificate_fingerprint, probe_server_certificate,
+    normalize_certificate_fingerprint, pinned_client_config, probe_server_certificate,
 };

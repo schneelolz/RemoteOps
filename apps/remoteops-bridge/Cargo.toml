@@ -1,0 +1,38 @@
+[package]
+name = "remoteops-bridge"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "RemoteOpsBridge"
+path = "src/main.rs"
+
+[package.metadata.winresource]
+FileDescription = "RemoteOps isolated host bridge"
+ProductName = "RemoteOpsBridge"
+OriginalFilename = "RemoteOpsBridge.exe"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+remoteops-agent = { path = "../remoteops-agent" }
+remoteops-bridge-protocol = { path = "../../crates/remoteops-bridge-protocol" }
+remoteops-product = { path = "../../crates/remoteops-product" }
+remoteops-domain = { path = "../../crates/remoteops-domain" }
+remoteops-device = { path = "../../crates/remoteops-device" }
+remoteops-protocol = { path = "../../crates/remoteops-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+remoteops-build = { path = "../../crates/remoteops-build" }
+winresource.workspace = true
+
+[lints]
+workspace = true

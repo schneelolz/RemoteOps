@@ -1,4 +1,6 @@
 target/
+**/bin/
+**/obj/
 artifacts/
 outputs/
 work/

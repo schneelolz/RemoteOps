@@ -2,6 +2,8 @@
 mod control;
 #[path = "relay_portal.rs"]
 mod portal_access;
+#[path = "relay_desktop.rs"]
+mod desktop;
 #[path = "relay_tcp_forward.rs"]
 mod tcp;
 #[path = "relay_tools.rs"]
@@ -24,8 +26,8 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_ha
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
 use remoteops_domain::{
-    AgentBootId, AgentInstanceId, ApprovalId, ApprovalState, ConnectionDescriptor, ConnectionState,
-    ControllerInstanceId, ControllerOwnerId, EventSource, PairingCode, PairingLease,
+    AccessCode, AgentBootId, AgentInstanceId, ApprovalId, ApprovalState, ConnectionDescriptor,
+    ConnectionState, ControllerInstanceId, ControllerOwnerId, EventSource, PairingLease,
     PermissionMode, RemoteOperation, RequestId, SessionId, SessionRole,
 };
 use remoteops_enrollment_store::{EnrollmentStore, StoreError};
@@ -58,6 +60,7 @@ const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const CLIENT_HELLO_TIMEOUT: time::Duration = time::Duration::from_secs(10);
 const CONTROLLER_IDLE_TIMEOUT: time::Duration = time::Duration::from_secs(45);
 const MAX_REGISTERED_AGENTS: usize = 1024;
+const TEST_PAIRING_RETENTION: Duration = Duration::hours(2);
 const UNPAIRED_AGENT_RETENTION: Duration = Duration::hours(24);
 const MAX_AUDIT_EVENTS: usize = 1_000;
 // 未完成令牌交接时限制连续启动次数，防止退役标识无限积累。
@@ -116,6 +119,7 @@ where
 struct AgentRecord {
     hello: AgentHello,
     lease: PairingLease,
+    test_pairing: Option<TestPairingLease>,
     resume_token: Option<String>,
     previous_resume_token: Option<PreviousResumeToken>,
     pending_resume: Option<PendingResume>,
@@ -137,6 +141,13 @@ struct AgentRecord {
     lease_expired: bool,
     /// Agent 本地用户选择的会话级权限，不持久化。
     permission_mode: PermissionMode,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TestPairingLease {
+    fingerprint: String,
+    code: AccessCode,
+    expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -189,10 +200,14 @@ struct SessionBindings {
     human: Option<SessionBinding>,
     ai: Option<SessionBinding>,
     human_takeover: bool,
+    // 桌面输入授权由当前媒体流持有，流关闭时独立释放。
+    desktop_takeover: bool,
     managed_connection_id: Option<Uuid>,
 }
 
 impl SessionBindings {
+    fn taken_over(&self) -> bool { self.human_takeover || self.desktop_takeover }
+
     fn permission_mode(&self) -> PermissionMode {
         self.active_controller_kind()
             .map_or(self.agent_permission_mode, |kind| {
@@ -206,7 +221,7 @@ impl SessionBindings {
             .map_or(PermissionMode::ApprovalRequired, |binding| {
                 minimum_permission_mode(binding.permission_mode, self.agent_permission_mode)
             });
-        if kind == ControllerKind::Ai && self.human_takeover {
+        if kind == ControllerKind::Ai && self.taken_over() {
             PermissionMode::ReadOnly
         } else {
             permission_mode
@@ -214,7 +229,7 @@ impl SessionBindings {
     }
 
     fn active_controller_kind(&self) -> Option<ControllerKind> {
-        if self.human_takeover && self.human.is_some() {
+        if self.taken_over() && self.human.is_some() {
             Some(ControllerKind::Human)
         } else if self.ai.is_some() {
             Some(ControllerKind::Ai)
@@ -336,10 +351,11 @@ struct AgentRegistration {
 #[derive(Default)]
 struct RelayState {
     tcp: tcp::TcpState,
+    desktops: BTreeMap<SessionId, desktop::Stream>,
     global_guide: GlobalGuide,
     tool_state: tools::ToolRelayState,
     agents: BTreeMap<AgentInstanceId, AgentRecord>,
-    pairing_index: BTreeMap<PairingCode, AgentInstanceId>,
+    pairing_index: BTreeMap<AccessCode, AgentInstanceId>,
     controllers: BTreeMap<ControllerInstanceId, ControllerRecord>,
     session_bindings: BTreeMap<SessionId, SessionBindings>,
     approvals: BTreeMap<ApprovalId, RelayApprovalRecord>,
@@ -380,6 +396,8 @@ struct PersistedAgent {
     managed_target_id: Option<String>,
     /// 控制码和逻辑会话的租约。
     lease: PairingLease,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    test_pairing: Option<TestPairingLease>,
     /// 最近一次已经确认的 Agent 恢复令牌。
     resume_token: Option<String>,
     /// 恢复令牌两阶段确认期间仍可接受的上一个令牌。
@@ -1391,6 +1409,9 @@ impl Relay {
     {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let hello = read_client_hello(&mut reader, CLIENT_HELLO_TIMEOUT).await?;
+        if let WireMessage::DesktopMedia(ticket) = hello {
+            return self.attach_desktop_media(ticket, reader, writer).await;
+        }
         let (sender, mut receiver, connection_closed) = outbound_channel();
         let writer_closed = connection_closed.clone();
         let writer_task = tokio::spawn(async move {
@@ -1429,7 +1450,12 @@ impl Relay {
     where
         R: AsyncRead + Unpin,
     {
-        if !remoteops_protocol::supports_protocol_version(hello.protocol_version) {
+        let test_pairing = hello.test_key_fingerprint.is_some();
+        if if test_pairing {
+            hello.protocol_version != remoteops_protocol::TEST_PAIRING_AGENT_PROTOCOL_VERSION
+        } else {
+            !remoteops_protocol::supports_protocol_version(hello.protocol_version)
+        } {
             bail!("Agent 协议版本不兼容：{}", hello.protocol_version);
         }
         let agent_id = hello.agent_instance_id;
@@ -1546,6 +1572,9 @@ impl Relay {
                         package_busy.clone(),
                     );
                 }
+                Ok(WireMessage::Desktop(event)) => {
+                    self.desktop_agent(agent_id, connection_generation, event).await;
+                }
                 Ok(WireMessage::TcpForwardV2(frame)) => {
                     self.tcp_from_agent(agent_id, connection_generation, frame)
                         .await;
@@ -1644,7 +1673,10 @@ impl Relay {
         }
         if sender
             .send(WireMessage::ControllerWelcome {
+                test_pairing_supported: true,
+                bridge_protocol_version: Some(remoteops_protocol::BRIDGE_PROTOCOL_VERSION),
                 tcp_forward_version: Some(remoteops_protocol::tcp_forward::TCP_FORWARD_VERSION),
+                desktop_version: Some(1),
                 resource_tools_schema_version: Some(1),
                 tool_center_schema_version: (hello.protocol_version >= 19).then_some(1),
                 protocol_version: hello.protocol_version,
@@ -1702,6 +1734,9 @@ impl Relay {
                         &sender,
                     )
                     .await;
+                }
+                Ok(WireMessage::Desktop(event)) => {
+                    self.desktop_controller(controller_id, connection_generation, event, &sender).await;
                 }
                 Ok(WireMessage::TcpForwardV2(frame)) => {
                     self.tcp_from_controller(controller_id, connection_generation, frame)
@@ -2084,7 +2119,7 @@ impl Relay {
             && state
                 .session_bindings
                 .get(&request.session_id)
-                .is_some_and(|bindings| bindings.human_takeover)
+                .is_some_and(SessionBindings::taken_over)
             && !ai_operation_allowed_after_takeover(&self.policy, &operation)
         {
             return approval_failure(
@@ -2268,6 +2303,16 @@ impl Relay {
         let now = Utc::now();
         let mut state = self.state.lock().await;
         let agent_id = hello.agent_instance_id;
+        if let Some(fingerprint) = &hello.test_key_fingerprint
+            && (hello.pairing_mode != PairingMode::AutoPerBoot
+                || fingerprint.len() != 64
+                || !fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+        {
+            bail!("测试密钥摘要或 Agent 模式无效");
+        }
+        reclaim_expired_test_codes(&mut state, now);
         if let Some(original) = state.agents.get(&agent_id).cloned() {
             if original.retired_boots.contains(&hello.boot_id) {
                 bail!("Agent 启动标识已经退役");
@@ -2299,6 +2344,9 @@ impl Relay {
             {
                 bail!("新启动必须提供已签发的 Agent 恢复令牌");
             }
+            if !new_boot && original.hello.test_key_fingerprint != hello.test_key_fingerprint {
+                bail!("同一次 Agent 启动不能切换测试密钥");
+            }
             let mut replacement = original.clone();
             if managed_bootstrap {
                 replacement.resume_token = None;
@@ -2309,12 +2357,23 @@ impl Relay {
                     bail!("Agent 未完成的启动切换次数过多，请恢复当前启动的握手");
                 }
                 replacement.retired_boots.insert(original.hello.boot_id);
-                replacement.lease =
-                    self.lease_for_agent(&state, agent_id, hello.pairing_mode, now)?;
+            }
+            let new_session = new_boot
+                || (hello.pairing_mode == PairingMode::LongPerBoot
+                    && !original.lease.is_valid_at(now))
+                || (hello.test_key_fingerprint.is_some() && original.test_pairing.is_none());
+            if new_session {
+                (replacement.lease, replacement.test_pairing) =
+                    self.lease_for_start(&state, &hello, replacement.test_pairing, now)?;
                 replacement.session_id = SessionId::new();
                 replacement.permission_mode = PermissionMode::ApprovalRequired;
             } else {
                 replacement.lease.renew(now, self.lease_lifetime);
+                if hello.test_key_fingerprint.is_some()
+                    && let Some(test) = replacement.test_pairing.as_mut()
+                {
+                    test.expires_at = now + TEST_PAIRING_RETENTION;
+                }
             }
             replacement.connection_generation = original
                 .connection_generation
@@ -2333,6 +2392,7 @@ impl Relay {
                 authenticated_token: replacement.hello.resume_token.clone(),
             });
             let welcome = AgentWelcome {
+                test_key_accepted: replacement.hello.test_key_fingerprint.is_some(),
                 pairing_code: replacement.lease.pairing_code.clone(),
                 pairing_mode: replacement.hello.pairing_mode,
                 managed_target_id: replacement.managed_target_id.clone(),
@@ -2343,7 +2403,7 @@ impl Relay {
             };
             replacement.persisted_lease_expires_at = replacement.lease.expires_at;
             let connection_generation = replacement.connection_generation;
-            if new_boot {
+            if new_session {
                 remove_pairing_index(&mut state, original.lease.pairing_code.as_ref());
                 insert_pairing_index(
                     &mut state,
@@ -2353,7 +2413,7 @@ impl Relay {
             }
             state.agents.insert(agent_id, replacement);
             if let Err(error) = self.persist_state_locked(&state) {
-                if new_boot {
+                if new_session {
                     remove_pairing_index(&mut state, welcome.pairing_code.as_ref());
                     insert_pairing_index(
                         &mut state,
@@ -2364,7 +2424,7 @@ impl Relay {
                 state.agents.insert(agent_id, original);
                 return Err(error.context("保存 Agent 恢复状态失败"));
             }
-            if new_boot {
+            if new_session {
                 end_restarted_session(&mut state, original.session_id);
             }
             if original.managed_target_id.is_some() {
@@ -2384,9 +2444,10 @@ impl Relay {
         }
         ensure_agent_capacity(state.agents.len())?;
         let managed_target_id = self.validate_managed_agent(&hello)?;
-        let lease = self.lease_for_agent(&state, agent_id, hello.pairing_mode, now)?;
+        let (lease, test_pairing) = self.lease_for_start(&state, &hello, None, now)?;
         let resume_token = new_secret_token();
         let welcome = AgentWelcome {
+            test_key_accepted: test_pairing.is_some(),
             pairing_code: lease.pairing_code.clone(),
             pairing_mode: hello.pairing_mode,
             managed_target_id: managed_target_id.clone(),
@@ -2402,6 +2463,7 @@ impl Relay {
                 hello,
                 managed_target_id,
                 lease: lease.clone(),
+                test_pairing,
                 resume_token: None,
                 previous_resume_token: None,
                 legacy_boot: false,
@@ -2432,6 +2494,35 @@ impl Relay {
         })
     }
 
+    fn lease_for_start(
+        &self,
+        state: &RelayState,
+        hello: &AgentHello,
+        reserved: Option<TestPairingLease>,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<(PairingLease, Option<TestPairingLease>)> {
+        let agent_id = hello.agent_instance_id;
+        let Some(fingerprint) = hello.test_key_fingerprint.as_ref() else {
+            return Ok((
+                self.lease_for_agent(state, agent_id, hello.pairing_mode, now)?,
+                reserved,
+            ));
+        };
+        let code = match reserved.filter(|lease| &lease.fingerprint == fingerprint) {
+            Some(lease) => lease.code,
+            None => unique_pairing_code(state, self.portal_store.as_deref())?,
+        };
+        let lease = PairingLease::new(agent_id, code.clone(), now, self.lease_lifetime);
+        Ok((
+            lease,
+            Some(TestPairingLease {
+                fingerprint: fingerprint.clone(),
+                code,
+                expires_at: now + TEST_PAIRING_RETENTION,
+            }),
+        ))
+    }
+
     fn lease_for_agent(
         &self,
         state: &RelayState,
@@ -2448,7 +2539,11 @@ impl Relay {
         } else {
             Ok(PairingLease::new(
                 agent_id,
-                unique_pairing_code(state, self.portal_store.as_deref())?,
+                if mode == PairingMode::LongPerBoot {
+                    AccessCode::random_long()
+                } else {
+                    unique_pairing_code(state, self.portal_store.as_deref())?
+                },
                 now,
                 self.lease_lifetime,
             ))
@@ -2573,11 +2668,16 @@ impl Relay {
             original_last_seen,
             original_lease,
             original_lease_expired,
+            original_test_pairing,
             should_persist,
             lease_expires_at,
         ) = {
             let agent = state.agents.get_mut(&agent_id)?;
             if agent.connection_generation != connection_generation || !agent.ready {
+                return None;
+            }
+            if agent.hello.pairing_mode == PairingMode::LongPerBoot && !agent.lease.is_valid_at(now)
+            {
                 return None;
             }
             if now - agent.last_seen < minimum_interval {
@@ -2586,16 +2686,27 @@ impl Relay {
             let original_last_seen = agent.last_seen;
             let original_lease = agent.lease.clone();
             let original_lease_expired = agent.lease_expired;
+            let original_test_pairing = agent.test_pairing.clone();
+            let testing = agent.hello.test_key_fingerprint.is_some();
+            if testing {
+                let test = agent
+                    .test_pairing
+                    .as_mut()
+                    .filter(|test| test.expires_at > now)?;
+                test.expires_at = now + TEST_PAIRING_RETENTION;
+            }
             agent.last_seen = now;
             agent.lease.renew(now, self.lease_lifetime);
             agent.lease_expired = false;
             let lease_expires_at = agent.lease.expires_at;
             let persistence_reserve = self.lease_lifetime / 2;
-            let should_persist = agent.persisted_lease_expires_at - now <= persistence_reserve;
+            let should_persist =
+                testing || agent.persisted_lease_expires_at - now <= persistence_reserve;
             (
                 original_last_seen,
                 original_lease,
                 original_lease_expired,
+                original_test_pairing,
                 should_persist,
                 lease_expires_at,
             )
@@ -2610,6 +2721,7 @@ impl Relay {
                 agent.last_seen = original_last_seen;
                 agent.lease = original_lease;
                 agent.lease_expired = original_lease_expired;
+                agent.test_pairing = original_test_pairing;
             }
             warn!(
                 agent_instance_id = %agent_id,
@@ -3022,6 +3134,7 @@ impl Relay {
                 agent.permission_mode = permission_mode;
                 (agent.session_id, agent.sender.clone())
             };
+            desktop::close(&mut state, session_id);
             if let Some(bindings) = state.session_bindings.get_mut(&session_id) {
                 bindings.agent_permission_mode = permission_mode;
                 if let Some(binding) = bindings.ai.as_mut() {
@@ -3201,6 +3314,20 @@ impl Relay {
             send_request_error(controller_sender, &request, code, message);
             return;
         }
+        if matches!(
+            request.operation,
+            RemoteOperation::DescribeHostCapabilities | RemoteOperation::QueryHostCapability { .. }
+        ) && !state.agents.values().any(|agent| {
+            agent.session_id == request.session_id && supports_host_business(&agent.hello)
+        }) {
+            send_request_error(
+                controller_sender,
+                &request,
+                "host_business_unsupported",
+                "目标未声明协议22及宿主业务能力，拒绝向旧Agent发送新操作",
+            );
+            return;
+        }
         if request.operation.is_resource_tool()
             && !state
                 .agents
@@ -3314,6 +3441,7 @@ impl Relay {
         }
 
         if matches!(request.operation, RemoteOperation::EmergencyStop) {
+            desktop::close(&mut state, request.session_id);
             let stopped_request_ids: Vec<_> = state
                 .in_flight
                 .iter()
@@ -3367,7 +3495,7 @@ impl Relay {
         let human_takeover = state
             .session_bindings
             .get(&request.session_id)
-            .is_some_and(|bindings| bindings.human_takeover);
+            .is_some_and(SessionBindings::taken_over);
         if controller_kind == ControllerKind::Ai
             && human_takeover
             && !ai_operation_allowed_after_takeover(&self.policy, &request.operation)
@@ -3516,6 +3644,12 @@ impl Relay {
             return;
         };
 
+        if matches!(request.operation, RemoteOperation::CloseConnection) {
+            desktop::close(&mut state, request.session_id);
+        }
+        if matches!(request.operation,RemoteOperation::ReleaseHumanTakeover) {
+            desktop::release_input(&mut state,request.session_id);
+        }
         let takeover_state = match &request.operation {
             RemoteOperation::HumanTakeover => Some(true),
             RemoteOperation::ReleaseHumanTakeover => Some(false),
@@ -3915,13 +4049,18 @@ impl Relay {
     #[allow(clippy::too_many_lines)]
     async fn cleanup_expired(&self) {
         self.cleanup_stale_controllers().await;
-        self.prune_tcp_locked(&mut *self.state.lock().await);
+        {
+            let mut state = self.state.lock().await;
+            self.prune_desktops(&mut state);
+            self.prune_tcp_locked(&mut state);
+        }
         let now = Utc::now();
         let (notifications, failures) = {
             let mut state = self.state.lock().await;
             state
                 .approvals
                 .retain(|_, approval| approval.expires_at > now);
+            let reclaimed_tests = reclaim_expired_test_codes(&mut state, now);
             let expired_ids: Vec<_> = state
                 .agents
                 .iter()
@@ -4000,7 +4139,9 @@ impl Relay {
                     info!(agent_instance_id = %agent_id, "已回收长期过期且未配对的 Agent 身份");
                 }
             }
-            if removed_any && let Err(error) = self.persist_state_locked(&state) {
+            if (removed_any || reclaimed_tests)
+                && let Err(error) = self.persist_state_locked(&state)
+            {
                 warn!(error = %error, "Relay 无法持久化租约清理结果");
             }
             (notifications, failures)
@@ -4306,6 +4447,7 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
             AgentRecord {
                 hello,
                 lease: persisted_agent.lease,
+                test_pairing: persisted_agent.test_pairing,
                 resume_token: persisted_agent.resume_token,
                 previous_resume_token: persisted_agent.previous_resume_token,
                 legacy_boot: persisted_agent.legacy_boot,
@@ -4323,6 +4465,23 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
                 permission_mode: PermissionMode::ApprovalRequired,
             },
         );
+    }
+    reclaim_expired_test_codes(state, now);
+    validate_persisted_test_codes(state)
+}
+
+fn validate_persisted_test_codes(state: &RelayState) -> anyhow::Result<()> {
+    let mut test_codes = BTreeSet::new();
+    for (agent_id, agent) in &state.agents {
+        if let Some(test) = &agent.test_pairing
+            && (!test_codes.insert(test.code.clone())
+                || state.pairing_index.get(&test.code).is_some_and(|owner| {
+                    owner != agent_id
+                        || agent.hello.test_key_fingerprint.as_ref() != Some(&test.fingerprint)
+                }))
+        {
+            bail!("Relay 状态文件包含重复的测试控制码");
+        }
     }
     Ok(())
 }
@@ -4345,6 +4504,7 @@ fn save_persisted_state(path: &Path, state: &RelayState) -> anyhow::Result<()> {
                 hello,
                 managed_target_id: agent.managed_target_id.clone(),
                 lease: agent.lease.clone(),
+                test_pairing: agent.test_pairing.clone(),
                 resume_token: agent.resume_token.clone(),
                 previous_resume_token: agent.previous_resume_token.clone(),
                 legacy_boot: agent.legacy_boot,
@@ -4506,6 +4666,7 @@ fn end_restarted_session(state: &mut RelayState, session_id: SessionId) {
 }
 
 fn end_session(state: &mut RelayState, session_id: SessionId, reason: &str) {
+    desktop::close(state, session_id);
     state.session_bindings.remove(&session_id);
     state
         .approvals
@@ -4645,14 +4806,24 @@ fn send_session_connection_update(
     }
 }
 
-fn remove_pairing_index(state: &mut RelayState, code: Option<&PairingCode>) {
+fn supports_host_business(hello: &AgentHello) -> bool {
+    hello.protocol_version == remoteops_protocol::BRIDGE_PROTOCOL_VERSION
+        && hello.target_context.as_ref().is_some_and(|context| {
+            context.capabilities.iter().any(|status| {
+                status.capability == "host_business_v1"
+                    && status.status == remoteops_domain::CapabilityAvailability::Available
+            })
+        })
+}
+
+fn remove_pairing_index(state: &mut RelayState, code: Option<&AccessCode>) {
     if let Some(code) = code {
         state.pairing_index.remove(code);
     }
 }
 fn insert_pairing_index(
     state: &mut RelayState,
-    code: Option<&PairingCode>,
+    code: Option<&AccessCode>,
     agent_id: AgentInstanceId,
 ) {
     if let Some(code) = code {
@@ -4660,15 +4831,41 @@ fn insert_pairing_index(
     }
 }
 
+fn reclaim_expired_test_codes(state: &mut RelayState, now: DateTime<Utc>) -> bool {
+    let mut reclaimed = false;
+    for agent in state.agents.values_mut() {
+        if agent
+            .test_pairing
+            .as_ref()
+            .is_some_and(|test| test.expires_at <= now)
+        {
+            let test = agent.test_pairing.take().expect("刚确认测试租约存在");
+            if agent.lease.pairing_code.as_ref() == Some(&test.code) {
+                state.pairing_index.remove(&test.code);
+                agent.lease.pairing_code = None;
+                agent.lease.expires_at = agent.lease.expires_at.min(now);
+            }
+            reclaimed = true;
+        }
+    }
+    reclaimed
+}
+
 fn unique_pairing_code(
     state: &RelayState,
     portal: Option<&PortalStore>,
-) -> anyhow::Result<PairingCode> {
+) -> anyhow::Result<AccessCode> {
     let mut rng = rand::thread_rng();
     for _ in 0..100 {
         let value = format!("{:09}", rng.gen_range(0_u32..1_000_000_000));
-        let code = PairingCode::parse(value).map_err(|error| anyhow!(error))?;
+        let code = AccessCode::parse(value).map_err(|error| anyhow!(error))?;
         if !state.pairing_index.contains_key(&code)
+            && !state.agents.values().any(|agent| {
+                agent
+                    .test_pairing
+                    .as_ref()
+                    .is_some_and(|test| test.code == code)
+            })
             && !portal
                 .map(|store| store.code_reserved(code.as_str(), Utc::now()))
                 .transpose()?
@@ -4699,6 +4896,7 @@ mod tests {
     include!("relay_tool_tests.rs");
     include!("relay_tool_transfer_tests.rs");
     include!("relay_boot_tests.rs");
+    include!("relay_bridge_tests.rs");
     include!("relay_portal_tests.rs");
     use std::path::PathBuf;
 
@@ -4772,6 +4970,7 @@ mod tests {
 
     fn hello(agent_instance_id: AgentInstanceId, resume_token: Option<String>) -> AgentHello {
         AgentHello {
+            test_key_fingerprint: None,
             target_context: None,
             pairing_mode: PairingMode::AutoPerBoot,
             managed_enrollment: None,
@@ -4893,6 +5092,7 @@ mod tests {
                 ai_id,
                 generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -4972,6 +5172,7 @@ mod tests {
                 ai_id,
                 generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -5072,6 +5273,7 @@ mod tests {
                     ai_id,
                     generation,
                     PairRequest {
+                        expected_agent_id: None,
                         connection_resume_token: None,
                         expected_session_id: None,
                         request_id: RequestId::new(),
@@ -5137,6 +5339,8 @@ mod tests {
     async fn ai_sender(relay: &Relay, controller_id: ControllerInstanceId) -> Sender {
         controller_sender(relay, controller_id).await
     }
+
+    include!("relay_desktop_tests.rs");
 
     async fn human_sender(relay: &Relay, controller_id: ControllerInstanceId) -> Sender {
         controller_sender(relay, controller_id).await
@@ -5848,6 +6052,7 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -5868,6 +6073,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -5888,6 +6094,7 @@ mod tests {
                 other_ai_id,
                 other_ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -5930,6 +6137,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6040,6 +6248,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6074,6 +6283,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6102,6 +6312,7 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6300,6 +6511,7 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6331,6 +6543,7 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6346,6 +6559,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6430,6 +6644,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6552,6 +6767,7 @@ mod tests {
                         id,
                         generation,
                         PairRequest {
+                            expected_agent_id: None,
                             connection_resume_token: None,
                             expected_session_id: None,
                             request_id: RequestId::new(),
@@ -6602,6 +6818,7 @@ mod tests {
                                 ai_id,
                                 ai_generation,
                                 PairRequest {
+                                    expected_agent_id: None,
                                     connection_resume_token: None,
                                     expected_session_id: None,
                                     request_id: RequestId::new(),
@@ -6641,6 +6858,7 @@ mod tests {
                             new_id,
                             new_generation,
                             PairRequest {
+                                expected_agent_id: None,
                                 connection_resume_token: None,
                                 expected_session_id: None,
                                 request_id: RequestId::new(),
@@ -6827,6 +7045,7 @@ mod tests {
                     id,
                     generation,
                     PairRequest {
+                        expected_agent_id: None,
                         connection_resume_token: None,
                         expected_session_id: None,
                         request_id: RequestId::new(),
@@ -7021,6 +7240,7 @@ mod tests {
                 first_id,
                 first_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -7034,6 +7254,7 @@ mod tests {
                 second_id,
                 second_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -7091,6 +7312,7 @@ mod tests {
                 first_id,
                 first_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -7132,6 +7354,7 @@ mod tests {
                 second_id,
                 second_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -7159,6 +7382,7 @@ mod tests {
                 controller_id,
                 generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -7216,6 +7440,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -7269,6 +7494,7 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -7371,6 +7597,7 @@ mod tests {
                     controller_id,
                     generation,
                     PairRequest {
+                        expected_agent_id: None,
                         connection_resume_token: None,
                         expected_session_id: None,
                         request_id: RequestId::new(),
@@ -7586,6 +7813,7 @@ mod tests {
                     controller_id,
                     generation,
                     PairRequest {
+                        expected_agent_id: None,
                         connection_resume_token: None,
                         expected_session_id: None,
                         request_id: RequestId::new(),

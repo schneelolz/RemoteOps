@@ -30,10 +30,20 @@ pub(super) fn run(
     args: &[OsString],
     bundled_tools: Option<remoteops_agent::BundledTools>,
 ) -> ExitCode {
+    run_with_key(profile, args, bundled_tools, None)
+}
+
+pub(super) fn run_with_key(
+    profile: ProductProfile,
+    args: &[OsString],
+    bundled_tools: Option<remoteops_agent::BundledTools>,
+    test_key_fingerprint: Option<String>,
+) -> ExitCode {
     let result = (|| -> anyhow::Result<()> {
+        remoteops_native_host::ensure_console()?;
         if args.iter().skip(1).any(|arg| arg == "--help") {
             println!(
-                "{} {}\n--cli 无图形模式\n--config PATH 指定产品配置\nhelp / status / full / confirm / quit",
+                "{} {}\n--cli 无图形模式\n--config PATH 指定产品配置\n--gen-key 生成 GUID | --key GUID / --key-file PATH 启动测试模式\nhelp / status / full / confirm / quit",
                 profile.name, profile.version
             );
             return Ok(());
@@ -43,14 +53,14 @@ pub(super) fn run(
             return Ok(());
         }
         let config = resolve_config(&profile, args.iter().cloned())?;
-        remoteops_native_host::ensure_console()?;
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(remoteops_agent::run_product_console_with_tools(
+            .block_on(remoteops_agent::run_product_console_with_test_key(
                 profile,
                 config,
                 bundled_tools,
+                test_key_fingerprint,
             ))
     })();
     match result {

@@ -1,0 +1,11 @@
+[package]
+name = "remoteops-desktop-media"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Windows 交互式人工桌面采集、H.264 编解码和本机观看窗口"
+
+[build-dependencies]
+cc = "1"

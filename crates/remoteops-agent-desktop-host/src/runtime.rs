@@ -76,6 +76,7 @@ pub(super) struct RuntimeHost {
     // 新旧产品的配置及身份目录隔离，正式入口切换前不改旧 Agent 数据。
     profile: ProductProfile,
     bundled_tools: Option<remoteops_agent::BundledTools>,
+    test_key_fingerprint: Option<String>,
     config: AgentConfig,
     config_path: PathBuf,
     preferences_path: PathBuf,
@@ -170,6 +171,7 @@ impl RuntimeHost {
         let mut host = Self {
             profile,
             bundled_tools: options.bundled_tools.clone(),
+            test_key_fingerprint: options.test_key_fingerprint.clone(),
             config,
             config_path,
             preferences_path,
@@ -453,6 +455,7 @@ impl RuntimeHost {
         let permission = self.permission.clone();
         let profile = self.profile.clone();
         let bundled_tools = self.bundled_tools.clone();
+        let test_key_fingerprint = self.test_key_fingerprint.clone();
         let ui_language = self.ui_language.clone();
         let (error_sender, error_receiver) = mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -463,15 +466,13 @@ impl RuntimeHost {
                     .enable_all()
                     .build();
                 if let Ok(runtime) = runtime {
+                    let mut options = AgentRuntimeOptions::interactive(profile)
+                        .with_ssh_trust_cli()
+                        .with_ui_language(ui_language)
+                        .with_bundled_tools(bundled_tools);
+                    options.test_key_fingerprint = test_key_fingerprint;
                     let result = runtime.block_on(run_agent_with_bounded_scoped_options(
-                        config,
-                        sender,
-                        shutdown,
-                        permission,
-                        AgentRuntimeOptions::interactive(profile)
-                            .with_ssh_trust_cli()
-                            .with_ui_language(ui_language)
-                            .with_bundled_tools(bundled_tools),
+                        config, sender, shutdown, permission, options,
                     ));
                     if let Err(error) = result {
                         let _ = error_sender.send(TrustResult::Failed(safe(&error.to_string())));

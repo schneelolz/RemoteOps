@@ -217,6 +217,8 @@ struct Args {
     /// 仅默认选择允许自动回退，显式命令行或产品环境变量保持原意。
     #[arg(skip)]
     automatic_renderer: bool,
+    #[arg(skip)]
+    test_key_fingerprint: Option<String>,
 }
 
 #[derive(Default)]
@@ -253,7 +255,8 @@ impl Args {
     {
         let mut command = Self::command()
             .name(profile.id.clone())
-            .about(profile.name.clone());
+            .about(profile.name.clone())
+            .after_help("--gen-key 生成 GUID；--key GUID / --key-file PATH 启动测试模式");
         if !profile.version.is_empty() {
             command = command.version(profile.version.clone());
         }
@@ -517,6 +520,7 @@ fn short_request_id(request_id: &RequestId) -> String {
 #[allow(dead_code)]
 struct RemoteOpsAgentApp {
     profile: ProductProfile,
+    test_key_fingerprint: Option<String>,
     options: GuiOptions,
     activity: activity::ActivityModel,
     event_epoch: Option<u64>,
@@ -654,6 +658,7 @@ impl RemoteOpsAgentApp {
         diagnostics: StartupDiagnostics,
         profile: ProductProfile,
         options: GuiOptions,
+        test_key_fingerprint: Option<String>,
     ) -> Self {
         configure_fonts(&cc.egui_ctx);
         install_style(&cc.egui_ctx);
@@ -707,6 +712,7 @@ impl RemoteOpsAgentApp {
         ui_language.set(target_ui_language(language));
         let mut app = Self {
             profile,
+            test_key_fingerprint,
             options,
             activity: activity::ActivityModel::default(),
             event_epoch: None,
@@ -807,6 +813,7 @@ impl RemoteOpsAgentApp {
             self.permission_control.clone(),
             self.profile.clone(),
             self.ui_language.clone(),
+            self.test_key_fingerprint.clone(),
         ));
     }
 
@@ -2932,6 +2939,7 @@ fn spawn_live(
     permission_control: AgentPermissionControl,
     profile: ProductProfile,
     ui_language: remoteops_agent::AgentUiLanguage,
+    test_key_fingerprint: Option<String>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("remoteops-agent-runtime".to_owned())
@@ -2942,13 +2950,16 @@ fn spawn_live(
                 .worker_threads(2)
                 .thread_name("remoteops-agent-worker")
                 .build();
+            let mut options =
+                AgentRuntimeOptions::interactive(profile).with_ui_language(ui_language);
+            options.test_key_fingerprint = test_key_fingerprint;
             let result = match runtime {
                 Ok(runtime) => runtime.block_on(run_agent_with_bounded_scoped_options(
                     config,
                     event_sender.clone(),
                     shutdown_receiver,
                     permission_control,
-                    AgentRuntimeOptions::interactive(profile).with_ui_language(ui_language),
+                    options,
                 )),
                 Err(error) => Err(anyhow::Error::new(error).context("无法创建 Agent 异步运行时")),
             };
@@ -3437,6 +3448,7 @@ fn run_gui(
                 .map(|path| path.with_file_name("demo-gui.ron"))
         })
         .flatten();
+    let test_key_fingerprint = args.test_key_fingerprint.clone();
     let startup = args.into_product_startup(&profile);
     let initial_setup = matches!(&startup, StartupState::Setup(_));
     diagnostics.record_detail("renderer", renderer);
@@ -3496,6 +3508,7 @@ fn run_gui(
                 app_diagnostics.clone(),
                 profile,
                 options,
+                test_key_fingerprint,
             );
             app_diagnostics.record("app_created");
             Ok(Box::new(app))
@@ -3607,9 +3620,9 @@ pub fn run_default() -> std::process::ExitCode {
 /// 按启动参数运行同一产品的 GUI 或无图形控制台。
 #[must_use]
 pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCode {
-    if console_startup::console_requested(std::env::args_os())
-        && let Err(error) = remoteops_native_host::ensure_console()
-    {
+    let command_line: Vec<_> = std::env::args_os().collect();
+    let cli_requested = console_startup::console_requested(command_line.iter().cloned());
+    if cli_requested && let Err(error) = remoteops_native_host::ensure_console() {
         eprintln!("无法初始化控制台：{error}");
         return std::process::ExitCode::FAILURE;
     }
@@ -3617,23 +3630,49 @@ pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCo
         eprintln!("{error}");
         return std::process::ExitCode::FAILURE;
     }
-    let _ = DIAGNOSTIC_PRODUCT.set(profile.clone());
-    install_panic_reporter();
-    let diagnostics = StartupDiagnostics::start();
-    diagnostics.record("panic_reporter_installed");
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    diagnostics.record("rustls_provider_installed");
-    let args = match Args::parse_for(&profile, std::env::args_os()) {
+    let (command_line, action) = match remoteops_agent::split_test_key_args(command_line) {
+        Ok(parsed) => parsed,
+        Err(error) => return test_key_startup_error(cli_requested, &error.to_string()),
+    };
+    let mut args = match Args::parse_for(&profile, command_line) {
         Ok(args) => args,
         Err(error) => {
             if let Some(error) = error.downcast_ref::<clap::Error>() {
                 let _ = error.print();
                 return std::process::ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(1));
             }
-            eprintln!("{error}");
-            return std::process::ExitCode::FAILURE;
+            return test_key_startup_error(cli_requested, &error.to_string());
         }
     };
+    match action {
+        remoteops_agent::TestKeyAction::Normal => {}
+        remoteops_agent::TestKeyAction::Use(fingerprint) => {
+            if args.demo {
+                return test_key_startup_error(cli_requested, "演示模式不接受测试密钥");
+            }
+            args.test_key_fingerprint = Some(fingerprint);
+        }
+        remoteops_agent::TestKeyAction::Generate => {
+            let guid = remoteops_agent::generate_test_key();
+            if args.cli {
+                println!("{guid}");
+                return std::process::ExitCode::SUCCESS;
+            }
+            #[cfg(windows)]
+            return match remoteops_native_host::show_test_key_dialog(&guid) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => test_key_startup_error(false, &error.to_string()),
+            };
+            #[cfg(not(windows))]
+            return test_key_startup_error(false, "此平台请使用 --cli 生成 GUID");
+        }
+    }
+    let _ = DIAGNOSTIC_PRODUCT.set(profile.clone());
+    install_panic_reporter();
+    let diagnostics = StartupDiagnostics::start();
+    diagnostics.record("panic_reporter_installed");
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    diagnostics.record("rustls_provider_installed");
     diagnostics.record("arguments_parsed");
     if args.cli {
         diagnostics.record("console_mode_selected");
@@ -3646,6 +3685,17 @@ pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCo
         return std::process::ExitCode::FAILURE;
     }
     launch_gui(args, &diagnostics, profile, options)
+}
+
+fn test_key_startup_error(cli: bool, message: &str) -> std::process::ExitCode {
+    #[cfg(windows)]
+    if !cli {
+        remoteops_native_host::show_startup_error(message);
+        return std::process::ExitCode::FAILURE;
+    }
+    let _ = cli;
+    eprintln!("{message}");
+    std::process::ExitCode::FAILURE
 }
 
 #[cfg(test)]
@@ -4412,6 +4462,7 @@ mod tests {
         RemoteOpsAgentApp {
             profile: ProductProfile::default(),
             options: GuiOptions::remoteops(),
+            test_key_fingerprint: None,
             activity: activity::ActivityModel::default(),
             event_epoch: None,
             logo: None,

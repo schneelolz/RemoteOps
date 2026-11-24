@@ -141,6 +141,7 @@ async fn boot_restart_rotates_code_and_session_and_revokes_all_old_runtime() {
                 human,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     request_id: RequestId::new(),
                     pairing_code: first.welcome.pairing_code.clone(),
@@ -175,7 +176,9 @@ async fn boot_restart_rotates_code_and_session_and_revokes_all_old_runtime() {
                 .contains_key(first.welcome.pairing_code.as_ref().unwrap())
         );
         assert_eq!(
-            state.pairing_index.get(next.welcome.pairing_code.as_ref().unwrap()),
+            state
+                .pairing_index
+                .get(next.welcome.pairing_code.as_ref().unwrap()),
             Some(&agent_id)
         );
         assert!(!state.session_bindings.contains_key(&session_id));
@@ -246,7 +249,9 @@ async fn boot_rotation_persistence_failure_preserves_old_identity_and_runtime() 
     assert!(restored.pending_resume.is_none());
     assert_eq!(state.pairing_index.len(), 1);
     assert_eq!(
-        state.pairing_index.get(original.lease.pairing_code.as_ref().unwrap()),
+        state
+            .pairing_index
+            .get(original.lease.pairing_code.as_ref().unwrap()),
         Some(&agent_id)
     );
     let binding = state.session_bindings[&session_id].ai.as_ref().unwrap();
@@ -497,6 +502,7 @@ async fn boot_pairing_expected_session_is_checked_before_any_binding() {
             controller,
             generation,
             PairRequest {
+                expected_agent_id: None,
                 connection_resume_token: None,
                 request_id: RequestId::new(),
                 pairing_code: first.welcome.pairing_code,
@@ -524,6 +530,7 @@ async fn boot_pairing_distinguishes_recoverable_offline_from_ended_session() {
         .mark_agent_disconnected(agent_id, first.connection_generation)
         .await;
     let request = PairRequest {
+        expected_agent_id: None,
         connection_resume_token: None,
         request_id: RequestId::new(),
         pairing_code: first.welcome.pairing_code.clone(),
@@ -577,4 +584,241 @@ async fn boot_pairing_distinguishes_recoverable_offline_from_ended_session() {
             .error_code,
         Some(PairingErrorCode::SessionEnded)
     );
+}
+
+async fn start_test_pairing_agent(
+    relay: &Relay,
+    agent_id: AgentInstanceId,
+    boot: AgentBootId,
+    token: Option<String>,
+    fingerprint: Option<&str>,
+) -> (AgentRegistration, mpsc::Receiver<WireMessage>, SessionId) {
+    let mut hello = boot_test_hello(agent_id, boot, token);
+    hello.test_key_fingerprint = fingerprint.map(str::to_owned);
+    let (sender, receiver) = test_channel();
+    let registration = relay.register_agent(hello, sender).await.unwrap();
+    assert!(
+        relay
+            .commit_agent_resume(agent_id, registration.connection_generation)
+            .await
+    );
+    assert!(
+        relay
+            .finalize_agent_resume(agent_id, registration.connection_generation)
+            .await
+            .is_some()
+    );
+    let session_id = relay.state.lock().await.agents[&agent_id].session_id;
+    (registration, receiver, session_id)
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_pairing_resumes_across_agent_and_relay_restarts() {
+    let state_file = TestStateFile::new("test-pairing");
+    let path = &state_file.path;
+    let lifetime = Duration::minutes(10);
+    let relay = persisted_relay(path, lifetime).unwrap();
+    let agent = AgentInstanceId::new();
+    let boot = AgentBootId::new();
+    let key = "a".repeat(64);
+    let (first, _rx, session) =
+        start_test_pairing_agent(&relay, agent, boot, None, Some(&key)).await;
+    assert!(first.welcome.test_key_accepted);
+    let code = first.welcome.pairing_code.clone().unwrap();
+    relay
+        .mark_agent_disconnected(agent, first.connection_generation)
+        .await;
+    let (first, _rx, reconnected_session) = start_test_pairing_agent(
+        &relay,
+        agent,
+        boot,
+        Some(first.welcome.resume_token),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(first.welcome.pairing_code.as_ref(), Some(&code));
+    assert_eq!(reconnected_session, session);
+    let before_renew = {
+        let mut state = relay.state.lock().await;
+        let record = state.agents.get_mut(&agent).unwrap();
+        record.last_seen -= Duration::seconds(30);
+        let test = record.test_pairing.as_mut().unwrap();
+        test.expires_at -= Duration::minutes(15);
+        test.expires_at
+    };
+    assert!(
+        relay
+            .renew_agent(agent, first.connection_generation)
+            .await
+            .is_some()
+    );
+    assert!(
+        relay.state.lock().await.agents[&agent]
+            .test_pairing
+            .as_ref()
+            .unwrap()
+            .expires_at
+            > before_renew
+    );
+    relay
+        .mark_agent_disconnected(agent, first.connection_generation)
+        .await;
+    let (controller, generation, _rx) = register_controller(&relay, ControllerKind::Ai).await;
+    let request = PairRequest {
+        request_id: RequestId::new(),
+        pairing_code: Some(code.clone()),
+        expected_session_id: None,
+        expected_agent_id: Some(agent),
+        connection_resume_token: None,
+        permission_mode: PermissionMode::ApprovalRequired,
+    };
+    assert_eq!(
+        relay
+            .pair_controller(controller, generation, request.clone())
+            .await
+            .error_code,
+        Some(PairingErrorCode::AgentOffline)
+    );
+
+    let restored = persisted_relay(path, lifetime).unwrap();
+    let (next, _rx, new_session) = start_test_pairing_agent(
+        &restored,
+        agent,
+        AgentBootId::new(),
+        Some(first.welcome.resume_token),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(next.welcome.pairing_code.as_ref(), Some(&code));
+    assert_ne!(new_session, session);
+    let (controller, generation, _rx) = register_controller(&restored, ControllerKind::Ai).await;
+    let wrong = PairRequest {
+        expected_agent_id: Some(AgentInstanceId::new()),
+        ..request.clone()
+    };
+    assert!(
+        restored
+            .pair_controller(controller, generation, wrong)
+            .await
+            .connection
+            .is_none()
+    );
+    assert!(restored.state.lock().await.session_bindings.is_empty());
+    assert_eq!(
+        restored
+            .pair_controller(controller, generation, request.clone())
+            .await
+            .connection
+            .unwrap()
+            .session_id,
+        new_session
+    );
+
+    let (normal, _rx, _) = start_test_pairing_agent(
+        &restored,
+        agent,
+        AgentBootId::new(),
+        Some(next.welcome.resume_token),
+        None,
+    )
+    .await;
+    assert!(!normal.welcome.test_key_accepted);
+    assert_ne!(normal.welcome.pairing_code.as_ref(), Some(&code));
+    assert!(
+        restored
+            .pair_controller(controller, generation, request)
+            .await
+            .connection
+            .is_none()
+    );
+    {
+        let state = restored.state.lock().await;
+        assert_eq!(
+            state.agents[&agent].test_pairing.as_ref().unwrap().code,
+            code
+        );
+        assert!(!state.pairing_index.contains_key(&code));
+    }
+    let (again, _rx, _) = start_test_pairing_agent(
+        &restored,
+        agent,
+        AgentBootId::new(),
+        Some(normal.welcome.resume_token),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(again.welcome.pairing_code.as_ref(), Some(&code));
+    let (rotated, _rx, session) = start_test_pairing_agent(
+        &restored,
+        agent,
+        AgentBootId::new(),
+        Some(again.welcome.resume_token),
+        Some(&"b".repeat(64)),
+    )
+    .await;
+    assert_ne!(rotated.welcome.pairing_code.as_ref(), Some(&code));
+    {
+        let state = restored.state.lock().await;
+        assert!(!state.pairing_index.contains_key(&code));
+        assert_eq!(state.agents[&agent].session_id, session);
+    }
+}
+
+#[tokio::test]
+async fn test_pairing_expiry_releases_code_even_before_identity_expires() {
+    let relay = relay(Duration::minutes(10));
+    let agent = AgentInstanceId::new();
+    let boot = AgentBootId::new();
+    let key = "a".repeat(64);
+    let (first, _rx, session) =
+        start_test_pairing_agent(&relay, agent, boot, None, Some(&key)).await;
+    let old = first.welcome.pairing_code.clone().unwrap();
+    {
+        let mut state = relay.state.lock().await;
+        let deadline = state.agents[&agent]
+            .test_pairing
+            .as_ref()
+            .unwrap()
+            .expires_at;
+        assert!(!reclaim_expired_test_codes(
+            &mut state,
+            deadline - Duration::seconds(1)
+        ));
+        assert!(reclaim_expired_test_codes(&mut state, deadline));
+        assert!(!state.pairing_index.contains_key(&old));
+        assert!(state.agents[&agent].resume_token.is_some());
+    }
+    let (next, _rx, new_session) = start_test_pairing_agent(
+        &relay,
+        agent,
+        boot,
+        Some(first.welcome.resume_token),
+        Some(&key),
+    )
+    .await;
+    assert!(next.welcome.pairing_code.is_some());
+    assert_ne!(session, new_session);
+}
+
+#[tokio::test]
+async fn concurrent_test_registrations_allocate_separate_codes() {
+    let relay = relay(Duration::minutes(10));
+    let key = "a".repeat(64);
+    let left = start_test_pairing_agent(
+        &relay,
+        AgentInstanceId::new(),
+        AgentBootId::new(),
+        None,
+        Some(&key),
+    );
+    let right = start_test_pairing_agent(
+        &relay,
+        AgentInstanceId::new(),
+        AgentBootId::new(),
+        None,
+        Some(&key),
+    );
+    let ((left, _left_rx, _), (right, _right_rx, _)) = tokio::join!(left, right);
+    assert_ne!(left.welcome.pairing_code, right.welcome.pairing_code);
 }

@@ -35,6 +35,7 @@ async fn agent_connect(
     write_frame(
         &mut stream,
         &WireMessage::Hello(ClientHello::Agent(AgentHello {
+            test_key_fingerprint: None,
             boot_id,
             target_context: None,
             pairing_mode: remoteops_protocol::PairingMode::AutoPerBoot,

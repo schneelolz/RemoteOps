@@ -113,6 +113,7 @@ async fn start_target_variant(
     write_frame(
         &mut stream,
         &WireMessage::Hello(ClientHello::Agent(AgentHello {
+            test_key_fingerprint: None,
             protocol_version: version,
             agent_instance_id: AgentInstanceId::new(),
             boot_id: AgentBootId::new(),

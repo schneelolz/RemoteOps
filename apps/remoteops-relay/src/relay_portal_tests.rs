@@ -10,6 +10,7 @@ mod managed_portal_tests {
     struct ManagedFixture {
         relay: Relay,
         principal_id: Uuid,
+        asset_id: String,
         token: String,
         hello: AgentHello,
         registration: AgentRegistration,
@@ -18,6 +19,10 @@ mod managed_portal_tests {
 
     impl ManagedFixture {
         async fn new() -> Self {
+            Self::with_asset("asset-a".into(), false).await
+        }
+
+        async fn with_asset(asset_id: String, delegated: bool) -> Self {
             let mut relay = relay(Duration::minutes(10));
             relay.portal_store = Some(Arc::new(PortalStore::in_memory(test_owner_id()).unwrap()));
             let principal = relay
@@ -28,13 +33,24 @@ mod managed_portal_tests {
                 })
                 .await
                 .unwrap();
-            let asset = relay
-                .portal_create_asset(CreateAssetRequest {
-                    asset_id: "asset-a".into(),
-                    principal_id: principal.principal.principal_id,
-                })
-                .await
-                .unwrap();
+            let asset = if delegated {
+                relay
+                    .portal_prepare_managed_enrollment(
+                        &principal.token,
+                        principal.principal.principal_id,
+                        &asset_id,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                relay
+                    .portal_create_asset(CreateAssetRequest {
+                        asset_id: asset_id.clone(),
+                        principal_id: principal.principal.principal_id,
+                    })
+                    .await
+                    .unwrap()
+            };
             let mut hello = hello(AgentInstanceId::new(), None);
             hello.pairing_mode = PairingMode::ManagedOnDemand;
             hello.target_context = Some(remoteops_domain::TargetContext {
@@ -69,6 +85,7 @@ mod managed_portal_tests {
             Self {
                 relay,
                 principal_id: principal.principal.principal_id,
+                asset_id,
                 token: principal.token,
                 hello,
                 registration,
@@ -78,7 +95,7 @@ mod managed_portal_tests {
 
         async fn issue(&self) -> IssuedInvitation {
             self.relay
-                .portal_issue(&self.token, "asset-a", issue_request())
+                .portal_issue(&self.token, &self.asset_id, issue_request())
                 .await
                 .unwrap()
         }
@@ -131,12 +148,55 @@ mod managed_portal_tests {
 
     fn first_pair(code: &str) -> PairRequest {
         PairRequest {
+            expected_agent_id: None,
             request_id: RequestId::new(),
-            pairing_code: Some(PairingCode::parse(code).unwrap()),
+            pairing_code: Some(AccessCode::parse(code).unwrap()),
             expected_session_id: None,
             permission_mode: PermissionMode::ApprovalRequired,
             connection_resume_token: None,
         }
+    }
+
+    #[tokio::test]
+    async fn delegated_asset_registers_redeems_and_closes() {
+        let fixture =
+            ManagedFixture::with_asset(format!("opscenter-managed-{}", "a".repeat(64)), true).await;
+        let relay = &fixture.relay;
+        let status = relay
+            .portal_status(&fixture.token, &fixture.asset_id)
+            .await
+            .unwrap();
+        assert_eq!(status["online"], true);
+        let issued = fixture.issue().await;
+        let (controller, generation, _receiver) =
+            register_controller(relay, ControllerKind::Ai).await;
+        let paired = relay
+            .pair_controller(controller, generation, first_pair(&issued.code))
+            .await;
+        assert!(paired.error.is_none());
+        let status = relay
+            .portal_store
+            .as_ref()
+            .unwrap()
+            .status(fixture.principal_id, &fixture.asset_id, Utc::now())
+            .unwrap();
+        let connection = status.connection.unwrap();
+        let closed = relay
+            .portal_close(
+                &fixture.token,
+                connection.connection_id,
+                Some(connection.revision),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.state, "closed");
+        assert!(
+            relay
+                .pair_controller(controller, generation, first_pair(&issued.code))
+                .await
+                .error
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -251,6 +311,7 @@ mod managed_portal_tests {
 
     fn resume_pair(session: SessionId, token: &str) -> PairRequest {
         PairRequest {
+            expected_agent_id: None,
             request_id: RequestId::new(),
             pairing_code: None,
             expected_session_id: Some(session),

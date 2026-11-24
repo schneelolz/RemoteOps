@@ -28,7 +28,11 @@ pub(super) struct PasswordFile {
     path: PathBuf,
 }
 impl PasswordFile {
+    #[cfg(test)]
     pub(super) fn new(password: &str) -> Result<Self, DeviceError> {
+        Self::new_in(password, &std::env::temp_dir())
+    }
+    pub(super) fn new_in(password: &str, directory: &Path) -> Result<Self, DeviceError> {
         if password.contains(['\r', '\n', '\0']) {
             return Err(DeviceError::InvalidInput(
                 "SSH 密码不能包含换行或 NUL".to_owned(),
@@ -38,7 +42,9 @@ impl PasswordFile {
         let sid = current_sid()?;
         #[cfg(not(windows))]
         let sid = String::new();
-        let path = std::env::temp_dir().join(format!(
+        std::fs::create_dir_all(directory)
+            .map_err(|_| DeviceError::Operation("无法创建实例临时目录".into()))?;
+        let path = directory.join(format!(
             "remoteops-ssh-{}.pw",
             remoteops_domain::RequestId::new()
         ));
@@ -62,6 +68,52 @@ impl Drop for PasswordFile {
         #[cfg(not(windows))]
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+pub(super) fn protect_directory(path: &Path) -> Result<(), DeviceError> {
+    std::fs::create_dir_all(path).map_err(|_| DeviceError::Operation("无法创建实例目录".into()))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+        };
+        let sid = current_sid()?;
+        let sddl: Vec<_> = format!("D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let name: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SDDL 只包含系统生成的 SID，缓冲直到系统调用结束保持有效。
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                1,
+                &raw mut descriptor,
+                None,
+            )
+        }
+        .map_err(|_| DeviceError::Operation("无法构造实例目录 ACL".into()))?;
+        // 只收紧 DACL，不改变所有者；调用后释放系统分配的描述符。
+        let result = unsafe {
+            SetFileSecurityW(
+                PCWSTR(name.as_ptr()),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor,
+            )
+        }
+        .ok();
+        unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+        result.map_err(|_| DeviceError::Operation("无法保护实例目录 ACL".into()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| DeviceError::Operation("无法保护实例目录权限".into()))?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

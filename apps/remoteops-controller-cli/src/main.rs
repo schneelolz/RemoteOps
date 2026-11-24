@@ -16,8 +16,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use remoteops_application::{ApplicationError, OperationResult, RelayClient, RelayClientConfig};
 use remoteops_audit::sha256_bytes;
 use remoteops_domain::{
-    ApprovalId, ApprovalState, ControllerInstanceId, ControllerOwnerId, EventPayload, EventSource,
-    FileTransferId, PairingCode, PermissionMode, PowerAction, RemoteOperation, RequestId,
+    AccessCode, ApprovalId, ApprovalState, ControllerInstanceId, ControllerOwnerId, EventPayload,
+    EventSource, FileTransferId, PermissionMode, PowerAction, RemoteOperation, RequestId,
     SerialDataBits, SerialFlowControl, SerialLineEnding, SerialParity, SerialSettings,
     SerialStopBits, SerialTerminalProfile, ServiceAction, SessionId, ShellId, ShellKind,
 };
@@ -73,7 +73,7 @@ struct Args {
 
 #[derive(Clone, Debug)]
 struct PairSpec {
-    code: PairingCode,
+    code: AccessCode,
     alias: Option<String>,
 }
 
@@ -1804,7 +1804,7 @@ fn parse_pair_spec(value: &str) -> Result<PairSpec, String> {
         .map_or((value, None), |(code, alias)| {
             (code, Some(alias.to_owned()))
         });
-    let code = PairingCode::parse(code).map_err(|error| error.to_string())?;
+    let code = AccessCode::parse(code).map_err(|error| error.to_string())?;
     Ok(PairSpec { code, alias })
 }
 

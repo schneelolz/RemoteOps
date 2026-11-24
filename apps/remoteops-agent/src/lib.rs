@@ -15,15 +15,22 @@ pub fn redact_diagnostic(text: &str) -> String {
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod console;
+#[cfg(all(windows, feature = "desktop-pilot"))]
+mod desktop;
+mod host_business;
+pub use host_business::{HostBusinessProvider, HostCapability, HostQuery, HostServiceDescription};
 mod observation;
 mod operation_log;
+mod test_key;
 pub use observation::{BoundedAgentEventReceiver, BoundedAgentEventSender, bounded_agent_events};
 mod product;
 mod runtime;
 mod ssh_trust_cli;
 mod tcp_forward;
 mod tool_transport;
-pub use console::{run_product_console, run_product_console_with_tools};
+pub use console::{
+    run_product_console, run_product_console_with_test_key, run_product_console_with_tools,
+};
 pub use remoteops_device::{BundledToolPaths, BundledTools, EmbeddedTool};
 pub use remoteops_domain::AgentRunMode;
 pub use remoteops_product::{EndpointPolicy, ProductProfile};
@@ -31,6 +38,7 @@ pub use runtime::{
     AgentCapabilityPolicy, AgentRuntimeOptions, AgentUiLanguage, VisualProviderFactory,
 };
 pub use ssh_trust_cli::{handle_ssh_trust_cli, handle_ssh_trust_cli_with_tools};
+pub use test_key::{TestKeyAction, generate_test_key, split_test_key_args};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -71,8 +79,8 @@ use remoteops_protocol::{
     ControlStateRequest, ControlStateResult, ControllerBinding, ControllerControlMode,
     CredentialEncryptionContext, CredentialEncryptionKeyPair, EncryptedCredentialPayload,
     PROTOCOL_VERSION, RemoteRequest, RemoteResponse, SessionControlState, WireMessage, connect_tls,
-    load_client_config, load_native_client_config, load_pinned_client_config,
-    normalize_certificate_fingerprint, open_credential, read_frame, write_frame,
+    load_client_config, load_native_client_config, normalize_certificate_fingerprint,
+    open_credential, read_frame, write_frame,
 };
 use remoteops_serial::{
     SerialDirection, SerialObservedChunk, SerialQueryError, SerialQueryPlan, SerialQueryRunner,
@@ -1103,7 +1111,11 @@ const MAX_RECENT_TASK_TERMINALS: usize = 1_024;
 
 /// `RemoteOps` 现场 Agent（Windows / Linux）。
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about,
+    after_help = "--gen-key 生成 GUID；--key GUID / --key-file PATH 启动测试模式"
+)]
 struct Args {
     /// Agent JSON 配置文件；默认读取用户本地 `RemoteOps` 目录。
     #[arg(long, env = "REMOTEOPS_AGENT_CONFIG")]
@@ -1208,8 +1220,18 @@ pub async fn shutdown_signal() -> std::io::Result<()> {
 ///
 /// 当 Agent 初始化、信号处理或后台任务失败时返回错误。
 pub async fn run_cli() -> anyhow::Result<()> {
+    let (args, test_key) = split_test_key_args(std::env::args_os().collect())?;
+    let args = Args::parse_from(args);
+    let test_key_fingerprint = match test_key {
+        TestKeyAction::Generate => {
+            println!("{}", generate_test_key());
+            return Ok(());
+        }
+        TestKeyAction::Use(fingerprint) => Some(fingerprint),
+        TestKeyAction::Normal => None,
+    };
     initialize_tracing();
-    let config = Args::parse().into_config()?;
+    let config = args.into_config()?;
     let (event_sender, event_receiver) = std_mpsc::channel();
     let printer = std::thread::spawn(move || {
         while let Ok(event) = event_receiver.recv() {
@@ -1223,6 +1245,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
     let mut options =
         AgentRuntimeOptions::interactive(ProductProfile::default()).with_ssh_trust_cli();
+    options.test_key_fingerprint = test_key_fingerprint;
     options.run_mode = AgentRunMode::Console;
     options.visual_enabled = visual_enabled;
     let mut task = tokio::spawn(run_agent_with_options(
@@ -1301,14 +1324,14 @@ pub async fn run_agent_with_scoped_events(
     permission_control
         .scoped_events
         .store(true, Ordering::SeqCst);
-    run_agent_with_visual_provider(
+    Box::pin(run_agent_with_visual_provider(
         config,
         event_sender,
         shutdown,
         permission_control,
         visual_provider,
         visual_enabled,
-    )
+    ))
     .await
 }
 
@@ -1404,6 +1427,7 @@ async fn run_agent_with_event_sink(
     options: AgentRuntimeOptions,
 ) -> anyhow::Result<()> {
     let mut config = config.resolve_product(&options.product, None)?;
+    let startup_started = Instant::now();
     if options.capability_policy.read_only() {
         config.default_full_control = false;
         permission_control.set_permission_mode(PermissionMode::ReadOnly);
@@ -1417,8 +1441,7 @@ async fn run_agent_with_event_sink(
         load_client_config(certificate_path)
             .with_context(|| format!("无法加载 Relay 证书 {}", certificate_path.display()))?
     } else if let Some(fingerprint) = config.tls_fingerprint.as_deref() {
-        load_pinned_client_config(&config.relay, &config.server_name, fingerprint)
-            .await
+        remoteops_protocol::pinned_client_config(fingerprint)
             .context("无法使用固定指纹验证 Relay 证书")?
     } else {
         load_native_client_config().context("无法加载操作系统可信根证书")?
@@ -1440,17 +1463,34 @@ async fn run_agent_with_event_sink(
     );
     // 同一运行只使用 Device 创建并规范化后的根，后续展示不能重新按 CWD 推导。
     config.transfer_root = device.transfer_root().to_path_buf();
-    let environment = detect_environment_profile(device.as_ref()).await;
+    startup_timing(
+        event_sender.as_ref(),
+        "identity_tls_configuration",
+        startup_started,
+    );
+    let environment_started = Instant::now();
+    let environment =
+        detect_environment_profile_inner(device.as_ref(), false, options.capability_policy).await;
+    startup_timing(
+        event_sender.as_ref(),
+        "environment_availability",
+        environment_started,
+    );
     let (mut boundary, visual_provider, capabilities) =
-        runtime::prepare(&options, &environment, runtime::native_facts()).await?;
+        runtime::prepare_deferred(&options, &environment, runtime::native_facts()).await?;
     let cache = config
         .state_file
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("resource-cache");
-    boundary.resources = Some(Arc::new(
-        remoteops_resources::ResourceManager::new_centralized(cache)?,
-    ));
+    if options.capability_policy.allows("resource_tools") {
+        boundary.resources = Some(Arc::new(
+            remoteops_resources::ResourceManager::new_centralized(cache)?,
+        ));
+    }
+    if let Some(provider) = &boundary.host_business {
+        host_business::validate_description(&provider.describe())?;
+    }
     if let Some(diagnostic) = boundary.visual_diagnostic() {
         emit_agent_event(
             event_sender.as_ref(),
@@ -1464,13 +1504,30 @@ async fn run_agent_with_event_sink(
         );
     }
     let boundary = Arc::new(boundary);
+    let environment = Arc::new(RwLock::new(environment));
+    let enriched = environment.clone();
+    let probe_device = device.clone();
+    let probe_policy = options.capability_policy;
+    let enrichment =
+        tokio::task::spawn_blocking(move || {
+            let profile = tokio::runtime::Handle::current().block_on(
+                detect_environment_profile_inner(probe_device.as_ref(), true, probe_policy),
+            );
+            *enriched
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = profile;
+        });
+    let visual_boundary = boundary.clone();
+    let background_visual = visual_provider.clone();
+    let visual_preparation = tokio::spawn(async move {
+        visual_boundary
+            .refresh_visual(background_visual.as_ref())
+            .await;
+    });
     let host_identity = remoteops_host_identity::collect();
     let hostname = host_identity.hostname;
     let mac_address = host_identity.mac_address;
-    let operating_system = environment.os_version.clone().map_or_else(
-        || format!("{} {}", environment.os_family, environment.architecture),
-        |version| format!("{version} {}", environment.architecture),
-    );
+    let operating_system = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
     let resume_token = Arc::new(Mutex::new(state.resume_token));
     let credential_encryption = Arc::new(CredentialEncryptionKeyPair::generate());
     let sequence = Arc::new(AtomicU64::new(1));
@@ -1498,6 +1555,7 @@ async fn run_agent_with_event_sink(
             break;
         }
         emit_agent_event(event_sender.as_ref(), AgentEvent::Connecting);
+        let tls_started = Instant::now();
         let connect = tokio::select! {
             result = connect_tls(&config.relay, &config.server_name, client_config.clone()) => result,
             () = wait_for_shutdown(&mut shutdown) => break,
@@ -1521,13 +1579,24 @@ async fn run_agent_with_event_sink(
             }
         };
         let current_resume_token = resume_token.lock().await.clone();
+        startup_timing(event_sender.as_ref(), "tls_connection", tls_started);
+        startup_timing(
+            event_sender.as_ref(),
+            "initialization_to_transport",
+            startup_started,
+        );
         let connection_shutdown = shutdown.clone();
+        let environment_snapshot = environment
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         match run_connection(
             stream,
             agent_instance_id,
             boot_id,
             boundary.clone(),
             options.pairing_mode,
+            options.test_key_fingerprint.clone(),
             managed_enrollment.clone(),
             current_resume_token,
             resume_token.clone(),
@@ -1536,7 +1605,18 @@ async fn run_agent_with_event_sink(
             mac_address.clone(),
             operating_system.clone(),
             capabilities.clone(),
-            environment.clone(),
+            environment_snapshot,
+            #[cfg(all(windows, feature = "desktop-pilot"))]
+            (options.run_mode == remoteops_domain::AgentRunMode::Interactive
+                && options.visual_enabled
+                && options.capability_policy.visual_allowed()
+                && options.product.endpoint.is_fixed()
+                && options.product.endpoint.endpoint() == (config.relay.as_str(), config.server_name.as_str()))
+                .then(|| desktop::Endpoint {
+                    address: config.relay.clone(),
+                    name: config.server_name.clone(),
+                    tls: client_config.clone(),
+                }),
             visual_provider.clone(),
             device.clone(),
             sequence.clone(),
@@ -1568,6 +1648,8 @@ async fn run_agent_with_event_sink(
         }
     }
     close_agent_resources(&shell_sessions, &serial_sessions).await;
+    visual_preparation.abort();
+    enrichment.abort();
     emit_agent_event(event_sender.as_ref(), AgentEvent::Stopped);
     Ok(())
 }
@@ -1587,6 +1669,7 @@ async fn run_connection<S>(
     boot_id: AgentBootId,
     boundary: Arc<runtime::RuntimeBoundary>,
     pairing_mode: remoteops_protocol::PairingMode,
+    test_key_fingerprint: Option<String>,
     managed_enrollment: Option<remoteops_protocol::ManagedAgentEnrollment>,
     resume_token: Option<String>,
     resume_token_state: Arc<Mutex<Option<String>>>,
@@ -1596,6 +1679,7 @@ async fn run_connection<S>(
     operating_system: String,
     capabilities: CapabilitySet,
     environment: EnvironmentProfile,
+    #[cfg(all(windows, feature = "desktop-pilot"))] desktop_endpoint: Option<desktop::Endpoint>,
     visual_provider: Arc<dyn VisualProvider>,
     device: Arc<SystemDevice>,
     sequence: Arc<AtomicU64>,
@@ -1613,9 +1697,27 @@ where
     let expected_target = managed_enrollment
         .as_ref()
         .map(|enrollment| enrollment.target_id.clone());
+    #[cfg(all(windows, feature = "desktop-pilot"))]
+    let environment = {
+        let mut profile = environment;
+        if desktop_endpoint.is_some() {
+            profile.tools.push(remoteops_domain::ToolProfile{name:"remoteops-desktop-v1".into(),available:true,version:Some("1".into())});
+        }
+        profile
+    };
     let tcp_enabled = capabilities.contains(Capability::TcpForward);
+    let test_pairing = test_key_fingerprint.is_some();
     let hello = WireMessage::Hello(ClientHello::Agent(AgentHello {
-        protocol_version: PROTOCOL_VERSION,
+        test_key_fingerprint,
+        protocol_version: if pairing_mode == remoteops_protocol::PairingMode::LongPerBoot
+            || boundary.host_business.is_some()
+        {
+            22
+        } else if test_pairing {
+            remoteops_protocol::TEST_PAIRING_AGENT_PROTOCOL_VERSION
+        } else {
+            PROTOCOL_VERSION
+        },
         agent_instance_id,
         boot_id,
         target_context: Some(runtime_target_context(&boundary, device.as_ref())),
@@ -1631,13 +1733,29 @@ where
         mac_address,
         supports_agent_shutdown: true,
     }));
+    let registration_started = Instant::now();
     write_frame(&mut stream, &hello).await?;
-    let welcome = match read_frame::<WireMessage, _>(&mut stream).await? {
+    let response = read_frame::<WireMessage, _>(&mut stream).await;
+    let response = if test_pairing {
+        response.context("Relay 未确认测试控制码，请核对 Relay 是否支持该功能")?
+    } else {
+        response?
+    };
+    let welcome = match response {
         WireMessage::AgentWelcome(welcome) => welcome,
         WireMessage::Error { code, message, .. } => bail!("{code}: {message}"),
         other => bail!("Relay 返回了意外消息：{other:?}"),
     };
+    if welcome.test_key_accepted != test_pairing || (test_pairing && welcome.pairing_code.is_none())
+    {
+        bail!("Relay 未确认测试控制码，请核对 Relay 是否支持该功能");
+    }
     if welcome.pairing_mode != pairing_mode
+        || (pairing_mode == remoteops_protocol::PairingMode::LongPerBoot
+            && !welcome
+                .pairing_code
+                .as_ref()
+                .is_some_and(remoteops_domain::AccessCode::is_long))
         || (pairing_mode == remoteops_protocol::PairingMode::ManagedOnDemand
             && (welcome.managed_target_id != expected_target || welcome.pairing_code.is_some()))
     {
@@ -1651,6 +1769,11 @@ where
         &state_file,
     )
     .await?;
+    startup_timing(
+        event_sender,
+        "registration_code_ready",
+        registration_started,
+    );
     if let Some(code) = &welcome.pairing_code {
         emit_agent_event(
             event_sender,
@@ -1685,8 +1808,16 @@ where
     let (reader, mut writer) = tokio::io::split(stream);
     let (sender, mut receiver) = mpsc::unbounded_channel::<WireMessage>();
     let (tcp_sender, mut tcp_receiver) = mpsc::channel(32);
-    let tool_transport =
-        tool_transport::AgentToolTransport::attach(boundary.resources.clone(), sender.clone());
+    let temporary_root = state_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("tmp");
+    std::fs::create_dir_all(&temporary_root)?;
+    let tool_transport = tool_transport::AgentToolTransport::attach_in(
+        boundary.resources.clone(),
+        sender.clone(),
+        Some(temporary_root),
+    );
     let _ = sender.send(WireMessage::AgentPermissionModeChanged(
         AgentPermissionModeChanged {
             permission_mode: if boundary.policy.read_only() {
@@ -1727,6 +1858,8 @@ where
     ));
     let tcp_forwards =
         tcp_forward::Manager::new(sender.clone(), tcp_sender, agent_instance_id, tcp_enabled);
+    #[cfg(all(windows, feature = "desktop-pilot"))]
+    let mut desktop = desktop::Manager::new(desktop_endpoint,sender.clone(),event_sender.cloned());
     let mut tcp_cleanup = interval(Duration::from_secs(1));
     let mut controller_bindings = BTreeMap::<ControllerInstanceId, ControllerBinding>::new();
     let mut default_queries = BTreeMap::<RequestId, (SessionControlState, Instant)>::new();
@@ -1774,6 +1907,8 @@ where
                     std::future::pending::<()>().await;
                 }
             } => {
+                #[cfg(all(windows, feature = "desktop-pilot"))]
+                desktop.stop("现场权限发生变化");
                 let permission_mode = *permission_mode_updates.borrow_and_update();
                 let permission_mode = if boundary.policy.read_only() { PermissionMode::ReadOnly } else { permission_mode };
                 let _ = sender.send(WireMessage::AgentPermissionModeChanged(
@@ -1798,7 +1933,18 @@ where
             ) => {
                 tool_transport.handle(message).await;
             }
+            #[cfg(all(windows, feature = "desktop-pilot"))]
+            Ok(WireMessage::Desktop(event)) => {
+                let binding=controller_bindings.values().find(|b|b.session_id==event.session && b.controller_kind==remoteops_protocol::ControllerKind::Human);
+                desktop.handle(event,binding,*permission_mode_updates.borrow());
+            }
             Ok(WireMessage::ControllerBinding(mut binding)) => {
+                #[cfg(all(windows, feature = "desktop-pilot"))]
+                if let Some(old) = controller_bindings.get(&binding.controller_instance_id)
+                    && (old.binding_token != binding.binding_token || old.permission_mode != binding.permission_mode)
+                {
+                    desktop.revoke(&old.binding_token);
+                }
                 info!(
                     session_id = %binding.session_id,
                     controller_instance_id = %binding.controller_instance_id,
@@ -1967,6 +2113,8 @@ where
                 session_id,
                 binding_token,
             }) => {
+                #[cfg(all(windows, feature = "desktop-pilot"))]
+                desktop.revoke(&binding_token);
                 if revoke_controller_binding(&mut controller_bindings, session_id, &binding_token) {
                     publish_execution_bindings(&execution_bindings, &controller_bindings);
                     if !controller_bindings
@@ -2172,6 +2320,8 @@ where
                     }));
                     continue;
                 }
+                #[cfg(all(windows, feature = "desktop-pilot"))]
+                if matches!(request.operation, RemoteOperation::EmergencyStop | RemoteOperation::CloseConnection) {desktop.stop("收到急停或断开连接指令");}
                 if matches!(request.operation, RemoteOperation::EmergencyStop) {
                     abort_pending_tasks(&tasks, Some(&log_observer), "紧急停止，操作已中断").await;
                     close_agent_resources(&shell_sessions, &serial_sessions).await;
@@ -2353,6 +2503,8 @@ where
             }
         }
     };
+    #[cfg(all(windows, feature = "desktop-pilot"))]
+    drop(desktop);
     drop(tcp_forwards);
     tool_transport.close().await;
     heartbeat_task.abort();
@@ -2942,6 +3094,44 @@ async fn execute_operation(
         details: None,
     };
     match &request.operation {
+        RemoteOperation::DescribeHostCapabilities => {
+            let provider = runtime_state
+                .boundary
+                .host_business
+                .as_ref()
+                .context("host_business_unavailable")?;
+            let description = provider.describe();
+            host_business::validate_description(&description)?;
+            response.details = Some(serde_json::to_value(description)?);
+            response.summary = "宿主服务与只读能力清单".into();
+        }
+        RemoteOperation::QueryHostCapability {
+            instance_id,
+            capability_id,
+            version,
+            arguments,
+        } => {
+            let provider = runtime_state
+                .boundary
+                .host_business
+                .as_ref()
+                .context("host_business_unavailable")?;
+            response.details = Some(
+                host_business::query(
+                    provider,
+                    HostQuery {
+                        request_id: request.request_id,
+                        session_id: request.session_id,
+                        instance_id: instance_id.clone(),
+                        capability_id: capability_id.clone(),
+                        version: version.clone(),
+                        arguments: arguments.clone(),
+                    },
+                )
+                .await?,
+            );
+            response.summary = "宿主只读业务查询完成".into();
+        }
         RemoteOperation::CreateTcpForward { .. } => {
             bail!("TCP 创建必须通过带固定目标规则的授权扩展执行");
         }
@@ -4610,7 +4800,32 @@ fn serial_output_for_remote_event(bytes: &[u8]) -> String {
     )
 }
 
+#[cfg(test)]
 async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile {
+    detect_environment_profile_inner(device, true, AgentCapabilityPolicy::default()).await
+}
+
+fn startup_timing(sender: Option<&AgentEventSink>, phase: &str, started: Instant) {
+    emit_agent_event(
+        sender,
+        AgentEvent::OperationLog(AgentOperationLog {
+            repetition: None,
+            request_id: None,
+            occurred_at: Utc::now(),
+            level: AgentLogLevel::Info,
+            message: format!(
+                "startup_phase={phase} elapsed_ms={}",
+                started.elapsed().as_millis()
+            ),
+        }),
+    );
+}
+
+async fn detect_environment_profile_inner(
+    device: &SystemDevice,
+    versions: bool,
+    policy: AgentCapabilityPolicy,
+) -> EnvironmentProfile {
     let available_shells = device.available_shells().await.unwrap_or_default();
     let shells = [
         ShellKind::Cmd,
@@ -4620,18 +4835,25 @@ async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile
     ]
     .into_iter()
     .map(|kind| {
-        let available = available_shells.contains(&kind);
+        let name = match kind {
+            ShellKind::Cmd | ShellKind::System => "cmd",
+            ShellKind::WindowsPowerShell => "windows_power_shell",
+            ShellKind::PowerShell => "power_shell",
+        };
+        let available = available_shells.contains(&kind) && policy.allows(name);
         ShellProfile {
             kind,
             available,
             executable: available.then(|| shell_executable(kind).to_owned()),
-            version: available.then(|| shell_version(kind)).flatten(),
+            version: (available && versions)
+                .then(|| shell_version(kind))
+                .flatten(),
         }
     })
     .collect();
     let ssh_executable = if cfg!(windows) { "ssh.exe" } else { "ssh" };
-    let ssh_available = command_exists(ssh_executable);
-    let keyscan_available = device.has_ssh_scanner();
+    let ssh_available = policy.allows("ssh") && command_exists(ssh_executable);
+    let keyscan_available = policy.allows("ssh") && device.has_ssh_scanner();
 
     EnvironmentProfile {
         schema_version: remoteops_domain::ENVIRONMENT_PROFILE_SCHEMA_VERSION,
@@ -4640,15 +4862,15 @@ async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         protocol_version: PROTOCOL_VERSION,
         os_family: std::env::consts::OS.to_owned(),
-        os_version: operating_system_version(),
+        os_version: versions.then(operating_system_version).flatten(),
         architecture: std::env::consts::ARCH.to_owned(),
-        elevated: detect_elevated(),
+        elevated: versions.then(detect_elevated).flatten(),
         shells,
         tools: {
             #[allow(unused_mut)]
             let mut tools = ssh_tool_profiles(
                 ssh_available,
-                ssh_available.then(ssh_version).flatten(),
+                (ssh_available && versions).then(ssh_version).flatten(),
                 cfg!(windows) && device.has_bundled_ssh(),
                 keyscan_available,
             );
@@ -5395,7 +5617,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use remoteops_domain::{
-        ApprovalId, ControllerInstanceId, ControllerOwnerId, EventSource, PairingCode,
+        AccessCode, ApprovalId, ControllerInstanceId, ControllerOwnerId, EventSource,
         PermissionMode, SessionId,
     };
     use remoteops_protocol::{AgentResumeCommitted, AgentWelcome, ControllerKind};
@@ -5807,7 +6029,8 @@ mod tests {
                 &mut agent,
                 identity,
                 &AgentWelcome {
-                    pairing_code: Some(PairingCode::parse("123456789").unwrap()),
+                    test_key_accepted: false,
+                    pairing_code: Some(AccessCode::parse("123456789").unwrap()),
                     pairing_mode: remoteops_protocol::PairingMode::AutoPerBoot,
                     managed_target_id: None,
                     lease_expires_at: Utc::now() + chrono::Duration::minutes(1),
@@ -5950,6 +6173,7 @@ mod tests {
                 remoteops_protocol::PairingMode::AutoPerBoot,
                 None,
                 None,
+                None,
                 Arc::new(Mutex::new(None)),
                 connection_state_file,
                 "test-host".to_owned(),
@@ -5957,6 +6181,8 @@ mod tests {
                 "test-os".to_owned(),
                 CapabilitySet::new([Capability::Cmd]),
                 EnvironmentProfile::empty(),
+                #[cfg(all(windows, feature = "desktop-pilot"))]
+                None,
                 provider,
                 Arc::new(SystemDevice::new()),
                 Arc::new(AtomicU64::new(1)),
@@ -5989,7 +6215,8 @@ mod tests {
         write_frame(
             &mut relay_stream,
             &WireMessage::AgentWelcome(AgentWelcome {
-                pairing_code: Some(PairingCode::parse("123456789").expect("测试控制码应有效")),
+                test_key_accepted: false,
+                pairing_code: Some(AccessCode::parse("123456789").expect("测试控制码应有效")),
                 pairing_mode: remoteops_protocol::PairingMode::AutoPerBoot,
                 managed_target_id: None,
                 lease_expires_at: Utc::now() + chrono::Duration::minutes(1),

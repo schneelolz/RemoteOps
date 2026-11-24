@@ -26,8 +26,8 @@ use remoteops_application::{
 };
 use remoteops_audit::sha256_bytes;
 use remoteops_domain::{
-    ApprovalId, Capability, ControllerInstanceId, ControllerOwnerId, EventSource, FileTransferId,
-    PairingCode, PermissionMode, PowerAction, RemoteOperation, RequestId, SerialDataBits,
+    AccessCode, ApprovalId, Capability, ControllerInstanceId, ControllerOwnerId, EventSource,
+    FileTransferId, PermissionMode, PowerAction, RemoteOperation, RequestId, SerialDataBits,
     SerialFlowControl, SerialLineEnding, SerialParity, SerialSettings, SerialStopBits,
     SerialTerminalProfile, ServiceAction, SessionId, ShellId, ShellKind, VisualTarget,
 };
@@ -347,7 +347,7 @@ impl From<CommandMode> for PermissionMode {
 
 #[derive(Clone, Debug)]
 struct PairSpec {
-    code: PairingCode,
+    code: AccessCode,
     alias: Option<String>,
 }
 
@@ -612,6 +612,17 @@ struct TargetInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct HostQueryInput {
+    session_id: String,
+    instance_id: String,
+    capability_id: String,
+    version: String,
+    #[schemars(schema_with = "tool_center_output::any_json_schema")]
+    arguments: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct VisualObserveInput {
     session_id: String,
     include_screenshot: Option<bool>,
@@ -637,8 +648,10 @@ struct VisualActionInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PairConnectionInput {
-    /// Agent 窗口显示的九位临时配对码。
+    /// Agent 九位配对码或 Bridge UUID v4 长授权码。
     pairing_code: String,
+    /// 重启后重新配对时，填入首次配对返回的 `agent_instance_id`。
+    expected_agent_id: Option<String>,
     /// 可选展示别名，例如“客户 A”。
     alias: Option<String>,
 }
@@ -1554,6 +1567,57 @@ impl RemoteOpsMcp {
         configured_tool_router(self.enable_test_ui)
     }
 
+    #[tool(
+        name = "describe_host_capabilities",
+        description = "查询当前会话绑定的 GRClient/UDServer 宿主身份、实例和只读业务能力。",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn describe_host_capabilities(
+        &self,
+        Parameters(input): Parameters<TargetInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::DescribeHostCapabilities,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "query_host_capability",
+        description = "按发现结果中的精确实例、能力与版本查询宿主业务数据，禁止重放结果未知的请求。",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn query_host_capability(
+        &self,
+        Parameters(input): Parameters<HostQueryInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::QueryHostCapability {
+                instance_id: input.instance_id,
+                capability_id: input.capability_id,
+                version: input.version,
+                arguments: input.arguments,
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
     /// 显式从 Relay 重新读取 `RemoteOps` 全局操作指引。
     #[tool(
         name = "refresh_global_guide",
@@ -2155,10 +2219,19 @@ impl RemoteOpsMcp {
         Parameters(input): Parameters<PairConnectionInput>,
     ) -> Result<Json<ConnectionOutput>, String> {
         let pairing_code =
-            PairingCode::parse(input.pairing_code).map_err(|error| error.to_string())?;
+            AccessCode::parse(input.pairing_code).map_err(|error| error.to_string())?;
+        let expected_agent_id = input
+            .expected_agent_id
+            .as_deref()
+            .map(|value| {
+                value
+                    .parse::<remoteops_domain::AgentInstanceId>()
+                    .map_err(|_| "预期 Agent ID 必须是有效的 GUID".to_owned())
+            })
+            .transpose()?;
         let connection = self
             .client
-            .pair(pairing_code)
+            .pair_for_agent(pairing_code, expected_agent_id)
             .await
             .map_err(application_error)?;
         if let Some(alias) = input.alias {
@@ -4779,7 +4852,7 @@ fn parse_pair_spec(value: &str) -> Result<PairSpec, String> {
         .map_or((value, None), |(code, alias)| {
             (code, Some(alias.to_owned()))
         });
-    let code = PairingCode::parse(code).map_err(|error| error.to_string())?;
+    let code = AccessCode::parse(code).map_err(|error| error.to_string())?;
     Ok(PairSpec { code, alias })
 }
 

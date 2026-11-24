@@ -72,6 +72,54 @@ fn issue(f: &Fixture, now: DateTime<Utc>) -> IssuedInvitation {
 }
 
 #[test]
+#[allow(clippy::manual_assert_eq)] // 比较失败时不得打印登记凭据。
+fn delegated_enrollment_retries_only_its_own_unclaimed_asset() {
+    let f = fixture();
+    let principal = f.principal.principal.principal_id;
+    let name = format!("opscenter-managed-{}", "a".repeat(64));
+    assert!(matches!(
+        f.store
+            .prepare_managed_enrollment(&f.principal.token, Uuid::new_v4(), &name),
+        Err(PortalError::Forbidden)
+    ));
+    assert!(matches!(
+        f.store
+            .prepare_managed_enrollment(&f.principal.token, principal, "asset-a"),
+        Err(PortalError::InvalidInput)
+    ));
+    let first = f
+        .store
+        .prepare_managed_enrollment(&f.principal.token, principal, &name)
+        .unwrap();
+    let retry = f
+        .store
+        .prepare_managed_enrollment(&f.principal.token, principal, &name)
+        .unwrap();
+    assert_eq!(first.asset.target_id, retry.asset.target_id);
+    assert_eq!(first.asset.revision, retry.asset.revision);
+    assert!(first.enrollment_token == retry.enrollment_token);
+    let owner = f.store.authenticate_principal(&f.principal.token).unwrap();
+    assert_eq!(owner.revision, 2);
+    assert_eq!(owner.allowed_assets.len(), 2);
+    let agent = AgentInstanceId::new();
+    f.store
+        .validate_agent_enrollment(&first.asset.target_id, &first.enrollment_token, agent)
+        .unwrap();
+    assert!(matches!(
+        f.store
+            .prepare_managed_enrollment(&f.principal.token, principal, &name),
+        Err(PortalError::Conflict)
+    ));
+    assert_eq!(
+        f.store
+            .asset_for_principal(principal, &name)
+            .unwrap()
+            .agent_id,
+        Some(agent)
+    );
+}
+
+#[test]
 fn enrollment_binds_exact_agent_and_principal_acl_is_enforced() {
     let f = fixture();
     assert!(f.store.authenticate_principal(&f.principal.token).is_ok());

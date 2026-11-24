@@ -24,6 +24,10 @@
 
 集成凭据返回后保存在 OpsCenter 后端受保护的凭据库。不要保存到网页 localStorage、URL、前端配置、普通日志或源码中。资产登记文件使用 `{"target_id":"<受控返回的 target_id>","token":"<enrollment_token>"}`，通过 Agent 的 `managed_enrollment_file` 路径加载；普通配置仅保存文件路径，不包含凭据正文。
 
+## OpsCenter 受管登记委托
+
+Relay `0.2.0-preview.23` 可在服务端通过 `REMOTEOPS_PORTAL_MANAGED_PROVISION_PRINCIPAL` 指定现有 OpsCenter 门户主体 UUID。该主体以自身门户凭据调用 `POST /api/portal/v1/assets/{asset_id}/managed-enrollment`，资产键限定为 `opscenter-managed-` 加 64 位小写十六进制字符。Relay 在同一事务内建立资产与该主体的白名单项；同一未登记资产重试返回相同结果。旧方式创建的同名资产、撤权资产和已经绑定 Agent 的资产拒绝再次下发登记凭据。该委托由部署配置显式开启。
+
 ## 管理员授权变更与资产迁移
 
 Relay `0.2.0-preview.10` 新增以下管理能力。只接受既有 Relay 管理认证；门户 `ropp1` 凭据、MCP 安装凭据和 Controller 凭据不能调用这些入口。沿用 32 KiB 正文限制、实际 TCP peer 限流、拒绝未知 JSON 字段以及 `no-store` 响应头。

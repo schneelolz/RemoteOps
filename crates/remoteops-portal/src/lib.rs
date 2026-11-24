@@ -273,6 +273,87 @@ impl PortalStore {
         })
     }
 
+    /// 为已委托的集成主体准备专用命名空间内的未登记资产，重复请求返回相同登记材料。
+    ///
+    /// # Errors
+    /// 主体未获委托、资产已绑定、名称冲突或持久化失败时返回错误。
+    pub fn prepare_managed_enrollment(
+        &self,
+        credential: &str,
+        delegated_principal: Uuid,
+        asset_id: &str,
+    ) -> PortalResult<CreatedAsset> {
+        let authenticated = self.authenticate_principal(credential)?;
+        if authenticated.principal_id != delegated_principal {
+            return Err(PortalError::Forbidden);
+        }
+        if !asset_id
+            .strip_prefix("opscenter-managed-")
+            .is_some_and(|id| {
+                id.len() == 64
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        {
+            return Err(PortalError::InvalidInput);
+        }
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        admin::require_principal_ready(&tx, delegated_principal)?;
+        let mut owner = principal(&tx, delegated_principal)?;
+        let existing: Option<(String, Vec<u8>)> = tx.query_row(
+            "SELECT target_id,enrollment_hash FROM portal_assets WHERE principal_id=?1 AND asset_id=?2",
+            params![delegated_principal.to_string(), asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let enrollment = |target_id: &str| {
+            format!(
+                "rope1.{target_id}.{}",
+                URL_SAFE_NO_PAD.encode(self.mac(
+                    b"remoteops-opscenter-managed-enrollment-v1\0",
+                    format!("{delegated_principal}:{target_id}").as_bytes()
+                ))
+            )
+        };
+        if let Some((target_id, expected)) = existing {
+            check_acl(&owner, asset_id)?;
+            let asset = read_asset(&tx, &target_id)?;
+            let token = enrollment(&target_id);
+            if asset.agent_id.is_some()
+                || !bool::from(expected.ct_eq(hash(token.as_bytes()).as_slice()))
+            {
+                return Err(PortalError::Conflict);
+            }
+            return Ok(CreatedAsset {
+                asset,
+                enrollment_token: token,
+            });
+        }
+        if check_acl(&owner, asset_id).is_err() {
+            if owner.allowed_assets.len() >= 1024 {
+                return Err(PortalError::Conflict);
+            }
+            owner.allowed_assets.push(asset_id.to_owned());
+            owner.allowed_assets.sort();
+            owner.revision = owner.revision.checked_add(1).ok_or(PortalError::Storage)?;
+            tx.execute(
+                "UPDATE portal_principals SET data=?1 WHERE id=?2",
+                params![encode(&owner)?, delegated_principal.to_string()],
+            )?;
+        }
+        let target_id = Uuid::new_v4().to_string();
+        let token = enrollment(&target_id);
+        tx.execute("INSERT INTO portal_assets(target_id,principal_id,asset_id,enrollment_hash,agent_id,revision) VALUES(?1,?2,?3,?4,NULL,1)",
+            params![target_id, delegated_principal.to_string(), asset_id, hash(token.as_bytes()).as_slice()])?;
+        let asset = read_asset(&tx, &target_id)?;
+        tx.commit()?;
+        Ok(CreatedAsset {
+            asset,
+            enrollment_token: token,
+        })
+    }
+
     /// 一次登记锁定准确 Agent 身份；同身份重试允许，其他身份不能抢占。
     ///
     /// # Errors

@@ -60,6 +60,8 @@ pub struct AgentRuntimeOptions {
     pub visual_provider_factory: Option<VisualProviderFactory>,
     /// 普通临时控制码或门户受管按需邀请。
     pub pairing_mode: PairingMode,
+    /// 本次启动指定的测试 GUID 摘要，不写入 Agent 配置。
+    pub test_key_fingerprint: Option<String>,
     /// 产品说明与案例引用，只提供给当前目标，不授予权限。
     pub guidance: Vec<TargetGuidance>,
     /// 当前真实程序入口是否实现 SSH 主机密钥管理 CLI；仅由宿主声明。
@@ -68,6 +70,8 @@ pub struct AgentRuntimeOptions {
     pub bundled_tools: Option<remoteops_device::BundledTools>,
     /// 宿主当前选择的语言；与运行中的目标上下文同步。
     pub ui_language: AgentUiLanguage,
+    /// 本机宿主提供的业务能力，不从远端配置构造。
+    pub host_business: Option<Arc<dyn super::HostBusinessProvider>>,
 }
 impl AgentRuntimeOptions {
     /// 创建兼容原 GUI 行为的交互宿主配置。
@@ -80,10 +84,12 @@ impl AgentRuntimeOptions {
             visual_enabled: cfg!(windows),
             visual_provider_factory: None,
             pairing_mode: PairingMode::AutoPerBoot,
+            test_key_fingerprint: None,
             guidance: Vec::new(),
             ssh_trust_cli: false,
             bundled_tools: None,
             ui_language: AgentUiLanguage::default(),
+            host_business: None,
         }
     }
     /// 声明当前程序已接入主机密钥核对 CLI，不从环境或远程配置推断。
@@ -154,6 +160,7 @@ struct VisualState {
 
 #[derive(Clone)]
 pub(crate) struct RuntimeBoundary {
+    pub host_business: Option<Arc<dyn super::HostBusinessProvider>>,
     pub context: Arc<TargetContext>,
     pub policy: AgentCapabilityPolicy,
     // 本地显式配置后创建，不能由远程上下文构造或扩张。
@@ -171,6 +178,7 @@ impl Default for RuntimeBoundary {
             context: Arc::new(TargetContext::default()),
             policy: AgentCapabilityPolicy::default(),
             resources: None,
+            host_business: None,
             ui_language: AgentUiLanguage::default(),
             visual_state: Arc::new(Mutex::new(None)),
             visual_probe: Arc::new(tokio::sync::Mutex::new(())),
@@ -201,6 +209,23 @@ impl RuntimeBoundary {
 
     pub fn snapshot(&self) -> TargetContext {
         let mut context = self.latest_context();
+        context
+            .capabilities
+            .retain(|status| status.capability != "host_business_v1");
+        let host_available = self.host_business.is_some() && self.policy.allows("host_business");
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "host_business_v1".into(),
+            status: if host_available {
+                CapabilityAvailability::Available
+            } else {
+                CapabilityAvailability::Unavailable
+            },
+            reasons: if host_available {
+                vec![]
+            } else {
+                vec!["host_business_disabled".into()]
+            },
+        });
         context.facts = native_facts();
         context
             .capabilities
@@ -263,8 +288,16 @@ impl RuntimeBoundary {
         });
         context.capabilities.push(TargetCapabilityStatus {
             capability: "tcp_forward_v2".into(),
-            status: CapabilityAvailability::Available,
-            reasons: Vec::new(),
+            status: if self.policy.allows("tcp_forward") {
+                CapabilityAvailability::Available
+            } else {
+                CapabilityAvailability::Unavailable
+            },
+            reasons: if self.policy.allows("tcp_forward") {
+                vec![]
+            } else {
+                vec!["product_policy_disabled".into()]
+            },
         });
         if let Some(reason) = self.hard_visual_reason() {
             set_visual_status(&mut context, Some(reason));
@@ -450,6 +483,12 @@ impl RuntimeBoundary {
     }
 
     pub fn check(&self, operation: &RemoteOperation) -> anyhow::Result<()> {
+        if required_capability(operation).is_some_and(|name| !self.policy.allows(name)) {
+            return Err(RuntimeDenied {
+                code: "product_policy_disabled".into(),
+            }
+            .into());
+        }
         if operation.is_resource_tool() && self.resources.is_none() {
             return Err(RuntimeDenied {
                 code: "resource_tools_disabled".into(),
@@ -509,14 +548,93 @@ pub(crate) fn native_facts() -> TargetRuntimeFacts {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
+fn filter_capabilities(
+    capabilities: CapabilitySet,
+    policy: AgentCapabilityPolicy,
+) -> CapabilitySet {
+    capabilities
+        .iter()
+        .copied()
+        .filter(|capability| {
+            serde_json::to_value(capability)
+                .ok()
+                .and_then(|value| value.as_str().map(|name| policy.allows(name)))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn required_capability(operation: &RemoteOperation) -> Option<&'static str> {
+    use RemoteOperation as Op;
+    match operation {
+        Op::DescribeHostCapabilities | Op::QueryHostCapability { .. } => Some("host_business"),
+        Op::OpenShell { shell }
+        | Op::RunCommand { shell, .. }
+        | Op::RunShellCommand { shell, .. } => Some(match shell {
+            remoteops_domain::ShellKind::Cmd | remoteops_domain::ShellKind::System => "cmd",
+            remoteops_domain::ShellKind::WindowsPowerShell => "windows_power_shell",
+            remoteops_domain::ShellKind::PowerShell => "power_shell",
+        }),
+        Op::RunSsh { .. } => Some("ssh"),
+        Op::ListSerial
+        | Op::OpenSerial { .. }
+        | Op::WriteSerial { .. }
+        | Op::RunSerialQuery { .. } => Some("serial"),
+        Op::TestPort { .. } => Some("port_probe"),
+        Op::TcpExchange { .. } => Some("tcp_exchange"),
+        Op::CreateTcpForward { .. } => Some("tcp_forward"),
+        Op::UploadFile { .. }
+        | Op::BeginUploadFile { .. }
+        | Op::UploadFileChunk { .. }
+        | Op::CompleteUploadFile { .. }
+        | Op::AbortUploadFile { .. }
+        | Op::DownloadFile { .. }
+        | Op::AuthorizeDownloadFile { .. }
+        | Op::DownloadFileChunk { .. }
+        | Op::GetFileMetadata { .. }
+        | Op::MoveFile { .. }
+        | Op::DeleteFile { .. } => Some("file_transfer"),
+        Op::ListProcesses
+        | Op::TerminateProcess { .. }
+        | Op::ListServices
+        | Op::ControlService { .. }
+        | Op::PowerControl { .. } => Some("system_operations"),
+        operation if operation.is_visual() => Some("visual"),
+        operation if operation.is_resource_tool() => Some("resource_tools"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 pub(crate) async fn prepare(
     options: &AgentRuntimeOptions,
     environment: &EnvironmentProfile,
     facts: TargetRuntimeFacts,
 ) -> anyhow::Result<(RuntimeBoundary, Arc<dyn VisualProvider>, CapabilitySet)> {
+    prepare_with_probe(options, environment, facts, true).await
+}
+
+pub(crate) async fn prepare_deferred(
+    options: &AgentRuntimeOptions,
+    environment: &EnvironmentProfile,
+    facts: TargetRuntimeFacts,
+) -> anyhow::Result<(RuntimeBoundary, Arc<dyn VisualProvider>, CapabilitySet)> {
+    prepare_with_probe(options, environment, facts, false).await
+}
+
+async fn prepare_with_probe(
+    options: &AgentRuntimeOptions,
+    environment: &EnvironmentProfile,
+    facts: TargetRuntimeFacts,
+    initial_probe: bool,
+) -> anyhow::Result<(RuntimeBoundary, Arc<dyn VisualProvider>, CapabilitySet)> {
     options.product.validate()?;
     if options.pairing_mode == PairingMode::Unknown {
         anyhow::bail!("未知的控制码签发模式");
+    }
+    if options.pairing_mode == PairingMode::LongPerBoot && options.test_key_fingerprint.is_some() {
+        anyhow::bail!("长授权码不能同时使用测试控制码协议21");
     }
     let reason = if !options.capability_policy.visual_allowed()
         || !options.visual_enabled
@@ -530,7 +648,10 @@ pub(crate) async fn prepare(
     } else {
         Some("visual_probe_pending")
     };
-    let capabilities = capabilities_from_environment(environment, false);
+    let capabilities = filter_capabilities(
+        capabilities_from_environment(environment, false),
+        options.capability_policy,
+    );
     let statuses =
         capability_statuses(&capabilities, reason, options.capability_policy.read_only());
     let context = TargetContext {
@@ -556,15 +677,12 @@ pub(crate) async fn prepare(
         .context("产品目标上下文无效")?;
     // visual_enabled=false 是旧入口也不可绕过的硬上限。
     let policy = if !options.visual_enabled || options.run_mode == AgentRunMode::WindowsService {
-        if options.capability_policy.read_only() {
-            AgentCapabilityPolicy::headless().with_read_only()
-        } else {
-            AgentCapabilityPolicy::headless()
-        }
+        options.capability_policy.without_visual()
     } else {
         options.capability_policy
     };
     let mut boundary = RuntimeBoundary {
+        host_business: options.host_business.clone(),
         context: Arc::new(context),
         policy,
         ui_language: options.ui_language.clone(),
@@ -578,15 +696,22 @@ pub(crate) async fn prepare(
             .unwrap_or_else(|| Arc::new(remoteops_visual::default_visual_provider)),
         provider: OnceLock::new(),
     });
-    let context = boundary
-        .refresh_visual_with_facts(
-            provider.as_ref(),
-            boundary.context.facts.clone(),
-            Duration::ZERO,
-            VISUAL_PROBE_BUDGET,
-        )
-        .await;
-    let capabilities = capabilities_from_environment(environment, context.visual_allowed());
+    let context = if initial_probe {
+        boundary
+            .refresh_visual_with_facts(
+                provider.as_ref(),
+                boundary.context.facts.clone(),
+                Duration::ZERO,
+                VISUAL_PROBE_BUDGET,
+            )
+            .await
+    } else {
+        boundary.context.as_ref().clone()
+    };
+    let capabilities = filter_capabilities(
+        capabilities_from_environment(environment, context.visual_allowed()),
+        options.capability_policy,
+    );
     boundary.context = Arc::new(context);
     Ok((boundary, provider, capabilities))
 }

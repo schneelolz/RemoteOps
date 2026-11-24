@@ -407,6 +407,14 @@ pub async fn load_pinned_client_config(
             actual: probe.sha256_fingerprint,
         });
     }
+    pinned_client_config(&expected)
+}
+
+/// 直接创建固定指纹配置，在正式握手中验证指纹、有效期和服务端名称。
+/// # Errors
+/// 指纹格式无效时返回错误，不建立探测连接。
+pub fn pinned_client_config(expected_fingerprint: &str) -> Result<Arc<ClientConfig>, TlsError> {
+    let expected = normalize_certificate_fingerprint(expected_fingerprint)?;
     let verifier = PinnedCertificateVerifier::new(expected);
     Ok(Arc::new(
         ClientConfig::builder()

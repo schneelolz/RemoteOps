@@ -18,6 +18,7 @@ struct Catalog {
 #[derive(Default)]
 struct Downloads {
     pending: Mutex<BTreeMap<String, oneshot::Sender<WireMessage>>>,
+    temporary_root: Option<PathBuf>,
 }
 pub(super) struct AgentToolTransport {
     downloads: Arc<Downloads>,
@@ -34,11 +35,23 @@ fn error(code: &str, message: &str) -> ResourceError {
     }
 }
 impl AgentToolTransport {
+    #[cfg(test)]
     pub(super) fn attach(
         resources: Option<Arc<ResourceManager>>,
         sender: mpsc::UnboundedSender<WireMessage>,
     ) -> Self {
-        let downloads = Arc::new(Downloads::default());
+        Self::attach_in(resources, sender, None)
+    }
+
+    pub(super) fn attach_in(
+        resources: Option<Arc<ResourceManager>>,
+        sender: mpsc::UnboundedSender<WireMessage>,
+        temporary_root: Option<PathBuf>,
+    ) -> Self {
+        let downloads = Arc::new(Downloads {
+            temporary_root,
+            ..Downloads::default()
+        });
         let (catalog, mut receiver) = watch::channel::<Option<Catalog>>(None);
         if let Some(manager) = &resources {
             manager.reset_catalog();
@@ -141,7 +154,13 @@ impl Downloads {
         if let Some(p) = &progress {
             p.report("download", 0, Some(package.size));
         }
-        let temporary = tempfile::NamedTempFile::new()
+        let temporary = self
+            .temporary_root
+            .as_ref()
+            .map_or_else(
+                tempfile::NamedTempFile::new,
+                tempfile::NamedTempFile::new_in,
+            )
             .map_err(|_| error("download_io", "无法创建包接收临时文件"))?
             .into_temp_path();
         let mut output = tokio::fs::File::create(&temporary)

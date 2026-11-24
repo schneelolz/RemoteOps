@@ -1,5 +1,6 @@
 //! `RemoteOps` 领域对象和值对象。
 
+mod access_code;
 mod capability;
 mod connection;
 mod environment;
@@ -12,6 +13,7 @@ mod target_context;
 mod visual;
 mod visual_wait;
 
+pub use access_code::AccessCode;
 pub use capability::{Capability, CapabilitySet, ShellKind};
 pub use connection::{ConnectionDescriptor, ConnectionState, SessionRole};
 pub use environment::{

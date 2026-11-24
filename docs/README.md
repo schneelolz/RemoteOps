@@ -63,6 +63,8 @@ RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该
 
 ## 公共底座与薄产品
 
+- [RemoteOpsBridge 接入与候选验收](integrations/remoteops-bridge.md)：独立进程、C# 双向通讯、长控制码、能力与目录隔离。
+
 Agent GUI 现提供公共库入口；产品配置与构建资源分别位于 `remoteops-product` 和 `remoteops-build`。RemoteOps 默认入口与独立中性示例复用同一宿主。职责、实际接口、固定依赖版本、外部构建验证及迁移步骤见 [薄产品接入与迁移](product-integration.md)。
 
 - [公共底座与产品定制分离交付记录](product-refactor-delivery.md)：实际接口、完整文件清单、验证结果与待完成验收。

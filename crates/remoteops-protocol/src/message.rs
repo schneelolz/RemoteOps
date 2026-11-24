@@ -1,13 +1,17 @@
 use chrono::{DateTime, Utc};
 use remoteops_domain::{
-    AgentBootId, AgentInstanceId, ApprovalId, ApprovalState, CapabilitySet, ConnectionDescriptor,
-    ControllerInstanceId, ControllerOwnerId, EnvironmentProfile, EventSource, PairingCode,
+    AccessCode, AgentBootId, AgentInstanceId, ApprovalId, ApprovalState, CapabilitySet,
+    ConnectionDescriptor, ControllerInstanceId, ControllerOwnerId, EnvironmentProfile, EventSource,
     PermissionMode, RemoteEvent, RemoteOperation, RequestId, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
 /// 当前线协议版本。
 pub const PROTOCOL_VERSION: u16 = 20;
+/// 长控制码和宿主业务扩展使用的显式协商版本。
+pub const BRIDGE_PROTOCOL_VERSION: u16 = 22;
+/// 仅用于已显式启用测试控制码的 Agent，旧 Relay 会在登记前拒绝。
+pub const TEST_PAIRING_AGENT_PROTOCOL_VERSION: u16 = 21;
 /// 保留启动边界语义的旧版交互客户协议。
 pub const LEGACY_PROTOCOL_VERSION: u16 = 17;
 
@@ -15,6 +19,7 @@ pub const LEGACY_PROTOCOL_VERSION: u16 = 17;
 #[must_use]
 pub const fn supports_protocol_version(version: u16) -> bool {
     version == PROTOCOL_VERSION
+        || version == BRIDGE_PROTOCOL_VERSION
         || version == 19
         || version == 18
         || version == LEGACY_PROTOCOL_VERSION
@@ -24,6 +29,8 @@ pub const fn supports_protocol_version(version: u16) -> bool {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PairingMode {
+    /// 每次启动由 Relay 签发 UUID v4 长控制码。
+    LongPerBoot,
     /// 旧版交互 Agent 每次启动签发控制码。
     #[default]
     AutoPerBoot,
@@ -82,6 +89,9 @@ pub struct AgentHello {
     pub agent_instance_id: AgentInstanceId,
     /// 本次运行标识；同一进程断线重连时保持不变。
     pub boot_id: AgentBootId,
+    /// 可选测试密钥摘要，用于查找已认证设备的测试租约。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_key_fingerprint: Option<String>,
     /// 当前启动的产品上下文；协议17客户可不提供。
     #[serde(default)]
     pub target_context: Option<remoteops_domain::TargetContext>,
@@ -162,8 +172,11 @@ pub enum ClientHello {
 /// Relay 接受 Agent 后颁发的信息。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentWelcome {
+    /// Relay 已为本次启动启用测试控制码。
+    #[serde(default)]
+    pub test_key_accepted: bool,
     /// 租约有效期内不变的配对码。
-    pub pairing_code: Option<PairingCode>,
+    pub pairing_code: Option<AccessCode>,
     /// Relay 确认的控制码签发模式。
     #[serde(default)]
     pub pairing_mode: PairingMode,
@@ -257,9 +270,12 @@ pub struct PairRequest {
     /// 请求标识。
     pub request_id: RequestId,
     /// 人工输入的控制码。
-    pub pairing_code: Option<PairingCode>,
+    pub pairing_code: Option<AccessCode>,
     /// 自动恢复时必须匹配的原会话；人工输入控制码时为空。
     pub expected_session_id: Option<SessionId>,
+    /// 配对前必须匹配的设备身份。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_agent_id: Option<AgentInstanceId>,
     /// 自动恢复受管连接的高熵凭据；此时不再提交一次性控制码。
     #[serde(default)]
     pub connection_resume_token: Option<String>,
@@ -277,6 +293,7 @@ impl std::fmt::Debug for PairRequest {
                 &self.pairing_code.as_ref().map(|_| "[REDACTED]"),
             )
             .field("expected_session_id", &self.expected_session_id)
+            .field("expected_agent_id", &self.expected_agent_id)
             .field(
                 "connection_resume_token",
                 &self.connection_resume_token.as_ref().map(|_| "[REDACTED]"),
@@ -506,6 +523,10 @@ pub struct RemoteResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum WireMessage {
+    /// 已配对控制链上的桌面生命周期和人工输入。
+    Desktop(crate::desktop::DesktopEvent),
+    /// 独立媒体 TLS 连接的首条消息。
+    DesktopMedia(crate::desktop::Ticket),
     /// 已协商的 v2 数据和生命周期帧。
     TcpForwardV2(crate::tcp_forward::TcpForwardFrame),
     /// 当前绑定的只读 TCP 策略查询。
@@ -618,9 +639,18 @@ pub enum WireMessage {
     AgentLeaseRenewed(AgentLeaseRenewed),
     /// Controller 连接就绪。
     ControllerWelcome {
+        /// Relay 支持在配对前核对目标设备身份。
+        #[serde(default)]
+        test_pairing_supported: bool,
+        /// 长授权码和宿主业务扩展版本，缺省时禁止发送新增能力。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bridge_protocol_version: Option<u16>,
         /// 持续转发扩展版本，缺省时禁止发送新转发消息。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tcp_forward_version: Option<u16>,
+        /// 桌面传输扩展，旧 Relay 缺省关闭。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desktop_version: Option<u16>,
         /// Relay 当前协议版本。
         protocol_version: u16,
         /// 可选资源工具协议版本，缺省表示 Relay 不支持。
@@ -710,8 +740,9 @@ mod tests {
         let code = "738291604";
         let secret = "test-managed-resume-secret-must-not-enter-debug";
         let request = WireMessage::PairRequest(PairRequest {
+            expected_agent_id: None,
             request_id: RequestId::new(),
-            pairing_code: Some(PairingCode::parse(code).unwrap()),
+            pairing_code: Some(AccessCode::parse(code).unwrap()),
             expected_session_id: None,
             connection_resume_token: Some(secret.to_owned()),
             permission_mode: PermissionMode::ReadOnly,
@@ -781,7 +812,10 @@ mod tests {
             updated_at: Some(chrono::Utc::now()),
         };
         let message = WireMessage::ControllerWelcome {
+            test_pairing_supported: false,
+            bridge_protocol_version: None,
             tcp_forward_version: Some(2),
+            desktop_version: None,
             protocol_version: PROTOCOL_VERSION,
             resource_tools_schema_version: Some(1),
             tool_center_schema_version: Some(1),
@@ -819,6 +853,7 @@ mod tests {
         };
         assert!(!format!("{enrollment:?}").contains(&enrollment.token));
         let value = serde_json::to_value(super::AgentWelcome {
+            test_key_accepted: false,
             pairing_code: None,
             pairing_mode: super::PairingMode::ManagedOnDemand,
             managed_target_id: Some("service-a".into()),

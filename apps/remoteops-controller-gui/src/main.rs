@@ -2,6 +2,8 @@
 
 mod ai_settings;
 mod backend;
+#[cfg(windows)]
+mod desktop;
 mod serial_workbench;
 mod theme;
 mod timeline;
@@ -23,8 +25,8 @@ use eframe::egui::{
 use egui_phosphor::regular as icons;
 use remoteops_audit::default_audit_log_path;
 use remoteops_domain::{
-    ConnectionDescriptor, ConnectionState, ControllerOwnerId, EventPayload, EventSource,
-    PairingCode, PermissionMode, RemoteEvent, RemoteOperation, RequestId, SessionId,
+    AccessCode, ConnectionDescriptor, ConnectionState, ControllerOwnerId, EventPayload,
+    EventSource, PermissionMode, RemoteEvent, RemoteOperation, RequestId, SessionId,
 };
 use remoteops_i18n::{Language, Translator};
 use serde::{Deserialize, Serialize};
@@ -356,6 +358,10 @@ struct RemoteOpsApp {
     demo_scroll_initialized: bool,
     /// 临时提示及剩余显示时间。
     toast: Option<(String, f32)>,
+    #[cfg(windows)]
+    desktop_active: std::collections::HashSet<SessionId>,
+    #[cfg(windows)]
+    desktop_errors: std::collections::HashMap<SessionId, String>,
     /// 独立串口工作台状态。
     serial_workbench: SerialWorkbench,
 }
@@ -473,6 +479,10 @@ impl RemoteOpsApp {
             active_request: None,
             demo_scroll_initialized: false,
             toast: None,
+            #[cfg(windows)]
+            desktop_active: Default::default(),
+            #[cfg(windows)]
+            desktop_errors: Default::default(),
             serial_workbench: SerialWorkbench::default(),
         }
     }
@@ -504,6 +514,11 @@ impl RemoteOpsApp {
             BackendEvent::Ready { demo, message } => {
                 self.demo = demo;
                 self.status = message;
+            }
+            #[cfg(windows)]
+            BackendEvent::DesktopEnded(id, error) => {
+                self.desktop_active.remove(&id);
+                if let Some(message) = error { self.desktop_errors.insert(id, message); }
             }
             BackendEvent::Connected(connected) => {
                 self.connected = connected;
@@ -1219,6 +1234,10 @@ impl RemoteOpsApp {
     /// 渲染当前目标、审批模式和暂停 AI 操作。
     #[allow(clippy::too_many_lines)]
     fn render_header(&mut self, ui: &mut Ui, palette: Palette) {
+        #[cfg(windows)]
+        if let Some(message) = self.selected_session.and_then(|id| self.desktop_errors.get(&id)) {
+            ui.label(format!("实时桌面未能继续 · {message}"));
+        }
         card(
             palette,
             palette.surface,
@@ -1320,6 +1339,22 @@ impl RemoteOpsApp {
                 });
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    #[cfg(windows)]
+                    if let Some(target) = self.selected_connection().filter(|c|
+                        c.state == ConnectionState::Online && c.environment.tools.iter()
+                            .any(|t| t.name == "remoteops-desktop-v1" && t.available))
+                    {
+                        let id = target.session_id;
+                        let title = target.hostname.clone();
+                        let active = self.desktop_active.contains(&id);
+                        let label = if active { "桌面已打开" } else if self.desktop_errors.contains_key(&id) { "重试实时桌面" } else { "实时桌面" };
+                        if ui.add_enabled(!active, egui::Button::new(label)).clicked() {
+                            self.desktop_errors.remove(&id);
+                            self.desktop_active.insert(id);
+                            self.send(BackendCommand::OpenDesktop { session_id: id, title });
+                        }
+                    }
+
                     let pause_kind = if self.ai_paused {
                         ButtonKind::Warning
                     } else {
@@ -2663,7 +2698,7 @@ impl eframe::App for RemoteOpsApp {
 
 /// 校验并规范化配对弹窗的输入。
 fn pairing_request(code: &str, alias: &str) -> Result<(String, Option<String>), &'static str> {
-    let code = PairingCode::parse(code.trim()).map_err(|_| "请输入正确的九位控制码")?;
+    let code = AccessCode::parse(code.trim()).map_err(|_| "请输入九位控制码或 UUID v4 长授权码")?;
     let alias = alias.trim();
     Ok((
         code.to_string(),
@@ -3621,7 +3656,7 @@ mod tests {
     fn pairing_request_rejects_invalid_code() {
         assert_eq!(
             pairing_request("12345678", "客户 A"),
-            Err("请输入正确的九位控制码")
+            Err("请输入九位控制码或 UUID v4 长授权码")
         );
     }
 

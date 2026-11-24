@@ -1394,6 +1394,27 @@ pub struct SystemDevice {
     bundled_tools: Option<BundledTools>,
 }
 
+/// 创建仅当前运行账号、系统和管理员可访问的实例目录。
+/// # Errors
+/// 拒绝经过符号链接或重解析点的路径，权限设置失败时返回错误。
+pub fn protect_instance_directory(path: &Path) -> Result<(), DeviceError> {
+    for ancestor in path.ancestors() {
+        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt as _;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    return Err(DeviceError::InvalidInput("实例路径不允许重解析点".into()));
+                }
+            }
+            if metadata.is_symlink() {
+                return Err(DeviceError::InvalidInput("实例路径不允许符号链接".into()));
+            }
+        }
+    }
+    ssh_password_file::protect_directory(path)
+}
+
 impl SystemDevice {
     /// 创建默认设备适配器。
     #[must_use]
@@ -2826,7 +2847,12 @@ impl SystemDevice {
             {
                 let credential = password
                     .as_ref()
-                    .map(|value| ssh_password_file::PasswordFile::new(value))
+                    .map(|value| {
+                        ssh_password_file::PasswordFile::new_in(
+                            value,
+                            &self.transfer_root.join(".tmp"),
+                        )
+                    })
                     .transpose()?;
                 if let Some(credential) = &credential {
                     let index = arguments.len() - 2;
@@ -2965,7 +2991,10 @@ impl SystemDevice {
                     "-o".to_owned(),
                     "PubkeyAuthentication=no".to_owned(),
                 ]);
-                credential = Some(ssh_password_file::PasswordFile::new(&password)?);
+                credential = Some(ssh_password_file::PasswordFile::new_in(
+                    &password,
+                    &self.transfer_root.join(".tmp"),
+                )?);
                 environment.extend([
                     ("SSH_ASKPASS".to_owned(), path_for_child_process(&askpass)),
                     ("SSH_ASKPASS_REQUIRE".to_owned(), "force".to_owned()),

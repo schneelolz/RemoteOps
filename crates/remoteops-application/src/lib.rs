@@ -20,9 +20,9 @@ use base64::Engine as _;
 use chrono::Utc;
 use remoteops_audit::{JsonlAuditStore, sha256_bytes};
 use remoteops_domain::{
-    ApprovalId, ApprovalState, AuditEvent, ConnectionDescriptor, ConnectionState,
-    ControllerOwnerId, DomainError, EventPayload, EventSource, PairingCode, PermissionMode,
-    RemoteEvent, RemoteOperation, RequestId, SessionId, TargetContext,
+    AccessCode, ApprovalId, ApprovalState, AuditEvent, ConnectionDescriptor, ConnectionState,
+    ControllerOwnerId, DomainError, EventPayload, EventSource, PermissionMode, RemoteEvent,
+    RemoteOperation, RequestId, SessionId, TargetContext,
 };
 use remoteops_policy::{DefaultPolicy, PolicyDecision};
 pub use remoteops_protocol::ControllerKind;
@@ -383,7 +383,11 @@ impl Drop for PendingRegistration {
 }
 
 struct ClientInner {
+    test_pairing_supported: std::sync::atomic::AtomicBool,
+    bridge_protocol_version: AtomicU64,
     guide_supported: std::sync::atomic::AtomicBool,
+    desktop_version: AtomicU64,
+    desktop_events: broadcast::Sender<remoteops_protocol::desktop::DesktopEvent>,
     tcp_forward_version: AtomicU64,
     config: RelayClientConfig,
     tls_config: Arc<ClientConfig>,
@@ -409,18 +413,19 @@ struct ClientInner {
     controller_modes: Mutex<Vec<ControllerControlModeUpdate>>,
     control_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ControlStateResult>>>,
     control_states: Mutex<BTreeMap<SessionId, SessionControlState>>,
-    known_pairings: Mutex<BTreeMap<PairingCode, SessionId>>,
+    known_pairings: Mutex<BTreeMap<AccessCode, SessionId>>,
     // 受管连接不保留已兑换的一次码，凭据仅存在本Controller进程。
     managed_pairings: Mutex<BTreeMap<SessionId, String>>,
-    automatic_pair_pending: Mutex<BTreeMap<RequestId, (Option<PairingCode>, SessionId)>>,
+    automatic_pair_pending: Mutex<BTreeMap<RequestId, (Option<AccessCode>, SessionId)>>,
     events: broadcast::Sender<RemoteEvent>,
     event_history: Mutex<VecDeque<RemoteEvent>>,
     audit: Option<Arc<JsonlAuditStore>>,
 }
 
 struct PendingPairRequest {
+    expected_agent_id: Option<remoteops_domain::AgentInstanceId>,
     // 仅由仍在等待的人工请求建立连接并记录恢复目标。
-    pairing_code: PairingCode,
+    pairing_code: AccessCode,
     // 只记录本请求等待期间已结束的会话，随请求完成或取消一起释放。
     excluded_sessions: BTreeSet<SessionId>,
     // 同一传输只发送一次；重连时复用同一请求标识进行幂等兑换。
@@ -489,6 +494,8 @@ impl RelayClient {
             .map(Arc::new);
         let inner = Arc::new(ClientInner {
             guide_supported: std::sync::atomic::AtomicBool::new(false),
+            test_pairing_supported: std::sync::atomic::AtomicBool::new(false),
+            bridge_protocol_version: AtomicU64::new(0),
             tcp_forward_version: AtomicU64::new(0),
             config,
             tls_config,
@@ -502,6 +509,8 @@ impl RelayClient {
             guide_pending: Mutex::new(BTreeMap::new()),
             tcp_open_pending: Mutex::new(BTreeMap::new()),
             tcp_events: broadcast::channel(256).0,
+            desktop_events: broadcast::channel(128).0,
+            desktop_version: AtomicU64::new(0),
             connected,
             core: Mutex::new(ControllerCore::default()),
             pending: Arc::new(PendingRegistry::default()),
@@ -583,6 +592,35 @@ impl RelayClient {
                 Err(ApplicationError::Transport("Relay 全局指引刷新超时".into()))
             }
         }
+    }
+
+    /// 检查当前中继的人工桌面能力。
+    #[must_use]
+    pub fn supports_desktop(&self) -> bool {
+        self.is_connected() && self.inner.config.controller_kind == ControllerKind::Human
+            && self.inner.desktop_version.load(Ordering::Acquire) == 1
+    }
+
+    /// 订阅已绑定桌面的生命周期事件。
+    #[must_use]
+    pub fn desktop_events(&self) -> broadcast::Receiver<remoteops_protocol::desktop::DesktopEvent> {
+        self.inner.desktop_events.subscribe()
+    }
+
+    /// 发送人工面板事件。每条事件还须由中继按当前绑定核验。
+    pub async fn desktop_command(&self, event: remoteops_protocol::desktop::DesktopEvent) -> Result<(), ApplicationError> {
+        if !self.supports_desktop() {
+            return Err(ApplicationError::Transport("当前连接无法打开人工桌面".into()));
+        }
+        self.send_wire(WireMessage::Desktop(event)).await
+    }
+
+    /// 复用当前控制端的 TLS 信任配置，接入一次性媒体通道。
+    pub async fn desktop_media(&self, ticket: remoteops_protocol::desktop::Ticket) -> Result<impl AsyncRead + Unpin + Send + 'static, ApplicationError> {
+        let mut stream = connect_tls(&self.inner.config.relay_address, &self.inner.config.server_name, self.inner.tls_config.clone())
+            .await.map_err(|e| ApplicationError::Transport(e.to_string()))?;
+        write_frame(&mut stream, &WireMessage::DesktopMedia(ticket)).await.map_err(|e| ApplicationError::Transport(e.to_string()))?;
+        Ok(stream)
     }
 
     /// 订阅持续 TCP 转发的入站数据和关闭事件。
@@ -780,14 +818,29 @@ impl RelayClient {
     /// 成功后才会把连接加入当前 Controller 的 Session 列表。
     pub async fn pair(
         &self,
-        pairing_code: remoteops_domain::PairingCode,
+        pairing_code: impl Into<remoteops_domain::AccessCode>,
     ) -> Result<ConnectionDescriptor, ApplicationError> {
+        self.pair_for_agent(pairing_code.into(), None).await
+    }
+
+    /// 使用控制码配对，并可在建立会话前核对目标设备身份。
+    ///
+    /// # Errors
+    ///
+    /// Relay 不支持设备核对、设备不匹配或配对失败时返回错误。
+    pub async fn pair_for_agent(
+        &self,
+        pairing_code: impl Into<remoteops_domain::AccessCode>,
+        expected_agent_id: Option<remoteops_domain::AgentInstanceId>,
+    ) -> Result<ConnectionDescriptor, ApplicationError> {
+        let pairing_code = pairing_code.into();
         let deadline = Instant::now() + TokioDuration::from_secs(20);
         let request_id = RequestId::new();
         let (sender, receiver) = oneshot::channel();
         self.inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
+                expected_agent_id,
                 pairing_code: pairing_code.clone(),
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
@@ -1086,6 +1139,53 @@ impl RelayClient {
         Ok(result)
     }
 
+    /// 获取精确会话绑定的宿主服务介绍和业务能力。
+    /// # Errors
+    /// 协议、目标或权限不满足时拒绝执行。
+    pub async fn describe_host_capabilities(
+        &self,
+        target: &str,
+        source: EventSource,
+    ) -> Result<OperationResult, ApplicationError> {
+        self.execute(
+            target,
+            source,
+            RemoteOperation::DescribeHostCapabilities,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// 查询发现结果中的精确宿主实例和能力版本，不自动重放。
+    /// # Errors
+    /// 协议、目标、参数或权限不满足时拒绝执行。
+    pub async fn query_host_capability(
+        &self,
+        target: &str,
+        source: EventSource,
+        instance_id: String,
+        capability_id: String,
+        version: String,
+        arguments: serde_json::Value,
+    ) -> Result<OperationResult, ApplicationError> {
+        self.execute(
+            target,
+            source,
+            RemoteOperation::QueryHostCapability {
+                instance_id,
+                capability_id,
+                version,
+                arguments,
+            },
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
     /// 根据目标字符串和策略执行远程操作。
     ///
     /// # Errors
@@ -1184,6 +1284,16 @@ impl RelayClient {
         secret: Option<String>,
         control_proof: Option<ControlProof>,
     ) -> Result<PendingOperation, ApplicationError> {
+        if matches!(
+            operation,
+            RemoteOperation::DescribeHostCapabilities | RemoteOperation::QueryHostCapability { .. }
+        ) && self.inner.bridge_protocol_version.load(Ordering::Acquire)
+            != u64::from(remoteops_protocol::BRIDGE_PROTOCOL_VERSION)
+        {
+            return Err(ApplicationError::PolicyDenied(
+                "bridge_protocol_unsupported: Relay未声明协议22".into(),
+            ));
+        }
         if secret.is_some() {
             return Err(ApplicationError::PolicyDenied(
                 "RemoteOps 协议不允许传递远端秘密".to_owned(),
@@ -1612,12 +1722,23 @@ where
         .map_err(|error| ApplicationError::Transport(error.to_string()))?
     {
         WireMessage::ControllerWelcome {
+            test_pairing_supported,
+            bridge_protocol_version,
             tcp_forward_version,
+            desktop_version,
             protocol_version,
             resource_tools_schema_version,
             tool_center_schema_version,
             global_guide,
         } if protocol_version == PROTOCOL_VERSION => {
+            inner.desktop_version.store(u64::from(desktop_version.unwrap_or(0)), Ordering::Release);
+            inner.bridge_protocol_version.store(
+                u64::from(bridge_protocol_version.unwrap_or(0)),
+                Ordering::Release,
+            );
+            inner
+                .test_pairing_supported
+                .store(test_pairing_supported, Ordering::Release);
             inner
                 .guide_supported
                 .store(global_guide.is_some(), Ordering::Release);
@@ -1738,11 +1859,42 @@ async fn send_pending_pairings(
 ) -> bool {
     let mut pending = inner.pair_pending.lock().await;
     pending.retain(|_, request| !request.sender.is_closed());
+    pending.retain(|request_id, request| {
+        if request.pairing_code.is_long()
+            && inner.bridge_protocol_version.load(Ordering::Acquire)
+                != u64::from(remoteops_protocol::BRIDGE_PROTOCOL_VERSION)
+        {
+            let (sender, _) = oneshot::channel();
+            let _ = std::mem::replace(&mut request.sender, sender).send(PairResult {
+                request_id: *request_id,
+                connection: None,
+                connection_resume_token: None,
+                error: Some("Relay未声明长授权码协议22，请升级配套Relay".into()),
+                error_code: Some(PairingErrorCode::UnsupportedMode),
+            });
+            return false;
+        }
+        if request.expected_agent_id.is_some()
+            && !inner.test_pairing_supported.load(Ordering::Acquire)
+        {
+            let (sender, _) = oneshot::channel();
+            let _ = std::mem::replace(&mut request.sender, sender).send(PairResult {
+                request_id: *request_id,
+                connection: None,
+                connection_resume_token: None,
+                error: Some("Relay 不支持核对预期 Agent 身份，请更新 Relay".into()),
+                error_code: Some(PairingErrorCode::UnsupportedMode),
+            });
+            return false;
+        }
+        true
+    });
     for (request_id, request) in pending.iter_mut() {
         if request.last_sent_generation == Some(generation) {
             continue;
         }
         let message = WireMessage::PairRequest(remoteops_protocol::PairRequest {
+            expected_agent_id: request.expected_agent_id,
             request_id: *request_id,
             pairing_code: Some(request.pairing_code.clone()),
             expected_session_id: None,
@@ -1786,6 +1938,7 @@ async fn send_recoverable_pairings(
         pending.insert(request_id, (pairing_code.clone(), session_id));
         if sender
             .send(WireMessage::PairRequest(remoteops_protocol::PairRequest {
+                expected_agent_id: None,
                 request_id,
                 pairing_code,
                 expected_session_id: Some(session_id),
@@ -1957,6 +2110,7 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
         return;
     }
     match message {
+        WireMessage::Desktop(event) => { let _ = inner.desktop_events.send(event); }
         message @ (WireMessage::TcpForwardV2(_)
         | WireMessage::TcpForwardPolicyResponse { .. }
         | WireMessage::TcpForwardData { .. }
@@ -2673,11 +2827,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pinning_pair_request_requires_relay_support() {
+        let inner = transport_test_inner();
+        let agent = remoteops_domain::AgentInstanceId::new();
+        let request_id = RequestId::new();
+        let (wire, mut output) = mpsc::unbounded_channel();
+        let insert = |sender| PendingPairRequest {
+            expected_agent_id: Some(agent),
+            pairing_code: AccessCode::parse("123456789").unwrap(),
+            excluded_sessions: BTreeSet::new(),
+            last_sent_generation: None,
+            sender,
+        };
+        let (reply, result) = oneshot::channel();
+        inner
+            .pair_pending
+            .lock()
+            .await
+            .insert(request_id, insert(reply));
+        assert!(send_pending_pairings(&inner, &wire, 1).await);
+        assert!(output.try_recv().is_err());
+        assert_eq!(
+            result.await.unwrap().error_code,
+            Some(PairingErrorCode::UnsupportedMode)
+        );
+        inner.test_pairing_supported.store(true, Ordering::Release);
+        let (reply, _result) = oneshot::channel();
+        inner
+            .pair_pending
+            .lock()
+            .await
+            .insert(request_id, insert(reply));
+        assert!(send_pending_pairings(&inner, &wire, 2).await);
+        assert!(matches!(
+            output.try_recv().unwrap(),
+            WireMessage::PairRequest(request) if request.expected_agent_id == Some(agent)
+        ));
+    }
+
     fn transport_test_inner() -> Arc<ClientInner> {
         let (connected, _) = watch::channel(false);
         let (events, _) = broadcast::channel(16);
         Arc::new(ClientInner {
             guide_supported: std::sync::atomic::AtomicBool::new(false),
+            test_pairing_supported: std::sync::atomic::AtomicBool::new(false),
+            bridge_protocol_version: AtomicU64::new(0),
             tcp_forward_version: AtomicU64::new(0),
             config: RelayClientConfig {
                 relay_address: "127.0.0.1:7443".to_owned(),
@@ -2702,6 +2897,8 @@ mod tests {
             guide_pending: Mutex::new(BTreeMap::new()),
             tcp_open_pending: Mutex::new(BTreeMap::new()),
             tcp_events: broadcast::channel(16).0,
+            desktop_events: broadcast::channel(128).0,
+            desktop_version: AtomicU64::new(0),
             connected,
             core: Mutex::new(ControllerCore::default()),
             pending: Arc::new(PendingRegistry::default()),
@@ -2899,9 +3096,7 @@ mod tests {
             inner: inner.clone(),
         };
         let pairing =
-            tokio::spawn(
-                async move { client.pair(PairingCode::parse("123456789").unwrap()).await },
-            );
+            tokio::spawn(async move { client.pair(AccessCode::parse("123456789").unwrap()).await });
         let WireMessage::PairRequest(first) = first_transport.recv().await.unwrap() else {
             panic!("应为首次配对")
         };
@@ -2971,9 +3166,7 @@ mod tests {
             inner: inner.clone(),
         };
         let pairing =
-            tokio::spawn(
-                async move { client.pair(PairingCode::parse("123456789").unwrap()).await },
-            );
+            tokio::spawn(async move { client.pair(AccessCode::parse("123456789").unwrap()).await });
         tokio::task::yield_now().await;
         tokio::time::advance(TokioDuration::from_secs(20)).await;
         assert!(matches!(
@@ -3173,7 +3366,8 @@ mod tests {
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
-                pairing_code: PairingCode::parse("123456789").unwrap(),
+                expected_agent_id: None,
+                pairing_code: AccessCode::parse("123456789").unwrap(),
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
                 sender,
@@ -3519,7 +3713,7 @@ mod tests {
     async fn recoverable_pairing_retries_until_target_is_online() {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
-        let pairing_code = PairingCode::parse("123-456-789").expect("测试控制码应有效");
+        let pairing_code = AccessCode::parse("123-456-789").expect("测试控制码应有效");
         inner
             .known_pairings
             .lock()
@@ -3589,7 +3783,7 @@ mod tests {
         ] {
             let inner = transport_test_inner();
             let session_id = SessionId::new();
-            let pairing_code = PairingCode::parse("123456789").unwrap();
+            let pairing_code = AccessCode::parse("123456789").unwrap();
             inner
                 .known_pairings
                 .lock()
@@ -3628,7 +3822,7 @@ mod tests {
         let inner = transport_test_inner();
         let original_session = SessionId::new();
         let other_session = SessionId::new();
-        let pairing_code = PairingCode::parse("123456789").unwrap();
+        let pairing_code = AccessCode::parse("123456789").unwrap();
         inner
             .known_pairings
             .lock()
@@ -3665,7 +3859,7 @@ mod tests {
     async fn removed_automatic_pairing_discards_its_late_success() {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
-        let pairing_code = PairingCode::parse("123456789").unwrap();
+        let pairing_code = AccessCode::parse("123456789").unwrap();
         inner
             .known_pairings
             .lock()
@@ -3704,11 +3898,12 @@ mod tests {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
         let request_id = RequestId::new();
-        let pairing_code = PairingCode::parse("123456789").unwrap();
+        let pairing_code = AccessCode::parse("123456789").unwrap();
         let (sender, receiver) = oneshot::channel();
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
+                expected_agent_id: None,
                 pairing_code,
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
@@ -3745,11 +3940,12 @@ mod tests {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
         let request_id = RequestId::new();
-        let pairing_code = PairingCode::parse("123456789").unwrap();
+        let pairing_code = AccessCode::parse("123456789").unwrap();
         let (sender, receiver) = oneshot::channel();
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
+                expected_agent_id: None,
                 pairing_code,
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
@@ -3781,7 +3977,8 @@ mod tests {
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
-                pairing_code: PairingCode::parse("123456789").unwrap(),
+                expected_agent_id: None,
+                pairing_code: AccessCode::parse("123456789").unwrap(),
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
                 sender,
@@ -3823,7 +4020,8 @@ mod tests {
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
-                pairing_code: PairingCode::parse("123456789").unwrap(),
+                expected_agent_id: None,
+                pairing_code: AccessCode::parse("123456789").unwrap(),
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
                 sender,
@@ -4144,7 +4342,7 @@ mod tests {
     async fn explicit_close_forgets_automatic_recovery_pairing() {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
-        let pairing_code = PairingCode::parse("987-654-321").expect("测试控制码应有效");
+        let pairing_code = AccessCode::parse("987-654-321").expect("测试控制码应有效");
         inner
             .known_pairings
             .lock()
@@ -4167,7 +4365,7 @@ mod tests {
     async fn relay_takeover_notification_removes_connection_and_recovery_state() {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
-        let pairing_code = PairingCode::parse("456-789-123").expect("测试控制码应有效");
+        let pairing_code = AccessCode::parse("456-789-123").expect("测试控制码应有效");
         inner
             .core
             .lock()
@@ -4245,7 +4443,8 @@ mod tests {
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
-                pairing_code: PairingCode::parse("123456789").unwrap(),
+                expected_agent_id: None,
+                pairing_code: AccessCode::parse("123456789").unwrap(),
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
                 sender: pair_sender,
