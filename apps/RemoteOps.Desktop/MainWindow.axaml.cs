@@ -37,7 +37,8 @@ public partial class MainWindow : Window
         Title=$"RemoteOps · 远程运维 v{Program.DisplayVersion}";
         ConfigureAppearance();
         Devices.SelectionChanged+=(_,_)=>{if(!updating){preferred=Selected?.Id; Update();}};
-        SettingsButton.IsVisible=!Profile.IsManaged;
+        SettingsButton.IsVisible=!Profile.IsManaged || OperatingSystem.IsMacOS();
+        if (Profile.IsManaged && OperatingSystem.IsMacOS()) SettingsButton.Content="人工运维凭据";
         RetryRelay.Click+=(_,_)=>Start();
         Pair.Click+=(_,_)=>PairDevice();
         Code.TextChanged+=(_,_)=>UpdatePairAvailability();
@@ -65,7 +66,12 @@ public partial class MainWindow : Window
             if(viewer!=null){SetStatus("请先结束桌面共享，再更改连接设置");return;}
             var result=await Profile.Edit(this,profile);
             if(result is not {} choice)return;
-            try { choice.Item1.Save(); profile=choice.Item1; credential=choice.Item2; Start(); }
+            try {
+                if (!Profile.IsManaged) choice.Item1.Save();
+                profile=choice.Item1;
+                credential=choice.Item2;
+                Start();
+            }
             catch(Exception ex){SetStatus(ex.Message);}
         };
         Opened+=(_,_)=>{

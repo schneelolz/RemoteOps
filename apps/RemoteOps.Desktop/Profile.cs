@@ -38,13 +38,14 @@ internal sealed record Profile(string relay="", string server="", string ca="", 
 
     public static Task<(Profile, string)?> Edit(Window parent, Profile current)
     {
+        bool managed = IsManaged;
         var dialog = new Window
         {
-            Title = "连接设置",
+            Title = managed ? "人工运维凭据" : "连接设置",
             Width = 520,
-            Height = 610,
+            Height = managed ? 320 : 610,
             MinWidth = 400,
-            MinHeight = 460,
+            MinHeight = managed ? 300 : 460,
             WindowStartupLocation = WindowStartupLocation.CenterOwner,
         };
 
@@ -53,8 +54,8 @@ internal sealed record Profile(string relay="", string server="", string ca="", 
         // Header
         var header = new Border { Classes = { "dialog-header" } };
         var headerStack = new StackPanel { Spacing = 3 };
-        headerStack.Children.Add(new TextBlock { Text = "Relay 连接设置", FontSize = 18, FontWeight = FontWeight.SemiBold });
-        headerStack.Children.Add(new TextBlock { Text = "公开连接参数将保存到本机配置，人工凭据仅在当前会话内存中生效。", Classes = { "muted" }, FontSize = 12.5 });
+        headerStack.Children.Add(new TextBlock { Text = managed ? "人工运维凭据" : "Relay 连接设置", FontSize = 18, FontWeight = FontWeight.SemiBold });
+        headerStack.Children.Add(new TextBlock { Text = managed ? "凭据仅在本次运行期间使用，退出应用后需重新输入。" : "公开连接参数将保存到本机配置，人工凭据仅在当前会话内存中生效。", Classes = { "muted" }, FontSize = 12.5 });
         header.Child = headerStack;
         root.Children.Add(header);
 
@@ -70,11 +71,17 @@ internal sealed record Profile(string relay="", string server="", string ca="", 
             panel.Children.Add(group);
             return field;
         }
-        var relay = Field("Relay 地址（主机和端口）", current.relay, "例如 relay.example.com:7443", mono: true);
-        var server = Field("TLS 服务名", current.server, "证书对应的域名或 IP", mono: true);
-        var ca = Field("信任证书路径（留空使用系统信任库）", current.ca, "可选，自签名或私有 CA 证书路径", mono: true);
-        var owner = Field("Owner UUID（留空沿用本机设置）", current.owner, "与 Relay / MCP 保持一致的 Owner ID", mono: true);
-        var token = Field("本次人工凭据（留空沿用本机环境变量）", "", "仅用于本次连接，不落盘保存");
+        Func<Profile> selectedProfile = () => current;
+        if (!managed)
+        {
+            var relay = Field("Relay 地址（主机和端口）", current.relay, "例如 relay.example.com:7443", mono: true);
+            var server = Field("TLS 服务名", current.server, "证书对应的域名或 IP", mono: true);
+            var ca = Field("信任证书路径（留空使用系统信任库）", current.ca, "可选，自签名或私有 CA 证书路径", mono: true);
+            var owner = Field("Owner UUID（留空沿用本机设置）", current.owner, "与 Relay / MCP 保持一致的 Owner ID", mono: true);
+            selectedProfile = () => new Profile(relay.Text?.Trim() ?? "", server.Text?.Trim() ?? "",
+                ca.Text?.Trim() ?? "", owner.Text?.Trim() ?? "");
+        }
+        var token = Field(managed ? "人工运维凭据" : "本次人工凭据（留空沿用本机环境变量）", "", "仅用于本次连接，不落盘保存");
         token.PasswordChar = '●';
 
         var scroll = new ScrollViewer { Content = panel };
@@ -87,8 +94,8 @@ internal sealed record Profile(string relay="", string server="", string ca="", 
         var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Spacing = 10 };
         var cancel = new Button { Content = "取消" };
         cancel.Click += (_, _) => dialog.Close(null);
-        var save = new Button { Content = "保存并连接", Classes = { "primary" } };
-        save.Click += (_, _) => dialog.Close(((new Profile(relay.Text?.Trim() ?? "", server.Text?.Trim() ?? "", ca.Text?.Trim() ?? "", owner.Text?.Trim() ?? "")), token.Text ?? ""));
+        var save = new Button { Content = managed ? "连接" : "保存并连接", Classes = { "primary" } };
+        save.Click += (_, _) => dialog.Close((selectedProfile(), token.Text ?? ""));
         actions.Children.Add(cancel);
         actions.Children.Add(save);
         footer.Child = actions;

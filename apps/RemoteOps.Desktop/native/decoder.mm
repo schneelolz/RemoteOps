@@ -36,7 +36,8 @@ void receive(void*, void* context, OSStatus status, VTDecodeInfoFlags,
     output.status = status;
     if (image && status == noErr) {
         if (output.image) CFRelease(output.image);
-        output.image = static_cast<CVImageBufferRef>(CFRetain(image));
+        CFRetain(image);
+        output.image = image;
     }
 }
 
