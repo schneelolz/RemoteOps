@@ -253,7 +253,7 @@ try {
             }
             $pairingMatch = [regex]::Match(
                 $agentText,
-                '控制码：([0-9]{3}-[0-9]{3}-[0-9]{3})'
+                '控制码：((?=[A-Z0-9-]*[0-9])[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3})'
             )
             if ($pairingMatch.Success) {
                 $pairingCode = $pairingMatch.Groups[1].Value

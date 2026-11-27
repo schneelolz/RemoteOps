@@ -21,6 +21,7 @@ remoteops-domain = { path = "../remoteops-domain" }
 rustls.workspace = true
 rustls-native-certs.workspace = true
 rustls-pemfile.workspace = true
+semver = "1"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // 回环真实业务验收；机密和原始输出仅在内存或当前用户私有C盘fixture中。
+import { shortCode } from './test-pairing-code-support.mjs';
 import {spawn} from 'node:child_process';
 
 import {randomBytes,randomUUID,createHash,X509Certificate} from 'node:crypto';
@@ -325,7 +326,7 @@ public static class StyledFixtureProbe{
         windows:(r.windows??[]).map(w=>({class:/^RemoteOpsStylePreview(?:Main|Observer|Dialog)$/.test(w.class)?w.class:'other_own_class',enabled:w.enabled===true,control_ids:(w.controls??[]).map(c=>c.id).filter(id=>Number.isInteger(id)&&id>=200&&id<1000)})),
         setup:Boolean(row(r,502)),
         tls:Boolean(row(r,524)),
-        code_available:/^\d{9}$/.test(text(r,303).replace(/\D/g,'')),
+        code_available:Boolean(shortCode(text(r,303))),
         observer:Boolean(observer(r)),
         readonly:row(r,202)?.read_only===true,
         running:Object.fromEntries([211,212,213,214,215].map(x=>[x,/·\s*(\d+)/.exec(text(r,x))?.[1]??'0']))
@@ -344,8 +345,8 @@ public static class StyledFixtureProbe{
   }
 
   async function pairReady(name){
-    const s=await waitUi(name,x=>/^\d{9}$/.test(text(x,303).replace(/\D/g,'')),65000);
-    return{snapshot:s,code:text(s,303).replace(/\D/g,'')};
+    const s=await waitUi(name,x=>Boolean(shortCode(text(x,303))),65000);
+    return{snapshot:s,code:shortCode(text(s,303))};
   }
 
   async function startNative(config,report,demo=false){
@@ -703,14 +704,14 @@ class FixturePrompt{static int Main(string[] a){try{if(a.Length!=10||a[0]!="--ho
     async function verifiedTlsPrompt(prefix){
       const prompt=await waitUi(`${prefix}_tls_prompt`,s=>row(s,524)?.read_only===true&&row(s,523)?.enabled);
       check(`${prefix}_shows_independently_verified_fingerprint`,sameTlsFingerprint(text(prompt,524).split(/\r?\n/).find(line=>line.startsWith('SHA256:'))?.slice(7),relayFingerprint));
-      check(`${prefix}_unconfirmed_has_no_pairing_code`,!/^\d{9}$/.test(text(prompt,303).replace(/\D/g,'')));
+      check(`${prefix}_unconfirmed_has_no_pairing_code`,!Boolean(shortCode(text(prompt,303))));
       return prompt;
     }
 
     async function cancelTlsPrompt(prefix){
       await ui('Invoke',521);
       const cancelled=await waitUi(`${prefix}_cancel_prompt_closed`,s=>!row(s,524));
-      check(`${prefix}_cancel_does_not_connect`,!/^\d{9}$/.test(text(cancelled,303).replace(/\D/g,'')));
+      check(`${prefix}_cancel_does_not_connect`,!Boolean(shortCode(text(cancelled,303))));
     }
 
     if(tlsOnceOnly){

@@ -495,7 +495,7 @@ function Get-AgentRegistration {
         )
         $codes = [regex]::Matches(
             [string]$text,
-            '控制码：([0-9]{3}-[0-9]{3}-[0-9]{3})'
+            '控制码：((?=[A-Z0-9-]*[0-9])[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3})'
         )
         $guids = [regex]::Matches(
             [string]$text,

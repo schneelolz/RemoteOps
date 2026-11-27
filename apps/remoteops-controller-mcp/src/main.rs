@@ -167,6 +167,16 @@ struct ResolvedArgs {
     reconnect_seconds: u64,
 }
 
+// 私有发行版在构建时固定业务地址；公版继续使用现有设置文件。
+fn check_product_endpoint(relay: &str, server: &str) -> anyhow::Result<()> {
+    if let Some(expected) = option_env!("REMOTEOPS_PRODUCT_RELAY")
+        && (!relay.eq_ignore_ascii_case(expected) || !Some(server).zip(option_env!("REMOTEOPS_PRODUCT_TLS_NAME")).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)))
+    {
+        bail!("连接配置与定制版的 Relay 或 TLS 服务名不匹配");
+    }
+    Ok(())
+}
+
 impl Args {
     fn resolve(self) -> anyhow::Result<ResolvedArgs> {
         self.resolve_with_credential_loader(setup::credential_token)
@@ -238,6 +248,7 @@ impl Args {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .map_or_else(|| infer_server_name(&relay), Ok)?;
+        check_product_endpoint(&relay, &server_name)?;
         let ca_cert = self.ca_cert.or(file_config.ca_cert.map(|path| {
             if path.is_absolute() {
                 path
@@ -648,7 +659,7 @@ struct VisualActionInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PairConnectionInput {
-    /// Agent 九位配对码或 Bridge UUID v4 长授权码。
+    /// Agent 九位临时码（字母不分大小写，兼容纯数字）或 Bridge UUID v4 长授权码。
     pairing_code: String,
     /// 重启后重新配对时，填入首次配对返回的 `agent_instance_id`。
     expected_agent_id: Option<String>,
@@ -809,6 +820,8 @@ struct TcpForwardCloseOutput {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct RemoteOpsInfoOutput {
+    latest_mcp_version: Option<String>,
+    mcp_release_status: String,
     mcp_version: String,
     protocol: u16,
     relay_connected: bool,
@@ -1699,7 +1712,11 @@ impl RemoteOpsMcp {
         &self,
         Parameters(_input): Parameters<RefreshGlobalGuideInput>,
     ) -> Json<RemoteOpsInfoOutput> {
+        let product = if option_env!("REMOTEOPS_PRODUCT_RELAY").is_some() { "jlai-mcp" } else { "remoteops-mcp" };
+        let release = self.client.published_version(product, env!("CARGO_PKG_VERSION"));
         Json(RemoteOpsInfoOutput {
+            mcp_release_status: release.as_ref().map_or("unknown", |(_,s)| *s).into(),
+            latest_mcp_version: release.map(|(v,_)| v),
             mcp_version: env!("CARGO_PKG_VERSION").into(),
             protocol: PROTOCOL_VERSION,
             relay_connected: self.client.is_connected(),
@@ -1985,16 +2002,28 @@ impl RemoteOpsMcp {
         message: &str,
         title: &'static str,
     ) -> Result<bool, String> {
+        self.confirm_permission(context, message, title, false).await
+    }
+
+    async fn confirm_permission(
+        &self,
+        context: &RequestContext<RoleServer>,
+        message: &str,
+        title: &'static str,
+        full_session: bool,
+    ) -> Result<bool, String> {
         let schema = ElicitationSchema::builder()
             .required_property(
                 "confirmed",
                 PrimitiveSchemaDefinition::Boolean(
                     BooleanSchema::new()
                         .title(title)
-                        .description(
-                            "在当前 MCP 确认界面点击允许即表示仅确认本次操作；这不是完全控制授权。配套 Agent 可由现场人员授权完全控制",
-                        )
-                        .with_default(true),
+                        .description(if full_session {
+                            "允许此 AI 会话执行命令和文件操作，直至断开、撤销或授权到期。"
+                        } else {
+                            "仅确认本次操作。"
+                        })
+                        .with_default(!full_session),
                 ),
             )
             .build()
@@ -2011,7 +2040,8 @@ impl RemoteOpsMcp {
             )
             .await
             .map_err(|error| elicitation_unavailable_error(&error.to_string()))?;
-        Ok(elicitation_accepted(&response.action))
+        Ok(elicitation_accepted(&response.action) && (!full_session
+            || response.content.as_ref().and_then(|v| v.get("confirmed")).and_then(|v| v.as_bool()) == Some(true)))
     }
 
     async fn confirm_large_transfer(
@@ -2205,7 +2235,7 @@ impl RemoteOpsMcp {
     /// 在 MCP 运行期间配对一个新 Agent。
     #[tool(
         name = "pair_connection",
-        description = "当用户提供 RemoteOps 控制码、RemoteOps 配对码或 Agent 窗口显示的九位码（例如 123-456-789）时，必须先调用此工具建立远程连接。可同时设置别名；无需修改 MCP 启动参数或重启 Codex。不要改用远程桌面、Computer Use、本机 Shell 或 SSH 直连。",
+        description = "当用户提供 RemoteOps 控制码、RemoteOps 配对码或 Agent 窗口显示的九位码（例如 A2C-D3E-F4G 或 123-456-789，字母不分大小写）时，必须先调用此工具建立远程连接。可同时设置别名；无需修改 MCP 启动参数或重启 Codex。不要改用远程桌面、Computer Use、本机 Shell 或 SSH 直连。",
         annotations(
             title = "配对远程连接",
             read_only_hint = false,
@@ -2217,6 +2247,7 @@ impl RemoteOpsMcp {
     async fn pair_connection(
         &self,
         Parameters(input): Parameters<PairConnectionInput>,
+        context: RequestContext<RoleServer>,
     ) -> Result<Json<ConnectionOutput>, String> {
         let pairing_code =
             AccessCode::parse(input.pairing_code).map_err(|error| error.to_string())?;
@@ -2248,10 +2279,28 @@ impl RemoteOpsMcp {
             .find(|item| item.session_id == connection.session_id)
             .ok_or_else(|| "配对成功后未找到连接".to_owned())?;
         let session_id = connection.session_id;
+        // 现场偏好只触发询问；实际授权仍绑定当前会话、当前版本和操作者确认。
+        let can_offer = option_env!("REMOTEOPS_PRODUCT_RELAY").is_some()
+            && !matches!(self.command_mode, CommandMode::Readonly | CommandMode::Approval)
+            && connection.target_context.as_ref().is_some_and(|ctx| ctx.capabilities.iter().any(|v| v.capability == "session_approval_offer_v1"));
         let mut output = connection_output(connection);
         output.transfer_root = self.transfer_root.display().to_string();
         output.local_transfer_root.clone_from(&output.transfer_root);
-        let state = self.control_mode_output(session_id).await;
+        let mut state = self.control_mode_output(session_id).await;
+        if can_offer && state.mode == "step_by_step"
+            && self.client.refresh_target_context(session_id).await.ok().is_some_and(|ctx|
+                ctx.capabilities.iter().any(|v| v.capability == "session_approval_offer_v1" && v.status == remoteops_domain::CapabilityAvailability::Available))
+        {
+            match self.set_control_mode(Parameters(SetControlModeInput {
+                session_id: session_id.to_string(), mode: McpControlMode::FullAccess,
+            }), context).await {
+                Ok(Json(granted)) => state = granted,
+                Err(reason) => {
+                    state = self.control_mode_output(session_id).await;
+                    state.message = format!("{}。本次配对保留，授权未完成：{reason}", state.message);
+                }
+            }
+        }
         output.control_mode = state.mode;
         output.control_source = state.source;
         output.control_revision = state.revision;
@@ -2284,7 +2333,7 @@ impl RemoteOpsMcp {
     /// 更改指定 Agent 在本 MCP 进程中的控制模式。
     #[tool(
         name = "set_control_mode",
-        description = "按精确 session_id 切换控制模式。默认保持 step_by_step；不得因为逐项确认界面不可用、超时或写操作被拒绝而调用 full_access。只有用户明确要求完全控制时才调用。调用 full_access 时只使用 Codex 对本工具的授权，不再嵌套弹出第二次确认；配套 Agent 支持现场授权；已生效时不要重复授权。切回逐项确认立即生效。",
+        description = "按精确 session_id 切换控制模式。默认保持 step_by_step；不得因为逐项确认界面不可用、超时或写操作被拒绝而调用 full_access。只有用户明确要求完全控制时才调用。调用 full_access 时需要操作者授权；定制端会确认本次连接的设备；配套 Agent 支持现场授权；已生效时不要重复授权。切回逐项确认立即生效。",
         annotations(
             title = "切换控制模式",
             read_only_hint = false,
@@ -2296,6 +2345,7 @@ impl RemoteOpsMcp {
     async fn set_control_mode(
         &self,
         Parameters(input): Parameters<SetControlModeInput>,
+        context: RequestContext<RoleServer>,
     ) -> Result<Json<ControlModeOutput>, String> {
         let session_id = parse_session_id(&input.session_id)?;
         self.ensure_connection_exists(session_id).await?;
@@ -2321,6 +2371,14 @@ impl RemoteOpsMcp {
                 .is_none_or(|expires| expires > chrono::Utc::now())
         {
             return Ok(Json(control_output(&expected)));
+        }
+        if mode == ControllerControlMode::FullAccess && option_env!("REMOTEOPS_PRODUCT_RELAY").is_some() {
+            let connection = self.client.list_connections().await.into_iter()
+                .find(|entry| entry.session_id == session_id).ok_or("配对已结束")?;
+            let message = format!("是否允许本次连接对 {} 完全控制？", connection.hostname);
+            if !self.confirm_permission(&context, &message, "授权本次连接", true).await? {
+                return Err("未授权本次连接完全控制".into());
+            }
         }
         let state = self
             .client

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, watch } from "vue";
+import { Copy, X } from "@lucide/vue";
 import * as c from "../services/operations";
+
 const item = computed(
   () => c.state.activeDrawerAgent || c.state.activeDrawerSession,
 );
@@ -47,6 +49,15 @@ const labels: Record<string, string> = {
   generation: "连接代次",
   status: "连接状态",
 };
+
+function isMono(key: string) {
+  return (
+    key.toLowerCase().includes("id") ||
+    key.toLowerCase().includes("mac") ||
+    key === "ownerUuid"
+  );
+}
+
 let previous: HTMLElement | null = null;
 watch(item, async (value) => {
   if (value) {
@@ -62,13 +73,13 @@ function keys(event: KeyboardEvent) {
     c.closeDrawer();
   }
   if (event.key === "Tab") {
-    const fields = [
+    const focusables = [
       ...(document.querySelectorAll<HTMLElement>(
         "#drawer-panel button:not(:disabled),#drawer-panel a",
       ) || []),
     ];
-    const first = fields[0],
-      last = fields.at(-1);
+    const first = focusables[0],
+      last = focusables.at(-1);
     if (event.shiftKey && document.activeElement === first) {
       event.preventDefault();
       last?.focus();
@@ -82,8 +93,8 @@ document.addEventListener("keydown", keys);
 onBeforeUnmount(() => document.removeEventListener("keydown", keys));
 </script>
 <template>
-  <Teleport to="body"
-    ><div
+  <Teleport to="body">
+    <div
       v-if="item"
       class="drawer-backdrop open"
       id="drawer-backdrop"
@@ -97,25 +108,27 @@ onBeforeUnmount(() => document.removeEventListener("keydown", keys));
         aria-labelledby="drawer-title"
       >
         <header class="drawer-header">
-          <div>
+          <div class="drawer-title-wrap">
             <h2 id="drawer-title">
               {{ isAgent ? "Agent 节点详情" : "会话详情" }}
             </h2>
-            <p class="font-mono text-break">{{ item.id }}</p>
+            <p class="font-mono text-break table-secondary-text">
+              {{ item.id }}
+            </p>
           </div>
           <button
-            class="btn btn-ghost"
+            class="btn btn-ghost btn-sm"
             aria-label="关闭详情"
             @click="c.closeDrawer()"
           >
-            ✕
+            <X :size="18" aria-hidden="true" />
           </button>
         </header>
         <div class="drawer-body">
-          <dl class="tools-facts">
-            <template v-for="[key, value] in fields" :key="key"
-              ><dt>{{ labels[key] || key }}</dt>
-              <dd>
+          <dl class="tools-facts drawer-facts">
+            <template v-for="[key, value] in fields" :key="key">
+              <dt>{{ labels[key] || key }}</dt>
+              <dd :class="{ 'font-mono': isMono(key) }">
                 {{
                   typeof value === "boolean"
                     ? value
@@ -123,54 +136,60 @@ onBeforeUnmount(() => document.removeEventListener("keydown", keys));
                       : "否"
                     : (value ?? "-")
                 }}
-              </dd></template
-            >
+              </dd>
+            </template>
           </dl>
-          <div class="action-row">
+        </div>
+        <footer class="modal-footer">
+          <button
+            class="btn btn-secondary"
+            @click="
+              c.copyToClipboard(item.id, isAgent ? 'Agent ID' : 'Session ID')
+            "
+          >
+            <Copy :size="15" aria-hidden="true" />
+            <span>复制标识</span>
+          </button>
+          <template
+            v-if="!isAgent && !item.isClosed && item.status !== 'WAITING'"
+          >
             <button
               class="btn btn-secondary"
               @click="
-                c.copyToClipboard(item.id, isAgent ? 'Agent ID' : 'Session ID')
-              "
-            >
-              复制标识</button
-            ><template v-if="!isAgent && !item.isClosed"
-              ><button
-                class="btn btn-secondary"
-                @click="
-                  c.openModal('terminateSession', {
-                    id: item.id,
-                    agentName: item.agentName,
-                  })
-                "
-              >
-                关闭会话</button
-              ><button
-                class="btn btn-danger"
-                @click="
-                  c.openModal('emergencyStop', {
-                    id: item.id,
-                    agentName: item.agentName,
-                  })
-                "
-              >
-                紧急停止
-              </button></template
-            ><button
-              v-if="isAgent && c.canShutdownAgent(item)"
-              class="btn btn-danger"
-              @click="
-                c.openModal('shutdownAgent', {
+                c.openModal('terminateSession', {
                   id: item.id,
-                  generation: item.generation,
+                  agentName: item.agentName,
                 })
               "
             >
-              关闭 Agent
+              关闭会话
             </button>
-          </div>
-        </div>
+            <button
+              class="btn btn-danger"
+              @click="
+                c.openModal('emergencyStop', {
+                  id: item.id,
+                  agentName: item.agentName,
+                })
+              "
+            >
+              紧急停止
+            </button>
+          </template>
+          <button
+            v-if="isAgent && c.canShutdownAgent(item)"
+            class="btn btn-danger"
+            @click="
+              c.openModal('shutdownAgent', {
+                id: item.id,
+                generation: item.generation,
+              })
+            "
+          >
+            关闭 Agent
+          </button>
+        </footer>
       </section>
-    </div></Teleport
-  >
+    </div>
+  </Teleport>
 </template>

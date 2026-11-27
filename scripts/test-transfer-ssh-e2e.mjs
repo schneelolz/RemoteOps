@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // 本机隔离的真实 Agent/Relay/MCP 传输与 SSH 验收；机密与原始输出只留内存。
+import { consoleCode, shortCode } from './test-pairing-code-support.mjs';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
@@ -300,9 +301,9 @@ class FixturePrompt { static int Main(string[] a) { try {
     const agent = start(agentExe, ['--config', agentConfig], envFor('agent'));
     const pairing = await until('regular_agent_pairing_ready', () => {
       if (agent.ended) throw fail('agent_ended');
-      return /控制码[：:]\s*(\d[\d -]{7,14}\d)/u.exec(agent.stdout)?.[1]?.replace(/\D/g, '');
+      return consoleCode(agent.stdout);
     }, 60000);
-    check('pairing_code_only_in_memory', /^\d{9}$/.test(pairing));
+    check('pairing_code_only_in_memory', Boolean(shortCode(pairing)));
     const mcpConfig = path.join(directories['mcp-local'], 'mcp-config.json');
     await fs.writeFile(mcpConfig, '{}', { flag: 'wx' });
     const mcpState = start(mcpExe, ['--config', mcpConfig, '--relay', address, '--server-name', 'localhost',

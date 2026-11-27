@@ -647,3 +647,64 @@ async fn agent_heartbeat_expires_and_resynchronizes_only_current_generation() {
         matches!(receiver.try_recv().unwrap(), WireMessage::ControlStateUpdated(state) if state == expired)
     );
 }
+
+#[tokio::test]
+async fn installation_grants_require_an_explicit_pair_and_live_revoke_invalidates_the_revision() {
+    let (relay, installation, token) = enrolled_relay();
+    let id = AgentInstanceId::new();
+    let (agent, mut events, session) = ready_agent(&relay, id, None).await;
+    let other_id = AgentInstanceId::new();
+    let (other, _events, _) = ready_agent(&relay, other_id, None).await;
+    for device in [id, other_id] {
+        let mut state = relay.state.lock().await;
+        let context = state.agents.get_mut(&device).unwrap().hello.target_context.get_or_insert_with(Default::default);
+        for cap in ["control_initialization_v1", "managed_install_grant_v1"] {
+            context.capabilities.push(remoteops_domain::TargetCapabilityStatus {
+                capability: cap.into(), status: remoteops_domain::CapabilityAvailability::Available, reasons: vec![],
+            });
+        }
+    }
+    let hello = installation_hello(token);
+    let (tx, mut controller_events) = test_channel();
+    let generation = relay.authenticate_and_register_controller(&hello, tx).await.unwrap();
+    let pair = |code, expected| PairRequest {
+        request_id: RequestId::new(), expected_session_id: expected, expected_agent_id: None,
+        pairing_code: code, connection_resume_token: None, permission_mode: PermissionMode::ControllerApproved,
+    };
+    relay.set_device_grant(installation, id.as_uuid(), true).await.unwrap();
+    let result = relay.pair_controller(hello.controller_instance_id, generation, pair(other.welcome.pairing_code, None)).await;
+    let other_session = result.connection.unwrap().session_id;
+    assert_eq!(relay.state.lock().await.session_bindings[&other_session].ai.as_ref().unwrap().installation_grant, Some(false));
+    let result = relay.pair_controller(hello.controller_instance_id, generation, pair(agent.welcome.pairing_code.clone(), None)).await;
+    assert!(result.error.is_none());
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|m| matches!(m, WireMessage::ControllerBinding(b) if b.installation_grant == Some(true))));
+    let initial = current_control(&relay, session).await;
+    assert!(initial.initialization_pending);
+    let change = |expected: SessionControlState| ControlStateRequest {
+        request_id: RequestId::new(), session_id: session, mode: Some(ControllerControlMode::FullAccess),
+        source: Some(ControlSource::LocalDefault), expected: Some(expected),
+    };
+    let (responses, mut rx) = test_channel();
+    relay.handle_agent_control_state(id, agent.connection_generation, change(initial.clone()), &responses).await;
+    assert!(matches!(rx.try_recv().unwrap(), WireMessage::ControlStateResult(r) if r.error.is_none()));
+    let full = current_control(&relay, session).await;
+    assert_eq!(full.mode, ControllerControlMode::FullAccess);
+    assert_eq!(full.source, Some(ControlSource::LocalDefault));
+    relay.set_device_grant(installation, id.as_uuid(), false).await.unwrap();
+    let revoked = current_control(&relay, session).await;
+    assert_eq!(revoked.mode, ControllerControlMode::StepByStep);
+    assert!(revoked.revision > full.revision && !revoked.initialization_pending);
+    assert!(std::iter::from_fn(|| controller_events.try_recv().ok()).any(|m| matches!(m, WireMessage::ControlStateUpdated(s) if s == revoked)));
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|m| matches!(m, WireMessage::ControlStateUpdated(s) if s == revoked)));
+    for snapshot in [initial, revoked] {
+        relay.handle_agent_control_state(id, agent.connection_generation, change(snapshot), &responses).await;
+        assert!(matches!(rx.try_recv().unwrap(), WireMessage::ControlStateResult(r) if r.error.is_some()));
+    }
+    relay.remove_controller(hello.controller_instance_id, generation).await;
+    relay.set_device_grant(installation, id.as_uuid(), true).await.unwrap();
+    let (tx, _rx) = test_channel();
+    let generation = relay.authenticate_and_register_controller(&hello, tx).await.unwrap();
+    let r = relay.pair_controller(hello.controller_instance_id, generation, pair(agent.welcome.pairing_code, Some(session))).await;
+    assert!(r.error.is_none());
+    assert_eq!(relay.state.lock().await.session_bindings[&session].ai.as_ref().unwrap().installation_grant, Some(false));
+}

@@ -205,6 +205,8 @@ pub struct ProductSnapshot {
     pub product_name: String,
     /// 当前原生宿主版本。
     pub version: String,
+    /// 当前 Relay 公告的可更新版本。
+    pub latest_update: Option<String>,
     /// 当前连接阶段。
     pub phase: ProductPhase,
     /// 本地化连接状态。
@@ -241,6 +243,12 @@ pub struct ProductSnapshot {
     pub can_copy: bool,
     /// 当前绑定的控制端数量。
     pub controllers: usize,
+    /// 当前是否存在 AI 绑定，独立于人工控制端。
+    pub ai_connected: bool,
+    /// 当前是否绑定人工运维控制端。
+    pub human_connected: bool,
+    /// 正在等待所选 AI 绑定的中继撤销确认。
+    pub disconnect_pending: bool,
     /// 按真实执行状态统计的在途任务数。
     pub running_count: usize,
     /// 已开始且未终止的结构化请求集合，与日志历史容量独立。
@@ -286,6 +294,7 @@ impl Default for ProductSnapshot {
             title: format!("RemoteOps · 远程协助 v{}", env!("CARGO_PKG_VERSION")),
             product_name: "RemoteOps".into(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            latest_update: None,
             phase: ProductPhase::Setup,
             status: "首次使用，请配置连接".to_owned(),
             detail: String::new(),
@@ -304,12 +313,15 @@ impl Default for ProductSnapshot {
             countdown: String::new(),
             can_copy: false,
             controllers: 0,
+            ai_connected: false,
+            human_connected: false,
+            disconnect_pending: false,
             running_count: 0,
             active_operations: Vec::new(),
             lifecycle_events: VecDeque::new(),
             activity: "系统就绪 · 等待操作".to_owned(),
             last_result: String::new(),
-            control_summary: "等待控制端连接".to_owned(),
+            control_summary: "等待 AI 工程师连接后，可切换本次权限".to_owned(),
             control_source: String::new(),
             control_enabled: false,
             control_pending: false,
@@ -415,6 +427,10 @@ pub enum ProductAction {
     SaveDefaultControl {
         full: bool,
     },
+    /// 现场撤销当前 AI 配对，保留人工连接。
+    DisconnectAi,
+    /// 仅断开当前人工运维绑定。
+    DisconnectHuman,
     TrustCancel,
     TrustOnce,
     TrustSave,
@@ -495,6 +511,7 @@ impl ProductHost {
         };
         #[cfg(feature = "agent-runtime")]
         if let Some(profile) = &options.product_profile {
+            host.state.endpoint_editable = !profile.endpoint.is_fixed();
             host.state.product_name.clone_from(&profile.name);
             host.state.version.clone_from(&profile.version);
             host.state.title = format!("{} · 远程协助 v{}", profile.name, profile.version);
@@ -617,7 +634,9 @@ impl ProductHost {
                     self.state.phase = ProductPhase::Stopped;
                     "已停止 · 界面演示".clone_into(&mut self.state.status);
                 }
-                ProductAction::RequestControl { .. } | ProductAction::SaveDefaultControl { .. } => {
+                ProductAction::DisconnectAi | ProductAction::DisconnectHuman
+                | ProductAction::RequestControl { .. }
+                | ProductAction::SaveDefaultControl { .. } => {
                     return Err("界面演示未连接控制端".to_owned());
                 }
                 _ => {}

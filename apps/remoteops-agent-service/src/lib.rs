@@ -208,6 +208,7 @@ fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: Agen
         AgentEvent::Connected {
             pairing_code,
             lease_expires_at,
+            ..
         } => {
             "waiting".clone_into(&mut status.status);
             status.pairing_code = Some(pairing_code);
@@ -582,6 +583,7 @@ mod tests {
             &path,
             &mut status,
             AgentEvent::Connected {
+                latest_update: None,
                 pairing_code: "123-456-789".into(),
                 lease_expires_at: Utc::now(),
             },

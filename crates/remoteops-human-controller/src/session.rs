@@ -23,7 +23,7 @@ fn config(v:&Value)->Result<RelayClientConfig>{
     })
 }
 fn device(c:&remoteops_domain::ConnectionDescriptor, connected:bool, desktop:bool)->Value {
-    json!({"session":c.session_id,"device_id":c.agent_instance_id,"name":c.display_name(),"online":connected && c.state==ConnectionState::Online,
+    json!({"session":c.session_id,"device_id":c.agent_instance_id,"name":c.display_name(),"hostname":c.hostname,"online":connected && c.state==ConnectionState::Online,
         "desktop":desktop && c.environment.tools.iter().any(|t|t.name=="remoteops-desktop-v1" && t.available),
         "writable":c.permission_mode!=PermissionMode::ReadOnly})
 }
@@ -50,13 +50,14 @@ pub(super) async fn run(options:Value,mut commands:mpsc::Receiver<Value>,out:Eve
                         match cmd["op"].as_str(){
                             Some("pair")=>{
                                 let code:PairingCode=cmd["code"].as_str().context("请输入控制码")?.parse()?;
+                                let grouped=code.display_grouped();
                                 let paired=tool_client.pair(code).await?;
-                                let _=tool_out.try_send(json!({"kind":"paired","session":paired.session_id,"device":device(&paired,tool_client.is_connected(),tool_client.supports_desktop()),"text":"已连接"}));
+                                let _=tool_out.try_send(json!({"kind":"paired","pair_code":grouped,"session":paired.session_id,"device":device(&paired,tool_client.is_connected(),tool_client.supports_desktop()),"text":"已连接"}));
                             }
                             Some("disconnect")=>{
                                 let session:SessionId=serde_json::from_value(cmd["session"].clone())?;
-                                let r=tool_client.close_connection(&session.to_string()).await?;
-                                let _=tool_out.try_send(message("status",&r.response.summary));
+                                tool_client.release_binding(session).await?;
+                                let _=tool_out.try_send(message("status","本次人工运维已断开"));
                             }
                             _=>state.command(&tool_client,&cmd,&tool_out).await?
                         }
@@ -86,7 +87,13 @@ pub(super) async fn run(options:Value,mut commands:mpsc::Receiver<Value>,out:Eve
             _=timer.tick()=>{
                 let current=client.is_connected();
                 if online!=Some(current){
-                    online=Some(current);let _=out.try_send(message("status",if current{"Relay 已连接"}else{"正在连接 Relay"}));
+                    let text=if current{"Relay 已连接"}else{"Relay 已断开，正在重新连接"};
+                    let release = options["version"].as_str().and_then(|v| client.published_version(
+                        if options["managed"].as_bool() == Some(true) { "jlai-human-desktop" } else { "remoteops-human-desktop" }, v));
+                    let update = release.filter(|(_,status)| *status == "update_available").map(|(v,_)| v);
+                    if out.try_send(json!({"kind":"connection","online":current,"text":text,"update":update})).is_ok(){
+                        online=Some(current);
+                    }
                 }
                 let list=devices(&client).await;
                 if list!=prev && out.try_send(list.clone()).is_ok(){prev=list}
@@ -99,7 +106,8 @@ pub(super) async fn run(options:Value,mut commands:mpsc::Receiver<Value>,out:Eve
                         Some("open")=>{
                             let session:SessionId=serde_json::from_value(cmd["session"].clone())?;
                             if desktop.is_some(){bail!("请先关闭当前桌面窗口")}
-                            desktop=Some(Desktop::start(client.clone(),session,cmd["view"].as_u64().unwrap_or(0),out.clone(),video.clone(),release.subscribe()));
+                            let mode=cmd.get("quality").map(|v| serde_json::from_value(v.clone())).transpose()?.unwrap_or_default();
+                            desktop=Some(Desktop::start(client.clone(),session,cmd["view"].as_u64().unwrap_or(0),mode,cmd["backend"].as_str().unwrap_or("auto"),out.clone(),video.clone(),release.subscribe()));
                         }
                         Some("end"|"disconnect")=>{
                             let session:SessionId=serde_json::from_value(cmd["session"].clone())?;
@@ -107,6 +115,12 @@ pub(super) async fn run(options:Value,mut commands:mpsc::Receiver<Value>,out:Eve
                                 if let Some(d)=desktop.take(){d.end().await;}
                             }
                             if cmd["op"]=="disconnect"{tools_tx.try_send(cmd.clone()).context("人工工具忙")?;}
+                        }
+                        Some("quality")=>{
+                            let session:SessionId=serde_json::from_value(cmd["session"].clone())?;
+                            if let Some(d)=desktop.as_ref().filter(|d|d.session==session && cmd["view"].as_u64()==Some(d.view)) {
+                                d.picture.send_replace(serde_json::from_value(cmd["quality"].clone())?);
+                            }
                         }
                         Some("input"|"control"|"release"|"clipboard")=>{
                             let session:SessionId=serde_json::from_value(cmd["session"].clone())?;

@@ -11,7 +11,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$expectedMcpVersion = '0.2.0-preview.32'
+$expectedMcpVersion = '0.2.0-preview.36'
 $expectedCredentialPromptVersion = '0.2.0-preview.7'
 $expectedToolTimeoutSec = 360
 $configPath = Join-Path $CodexHome 'config.toml'

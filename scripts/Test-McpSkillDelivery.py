@@ -69,7 +69,8 @@ function Move-Item {
 
 class DeliveryTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="remoteops-delivery-test-")
+        # Leave room for versioned nested backup paths on Windows.
+        self.temporary = tempfile.TemporaryDirectory(prefix="ro-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.output = self.root / "RemoteOps"

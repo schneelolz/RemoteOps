@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-agent"
-version = "0.2.0-preview.42"
+version = "0.2.0-preview.43"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,8 @@ OriginalFilename = "remoteops-agent.exe"
 LegalCopyright = "Copyright (c) RemoteOps contributors"
 
 [features]
+controller-approved-default = []
+managed-install-grant = ["controller-approved-default"]
 desktop-pilot = ["dep:remoteops-desktop-media"]
 paired-human-desktop = ["desktop-pilot", "remoteops-protocol/desktop-lan"]
 

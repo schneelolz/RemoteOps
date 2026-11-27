@@ -479,6 +479,8 @@ pub enum AgentEvent {
     Connecting,
     /// 已建立 Relay 连接并取得控制码。
     Connected {
+        /// 同平台同产品有已发布更新时的最新版本。
+        latest_update: Option<String>,
         /// 供工程师配对的临时控制码。
         pairing_code: String,
         /// 控制码租约到期时间。
@@ -486,6 +488,8 @@ pub enum AgentEvent {
     },
     /// 已登记受管目标，保持无码待命，等待门户邀请。
     Registered {
+        /// 同平台同产品有已发布更新时的最新版本。
+        latest_update: Option<String>,
         /// 门户稳定目标标识。
         managed_target_id: Option<String>,
     },
@@ -647,6 +651,10 @@ pub struct AgentOperationLog {
 /// Agent 向本地表现层公开的 Controller 绑定摘要。
 #[derive(Clone, Debug)]
 pub struct AgentControllerBinding {
+    /// 当前产品与 Relay 已核准此安装及设备的授权。
+    pub installation_authorized: bool,
+    /// 现场可撤销的当前 AI 绑定。旧中继和人工绑定为空。
+    pub disconnect_target: Option<BindingDisconnectTarget>,
     /// Relay 确认的有效会话授权，缺失时不能视为已授权。
     pub control_state: Option<SessionControlState>,
     /// Controller 的稳定 Owner。
@@ -661,6 +669,20 @@ pub struct AgentControllerBinding {
     pub full_access_authorized_locally: bool,
 }
 
+/// 仅用于撤销当前 AI 配对的句柄，调试输出不包含绑定凭据。
+#[derive(Clone, PartialEq, Eq)]
+pub struct BindingDisconnectTarget {
+    session_id: SessionId,
+    token: String,
+    kind: remoteops_protocol::ControllerKind,
+}
+
+impl std::fmt::Debug for BindingDisconnectTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BindingDisconnectTarget")
+    }
+}
+
 /// Agent 本地用户对当前进程选择的权限模式。
 #[derive(Clone, Debug)]
 pub struct AgentPermissionControl {
@@ -668,6 +690,9 @@ pub struct AgentPermissionControl {
     sender: watch::Sender<PermissionMode>,
     // 本地变更请求独立于旧 Owner 权限。
     control_requests: tokio::sync::broadcast::Sender<ControlStateRequest>,
+    disconnect_requests: tokio::sync::broadcast::Sender<BindingDisconnectTarget>,
+    disconnect_supported: Arc<AtomicBool>,
+    human_disconnect_supported: Arc<AtomicBool>,
     default_full: Arc<AtomicBool>,
     auto_suppressed: Arc<AtomicBool>,
     scoped_events: Arc<AtomicBool>,
@@ -682,6 +707,9 @@ impl AgentPermissionControl {
         Self {
             sender,
             control_requests: tokio::sync::broadcast::channel(16).0,
+            disconnect_requests: tokio::sync::broadcast::channel(4).0,
+            disconnect_supported: Arc::new(AtomicBool::new(false)),
+            human_disconnect_supported: Arc::new(AtomicBool::new(false)),
             default_full: Arc::new(AtomicBool::new(false)),
             auto_suppressed: Arc::new(AtomicBool::new(false)),
             scoped_events: Arc::new(AtomicBool::new(false)),
@@ -708,11 +736,35 @@ impl AgentPermissionControl {
     pub fn set_default_full_control(&self, enabled: bool) {
         self.default_full.store(enabled, Ordering::SeqCst);
     }
+    /// 向运行中的 Agent 提交用户选中的 AI 绑定，结果由中继撤销通知确认。
+    ///
+    /// # Errors
+    /// 当前连接不支持现场断开或已停止。
+    pub fn disconnect_binding(&self, target: BindingDisconnectTarget) -> anyhow::Result<()> {
+        self.disconnect_requests
+            .send(target)
+            .map(|_| ())
+            .map_err(|_| anyhow!("Agent 未连接"))
+    }
+
     /// 读取默认偏好。
     #[must_use]
     pub fn default_full_control(&self) -> bool {
         self.default_full.load(Ordering::SeqCst)
     }
+    fn requests_full_on_pair(&self, binding: &ControllerBinding) -> bool {
+        if !self.default_full_control() || binding.controller_kind != remoteops_protocol::ControllerKind::Ai {
+            return false;
+        }
+        if cfg!(feature = "managed-install-grant") {
+            return binding.installation_grant == Some(true)
+                && binding.control_state.as_ref().is_some_and(|s| s.initialization_pending)
+                && self.locally_revoked.read().is_ok_and(|revoked|
+                    revoked.as_ref().is_none_or(|old| old.session_id != binding.session_id));
+        }
+        !cfg!(feature = "controller-approved-default") && !self.auto_suppressed.load(Ordering::SeqCst)
+    }
+
     /// 提交现场变更；逐项确认立即抑制本进程自动授权。
     ///
     /// # Errors
@@ -849,6 +901,8 @@ struct AgentState {
 
 #[derive(Clone)]
 struct SerialRuntime {
+    // 创建资源的控制端绑定。
+    owner_binding: String,
     session_id: SessionId,
     port_name: String,
     writable: bool,
@@ -948,6 +1002,8 @@ impl SerialQueryTransport for AgentSerialQueryTransport {
 
 #[derive(Clone)]
 struct ShellRuntime {
+    // 创建资源的控制端绑定。
+    owner_binding: String,
     /// 所属远程逻辑会话。
     session_id: SessionId,
     /// 实际 Shell 类型。
@@ -990,6 +1046,8 @@ struct FileUploadRuntime {
 
 #[derive(Clone)]
 struct RequestRuntimeState {
+    // 此请求经 Relay 认证的绑定，资源按此归属独立释放。
+    binding_token: String,
     // 本地观察器不参与协议和授权。
     log_observer: Option<Arc<std::sync::Mutex<operation_log::LogObserver>>>,
     /// 本次文件操作的取消与不可逆提交点。
@@ -1009,6 +1067,8 @@ struct RequestRuntimeState {
 }
 
 struct PendingTask {
+    // 现场断开时只取消由该次配对创建的任务。
+    binding_token: String,
     // 外部调用取消后不能把未知远端结果解释为尚未执行。
     resource_call: bool,
     /// 完成上传被取消时回收对应的暂存会话。
@@ -1503,6 +1563,9 @@ async fn run_agent_with_event_sink(
             }),
         );
     }
+    if cfg!(feature = "controller-approved-default") {
+        boundary.session_approval_offer = Some(permission_control.default_full.clone());
+    }
     let boundary = Arc::new(boundary);
     let environment = Arc::new(RwLock::new(environment));
     let enriched = environment.clone();
@@ -1702,6 +1765,10 @@ where
         let mut profile = environment;
         if desktop_endpoint.is_some() {
             profile.tools.push(remoteops_domain::ToolProfile{name:"remoteops-desktop-v1".into(),available:true,version:Some("1".into())});
+            #[cfg(feature = "paired-human-desktop")]
+            if desktop::crossdesk_available() {
+                profile.tools.push(remoteops_domain::ToolProfile{name:"remoteops-crossdesk-v1".into(),available:true,version:Some("1".into())});
+            }
         }
         profile
     };
@@ -1731,6 +1798,7 @@ where
         credential_encryption_public_key: credential_encryption.public_key_base64().to_owned(),
         credential_encryption_key_id: credential_encryption.key_id().to_owned(),
         mac_address,
+        supports_mixed_pairing_code: true,
         supports_agent_shutdown: true,
     }));
     let registration_started = Instant::now();
@@ -1774,10 +1842,21 @@ where
         "registration_code_ready",
         registration_started,
     );
+    let context = boundary.snapshot();
+    let latest_update = welcome.release_catalog.as_ref().and_then(|catalog|
+        catalog.compare(&context.product_id, std::env::consts::OS, std::env::consts::ARCH, &context.version)
+    ).and_then(|(latest, status)| (status == "update_available").then(|| latest.to_owned()));
+    if let Some(latest) = &latest_update {
+        emit_agent_event(event_sender, AgentEvent::OperationLog(AgentOperationLog {
+            repetition: None, request_id: None, occurred_at: Utc::now(), level: AgentLogLevel::Info,
+            message: format!("Agent 当前 v{}，可更新至 v{latest}", context.version),
+        }));
+    }
     if let Some(code) = &welcome.pairing_code {
         emit_agent_event(
             event_sender,
             AgentEvent::Connected {
+                latest_update,
                 pairing_code: code.display_grouped(),
                 lease_expires_at: welcome.lease_expires_at,
             },
@@ -1786,6 +1865,7 @@ where
         emit_agent_event(
             event_sender,
             AgentEvent::Registered {
+                latest_update,
                 managed_target_id: welcome.managed_target_id.clone(),
             },
         );
@@ -1864,6 +1944,13 @@ where
     let mut controller_bindings = BTreeMap::<ControllerInstanceId, ControllerBinding>::new();
     let mut default_queries = BTreeMap::<RequestId, (SessionControlState, Instant)>::new();
     let execution_bindings = Arc::new(RwLock::new(controller_bindings.clone()));
+    let permission = &local_permission_policy.permission_control;
+    permission
+        .disconnect_supported
+        .store(welcome.allow_agent_ai_disconnect, Ordering::SeqCst);
+    permission.human_disconnect_supported.store(welcome.allow_agent_human_disconnect, Ordering::SeqCst);
+    let mut disconnect_requests = permission.disconnect_requests.subscribe();
+    let mut requested_disconnect = None;
     let mut control_requests = local_permission_policy
         .permission_control
         .control_requests
@@ -1895,6 +1982,20 @@ where
         let incoming = tokio::select! {
             _ = tcp_cleanup.tick() => { continue; },
             result = &mut incoming_future => Some(result),
+            target = disconnect_requests.recv() => {
+                if let Ok(target) = target
+                    && (match target.kind { remoteops_protocol::ControllerKind::Ai => welcome.allow_agent_ai_disconnect, remoteops_protocol::ControllerKind::Human => welcome.allow_agent_human_disconnect })
+                    && controller_bindings.values().any(|binding| binding.controller_kind == target.kind
+                        && binding.session_id == target.session_id && binding.binding_token == target.token)
+                {
+                    requested_disconnect = Some(target.token.clone());
+                    let _ = sender.send(WireMessage::ControllerBindingRevoked {
+                        session_id: target.session_id,
+                        binding_token: target.token,
+                    });
+                }
+                continue;
+            },
             request = control_requests.recv() => {
                 if let Ok(mut request) = request {
                     if boundary.policy.read_only() && request.mode.is_some() { request.mode = Some(ControllerControlMode::ReadOnly); }
@@ -1975,12 +2076,8 @@ where
                 if new_binding
                     && local_permission_policy
                         .permission_control
-                        .default_full_control()
+                        .requests_full_on_pair(&binding)
                     && !boundary.policy.read_only()
-                    && !local_permission_policy
-                        .permission_control
-                        .auto_suppressed
-                        .load(Ordering::SeqCst)
                     && binding.controller_kind == remoteops_protocol::ControllerKind::Ai
                     && let Some(state) = &binding.control_state
                     && !matches!(
@@ -1999,7 +2096,7 @@ where
                     default_queries
                         .retain(|_, (_, started)| started.elapsed() < Duration::from_secs(5));
                     default_queries.insert(request_id, (state.clone(), Instant::now()));
-                } else if let Some(state) = binding
+                } else if new_binding && let Some(state) = binding
                     .control_state
                     .as_ref()
                     .filter(|state| state.initialization_pending)
@@ -2066,17 +2163,10 @@ where
                     && result.error.is_none()
                     && let Some(state) = &result.state
                     && same_control_binding(Some(&queried), Some(state))
-                    && controller_bindings
-                        .values()
-                        .any(|b| b.control_state.as_ref() == Some(state))
-                    && local_permission_policy
-                        .permission_control
-                        .default_full_control()
+                    && controller_bindings.get(&state.controller_id).is_some_and(|binding|
+                        binding.control_state.as_ref() == Some(state)
+                        && local_permission_policy.permission_control.requests_full_on_pair(binding))
                     && !boundary.policy.read_only()
-                    && !local_permission_policy
-                        .permission_control
-                        .auto_suppressed
-                        .load(Ordering::SeqCst)
                     && matches!(
                         state.mode,
                         ControllerControlMode::StepByStep | ControllerControlMode::Expired
@@ -2115,8 +2205,23 @@ where
             }) => {
                 #[cfg(all(windows, feature = "desktop-pilot"))]
                 desktop.revoke(&binding_token);
+                let human = controller_bindings.values().any(|b| b.session_id == session_id
+                    && b.binding_token == binding_token && b.controller_kind == remoteops_protocol::ControllerKind::Human);
                 if revoke_controller_binding(&mut controller_bindings, session_id, &binding_token) {
                     publish_execution_bindings(&execution_bindings, &controller_bindings);
+                    let locally_requested = requested_disconnect.as_ref() == Some(&binding_token);
+                    if locally_requested { requested_disconnect = None; }
+                    if human || locally_requested {
+                        abort_pending_tasks_for_session(
+                            &tasks,
+                            Some(&log_observer),
+                            session_id,
+                            Some(&binding_token),
+                            "现场已断开该控制端，操作已中断",
+                        )
+                        .await;
+                    }
+                    close_owned_resources(&shell_sessions, &serial_sessions, session_id, Some(&binding_token)).await;
                     if !controller_bindings
                         .values()
                         .any(|binding| binding.session_id == session_id)
@@ -2125,6 +2230,7 @@ where
                             &tasks,
                             Some(&log_observer),
                             session_id,
+                            None,
                             "Controller 会话已撤销，操作已中断",
                         )
                         .await;
@@ -2234,6 +2340,7 @@ where
                     session_id = %authorized.request.session_id,
                     "Agent 已收到 Relay 授权请求"
                 );
+                let task_binding_token = authorized.authorization.binding_token.clone();
                 let authorization_at_execution = authorized.clone();
                 let request = match verify_authorized_request(
                     &policy,
@@ -2410,6 +2517,7 @@ where
                 )
                 .then(FileCommitControl::default);
                 let runtime_state = RequestRuntimeState {
+                    binding_token: task_binding_token.clone(),
                     log_observer: Some(log_observer.clone()),
                     file_commit: file_commit.clone().unwrap_or_default(),
                     shell_sessions: shell_sessions.clone(),
@@ -2473,6 +2581,7 @@ where
                 tasks.lock().await.insert(
                     request_id,
                     PendingTask {
+                        binding_token: task_binding_token,
                         resource_call,
                         file_transfer_id,
                         file_commit,
@@ -2759,6 +2868,15 @@ fn emit_controller_bindings(
     let bindings = bindings
         .values()
         .map(|binding| AgentControllerBinding {
+            installation_authorized: cfg!(feature = "managed-install-grant") && binding.installation_grant == Some(true),
+            disconnect_target: match binding.controller_kind {
+                remoteops_protocol::ControllerKind::Ai => &local_permission_policy.permission_control.disconnect_supported,
+                remoteops_protocol::ControllerKind::Human => &local_permission_policy.permission_control.human_disconnect_supported,
+            }.load(Ordering::SeqCst).then(|| BindingDisconnectTarget {
+                kind: binding.controller_kind,
+                session_id: binding.session_id,
+                token: binding.binding_token.clone(),
+            }),
             owner_id: binding.owner_id,
             controller_kind: binding.controller_kind,
             permission_mode: binding.permission_mode,
@@ -3336,6 +3454,7 @@ async fn execute_operation(
             sessions.insert(
                 shell_id,
                 ShellRuntime {
+                    owner_binding: runtime_state.binding_token.clone(),
                     session_id: request.session_id,
                     shell: *shell,
                     session,
@@ -3889,6 +4008,7 @@ async fn execute_operation(
             sessions.insert(
                 serial_session_id,
                 SerialRuntime {
+                    owner_binding: runtime_state.binding_token.clone(),
                     session_id: request.session_id,
                     port_name: port_name.clone(),
                     writable: *writable,
@@ -4344,6 +4464,7 @@ async fn abort_pending_tasks(
     };
     for (request_id, pending) in pending {
         let PendingTask {
+            binding_token: _,
             resource_call: _,
             file_transfer_id: _,
             file_commit,
@@ -4399,13 +4520,18 @@ async fn abort_pending_tasks_for_session(
     tasks: &Arc<Mutex<BTreeMap<RequestId, PendingTask>>>,
     log_observer: Option<&Arc<std::sync::Mutex<operation_log::LogObserver>>>,
     session_id: SessionId,
+    binding_token: Option<&str>,
     message: &str,
 ) {
     let pending = {
         let mut tasks = tasks.lock().await;
         let ids = tasks
             .iter()
-            .filter_map(|(id, task)| (task.session_id == session_id).then_some(*id))
+            .filter_map(|(id, task)| {
+                (task.session_id == session_id
+                    && binding_token.is_none_or(|token| token == task.binding_token))
+                .then_some(*id)
+            })
             .collect::<Vec<_>>();
         ids.into_iter()
             .filter_map(|id| tasks.remove(&id).map(|task| (task, id)))
@@ -4413,6 +4539,7 @@ async fn abort_pending_tasks_for_session(
     };
     for (pending, request_id) in pending {
         let PendingTask {
+            binding_token: _,
             resource_call: _,
             file_transfer_id: _,
             file_commit,
@@ -4464,6 +4591,7 @@ async fn cancel_pending_task(
         };
     };
     let PendingTask {
+        binding_token: _,
         resource_call: _,
         file_transfer_id: _,
         file_commit,
@@ -5460,11 +5588,19 @@ async fn close_session_resources(
     serial_sessions: &Arc<Mutex<BTreeMap<SerialSessionId, SerialRuntime>>>,
     session_id: SessionId,
 ) {
+    close_owned_resources(shell_sessions, serial_sessions, session_id, None).await;
+}
+
+async fn close_owned_resources(
+    shell_sessions: &Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
+    serial_sessions: &Arc<Mutex<BTreeMap<SerialSessionId, SerialRuntime>>>,
+    session_id: SessionId, binding: Option<&str>,
+) {
     let shells = {
         let mut sessions = shell_sessions.lock().await;
         let ids = sessions
             .iter()
-            .filter_map(|(id, runtime)| (runtime.session_id == session_id).then_some(*id))
+            .filter_map(|(id, runtime)| (runtime.session_id == session_id && binding.is_none_or(|token| token == runtime.owner_binding)).then_some(*id))
             .collect::<Vec<_>>();
         ids.into_iter()
             .filter_map(|id| sessions.remove(&id))
@@ -5475,7 +5611,7 @@ async fn close_session_resources(
         let mut sessions = serial_sessions.lock().await;
         let ids = sessions
             .iter()
-            .filter_map(|(id, runtime)| (runtime.session_id == session_id).then_some(*id))
+            .filter_map(|(id, runtime)| (runtime.session_id == session_id && binding.is_none_or(|token| token == runtime.owner_binding)).then_some(*id))
             .collect::<Vec<_>>();
         ids.into_iter()
             .filter_map(|id| sessions.remove(&id))
@@ -5512,6 +5648,7 @@ fn print_agent_event(event: &AgentEvent) {
         AgentEvent::Connected {
             pairing_code,
             lease_expires_at,
+            ..
         } => {
             println!("Relay 已连接");
             println!("控制码：{pairing_code}");
@@ -5660,6 +5797,7 @@ mod tests {
         };
         let (sender, _receiver) = mpsc::unbounded_channel();
         let runtime_state = RequestRuntimeState {
+            binding_token: String::new(),
             log_observer: None,
             file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -6029,6 +6167,9 @@ mod tests {
                 &mut agent,
                 identity,
                 &AgentWelcome {
+                    allow_agent_ai_disconnect: false,
+                    allow_agent_human_disconnect: false,
+                    release_catalog: None,
                     test_key_accepted: false,
                     pairing_code: Some(AccessCode::parse("123456789").unwrap()),
                     pairing_mode: remoteops_protocol::PairingMode::AutoPerBoot,
@@ -6208,6 +6349,7 @@ mod tests {
             WireMessage::Hello(ClientHello::Agent(AgentHello {
                 agent_instance_id: observed,
                 boot_id: observed_boot,
+                supports_mixed_pairing_code: true,
                 ..
             })) if observed == agent_instance_id && observed_boot == boot_id
         ));
@@ -6215,7 +6357,10 @@ mod tests {
         write_frame(
             &mut relay_stream,
             &WireMessage::AgentWelcome(AgentWelcome {
-                test_key_accepted: false,
+                allow_agent_ai_disconnect: false,
+                    allow_agent_human_disconnect: false,
+                    release_catalog: None,
+                    test_key_accepted: false,
                 pairing_code: Some(AccessCode::parse("123456789").expect("测试控制码应有效")),
                 pairing_mode: remoteops_protocol::PairingMode::AutoPerBoot,
                 managed_target_id: None,
@@ -6270,6 +6415,7 @@ mod tests {
         write_frame(
             &mut relay_stream,
             &WireMessage::ControllerBinding(ControllerBinding {
+                installation_grant: None,
                 session_id,
                 controller_instance_id,
                 owner_id: test_owner_id(),
@@ -6410,6 +6556,7 @@ mod tests {
         shell_sessions.lock().await.insert(
             ShellId::new(),
             ShellRuntime {
+                owner_binding: String::new(),
                 session_id,
                 shell,
                 session: idle_shell.clone(),
@@ -6466,6 +6613,7 @@ mod tests {
         };
 
         let runtime_state = RequestRuntimeState {
+            binding_token: String::new(),
             log_observer: None,
             file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -6659,6 +6807,7 @@ mod tests {
         tasks.lock().await.insert(
             request_id,
             PendingTask {
+                binding_token: String::new(),
                 resource_call: false,
                 file_transfer_id: None,
                 file_commit: None,
@@ -6701,6 +6850,7 @@ mod tests {
         let tasks = Arc::new(Mutex::new(BTreeMap::from([(
             request_id,
             PendingTask {
+                binding_token: String::new(),
                 resource_call: false,
                 file_transfer_id: None,
                 file_commit: Some(control),
@@ -6738,6 +6888,7 @@ mod tests {
         let tasks = Arc::new(Mutex::new(BTreeMap::from([(
             request_id,
             PendingTask {
+                binding_token: String::new(),
                 resource_call: false,
                 file_transfer_id: None,
                 file_commit: Some(control.clone()),
@@ -6771,6 +6922,7 @@ mod tests {
         tasks.lock().await.insert(
             request_id,
             PendingTask {
+                binding_token: String::new(),
                 resource_call: false,
                 file_transfer_id: None,
                 file_commit: None,
@@ -6811,6 +6963,7 @@ mod tests {
             tasks.insert(
                 running_id,
                 PendingTask {
+                    binding_token: String::new(),
                     resource_call: false,
                     file_transfer_id: None,
                     file_commit: None,
@@ -6823,6 +6976,7 @@ mod tests {
             tasks.insert(
                 completed_id,
                 PendingTask {
+                    binding_token: String::new(),
                     resource_call: false,
                     file_transfer_id: None,
                     file_commit: None,
@@ -6872,6 +7026,7 @@ mod tests {
         controller_instance_id: remoteops_domain::ControllerInstanceId,
     ) -> ControllerBinding {
         ControllerBinding {
+            installation_grant: None,
             session_id,
             controller_instance_id,
             owner_id: test_owner_id(),
@@ -6881,6 +7036,32 @@ mod tests {
             control_state: Some(test_control_state(session_id, controller_instance_id)),
             binding_token: "relay-only-binding-token".to_owned(),
         }
+    }
+
+    #[cfg(feature = "managed-install-grant")]
+    #[test]
+    fn managed_default_requires_preference_matching_grant_pending_and_no_local_downgrade() {
+        let session = SessionId::new();
+        let mut b = binding(session, ControllerInstanceId::new());
+        let control = AgentPermissionControl::new(PermissionMode::ControllerApproved);
+        b.control_state.as_mut().unwrap().initialization_pending = true;
+        control.set_default_full_control(true);
+        for grant in [None, Some(false), Some(true)] {
+            b.installation_grant = grant;
+            assert_eq!(control.requests_full_on_pair(&b), grant == Some(true));
+        }
+        control.set_default_full_control(false);
+        assert!(!control.requests_full_on_pair(&b));
+        control.set_default_full_control(true);
+        b.controller_kind = ControllerKind::Human;
+        assert!(!control.requests_full_on_pair(&b));
+        b.controller_kind = ControllerKind::Ai;
+        b.control_state.as_mut().unwrap().initialization_pending = false;
+        assert!(!control.requests_full_on_pair(&b));
+        b.control_state.as_mut().unwrap().initialization_pending = true;
+        let _ = control.request_control(b.control_state.clone().unwrap(), ControllerControlMode::StepByStep);
+        b.control_state.as_mut().unwrap().agent_generation += 1;
+        assert!(!control.requests_full_on_pair(&b));
     }
 
     #[test]
@@ -7074,6 +7255,38 @@ mod tests {
             .unwrap()
             .revision += 1;
         assert!(verify_authorized_request(&policy, &local, &bindings, request).is_err());
+    }
+
+    #[test]
+    fn onsite_disconnect_handle_is_limited_to_current_ai_on_capable_relays() {
+        let (sender, receiver) = std_mpsc::channel();
+        let sink = AgentEventSink::Legacy(sender);
+        let policy = LocalPermissionPolicy::default();
+        let session = SessionId::new();
+        let ai_id = ControllerInstanceId::new();
+        let human_id = ControllerInstanceId::new();
+        let ai = binding(session, ai_id);
+        let mut human = binding(session, human_id);
+        human.controller_kind = remoteops_protocol::ControllerKind::Human;
+        let pairs = BTreeMap::from([(ai_id, ai.clone()), (human_id, human)]);
+        let mut requests = policy.permission_control.disconnect_requests.subscribe();
+        for supported in [false, true] {
+            policy.permission_control.disconnect_supported.store(supported, Ordering::SeqCst);
+            emit_controller_bindings(Some(&sink), &pairs, &policy);
+            let AgentEvent::ControllerBindingsChanged { bindings } = receiver.try_recv().unwrap()
+            else { panic!("缺少绑定快照"); };
+            for summary in bindings {
+                let eligible = supported && summary.controller_kind == remoteops_protocol::ControllerKind::Ai;
+                assert_eq!(summary.disconnect_target.is_some(), eligible);
+                if let Some(target) = summary.disconnect_target {
+                    assert!(!format!("{target:?}").contains(&ai.binding_token));
+                    policy.permission_control.disconnect_binding(target).unwrap();
+                    let request = requests.try_recv().unwrap();
+                    assert_eq!(request.session_id, session);
+                    assert!(request.token == ai.binding_token);
+                }
+            }
+        }
     }
 
     #[test]
@@ -7476,6 +7689,7 @@ mod tests {
         shell_sessions: Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
     ) -> RequestRuntimeState {
         RequestRuntimeState {
+            binding_token: String::new(),
             log_observer: None,
             file_commit: FileCommitControl::default(),
             shell_sessions,
@@ -7761,6 +7975,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn human_detach_preserves_ai_shell_in_same_session() {
+        let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut state = shell_test_state(sessions.clone());
+        let session = SessionId::new();
+        let shell = if cfg!(windows) { ShellKind::Cmd } else { ShellKind::System };
+        for owner in ["ai", "human"] {
+            state.binding_token = owner.to_owned();
+            let (_, opened) = execute_test_shell_request(&state, session, RemoteOperation::OpenShell { shell }).await;
+            assert!(opened.error_code.is_none());
+        }
+        close_owned_resources(&sessions, &state.serial_sessions, session, Some("human")).await;
+        {
+            let remaining=sessions.lock().await;
+            assert_eq!(remaining.len(), 1);
+            let ai=remaining.values().next().unwrap();
+            assert_eq!(ai.owner_binding, "ai");
+            assert!(!ai.session.is_closed());
+        }
+        close_session_resources(&sessions, &state.serial_sessions, session).await;
+    }
+
+    #[tokio::test]
     async fn successful_shell_open_publishes_actual_resource_context_only_after_creation() {
         let mut state = shell_test_state(Arc::new(Mutex::new(BTreeMap::new())));
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -7794,6 +8030,7 @@ mod tests {
             .unwrap();
         session.close().await.unwrap();
         let runtime = ShellRuntime {
+            owner_binding: String::new(),
             session_id,
             shell,
             session,
@@ -7827,6 +8064,7 @@ mod tests {
         let state = shell_test_state(Arc::new(Mutex::new(BTreeMap::from([(
             shell_id,
             ShellRuntime {
+                owner_binding: String::new(),
                 session_id,
                 shell,
                 session,
@@ -7855,6 +8093,7 @@ mod tests {
         let shell = lifecycle_test_shell();
         let device = SystemDevice::new();
         let old = ShellRuntime {
+            owner_binding: String::new(),
             session_id: SessionId::new(),
             shell,
             session: device.open_interactive_shell(shell).await.unwrap(),
@@ -7862,6 +8101,7 @@ mod tests {
         };
         old.session.close().await.unwrap();
         let replacement = ShellRuntime {
+            owner_binding: String::new(),
             session_id: old.session_id,
             shell,
             session: device.open_interactive_shell(shell).await.unwrap(),
@@ -7951,6 +8191,7 @@ mod tests {
         sessions.insert(
             serial_session_id,
             SerialRuntime {
+                owner_binding: String::new(),
                 session_id,
                 port_name: "mock-port".to_owned(),
                 writable: true,
@@ -8024,6 +8265,7 @@ mod tests {
         let shell_sessions = Arc::new(Mutex::new(BTreeMap::from([(
             ShellId::new(),
             ShellRuntime {
+                owner_binding: String::new(),
                 session_id: SessionId::new(),
                 shell,
                 session: session.clone(),
@@ -8191,6 +8433,7 @@ mod tests {
         let device = SystemDevice::with_transfer_root(&transfer_root).expect("应创建交换目录");
         let ssh_provider = RecordingSshProvider::default();
         let runtime_state = RequestRuntimeState {
+            binding_token: String::new(),
             log_observer: None,
             file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -8300,6 +8543,7 @@ mod tests {
             ),
         };
         let runtime_state = RequestRuntimeState {
+            binding_token: String::new(),
             log_observer: None,
             file_commit: FileCommitControl::default(),
             shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -8458,6 +8702,7 @@ mod tests {
                 sequence.clone(),
             );
             let runtime = SerialRuntime {
+                owner_binding: String::new(),
                 session_id,
                 port_name: "early-echo-mock".into(),
                 writable: true,
@@ -8473,6 +8718,7 @@ mod tests {
                 .await
                 .insert(serial_id, runtime.clone());
             let state = RequestRuntimeState {
+                binding_token: String::new(),
                 log_observer: Some(observer),
                 file_commit: FileCommitControl::default(),
                 shell_sessions: Arc::new(Mutex::new(BTreeMap::new())),

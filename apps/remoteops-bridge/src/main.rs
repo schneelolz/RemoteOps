@@ -302,7 +302,7 @@ async fn main() -> anyhow::Result<()> {
                                     tokio::select! { _ = event_shutdown.changed() => break, _ = timer.tick() => {} }
                                     while let Ok(event) = event_receiver.try_recv() {
                                         let update = match event {
-                                            AgentEvent::Connected { pairing_code, lease_expires_at } => Some(json!({"state":"ready","accessCode":pairing_code,"leaseExpiresAt":lease_expires_at,"readyElapsedMs":ready_started.elapsed().as_millis()})),
+                                            AgentEvent::Connected { pairing_code, lease_expires_at, .. } => Some(json!({"state":"ready","accessCode":pairing_code,"leaseExpiresAt":lease_expires_at,"readyElapsedMs":ready_started.elapsed().as_millis()})),
                                             AgentEvent::Connecting => Some(json!({"state":"connecting"})),
                                             AgentEvent::Reconnecting { message, .. } => Some(json!({"state":"offline","code":error_code(&message)})),
                                             AgentEvent::OperationLog(log) if log.message.starts_with("startup_phase=") => { let _ = event_output.send(Message::request(None, "bridge.timing", json!({"measurement":log.message}))).await; None },

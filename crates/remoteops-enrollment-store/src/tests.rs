@@ -1083,7 +1083,7 @@ fn version_one_database_migrates_with_tool_management_disabled() {
     let connection = Connection::open(database.path()).unwrap();
     connection
         .execute_batch(
-            "ALTER TABLE enrollment_clients DROP COLUMN tool_management; PRAGMA user_version = 1;",
+            "DROP TABLE enrollment_device_grants; ALTER TABLE enrollment_clients DROP COLUMN tool_management; PRAGMA user_version = 1;",
         )
         .unwrap();
     drop(connection);
@@ -1091,4 +1091,40 @@ fn version_one_database_migrates_with_tool_management_disabled() {
     assert!(!store.has_tool_management(request.installation_id).unwrap());
     assert!(!store.list_clients().unwrap()[0].tool_management);
     assert!(store.authenticate_token(&token(&request), now).is_ok());
+}
+
+#[test]
+fn device_grants_migrate_persist_and_match_only_the_enrolled_pair() {
+    let db = TestDatabase::new();
+    let owner = ControllerOwnerId::new();
+    let first = EnrollmentStore::open(db.path(), owner).unwrap();
+    first.set_settings(endpoints()).unwrap();
+    let now = Utc::now();
+    let installs = [0, 1].map(|_| {
+        let r = request(&create(&first, now));
+        first.redeem(r.clone(), now).unwrap();
+        r.installation_id
+    });
+    drop(first);
+    Connection::open(db.path()).unwrap().execute_batch("DROP TABLE enrollment_device_grants; PRAGMA user_version = 2;").unwrap();
+    let store = EnrollmentStore::open(db.path(), owner).unwrap();
+    let devices = [Uuid::new_v4(), Uuid::new_v4()];
+    assert!(store.list_device_grants(installs[0]).unwrap().is_empty());
+    assert!(store.set_device_grant(installs[0], devices[0], true).unwrap());
+    assert!(!store.set_device_grant(installs[0], devices[0], true).unwrap());
+    drop(store);
+    let store = EnrollmentStore::open(db.path(), owner).unwrap();
+    for (i, installation) in installs.into_iter().enumerate() {
+        for (j, device) in devices.into_iter().enumerate() {
+            assert_eq!(store.has_device_grant(installation, device).unwrap(), (i, j) == (0, 0));
+        }
+    }
+    assert_eq!(store.list_device_grants(installs[0]).unwrap(), vec![devices[0]]);
+    assert!(store.set_device_grant(installs[0], devices[0], false).unwrap());
+    assert!(!store.has_device_grant(installs[0], devices[0]).unwrap());
+    store.set_device_grant(installs[0], devices[0], true).unwrap();
+    store.forget_device_grants(devices[0]).unwrap();
+    assert!(!store.has_device_grant(installs[0], devices[0]).unwrap());
+    store.revoke_client(installs[1]).unwrap();
+    assert!(store.set_device_grant(installs[1], devices[0], true).is_err());
 }

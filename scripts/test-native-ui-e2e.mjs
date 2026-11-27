@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // 本机隔离的真实原生 GUI 端到端验收；凭据、控制码、命令输出只留临时 fixture 和内存。
+import { shortCode } from './test-pairing-code-support.mjs';
 import { spawn } from 'node:child_process';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
@@ -202,7 +203,7 @@ function classifyDiagnosticText(text) {
 function recordUiDiagnostic(snapshot) {
   const has = id => snapshot.main?.controls?.some(row => row.id === id);
   const page = has(335) ? 'trust' : has(314) ? 'setup' : has(331) ? 'permissions' : has(303) ? 'main' : has(337) ? 'details' : has(324) ? 'logs' : has(317) ? 'preferences' : 'other';
-  const summary = { step: current, page, copy_enabled: snapshot.main?.controls?.some(row => row.id === 304 && row.enabled) ?? false, code_available: controlText(snapshot, 303).replace(/\D/g, '').length === 9,
+  const summary = { step: current, page, copy_enabled: snapshot.main?.controls?.some(row => row.id === 304 && row.enabled) ?? false, code_available: Boolean(shortCode(controlText(snapshot, 303))),
     error_categories: classifyDiagnosticText(controlText(snapshot, 312)),
     status_categories: classifyDiagnosticText(controlText(snapshot, 300)),
     observer_visible: Boolean(snapshot.observer?.visible) };
@@ -284,8 +285,8 @@ async function pairingReady(name) {
   try {
     // Agent 首次视觉探测已有35秒预算，且环境探测先于Started；连接等待覆盖该启动预算。
     // 这不是日志的100毫秒批处理或每十万行15秒门槛，后两者保持原值。
-    const snapshot = await waitUi(name, value => controlText(value, 303).replace(/\D/g, '').length === 9, 60000);
-    return { snapshot, code: controlText(snapshot, 303).replace(/\D/g, '') };
+    const snapshot = await waitUi(name, value => Boolean(shortCode(controlText(value, 303))), 60000);
+    return { snapshot, code: shortCode(controlText(snapshot, 303)) };
   } catch (error) {
     // 仅在本轮测试主窗超时后进入详情/日志，正文只做固定分类，绝不保存正文或路径。
     const details = {};
@@ -404,7 +405,7 @@ try {
     return { config: configPath, report: path.join(directory, 'application-report.json') };
   }
   const trustVisible = snapshot => [334, 335, 336].every(id => snapshot.main.controls.some(row => row.id === id && row.enabled));
-  const noPairing = snapshot => controlText(snapshot, 303).replace(/\D/g, '').length !== 9
+  const noPairing = snapshot => !shortCode(controlText(snapshot, 303))
     && !snapshot.main.controls.some(row => row.id === 304 && row.enabled);
 
   if (options.scenario === 'all') {

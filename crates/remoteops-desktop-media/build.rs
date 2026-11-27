@@ -17,11 +17,14 @@ fn main() {
         build.file(source);
     }
     println!("cargo:rerun-if-changed=native/clipboard_internal.hpp");
+    println!("cargo:rerun-if-changed=native/clipboard_image.hpp");
+    println!("cargo:rerun-if-changed=native/crossdesk_capture.hpp");
     build.compile("remoteops_desktop");
     for lib in [
         "d3d11",
         "dxgi",
         "gdi32",
+        "windowscodecs",
         "user32",
         "ole32",
         "shell32",

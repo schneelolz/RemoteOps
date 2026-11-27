@@ -35,6 +35,8 @@ export interface SessionRow {
   controllerHostname: string;
   controllerMacAddress: string;
   controllerInstanceId: string;
+  controllerInstanceIds: string[];
+  controllerHostnames: string[];
   humanController: string;
   ownerUuid: string;
   permissionMode: string;

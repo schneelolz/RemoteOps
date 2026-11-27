@@ -13,6 +13,8 @@ pub mod windows_mcp_stdio;
 // 在任何托管 UIA 查询前加载标准控件代理，避免 PowerShell 动态调用栈使默认代理初始化失败。
 #[cfg(windows)]
 const UIA_CLIENT_INITIALIZATION: &str = include_str!("windows_uia_initialize.ps1");
+#[cfg(windows)]
+const CROSSDESK_UIA: &str = include_str!("windows_crossdesk.ps1");
 
 /// 观察和动作共用相同的控件身份算法，区分同名、同类型的不同 UIA 实例。
 #[cfg(windows)]
@@ -146,6 +148,23 @@ fn hidden_powershell_command() -> tokio::process::Command {
 async fn run_desktop_command(
     mut command: tokio::process::Command,
 ) -> Result<std::process::Output, VisualProviderError> {
+    command.env_remove("REMOTEOPS_VALIDATED_GFX_DLL");
+    // 保持只读映像锁直到受监管的子进程结束，避免校验后被替换。
+    let _image = if let Some(expected) = option_env!("REMOTEOPS_CROSSDESK_CAPTURE_SHA256") {
+        use std::os::windows::fs::OpenOptionsExt;
+        use sha2::{Digest, Sha256};
+        let path = std::env::current_exe().map_err(|e| VisualProviderError::Protocol(e.to_string()))?
+            .with_file_name("remoteops-crossdesk-native.dll");
+        let mut image = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path)
+            .map_err(|_| VisualProviderError::Protocol("定制包缺少 CrossDesk 现场组件".into()))?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut image, &mut hasher).map_err(|e| VisualProviderError::Protocol(e.to_string()))?;
+        if !expected.eq_ignore_ascii_case(&format!("{:x}",hasher.finalize())) {
+            return Err(VisualProviderError::Rejected("CrossDesk 现场组件摘要不一致".into()));
+        }
+        command.env("REMOTEOPS_VALIDATED_GFX_DLL", path);
+        Some(image)
+    } else { None };
     if let Ok(result) =
         tokio::time::timeout(std::time::Duration::from_secs(30), command.output()).await
     {
@@ -453,6 +472,9 @@ $action=$env:REMOTEOPS_UIA_ACTION
 if($action -eq 'press_enter') {
   Add-Type -AssemblyName System.Windows.Forms
   [void]$element.SetFocus(); [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+} elseif ($env:REMOTEOPS_VALIDATED_GFX_DLL) {
+  [void](Assert-RemoteOpsTarget)
+  [RemoteOpsCrossDesk]::Act($targetHandle,$element.GetRuntimeId(),1,'')
 } else {
   $pattern=$element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); [void](Assert-RemoteOpsTarget); $pattern.Invoke()
 }
@@ -462,6 +484,7 @@ if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$tr
             "{TARGET_WINDOW_GUARD}
 {UIA_CONTROL_HELPERS}
 {UIA_CLIENT_INITIALIZATION}
+{CROSSDESK_UIA}
 {script}"
         );
         let mut command = hidden_powershell_command();
@@ -539,12 +562,13 @@ $root=[System.Windows.Automation.AutomationElement]::FromHandle($targetHandle)
 if($null -eq $root){ throw '没有可验证的前台窗口' }
 $element=Find-RemoteOpsControl $root 0
 if($null -eq $element){throw '前台窗口中未找到 UIA 文本目标'}
-$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if($pattern.Current.IsReadOnly){throw 'UIA 文本控件为只读'}; [void](Assert-RemoteOpsTarget); $pattern.SetValue($env:REMOTEOPS_TEXT); if($pattern.Current.Value -cne $env:REMOTEOPS_TEXT){throw 'UIA value verification failed'}; if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if($pattern.Current.IsReadOnly){throw 'UIA 文本控件为只读'}; [void](Assert-RemoteOpsTarget); if($env:REMOTEOPS_VALIDATED_GFX_DLL){[RemoteOpsCrossDesk]::Act($targetHandle,$element.GetRuntimeId(),2,$env:REMOTEOPS_TEXT)}else{$pattern.SetValue($env:REMOTEOPS_TEXT)}; if($pattern.Current.Value -cne $env:REMOTEOPS_TEXT){throw 'UIA value verification failed'}; if($comResult -ge 0){[RemoteOpsCom]::CoUninitialize()}; [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 "#;
         let script = format!(
             "{TARGET_WINDOW_GUARD}
 {UIA_CONTROL_HELPERS}
 {UIA_CLIENT_INITIALIZATION}
+{CROSSDESK_UIA}
 {script}"
         );
         let mut command = hidden_powershell_command();
@@ -648,7 +672,15 @@ public static class RemoteOpsInput {
  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, int data, UIntPtr extra);
 }
 '@ }
-[void](Assert-RemoteOpsTarget)
+$targetHandle=Assert-RemoteOpsTarget
+if($env:REMOTEOPS_VALIDATED_GFX_DLL -and $env:REMOTEOPS_INPUT -notlike 'key:*') {
+ $actions=@{move=0;click=1;left_click=1;double_click=2;right_click=3;middle_click=4;wheel_up=5;wheel_down=6;drag=7;drag_left=7}
+ if(-not $actions.ContainsKey($env:REMOTEOPS_INPUT)){throw '不支持的坐标操作'}
+ [RemoteOpsCrossDesk]::Pointer($targetHandle,[int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS_Y,[int]$env:REMOTEOPS_END_X,[int]$env:REMOTEOPS_END_Y,$actions[$env:REMOTEOPS_INPUT])
+ Assert-RemoteOpsTargetUnchanged $targetHandle
+ [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+ exit 0
+}
 if(-not [RemoteOpsInput]::SetCursorPos([int]$env:REMOTEOPS_X,[int]$env:REMOTEOPS_Y)){throw '无法定位鼠标'}
 $targetHandle=Assert-RemoteOpsTarget
 $inputName=$env:REMOTEOPS_INPUT
@@ -684,6 +716,7 @@ Assert-RemoteOpsTargetUnchanged $targetHandle
 "#;
         let script = format!(
             "{TARGET_WINDOW_GUARD}
+{CROSSDESK_UIA}
 {script}"
         );
         let mut command = hidden_powershell_command();
@@ -857,8 +890,20 @@ $shot = $null; $w = $null; $h = $null; $screenshotError = $null
 if ($env:REMOTEOPS_INCLUDE_SCREENSHOT -eq '1' -and $screens.Count -gt 0) {
   try {
     $b = $screens[0].Bounds; $w=$b.Width; $h=$b.Height
-    $bmp = New-Object System.Drawing.Bitmap($w,$h); $g=[System.Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $ms=New-Object System.IO.MemoryStream
+    $bmp = New-Object System.Drawing.Bitmap($w,$h)
+    if($env:REMOTEOPS_VALIDATED_GFX_DLL -and $screens[0].Primary -and $w%2 -eq 0 -and $h%2 -eq 0) {
+      $bytes=[RemoteOpsCrossDesk]::Capture($w,$h)
+      $rect=[System.Drawing.Rectangle]::new(0,0,$w,$h)
+      $surface=$bmp.LockBits($rect,[Drawing.Imaging.ImageLockMode]::WriteOnly,[Drawing.Imaging.PixelFormat]::Format32bppRgb)
+      try {
+        if($surface.Stride -ne $w*4){throw '图形缓冲区行宽不匹配'}
+        [Runtime.InteropServices.Marshal]::Copy($bytes,0,$surface.Scan0,$bytes.Length)
+      } finally {$bmp.UnlockBits($surface)}
+    } else {
+      $g=[System.Drawing.Graphics]::FromImage($bmp)
+      $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size)
+    }
+    $ms=New-Object System.IO.MemoryStream
     $bmp.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png); $shot=[Convert]::ToBase64String($ms.ToArray())
   } catch { $screenshotError = (Safe-Text $_.Exception.Message); $shot = $null; $w = $null; $h = $null }
   finally { if ($null -ne $g) { $g.Dispose() }; if ($null -ne $bmp) { $bmp.Dispose() }; if ($null -ne $ms) { $ms.Dispose() } }
@@ -889,6 +934,13 @@ if($null -ne $ui -and $null -ne $screenshotError){$ui | Add-Member -NoteProperty
 [void]0
 $cursor = $null
 try { $p = New-Object RemoteOpsUser32+POINT; if ([RemoteOpsUser32]::GetCursorPos([ref]$p)) { $cursor = [pscustomobject]@{ x=$p.X; y=$p.Y } } } catch { $cursor = $null }
+if ($env:REMOTEOPS_VALIDATED_GFX_DLL -and $ui -and $env:REMOTEOPS_INCLUDE_UI_TREE -eq '1' -and $script:activeFingerprint) {
+ $current=[RemoteOpsUser32]::GetForegroundWindow()
+ if ($current -eq $foreground -and $foreground -ne [IntPtr]::Zero) {
+  $nativeTree=[RemoteOpsCrossDesk]::Tree($current) | ConvertFrom-Json
+  $ui | Add-Member -NotePropertyName crossdesk -NotePropertyValue $nativeTree -Force
+ }
+}
 # UIA 树通常有 6 层，JSON 深度不足会让 ListItem 等深层节点退化成字符串，控制器将无法定位文件项目。
 [pscustomobject]@{ state=$state; state_reason=$stateReason; displays=$displays; windows=$windows; active_window_fingerprint=$script:activeFingerprint; screenshot_base64=$shot; screenshot_width=$w; screenshot_height=$h; cursor=$cursor; ui_tree=$ui } | ConvertTo-Json -Compress -Depth 32
 "#;
@@ -896,6 +948,7 @@ try { $p = New-Object RemoteOpsUser32+POINT; if ([RemoteOpsUser32]::GetCursorPos
             "{TARGET_WINDOW_GUARD}
 {UIA_CONTROL_HELPERS}
 {UIA_CLIENT_INITIALIZATION}
+{CROSSDESK_UIA}
 {script}"
         );
         let mut command = hidden_powershell_command();
@@ -966,7 +1019,7 @@ try { $p = New-Object RemoteOpsUser32+POINT; if ([RemoteOpsUser32]::GetCursorPos
             .unwrap_or(remoteops_domain::VisualSessionState::NoInteractiveDesktop);
         let mut ui_tree = value.get("ui_tree").cloned().filter(|v| !v.is_null());
         if let Some(tree) = ui_tree.as_mut().and_then(serde_json::Value::as_object_mut) {
-            tree.insert("provider".into(), serde_json::json!("windows-native-uia"));
+            tree.insert("provider".into(), serde_json::json!(if tree.contains_key("crossdesk") {"crossdesk-uia"} else {"windows-native-uia"}));
             if let Some(snapshot) = upstream_snapshot {
                 tree.insert(
                     "upstream".into(),

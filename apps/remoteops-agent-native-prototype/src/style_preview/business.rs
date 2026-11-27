@@ -205,7 +205,7 @@ fn refresh_values(app: &App) {
         }
         let ids: &[i32] = match panel.kind {
             Kind::Main if app.state.borrow().logs => &[312],
-            Kind::Main => &[300, 303, 304, 305, 306, 312],
+            Kind::Main => &[300, 303, 304, 305, 306, 312, 341, 343, 344, 345],
             Kind::Details => &[402, 404, 406, 408, 410],
             Kind::Permissions => &[421, 426],
             Kind::Grant => &[441],
@@ -448,6 +448,10 @@ pub(super) fn command(panel: &Panel, id: i32) -> bool {
         return false;
     }
     match id {
+        345 => { perform(app, ProductAction::DisconnectHuman); }
+        341 => {
+            perform(app, ProductAction::DisconnectAi);
+        }
         304 => {
             app.state.borrow_mut().copied = None;
             let snapshot = app.state.borrow().product.clone().expect("业务快照");
@@ -567,7 +571,13 @@ pub(super) fn command(panel: &Panel, id: i32) -> bool {
             }
         }
         506 => {
-            let relay = value(panel.control(502));
+            let relay = app
+                .state
+                .borrow()
+                .product
+                .as_ref()
+                .filter(|p| !p.endpoint_editable)
+                .map_or_else(|| value(panel.control(502)), |p| p.relay.clone());
             if perform(app, ProductAction::SaveSetup { relay }) {
                 app.business
                     .borrow_mut()
@@ -682,13 +692,33 @@ pub(super) fn menu(panel: &Panel, id: i32) -> bool {
             app.open(Kind::About, panel.hwnd.get());
         }
         5022 => {
-            app.open(Kind::Setup, panel.hwnd.get());
+            if app
+                .state
+                .borrow()
+                .product
+                .as_ref()
+                .is_some_and(|p| p.endpoint_editable)
+            {
+                app.open(Kind::Setup, panel.hwnd.get());
+            }
         }
         5043 => app.observer(),
         5030..=5046 => {}
         _ => return false,
     }
     true
+}
+
+fn display_detail(snapshot: &ProductSnapshot, text: &str) -> String {
+    let mut display = text.to_owned();
+    if !snapshot.endpoint_editable {
+        for address in [&snapshot.relay, &snapshot.server_name] {
+            if !address.is_empty() {
+                display = display.replace(address, snapshot.t("组织中继", "organization relay"));
+            }
+        }
+    }
+    display
 }
 
 fn logs(snapshot: &ProductSnapshot, filter: usize) -> String {
@@ -704,7 +734,10 @@ fn logs(snapshot: &ProductSnapshot, filter: usize) -> String {
     }) {
         let row = format!(
             "{} [{}] {} {}",
-            log.occurred, log.request, log.source, log.message
+            log.occurred,
+            log.request,
+            log.source,
+            display_detail(snapshot, &log.message)
         )
         .replace('\0', "\u{2400}");
         let size = row.encode_utf16().count() + 2;
@@ -741,22 +774,29 @@ pub(super) fn text_for(panel: &Panel, id: i32, original: &str) -> String {
         460 => if state.english { format!("Exit {}?", snapshot.product_name) } else { format!("确认退出 {}？", snapshot.product_name) },
         500 => if state.english { format!("Welcome to {}", snapshot.product_name) } else { format!("欢迎使用 {}", snapshot.product_name) },
         540 => snapshot.product_name.clone(),
-        300 => snapshot.status.clone(),
+        300 => if snapshot.tls.is_some() || !matches!(snapshot.phase, crate::product::ProductPhase::Waiting | crate::product::ProductPhase::Controlled) { snapshot.status.clone() } else { String::new() },
+        341 | 345 => t("断开", "End").into(),
+        343 => if snapshot.ai_connected { t("AI 工程师\r\n已连接", "AI engineer\r\nConnected") } else { t("AI 工程师\r\n未连接", "AI engineer\r\nOffline") }.into(),
+        344 => if snapshot.human_connected { t("人工运维\r\n已连接", "Operator\r\nConnected") } else { t("人工运维\r\n未连接", "Operator\r\nOffline") }.into(),
         303 => snapshot.code.clone().unwrap_or_else(|| "--- --- ---".into()),
         304 => if state.copied.is_some() { "✓".into() } else { t("复制控制码", "Copy code").into() },
         305 => snapshot.countdown.clone(),
         306 => state.activity_view.text(snapshot.language),
-        312 | 504 => if state.business_error.is_empty() { snapshot.detail.clone() } else { state.business_error.clone() },
+        312 | 504 => display_detail(snapshot, if state.business_error.is_empty() { &snapshot.detail } else { &state.business_error }),
         311 if panel.kind == Kind::Main => logs(snapshot, state.filter),
         410 => state.business_error.clone(),
-        402 => snapshot.relay.clone(),
+        402 if snapshot.endpoint_editable => snapshot.relay.clone(),
+        402 => String::new(),
         404 => t(if snapshot.elevated { "管理员" } else { "普通用户" }, if snapshot.elevated { "Administrator" } else { "Standard user" }).into(),
         406 => snapshot.transfer_root.clone(),
         408 => snapshot.capabilities.iter().filter(|(_, enabled)| *enabled).map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(" · "),
         421 => if snapshot.control_source.is_empty() { t("由本机用户决定工程师可以执行的操作。", "The local user controls permitted operations.").into() } else { format!("{}：{}", t("授权来源", "Permission source"), snapshot.control_source) },
         424 => t("以后默认允许完全控制", "Allow full control by default").into(),
         426 => {
-            let mut text = snapshot.control_summary.clone();
+            let mut text = format!("{} · {}", t("本次连接", "This session"), snapshot.control_summary);
+            if !snapshot.control_pending && !snapshot.control_enabled && snapshot.ai_connected {
+                text.push_str(t("\r\n人工接管或连接策略限制了权限切换。", "\r\nTakeover or connection policy restricts mode changes."));
+            }
             if snapshot.control_pending { text.push_str(t("\r\n正在等待权限确认", "\r\nWaiting for permission confirmation")); }
             if let Some(error) = &snapshot.control_error { text.push_str("\r\n"); text.push_str(error); }
             if !state.business_error.is_empty() { text.push_str("\r\n"); text.push_str(&state.business_error); }
@@ -774,13 +814,18 @@ pub(super) fn text_for(panel: &Panel, id: i32, original: &str) -> String {
             if state.business_error.is_empty() { text } else { format!("{text}\r\n{}", state.business_error) }
         }
         502 => app.business.borrow().as_ref().and_then(|business| business.draft_relay.clone()).unwrap_or_else(|| snapshot.relay.clone()),
+        503 if !snapshot.endpoint_editable => t("使用组织预设的连接。", "Uses the connection provided by your organization.").into(),
         503 => format!("{}\r\n{}：{}", t("保存后将建立真实连接并获取控制码。", "Saving establishes a real connection and obtains a pairing code."), t("配置文件", "Configuration"), snapshot.config_path),
+        506 if !snapshot.endpoint_editable => t("重新连接", "Reconnect").into(),
         506 => t("保存并连接", "Save and connect").into(),
         523 => t("信任并保存", "Trust and save").into(),
-        524 => snapshot.tls.as_ref().map_or_else(String::new, |tls| format!("Relay: {}\r\nSHA256: {}\r\n{}", tls.relay, tls.fingerprint, tls.reason)),
+        524 => snapshot.tls.as_ref().map_or_else(String::new, |tls| if snapshot.endpoint_editable { format!("Relay: {}\r\nSHA256: {}\r\n{}", tls.relay, tls.fingerprint, tls.reason) } else { format!("{}\r\nSHA256: {}\r\n{}", t("请核对组织服务证书", "Verify your organization’s certificate"), tls.fingerprint, display_detail(snapshot, &tls.reason)) }),
         526 => if state.business_error.is_empty() { snapshot.tls.as_ref().and_then(|tls| tls.error.clone()).unwrap_or_else(|| t("请通过可信渠道核对指纹后再继续。", "Verify the fingerprint using a trusted channel.").into()) } else { state.business_error.clone() },
         542 => t("Windows 原生界面；复用现有 RemoteOps 业务核心。\r\n实际连接、权限和操作结果由共享宿主提供。", "Windows native interface using the existing RemoteOps core.\r\nThe shared host provides actual connection, permission and operation results.").into(),
-        543 => format!("{} v{}", snapshot.product_name, snapshot.version),
+        543 => match &snapshot.latest_update {
+            Some(latest) => format!("{} v{} · {} v{latest}", snapshot.product_name, snapshot.version, t("可更新至", "Update available")),
+            None => format!("{} v{}", snapshot.product_name, snapshot.version),
+        },
         _ => original.into(),
     }
 }
@@ -806,6 +851,18 @@ pub(super) fn decorate(panel: &Panel) {
         return;
     };
     unsafe {
+        if let Some(snapshot) = app.state.borrow().product.as_ref() {
+            for (id, connected) in [(341, snapshot.ai_connected), (345, snapshot.human_connected)] {
+                let button = panel.control(id);
+                if button.is_null() { continue; }
+                if (IsWindowVisible(button) != 0) != connected {
+                    ShowWindow(button, if connected { SW_SHOWNOACTIVATE } else { SW_HIDE });
+                }
+                if (IsWindowEnabled(button) != 0) == snapshot.disconnect_pending {
+                    EnableWindow(button, i32::from(!snapshot.disconnect_pending));
+                }
+            }
+        }
         for (id, enabled) in [
             (304, can_copy),
             (323, has_transfer_root),

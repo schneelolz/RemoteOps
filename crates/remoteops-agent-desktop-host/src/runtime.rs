@@ -90,6 +90,7 @@ pub(super) struct RuntimeHost {
     pending_trust: Option<AgentConfig>,
     epoch: Option<u64>,
     bindings: Vec<AgentControllerBinding>,
+    pending_disconnect: Option<(remoteops_agent::BindingDisconnectTarget, Instant)>,
     running: BTreeSet<RequestId>,
     contexts: BTreeMap<RequestId, OperationContext>,
     pending_control: Option<(RequestId, Instant)>,
@@ -184,6 +185,7 @@ impl RuntimeHost {
             pending_trust: None,
             epoch: None,
             bindings: Vec::new(),
+            pending_disconnect: None,
             running: BTreeSet::new(),
             contexts: BTreeMap::new(),
             pending_control: None,
@@ -282,6 +284,20 @@ impl RuntimeHost {
                 self.update_control(state);
                 Ok(())
             }
+            ProductAction::DisconnectAi | ProductAction::DisconnectHuman => {
+                let kind = if matches!(action,ProductAction::DisconnectHuman) {ControllerKind::Human} else {ControllerKind::Ai};
+                let binding = self.bindings.iter().find(|b| b.controller_kind == kind)
+                    .ok_or_else(|| state.t("AI 工程师已断开", "AI engineer already disconnected").to_owned())?;
+                let target = binding.disconnect_target.clone().ok_or_else(|| state.t(
+                    "当前中继不支持现场断开，请联系管理员升级中继。", "Update the relay to disconnect an AI engineer here.").to_owned())?;
+                if self.pending_disconnect.is_none() {
+                    self.permission.disconnect_binding(target.clone()).map_err(|e| safe(&e.to_string()))?;
+                    self.pending_disconnect = Some((target, Instant::now()));
+                    state.detail.clear();
+                    self.update_control(state);
+                }
+                Ok(())
+            }
             ProductAction::RequestControl { full } => {
                 if self.pending_control.is_some() {
                     return Err(state
@@ -293,10 +309,7 @@ impl RuntimeHost {
                         .t("尚未获得有效会话权限", "No confirmed session permission")
                         .to_owned()
                 })?;
-                if matches!(
-                    current.mode,
-                    ControllerControlMode::ReadOnly | ControllerControlMode::ExternalApproval
-                ) {
+                if !self.can_change_control() {
                     return Err(state
                         .t(
                             "当前会话不允许修改控制模式",
@@ -626,6 +639,15 @@ impl RuntimeHost {
     }
 
     fn refresh_control_timeout(&mut self, state: &mut ProductSnapshot) {
+        if self.pending_disconnect.as_ref().is_some_and(|(_, start)| start.elapsed() >= Duration::from_secs(6)) {
+            self.pending_disconnect = None;
+            state.detail = state
+                .t(
+                    "中继尚未确认断开，可重试",
+                    "Disconnect not yet confirmed; retry",
+                )
+                .into();
+        }
         if self
             .pending_control
             .as_ref()
@@ -749,13 +771,16 @@ impl RuntimeHost {
                 .to_vec();
             }
             AgentEvent::Connecting => {
+                state.latest_update = None;
                 self.clear_connection(state);
                 state.phase = ProductPhase::Connecting;
             }
             AgentEvent::Connected {
                 pairing_code,
                 lease_expires_at,
+                latest_update,
             } => {
+                state.latest_update = latest_update;
                 state.code = Some(format_code(&pairing_code));
                 state.code_expires_unix = Some(lease_expires_at.timestamp());
                 state.phase = if state.controllers > 0 {
@@ -765,7 +790,8 @@ impl RuntimeHost {
                 };
                 state.detail.clear();
             }
-            AgentEvent::Registered { .. } => {
+            AgentEvent::Registered { latest_update, .. } => {
+                state.latest_update = latest_update;
                 state.code = None;
                 state.phase = ProductPhase::Waiting;
             }
@@ -773,11 +799,6 @@ impl RuntimeHost {
                 state.code_expires_unix = Some(lease_expires_at.timestamp());
             }
             AgentEvent::ControllerCountChanged { active_connections } => {
-                if active_connections > state.controllers {
-                    state.record_lifecycle(LifecycleKind::Connected, None);
-                } else if active_connections < state.controllers {
-                    state.record_lifecycle(LifecycleKind::Disconnected, None);
-                }
                 state.controllers = active_connections;
                 if active_connections == 0 {
                     self.bindings.clear();
@@ -1123,9 +1144,6 @@ impl RuntimeHost {
 
     fn clear_connection(&mut self, state: &mut ProductSnapshot) {
         state.resource_progress = None;
-        if state.controllers > 0 {
-            state.record_lifecycle(LifecycleKind::Disconnected, None);
-        }
         self.epoch = None;
         self.bindings.clear();
         self.running.clear();
@@ -1149,14 +1167,35 @@ impl RuntimeHost {
             .and_then(|binding| binding.control_state.clone())
     }
 
-    fn update_control(&self, state: &mut ProductSnapshot) {
+    fn can_change_control(&self) -> bool {
+        self.bindings.iter().find(|b| b.controller_kind == ControllerKind::Ai).is_some_and(|b| {
+            matches!(b.permission_mode, remoteops_domain::PermissionMode::ControllerApproved | remoteops_domain::PermissionMode::FullAccess)
+                && b.control_state.as_ref().is_some_and(|state| !state.initialization_pending && state.mode != ControllerControlMode::ExternalApproval)
+        })
+    }
+
+    fn update_control(&mut self, state: &mut ProductSnapshot) {
+        let ai = self.bindings.iter().find(|b| b.controller_kind == ControllerKind::Ai);
+        if state.ai_connected != ai.is_some() {
+            state.record_lifecycle(
+                if ai.is_some() {
+                    LifecycleKind::Connected
+                } else {
+                    LifecycleKind::Disconnected
+                },
+                None,
+            );
+        }
+        state.ai_connected = ai.is_some();
+        state.human_connected = self.bindings.iter().any(|b| b.controller_kind == ControllerKind::Human);
+        if self.pending_disconnect.as_ref().is_some_and(|(target, _)| {
+            !self.bindings.iter().any(|b| b.disconnect_target.as_ref() == Some(target))
+        }) {
+            self.pending_disconnect = None;
+        }
+        state.disconnect_pending = self.pending_disconnect.is_some();
         let current = self.control_state();
-        state.control_enabled = current.as_ref().is_some_and(|s| {
-            !matches!(
-                s.mode,
-                ControllerControlMode::ReadOnly | ControllerControlMode::ExternalApproval
-            )
-        }) && !state.control_pending;
+        state.control_enabled = self.can_change_control() && !state.control_pending;
         let expired = current.as_ref().is_some_and(|s| {
             s.mode == ControllerControlMode::FullAccess
                 && s.expires_at.is_some_and(|end| end <= chrono::Utc::now())
@@ -1164,7 +1203,7 @@ impl RuntimeHost {
         state.control_summary = current.as_ref().map_or_else(
             || {
                 state
-                    .t("等待控制端连接", "Waiting for controller")
+                    .t("等待 AI 工程师连接后，可切换本次权限", "Connect an AI engineer to change session permissions")
                     .to_owned()
             },
             |s| {
@@ -1184,9 +1223,15 @@ impl RuntimeHost {
                 .to_owned()
             },
         );
-        state.control_source = current
-            .and_then(|s| s.source)
-            .map_or_else(String::new, |source| format!("{source:?}"));
+        use remoteops_protocol::ControlSource;
+        state.control_source = match current.and_then(|s| s.source) {
+            Some(ControlSource::LocalDefault) if ai.is_some_and(|b| b.installation_authorized) =>
+                state.t("管理员已授权此安装", "Administrator authorized this installation"),
+            Some(ControlSource::LocalDefault) => state.t("现场默认设置", "Local preference"),
+            Some(ControlSource::Local) => state.t("现场手动授权", "Granted locally"),
+            Some(ControlSource::Mcp) => state.t("控制端手动授权", "Granted by controller"),
+            None => "",
+        }.to_owned();
     }
 
     fn update_status(state: &mut ProductSnapshot) {
@@ -1200,7 +1245,11 @@ impl RuntimeHost {
             ProductPhase::Setup => state.t("首次使用，请配置连接", "Configure the connection"),
             ProductPhase::Connecting => state.t("正在连接", "Connecting"),
             ProductPhase::Waiting => state.t("等待工程师连接", "Waiting for engineer"),
-            ProductPhase::Controlled => state.t("AI工程师已连接", "AI engineer connected"),
+            ProductPhase::Controlled if state.ai_connected && state.human_connected => state.t("AI 工程师与人工运维已连接","AI engineer and operator connected"),
+            ProductPhase::Controlled if state.ai_connected => {
+                state.t("AI 工程师已连接", "AI engineer connected")
+            }
+            ProductPhase::Controlled => state.t("人工控制端已连接", "Operator connected"),
             ProductPhase::Reconnecting => state.t("连接中断，正在重连", "Reconnecting"),
             ProductPhase::Failed => state.t("连接失败，请查看详情", "Connection failed"),
             ProductPhase::Stopped => state.t("远程协助已停止", "Remote assistance stopped"),
@@ -1288,11 +1337,8 @@ impl Drop for RuntimeHost {
 }
 
 fn format_code(code: &str) -> String {
-    if code.len() == 9 && code.bytes().all(|b| b.is_ascii_digit()) {
-        format!("{}-{}-{}", &code[..3], &code[3..6], &code[6..])
-    } else {
-        code.to_owned()
-    }
+    remoteops_domain::PairingCode::parse(code)
+        .map_or_else(|_| code.to_owned(), |value| value.display_grouped())
 }
 
 async fn verify_trust(config: AgentConfig) -> TrustResult {
@@ -1345,6 +1391,46 @@ mod tests {
     }
 
     #[test]
+    fn operator_stays_connected_after_the_ai_leaves() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut host, mut state) = isolated_host(directory.path());
+        let mut output = Vec::new();
+        state.phase = ProductPhase::Controlled;
+        state.controllers = 1;
+        let mut human = binding();
+        human.controller_kind = ControllerKind::Human;
+        human.control_state = None;
+        host.apply(
+            AgentEvent::ControllerBindingsChanged {
+                bindings: vec![human.clone(), binding()],
+            },
+            &mut state,
+            &mut output,
+        );
+        assert!(state.ai_connected && state.human_connected);
+        RuntimeHost::update_status(&mut state);
+        assert_eq!(state.status, "AI 工程师与人工运维已连接");
+        assert!(host.action(ProductAction::DisconnectHuman, &mut state).unwrap_err().contains("升级中继"));
+        assert!(host.action(ProductAction::DisconnectAi, &mut state).unwrap_err().contains("升级中继"));
+        assert!(state.ai_connected);
+        host.apply(
+            AgentEvent::ControllerBindingsChanged {
+                bindings: vec![human],
+            },
+            &mut state,
+            &mut output,
+        );
+        RuntimeHost::update_status(&mut state);
+        assert!(!state.ai_connected);
+        assert_eq!(state.controllers, 1);
+        assert_eq!(state.status, "人工控制端已连接");
+        assert_eq!(
+            state.lifecycle_events.back().unwrap().kind,
+            LifecycleKind::Disconnected
+        );
+    }
+
+    #[test]
     fn lifecycle_preserves_all_batched_transitions_and_parallel_execution_without_output() {
         let directory = tempfile::tempdir().unwrap();
         let (mut host, mut state) = isolated_host(directory.path());
@@ -1352,6 +1438,13 @@ mod tests {
         host.apply(
             AgentEvent::ControllerCountChanged {
                 active_connections: 1,
+            },
+            &mut state,
+            &mut output,
+        );
+        host.apply(
+            AgentEvent::ControllerBindingsChanged {
+                bindings: vec![binding()],
             },
             &mut state,
             &mut output,
@@ -2037,6 +2130,8 @@ mod tests {
 
     fn binding() -> AgentControllerBinding {
         AgentControllerBinding {
+            installation_authorized: false,
+            disconnect_target: None,
             control_state: Some(SessionControlState {
                 initialization_pending: false,
                 session_id: remoteops_domain::SessionId::new(),
@@ -2050,7 +2145,7 @@ mod tests {
             }),
             owner_id: remoteops_domain::ControllerOwnerId::new(),
             controller_kind: ControllerKind::Ai,
-            permission_mode: remoteops_domain::PermissionMode::ApprovalRequired,
+            permission_mode: remoteops_domain::PermissionMode::ControllerApproved,
             controller_control_mode: Some(ControllerControlMode::StepByStep),
             full_access_authorized_locally: false,
         }
@@ -2100,6 +2195,24 @@ mod tests {
         assert!(host.config.tls_fingerprint.is_none());
         assert!(state.tls.unwrap().error.is_some());
         assert!(host.pending_trust.is_some());
+    }
+
+    #[test]
+    fn control_buttons_follow_the_live_ai_permission_ceiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut host, mut state) = isolated_host(directory.path());
+        let mut ai = binding();
+        ai.control_state.as_mut().unwrap().mode = ControllerControlMode::ReadOnly;
+        for (ceiling, allowed) in [
+            (remoteops_domain::PermissionMode::ReadOnly, false),
+            (remoteops_domain::PermissionMode::ApprovalRequired, false),
+            (remoteops_domain::PermissionMode::ControllerApproved, true),
+        ] {
+            ai.permission_mode = ceiling;
+            host.bindings = vec![ai.clone()];
+            host.update_control(&mut state);
+            assert_eq!(state.control_enabled, allowed);
+        }
     }
 
     #[test]
@@ -2264,6 +2377,7 @@ mod tests {
     fn pairing_code_format_does_not_slice_non_ascii() {
         assert_eq!(format_code("123456789"), "123-456-789");
         assert_eq!(format_code("中文码"), "中文码");
+        assert_eq!(format_code("a2cd3ef4g"), "A2C-D3E-F4G");
     }
 
     #[test]

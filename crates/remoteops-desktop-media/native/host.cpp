@@ -14,6 +14,7 @@
 #include <dxgi1_2.h>
 #include <wtsapi32.h>
 #include <wrl/client.h>
+#include "crossdesk_capture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -544,7 +545,7 @@ INPUT KeyEvent(WORD vk) noexcept {
     return input;
 }
 
-bool SendOne(INPUT& input) noexcept {
+bool LegacySendOne(INPUT& input) noexcept {
     return SendInput(1, &input, sizeof(input)) == 1;
 }
 
@@ -566,6 +567,20 @@ bool NormalizePixel(LONG pixel, LONG begin, LONG end, LONG& result) noexcept {
 
 enum class Action : UINT_PTR { None, View, Control, Stop };
 
+// 数值经 ro_host_stop_reason 交给 Rust；保留旧原因的编号。
+enum class StopReason : int {
+    None = 0, Operator = 1, SessionChange = 3, Dpi = 4,
+    ConsoleSession = 5, WindowStation = 6, ThreadDesktop = 7, SessionQuery = 8,
+    InactiveSession = 9, LockedSession = 10, ShellUser = 11, InputDesktop = 12,
+    DisplayLayout = 13, PanelHidden = 14, DisplayChanged = 15, PanelPosition = 16,
+    StopButton = 17, QuitMessage = 18, WindowDestroyed = 19, PanelText = 20,
+    ProcessSession = 21, PanelCreation = 22, SessionNotification = 23, Com = 24,
+    Allocation = 25, WrongThread = 26, PanelCovered = 27, PanelVisibility = 28,
+    Released = 29, ProtocolQuery = 30, UnsupportedProtocol = 31,
+    RdpDisconnect = 32, ServiceSession = 33
+};
+thread_local StopReason lastHostCreationError = StopReason::None;
+
 bool LocalMouseMessage() noexcept {
     INPUT_MESSAGE_SOURCE source{};
     return GetCurrentInputMessageSource(&source) &&
@@ -580,7 +595,7 @@ public:
     bool comInitialized = false;
 
     ~Host() {
-        Stop();
+        Stop(StopReason::Released);
         FinishStop();
         if (panel_) {
             if (registeredForSession_) {
@@ -602,11 +617,16 @@ public:
     bool Start() noexcept {
         if (!ProcessIdToSessionId(GetCurrentProcessId(), &session_) ||
             !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &ownToken_.value)) {
-            return false;
+            return Fail(StopReason::ProcessSession);
         }
-        if (!Interactive() || !ReadLayout(layout_)) {
-            Stop();
-            return true;
+        if (session_ == 0) return Fail(StopReason::ServiceSession);
+        // 仅已配对的人工桌面可选用本进程的 RDP 会话，绑定后不跟随其他桌面。
+        rdp_ = pairedOperator_ && session_ != WTSGetActiveConsoleSessionId();
+        if (const auto reason = InteractiveFailure(); reason != StopReason::None) {
+            return Fail(reason);
+        }
+        if (!ReadLayout(layout_)) {
+            return Fail(StopReason::DisplayLayout);
         }
 
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -646,9 +666,14 @@ public:
         viewButton_ = CreateButton(L"\u5141\u8BB8\u89C2\u770B", Action::View);
         controlButton_ = CreateButton(L"\u5141\u8BB8\u63A7\u5236", Action::Control);
         stopButton_ = CreateButton(L"\u505C\u6B62\u5171\u4EAB", Action::Stop);
-        if (!label_ || !viewButton_ || !controlButton_ || !stopButton_ ||
-            !PositionPanel() || !WTSRegisterSessionNotification(panel_, NOTIFY_FOR_THIS_SESSION)) {
-            return false;
+        if (!label_ || !viewButton_ || !controlButton_ || !stopButton_) {
+            return Fail(StopReason::PanelCreation);
+        }
+        if (!PositionPanel()) {
+            return Fail(StopReason::PanelPosition);
+        }
+        if (!WTSRegisterSessionNotification(panel_, NOTIFY_FOR_THIS_SESSION)) {
+            return Fail(StopReason::SessionNotification);
         }
         registeredForSession_ = true;
         viewing_ = pairedOperator_;
@@ -671,8 +696,11 @@ public:
 
     bool Service() noexcept {
         Pump();
-        if (stopped_ || !CheckEnvironment()) {
-            Stop(2);
+        if (!stopped_) {
+            const auto reason = EnvironmentFailure();
+            if (reason != StopReason::None) Stop(reason);
+        }
+        if (stopped_) {
             FinishStop();
             return false;
         }
@@ -697,6 +725,10 @@ public:
         return controlling_ ? 3 : viewing_ ? 2 : 1;
     }
 
+    bool UseCrossDeskCapture(const wchar_t* path) noexcept {
+        return pairedOperator_ && Service() && viewing_ && !controlling_ && crossdesk_.Open(path);
+    }
+
     int RequestInput(bool enabled) noexcept {
         if (!enabled) {
             const bool changed = inputRequested_ || controlling_;
@@ -711,8 +743,8 @@ public:
             if (changed && !stopped_) {
                 UpdatePanel();
             }
-            Service();
-            return 0;
+            const bool live = Service();
+            return live && !AnyHeld() ? 0 : -1;
         }
 
         if (!Service()) {
@@ -749,14 +781,16 @@ public:
             return -1;
         }
 
-        if (!capture_.Read(layout_)) {
-            return Service() && viewing_ && generation == generation_ ? -1 : 0;
+        if (crossdesk_.Active()) {
+            const int result = crossdesk_.Read(output, capacity, sourceW, sourceH, outW, outH);
+            if (result <= 0) return result;
+        } else {
+            if (!capture_.Read(layout_)) {
+                return Service() && viewing_ && generation == generation_ ? -1 : 0;
+            }
+            if (!Service() || !viewing_ || generation != generation_) return 0;
+            ScaleBgra(capture_.Pixels(), sourceW, sourceH, output, outW, outH);
         }
-        if (!Service() || !viewing_ || generation != generation_) {
-            return 0;
-        }
-
-        ScaleBgra(capture_.Pixels(), sourceW, sourceH, output, outW, outH);
         if (!Service() || !viewing_ || generation != generation_) {
             std::memset(output, 0, bytes);
             return 0;
@@ -797,9 +831,10 @@ public:
         }
     }
 
-    int StopReason() const noexcept { return stopReason_; }
+    StopReason Reason() const noexcept { return stopReason_; }
+    bool IsRdp() const noexcept { return rdp_; }
 
-    void Stop(int reason = 0) noexcept {
+    void Stop(StopReason reason) noexcept {
         if (!stopped_) {
             stopReason_ = reason;
             stopped_ = true;
@@ -812,15 +847,30 @@ public:
     }
 
     int DpiFailure() noexcept {
-        Stop(4);
+        Stop(StopReason::Dpi);
         FinishStop();
         return 0;
     }
 
 private:
-    bool Interactive() const noexcept {
-        if (!ownToken_.value || session_ == 0 || session_ != WTSGetActiveConsoleSessionId()) {
-            return false;
+    bool Fail(StopReason reason) noexcept {
+        Stop(reason);
+        return false;
+    }
+
+    StopReason InteractiveFailure() noexcept {
+        if (!ownToken_.value || session_ == 0) return StopReason::ProcessSession;
+        if (!rdp_ && session_ != WTSGetActiveConsoleSessionId()) return StopReason::ConsoleSession;
+        if (rdp_) {
+            WtsBuffer protocol;
+            DWORD bytes = 0;
+            if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session_, WTSClientProtocolType,
+                                             &protocol.value, &bytes) || !protocol.value || bytes < sizeof(USHORT)) {
+                return StopReason::ProtocolQuery;
+            }
+            USHORT type = 0;
+            std::memcpy(&type, protocol.value, sizeof(type));
+            if (type != WTS_PROTOCOL_TYPE_RDP) return StopReason::UnsupportedProtocol;
         }
 
         const HWINSTA station = GetProcessWindowStation();
@@ -828,9 +878,11 @@ private:
         DWORD needed = 0;
         if (!ObjectNamed(station, L"WinSta0") ||
             !GetUserObjectInformationW(station, UOI_FLAGS, &flags, sizeof(flags), &needed) ||
-            !(flags.dwFlags & WSF_VISIBLE) ||
-            !ObjectNamed(GetThreadDesktop(owner), L"Default")) {
-            return false;
+            !(flags.dwFlags & WSF_VISIBLE)) {
+            return StopReason::WindowStation;
+        }
+        if (!ObjectNamed(GetThreadDesktop(owner), L"Default")) {
+            return StopReason::ThreadDesktop;
         }
 
         WtsBuffer buffer;
@@ -838,43 +890,53 @@ private:
         if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session_, WTSSessionInfoEx,
                                          &buffer.value, &bytes) ||
             !buffer.value || bytes < sizeof(WTSINFOEXW)) {
-            return false;
+            return StopReason::SessionQuery;
         }
         const auto* info = reinterpret_cast<const WTSINFOEXW*>(buffer.value);
         if (info->Level != 1) {
-            return false;
+            return StopReason::SessionQuery;
         }
         const auto& logon = info->Data.WTSInfoExLevel1;
-        if (logon.SessionId != session_ || logon.SessionState != WTSActive ||
-            logon.SessionFlags != WTS_SESSIONSTATE_UNLOCK || !logon.UserName[0] ||
-            !SameShellUser(session_, ownToken_.value)) {
-            return false;
+        if (logon.SessionId != session_ || logon.SessionState != WTSActive || !logon.UserName[0]) {
+            return StopReason::InactiveSession;
+        }
+        if (logon.SessionFlags != WTS_SESSIONSTATE_UNLOCK) {
+            return StopReason::LockedSession;
+        }
+        if (!SameShellUser(session_, ownToken_.value)) {
+            return StopReason::ShellUser;
         }
 
         const DesktopHandle input{OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS)};
-        return ObjectNamed(input.value, L"Default") && session_ == WTSGetActiveConsoleSessionId();
+        if (!ObjectNamed(input.value, L"Default")) return StopReason::InputDesktop;
+        const bool onConsole = session_ == WTSGetActiveConsoleSessionId();
+        if (!rdp_) return onConsole ? StopReason::None : StopReason::ConsoleSession;
+        if (onConsole) return StopReason::SessionChange;
+        // RDP 重连可以复用数值相同的 Session ID；旧共享只能服务原来的连接。
+        if (rdpConnectedAt_ != 0 && rdpConnectedAt_ != logon.ConnectTime.QuadPart) return StopReason::SessionChange;
+        rdpConnectedAt_ = logon.ConnectTime.QuadPart;
+        return StopReason::None;
     }
 
-    bool CheckEnvironment() noexcept {
+    StopReason EnvironmentFailure() noexcept {
+        if (const auto reason = InteractiveFailure(); reason != StopReason::None) return reason;
+        if (!panel_ || !IsWindowVisible(panel_) || IsIconic(panel_)) return StopReason::PanelHidden;
         Layout fresh;
-        if (!Interactive() || !panel_ || !IsWindowVisible(panel_) || IsIconic(panel_) ||
-            !ReadLayout(fresh)) {
-            return false;
-        }
+        if (!ReadLayout(fresh)) return StopReason::DisplayLayout;
 
         const bool moved = !EqualRect(&layout_.work, &fresh.work);
         const bool changed = !SameDisplay(layout_, fresh);
         layout_ = fresh;
         if (displayDirty_ || changed) {
             // 显示器切换和物理布局变更需要重新授权，即使新屏像素相同。
-            if (viewing_) return false;
+            if (viewing_) return StopReason::DisplayChanged;
             displayDirty_ = false;
             capture_.Reset();
             ++generation_;
         }
         if (moved || changed || dpiDirty_) {
             if (!PositionPanel()) {
-                return false;
+                return StopReason::PanelPosition;
             }
         }
 
@@ -884,16 +946,18 @@ private:
         if (stopped_ || FAILED(DwmGetWindowAttribute(panel_, DWMWA_CLOAKED,
                                                       &cloaked, sizeof(cloaked))) ||
             cloaked || !(GetWindowLongPtrW(panel_, GWL_EXSTYLE) & WS_EX_TOPMOST) ||
-            !GetWindowRect(panel_, &panelRect) || !Contains(layout_.primary, panelRect) ||
-            !IsWindowVisible(stopButton_) || !IsWindowEnabled(stopButton_) ||
+            !GetWindowRect(panel_, &panelRect) || !Contains(layout_.primary, panelRect)) {
+            return StopReason::PanelVisibility;
+        }
+        if (!IsWindowVisible(stopButton_) || !IsWindowEnabled(stopButton_) ||
             !GetWindowRect(stopButton_, &stopRect) || !Contains(panelRect, stopRect) ||
             !ValidBounds(stopRect)) {
-            return false;
+            return StopReason::StopButton;
         }
 
         const POINT center{stopRect.left + (stopRect.right - stopRect.left) / 2,
                            stopRect.top + (stopRect.bottom - stopRect.top) / 2};
-        return WindowFromPoint(center) == stopButton_;
+        return WindowFromPoint(center) == stopButton_ ? StopReason::None : StopReason::PanelCovered;
     }
 
     void Pump() noexcept {
@@ -903,7 +967,7 @@ private:
                 break;
             }
             if (message.message == WM_QUIT) {
-                Stop();
+                Stop(StopReason::QuitMessage);
                 PostQuitMessage(static_cast<int>(message.wParam));
                 break;
             }
@@ -1022,7 +1086,7 @@ private:
         }
 
         if (!SetWindowTextW(label_, text)) {
-            Stop();
+            Stop(StopReason::PanelText);
             return;
         }
         ShowWindow(viewButton_, !viewing_ ? SW_SHOWNA : SW_HIDE);
@@ -1084,7 +1148,7 @@ private:
                 host.CancelPress();
                 if (clicked) {
                     if (action == Action::Stop) {
-                        host.Stop(1);
+                        host.Stop(StopReason::Operator);
                     } else {
                         host.pendingClick_ = action;
                     }
@@ -1148,10 +1212,10 @@ private:
             case WM_COMMAND:
                 // 停止支持标准按钮及辅助功能；授权按钮仍单独核对输入来源。
                 if (HIWORD(wparam) == BN_CLICKED && host->stopButton_ &&
-                    reinterpret_cast<HWND>(lparam) == host->stopButton_) host->Stop(1);
+                    reinterpret_cast<HWND>(lparam) == host->stopButton_) host->Stop(StopReason::Operator);
                 return 0;
             case WM_CLOSE:
-                host->Stop(1);
+                host->Stop(StopReason::Operator);
                 return 0;
             case WM_DISPLAYCHANGE:
                 host->displayDirty_ = true;
@@ -1161,15 +1225,15 @@ private:
                 host->dpiDirty_ = true;
                 return 0;
             case WM_WTSSESSION_CHANGE:
-                if (static_cast<DWORD>(lparam) == host->session_ &&
-                    (wparam == WTS_SESSION_LOCK || wparam == WTS_CONSOLE_DISCONNECT ||
-                     wparam == WTS_REMOTE_CONNECT || wparam == WTS_REMOTE_DISCONNECT ||
-                     wparam == WTS_SESSION_LOGOFF)) {
-                    host->Stop(3);
+                if (static_cast<DWORD>(lparam) == host->session_) {
+                    if (wparam == WTS_REMOTE_DISCONNECT) host->Stop(StopReason::RdpDisconnect);
+                    else if (wparam == WTS_SESSION_LOCK || wparam == WTS_CONSOLE_CONNECT ||
+                             wparam == WTS_CONSOLE_DISCONNECT || wparam == WTS_REMOTE_CONNECT ||
+                             wparam == WTS_SESSION_LOGOFF) host->Stop(StopReason::SessionChange);
                 }
                 return 0;
             case WM_NCDESTROY:
-                host->Stop();
+                host->Stop(StopReason::WindowDestroyed);
                 host->panel_ = nullptr;
                 SetWindowLongPtrW(window, GWLP_USERDATA, 0);
                 break;
@@ -1188,8 +1252,17 @@ private:
         GUITHREADINFO info{};
         info.cbSize = sizeof(info);
         const DWORD thread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
-        return IsPrimaryWindow(foreground) && thread && GetGUIThreadInfo(thread, &info) &&
-               (!info.hwndFocus || IsPrimaryWindow(info.hwndFocus));
+        if (!IsPrimaryWindow(foreground) || !thread) return false;
+        if (GetGUIThreadInfo(thread, &info)) {
+            if (!info.hwndFocus) return true;
+            const HWND focusRoot = GetAncestor(info.hwndFocus, GA_ROOT);
+            // 子控件可能没有独立显示器坐标，键盘目标跟随其前台顶层窗口。
+            return focusRoot == GetAncestor(foreground, GA_ROOT) || IsPrimaryWindow(focusRoot);
+        }
+        // 经典控制台可由无 GUI 消息队列的线程承载；仅接受仍处于前台的主屏控制台。
+        wchar_t name[32]{};
+        return GetClassNameW(foreground, name, 32) && lstrcmpW(name, L"ConsoleWindowClass") == 0 &&
+               foreground == GetForegroundWindow();
     }
 
     bool LocalPointerOnPanel() const noexcept {
@@ -1212,6 +1285,10 @@ private:
         info.cbSize = sizeof(info);
         return GetGUIThreadInfo(0, &info) &&
                (!info.hwndCapture || IsPrimaryWindow(info.hwndCapture));
+    }
+
+    bool SendOne(INPUT& input) noexcept {
+        return crossdesk_.Active() ? crossdesk_.Send(input) : LegacySendOne(input);
     }
 
     int Move(int a, int b) noexcept {
@@ -1290,12 +1367,14 @@ private:
 
         if (pressedButton_ || !ForegroundAllowed() ||
             (release.type != INPUT_KEYBOARD && (GetAsyncKeyState(vk) & 0x8000))) {
-            return -1;
+            // 前台切换、现场按住同一键或保护窗口只影响这个按键。
+            // 抑制输入时不取得键权；会话、桌面及租约失效仍由 Service 拒绝。
+            return pairedOperator_ ? 0 : -1;
         }
         INPUT input = release.type == INPUT_KEYBOARD ? release : KeyEvent(static_cast<WORD>(vk));
         input.ki.dwFlags &= ~KEYEVENTF_KEYUP;
         if (!SendOne(input)) {
-            return -1;
+            return pairedOperator_ && release.type != INPUT_KEYBOARD ? 0 : -1;
         }
         input.ki.dwFlags |= KEYEVENTF_KEYUP;
         release = input;
@@ -1313,7 +1392,7 @@ private:
             return true;
         }
         // 安全桌面期间保留待释放状态，回到原交互桌面后再尝试。
-        if (!Interactive()) {
+        if (InteractiveFailure() != StopReason::None) {
             return false;
         }
         for (std::size_t i = 0; i < mouseHeld_.size(); ++i) {
@@ -1341,6 +1420,8 @@ private:
     };
 
     DWORD session_ = 0;
+    bool rdp_ = false;
+    LONGLONG rdpConnectedAt_ = 0;
     KernelHandle ownToken_;
     HINSTANCE module_ = nullptr;
     ATOM windowClass_ = 0;
@@ -1354,6 +1435,7 @@ private:
     UINT fontDpi_ = 0;
     Layout layout_;
     Capture capture_;
+    CrossDeskCapture crossdesk_;
     std::array<INPUT, 256> keyUp_{};
     std::array<bool, 3> mouseHeld_{};
     std::uint64_t generation_ = 0;
@@ -1363,7 +1445,7 @@ private:
     bool registeredForSession_ = false;
     bool stopped_ = false;
     bool stopApplied_ = false;
-    int stopReason_ = 0;
+    StopReason stopReason_ = StopReason::None;
     bool viewing_ = false;
     bool inputRequested_ = false;
     bool controlling_ = false;
@@ -1380,17 +1462,26 @@ Host* OnOwnerThread(void* context) noexcept {
 
 /// 在调用方的专用 MTA 线程上创建本地许可面板。
 static void* createHost(bool pairedOperator) noexcept {
+    lastHostCreationError = StopReason::None;
     const DpiScope dpi;
     if (!dpi) {
+        lastHostCreationError = StopReason::Dpi;
         return nullptr;
     }
 
     std::unique_ptr<Host> host(new (std::nothrow) Host(pairedOperator));
-    if (!host || FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+    if (!host) {
+        lastHostCreationError = StopReason::Allocation;
+        return nullptr;
+    }
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+        lastHostCreationError = StopReason::Com;
         return nullptr;
     }
     host->comInitialized = true;
-    return host->Start() ? host.release() : nullptr;
+    if (host->Start()) return host.release();
+    lastHostCreationError = host->Reason() == StopReason::None ? StopReason::PanelCreation : host->Reason();
+    return nullptr;
 }
 
 extern "C" void* ro_host_new() noexcept { return createHost(false); }
@@ -1404,8 +1495,21 @@ extern "C" void ro_host_free(void* context) noexcept {
 
 /// 返回首次停止桌面的本地原因。
 extern "C" int ro_host_stop_reason(void* context) noexcept {
+    if (!context) return static_cast<int>(lastHostCreationError);
     const Host* host = OnOwnerThread(context);
-    return host ? host->StopReason() : 0;
+    return static_cast<int>(host ? host->Reason() : StopReason::WrongThread);
+}
+
+/// 标识本次共享实际验证通过的 RDP 会话。
+extern "C" int ro_host_is_rdp(void* context) noexcept {
+    const Host* host = OnOwnerThread(context);
+    return host && host->IsRdp();
+}
+
+extern "C" int ro_host_select_crossdesk(void* context, const wchar_t* path) noexcept {
+    Host* host = OnOwnerThread(context);
+    const DpiScope dpi;
+    return dpi && host && host->UseCrossDeskCapture(path) ? 1 : 0;
 }
 
 /// 轮询许可状态。已有观看许可时，等待控制授权仍返回 2。
@@ -1421,7 +1525,7 @@ extern "C" int ro_host_poll(void* context) noexcept {
     return host->Service() ? host->State() : 0;
 }
 
-/// 请求本地控制授权，或立即撤回控制并尝试释放按键。返回 0 表示受理。
+/// 撤回控制时，只有确认旧输入已全部释放才返回 0。
 extern "C" int ro_host_request_input(void* context, int enabled) noexcept {
     Host* host = OnOwnerThread(context);
     if (!host) {
@@ -1430,7 +1534,7 @@ extern "C" int ro_host_request_input(void* context, int enabled) noexcept {
     const DpiScope dpi;
     if (!dpi) {
         host->DpiFailure();
-        return enabled ? -1 : 0;
+        return -1;
     }
     return host->RequestInput(enabled != 0);
 }

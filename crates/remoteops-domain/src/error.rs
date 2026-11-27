@@ -6,8 +6,8 @@ pub enum DomainError {
     /// UUID 或其他内部标识格式无效。
     #[error("标识格式无效：{0}")]
     InvalidIdentifier(String),
-    /// 配对码必须是九位数字。
-    #[error("配对码必须是九位数字")]
+    /// 临时配对码的字符或长度不合法。
+    #[error("短配对码须为九位字母和数字，或九位纯数字")]
     InvalidPairingCode,
     /// 目标连接不存在。
     #[error("未找到目标连接")]

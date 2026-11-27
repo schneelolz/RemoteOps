@@ -4,6 +4,7 @@ defineProps<{ title: string; description?: string }>();
 <template>
   <div class="empty-state">
     <h3 class="empty-state-title">{{ title }}</h3>
-    <p class="empty-state-desc">{{ description }}</p>
+    <p v-if="description" class="empty-state-desc">{{ description }}</p>
+    <slot />
   </div>
 </template>

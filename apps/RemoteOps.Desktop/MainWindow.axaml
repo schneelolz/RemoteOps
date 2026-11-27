@@ -1,50 +1,240 @@
-<Window xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:local="using:RemoteOps.Desktop" Icon="/Assets/remoteops.ico" x:Class="RemoteOps.Desktop.MainWindow" Title="RemoteOps · 人工控制端" Width="950" Height="650" MinWidth="650" MinHeight="440">
-  <Grid RowDefinitions="58,*">
-    <Border Background="{DynamicResource DeskBar}" Padding="22,0"><Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
-      <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
-        <Image Width="30" Height="30" Source="/Assets/remoteops.png"/>
-        <TextBlock Text="RemoteOps" FontSize="21" FontWeight="SemiBold" Foreground="{DynamicResource DeskInk}" VerticalAlignment="Center"/>
-      </StackPanel>
-      <local:AppearanceButton Grid.Column="1" VerticalAlignment="Center"/>
-      <Button Grid.Column="2" Name="SettingsButton" Content="连接设置" VerticalAlignment="Center"/>
-    </Grid></Border>
-    <Grid Grid.Row="1" ColumnDefinitions="210,*">
-      <Border Background="{DynamicResource DeskSide}" BorderBrush="{DynamicResource DeskRule}" BorderThickness="0,0,1,0" Padding="16,21,16,14">
-        <Grid RowDefinitions="Auto,*,Auto">
-          <TextBlock Text="已配对设备" FontSize="16" FontWeight="SemiBold" Margin="4,0,0,12"/>
-          <ListBox Grid.Row="1" Name="Devices" Background="Transparent" BorderThickness="0"/>
-          <Button Grid.Row="2" Name="Refresh" Content="刷新设备" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"/>
+<Window xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Icon="/Assets/remoteops.ico" x:Class="RemoteOps.Desktop.MainWindow" Title="RemoteOps · 远程运维" Width="980" Height="660" MinWidth="680" MinHeight="460">
+  <Window.Resources>
+    <StreamGeometry x:Key="MonitorIcon">M4,3 H20 A2,2 0 0 1 22,5 V15 A2,2 0 0 1 20,17 H4 A2,2 0 0 1 2,15 V5 A2,2 0 0 1 4,3 Z M4,5 V15 H20 V5 Z M11,17 H13 V20 H17 V22 H7 V20 H11 Z</StreamGeometry>
+    <ControlTheme x:Key="AppearanceOption" TargetType="RadioButton">
+      <Setter Property="MinHeight" Value="32"/>
+      <Setter Property="Padding" Value="9,3"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskSubtle}"/>
+      <Setter Property="Template">
+        <ControlTemplate>
+          <ContentPresenter Name="PART_ContentPresenter"
+                            Background="Transparent" BorderBrush="Transparent" BorderThickness="1"
+                            CornerRadius="5" Padding="{TemplateBinding Padding}"
+                            Content="{TemplateBinding Content}" ContentTemplate="{TemplateBinding ContentTemplate}"
+                            HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+        </ControlTemplate>
+      </Setter>
+      <Style Selector="^:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource DeskButtonHover}"/>
+      </Style>
+      <Style Selector="^:checked">
+        <Setter Property="Foreground" Value="{DynamicResource DeskAccentInk}"/>
+      </Style>
+      <Style Selector="^:checked /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource DeskAccentSoft}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource DeskConnectBorder}"/>
+      </Style>
+      <Style Selector="^:focus-visible /template/ ContentPresenter">
+        <Setter Property="BorderBrush" Value="{DynamicResource DeskAccent}"/>
+      </Style>
+    </ControlTheme>
+  </Window.Resources>
+  <Window.Styles>
+    <Style Selector="Button#Pair:disabled /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource DeskAccentSoft}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskAccentSoft}"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskSubtle}"/>
+      <Setter Property="Opacity" Value="1"/>
+    </Style>
+    <Style Selector="Button#Pair:disabled PathIcon">
+      <Setter Property="Foreground" Value="{DynamicResource DeskSubtle}"/>
+    </Style>
+    <Style Selector="Expander#LogPanel /template/ ToggleButton#ExpanderHeader">
+      <Setter Property="Background" Value="{DynamicResource DeskCardSubtle}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskRule}"/>
+      <Setter Property="BorderThickness" Value="0,1,0,0"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskInk}"/>
+      <Setter Property="Padding" Value="28,0,0,0"/>
+      <Setter Property="AutomationProperties.Name" Value="操作记录"/>
+    </Style>
+    <Style Selector="Expander#LogPanel /template/ ToggleButton#ExpanderHeader:pointerover /template/ Border#ToggleButtonBackground">
+      <Setter Property="Background" Value="{DynamicResource DeskButtonHover}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskRule}"/>
+    </Style>
+    <Style Selector="Expander#LogPanel /template/ ToggleButton#ExpanderHeader:pressed /template/ Border#ToggleButtonBackground">
+      <Setter Property="Background" Value="{DynamicResource DeskAccentSoft}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskRule}"/>
+    </Style>
+  </Window.Styles>
+  <Grid RowDefinitions="Auto,*,Auto">
+    <Border Background="{DynamicResource DeskBar}" BorderBrush="{DynamicResource DeskRule}" BorderThickness="0,0,0,1" Padding="28,12">
+      <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="10">
+        <Grid ColumnDefinitions="Auto,*" ColumnSpacing="10" VerticalAlignment="Center">
+          <Image Width="36" Height="36" Source="/Assets/remoteops.png"/>
+          <TextBlock Grid.Column="1" Name="ProductName" Text="RemoteOps" FontSize="18" FontWeight="Bold"
+                     VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
         </Grid>
-      </Border>
-      <ScrollViewer Grid.Column="1" HorizontalScrollBarVisibility="Disabled">
-        <StackPanel Margin="28,24" Spacing="14">
-          <TextBlock Text="连接远程设备" FontSize="29" FontWeight="SemiBold"/>
-          <TextBlock Text="输入现场 Agent 显示的控制码" Classes="muted"/>
-          <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
-            <TextBox Name="Code" Watermark="控制码" MaxLength="16" AutomationProperties.Name="现场控制码"/>
-            <Button Name="Pair" Grid.Column="1" Classes="primary" Content="连接"/>
-          </Grid>
-          <Border BorderBrush="{DynamicResource DeskRule}" BorderThickness="0,1,0,0" Margin="0,6,0,0"/>
-          <TextBlock Name="Target" FontSize="21" FontWeight="SemiBold" Text="尚未选择设备" TextWrapping="Wrap"/>
-          <TextBlock Name="Status" Classes="muted" Text="正在连接 Relay"/>
-          <WrapPanel>
-            <Button Name="OpenDesktop" Classes="primary" Content="打开实时桌面" Margin="0,0,8,6"/>
-            <Button Name="ToolsButton" Content="人工工具" Margin="0,0,8,6"/>
-            <Button Name="Disconnect" Content="断开整个会话" Margin="0,0,0,6"/>
-          </WrapPanel>
-          <StackPanel Name="Pending" Spacing="6"/>
-          <StackPanel Name="ToolsPanel" IsVisible="False" Spacing="10">
-            <TextBlock Text="人工命令" FontSize="16" FontWeight="SemiBold"/>
-            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8"><TextBox Name="Command" Watermark="Windows PowerShell 命令"/><Button Grid.Column="1" Name="Run" Content="执行"/></Grid>
-            <TextBlock Text="串口" FontSize="16" FontWeight="SemiBold"/>
-            <WrapPanel><Button Name="ListPorts" Content="列出串口" Margin="0,0,8,4"/><TextBox Name="Port" Width="92" Watermark="COM3" Margin="0,0,8,4"/><TextBox Name="Baud" Width="86" Text="9600" AutomationProperties.Name="波特率" Margin="0,0,8,4"/><CheckBox Name="Writable" Content="允许发送" Margin="0,0,8,4"/><Button Name="OpenPort" Content="打开串口"/></WrapPanel>
-            <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="6"><TextBox Name="SerialText" Watermark="串口文本（发送时追加回车）"/><Button Grid.Column="1" Name="WritePort" Content="发送"/><Button Grid.Column="2" Name="ClosePort" Content="关闭串口"/></Grid>
+        <Border Grid.Column="1" Name="ServiceBadge" Classes="state-offline" CornerRadius="6"
+                Padding="8,4" VerticalAlignment="Center">
+          <StackPanel Orientation="Horizontal" Spacing="6">
+            <TextBlock Text="●" FontSize="8" VerticalAlignment="Center" AutomationProperties.AccessibilityView="Raw"/>
+            <TextBlock Name="ServiceStatus" Text="正在连接服务" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"/>
           </StackPanel>
-          <Expander Name="LogPanel" Header="操作记录" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
-            <TextBox Name="Log" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" Height="132"/>
-          </Expander>
+        </Border>
+        <Button Grid.Column="2" Name="SettingsButton" Content="连接设置" Classes="tool" VerticalAlignment="Center"/>
+        <Border Grid.Column="3" Name="AppearancePicker" Classes="segment-group" VerticalAlignment="Center">
+          <StackPanel Orientation="Horizontal" Spacing="2">
+            <RadioButton Name="AppearanceAuto" Theme="{StaticResource AppearanceOption}" GroupName="DesktopAppearance"
+                         AutomationProperties.Name="自动（跟随系统）" ToolTip.Tip="跟随系统外观">
+              <StackPanel Orientation="Horizontal" Spacing="5">
+                <PathIcon Data="{StaticResource MonitorIcon}" Width="14" Height="14"/>
+                <TextBlock Text="自动" VerticalAlignment="Center"/>
+              </StackPanel>
+            </RadioButton>
+            <RadioButton Name="AppearanceLight" Theme="{StaticResource AppearanceOption}" GroupName="DesktopAppearance" AutomationProperties.Name="浅色">
+              <StackPanel Orientation="Horizontal" Spacing="5">
+                <PathIcon Data="M12,7 A5,5 0 1 0 12,17 A5,5 0 1 0 12,7 Z M12,9 A3,3 0 1 1 12,15 A3,3 0 1 1 12,9 Z M11,1 H13 V5 H11 Z M11,19 H13 V23 H11 Z M1,11 H5 V13 H1 Z M19,11 H23 V13 H19 Z M3,4.4 L4.4,3 L7.2,5.8 L5.8,7.2 Z M16.8,18.2 L18.2,16.8 L21,19.6 L19.6,21 Z M16.8,5.8 L19.6,3 L21,4.4 L18.2,7.2 Z M3,19.6 L5.8,16.8 L7.2,18.2 L4.4,21 Z" Width="14" Height="14"/>
+                <TextBlock Text="浅色" VerticalAlignment="Center"/>
+              </StackPanel>
+            </RadioButton>
+            <RadioButton Name="AppearanceDark" Theme="{StaticResource AppearanceOption}" GroupName="DesktopAppearance" AutomationProperties.Name="深色">
+              <StackPanel Orientation="Horizontal" Spacing="5">
+                <PathIcon Data="M10,2 A10,10 0 1 0 22,14 A8,8 0 0 1 10,2 Z M7,5.5 A10,10 0 0 0 18.5,17 A8,8 0 1 1 7,5.5 Z" Width="14" Height="14"/>
+                <TextBlock Text="深色" VerticalAlignment="Center"/>
+              </StackPanel>
+            </RadioButton>
+          </StackPanel>
+        </Border>
+      </Grid>
+    </Border>
+
+    <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel Margin="28,24" Spacing="20">
+        <Border Background="{DynamicResource DeskConnectSurface}" BorderBrush="{DynamicResource DeskConnectBorder}"
+                BorderThickness="1" CornerRadius="12" Padding="26" MinHeight="184">
+          <Grid ColumnDefinitions="*,1.08*" ColumnSpacing="20">
+            <StackPanel Spacing="7" VerticalAlignment="Center">
+              <Border Width="38" Height="38" HorizontalAlignment="Left" CornerRadius="9"
+                      Background="{DynamicResource DeskCard}" BorderBrush="{DynamicResource DeskConnectBorder}" BorderThickness="1">
+                <PathIcon Width="19" Height="19" Foreground="{DynamicResource DeskAccentInk}"
+                          Data="M9,7 H7 A5,5 0 0 0 7,17 H9 V15 H7 A3,3 0 0 1 7,9 H9 Z M15,7 H17 A5,5 0 0 1 17,17 H15 V15 H17 A3,3 0 0 0 17,9 H15 Z M8,11 H16 V13 H8 Z"/>
+              </Border>
+              <TextBlock Text="连接远程设备" FontSize="29" FontWeight="Bold" TextWrapping="Wrap"/>
+              <TextBlock Text="输入现场端显示的临时控制码。" Classes="muted" FontSize="13"/>
+            </StackPanel>
+            <Border Grid.Column="1" Background="{DynamicResource DeskCard}" BorderBrush="{DynamicResource DeskConnectBorder}"
+                    BorderThickness="1" CornerRadius="10" Padding="16" VerticalAlignment="Center">
+              <StackPanel Spacing="8">
+                <TextBlock Text="现场控制码" FontSize="13" FontWeight="SemiBold"/>
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                  <TextBox Name="Code" Watermark="A2C-D3E-F4G" MaxLength="16" MinHeight="44" FontSize="16" Padding="12,4,12,8"
+                           Background="{DynamicResource DeskSurface}" FontFamily="Cascadia Code, Consolas, Microsoft YaHei UI"
+                           AutomationProperties.Name="现场控制码"/>
+                  <Button Name="Pair" Grid.Column="1" IsEnabled="False" Classes="primary" MinHeight="44" AutomationProperties.Name="连接">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                      <TextBlock Text="连接" VerticalAlignment="Center"/>
+                      <PathIcon Data="M3,11 H17 L12,6 L13.4,4.6 L21,12 L13.4,19.4 L12,18 L17,13 H3 Z" Width="14" Height="14"/>
+                    </StackPanel>
+                  </Button>
+                </Grid>
+                <TextBlock Name="Status" Classes="muted" FontSize="13" IsVisible="False"/>
+                <Button Name="RetryRelay" Content="重试连接" HorizontalAlignment="Left" IsVisible="False"/>
+              </StackPanel>
+            </Border>
+          </Grid>
+        </Border>
+
+        <StackPanel Spacing="8">
+          <Grid ColumnDefinitions="*,Auto">
+            <StackPanel Orientation="Horizontal" Spacing="9" VerticalAlignment="Center">
+              <TextBlock Text="已配对设备" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
+              <TextBlock Name="DeviceCount" Text="0" Classes="muted" FontSize="12" VerticalAlignment="Center"/>
+            </StackPanel>
+            <Button Grid.Column="1" Name="Refresh" MinHeight="36" AutomationProperties.Name="刷新设备">
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <PathIcon Data="M20,4 V10 H14 L16.4,7.6 A6,6 0 0 0 6.3,10 H4.2 A8,8 0 0 1 17.8,6.2 Z M4,20 V14 H10 L7.6,16.4 A6,6 0 0 0 17.7,14 H19.8 A8,8 0 0 1 6.2,17.8 Z" Width="15" Height="15"/>
+                <TextBlock Text="刷新设备" VerticalAlignment="Center"/>
+              </StackPanel>
+            </Button>
+          </Grid>
+          <Border Background="{DynamicResource DeskCard}" BorderBrush="{DynamicResource DeskRule}" BorderThickness="1" CornerRadius="9">
+            <Grid>
+              <ListBox Name="Devices" Background="Transparent" BorderThickness="0" Padding="4,4,4,0"
+                       MaxHeight="154" ScrollViewer.HorizontalScrollBarVisibility="Disabled" IsVisible="False"/>
+              <StackPanel Name="EmptyDevicesHint" Orientation="Horizontal" Spacing="12" Margin="16"
+                          MinHeight="50" VerticalAlignment="Center">
+                <Border Width="38" Height="38" CornerRadius="8" Background="{DynamicResource DeskCardSubtle}">
+                  <PathIcon Data="{StaticResource MonitorIcon}" Width="18" Height="18" Foreground="{DynamicResource DeskSubtle}"/>
+                </Border>
+                <TextBlock Text="暂无已配对设备" Classes="muted" FontSize="13" VerticalAlignment="Center"/>
+              </StackPanel>
+            </Grid>
+          </Border>
         </StackPanel>
-      </ScrollViewer>
-    </Grid>
+
+          <!-- 已选设备的会话操作。 -->
+          <Border Name="DeviceWorkspace" Classes="card" IsVisible="False">
+            <StackPanel Spacing="14">
+              <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                <StackPanel Spacing="2">
+                  <TextBlock Name="DeviceCaption" Classes="muted" FontSize="12"/>
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <TextBlock Name="Target" VerticalAlignment="Center" FontSize="19" FontWeight="SemiBold" Foreground="{DynamicResource DeskInk}"/>
+                    <Button Name="CopyPairCode" Content="复制" AutomationProperties.Name="复制本次配对码" MinHeight="28" Padding="8,2" IsVisible="False"/>
+                  </StackPanel>
+                </StackPanel>
+                <Border Name="TargetStateBadge" Grid.Column="1" Classes="state-offline" BorderThickness="1" CornerRadius="99" Padding="10,4" VerticalAlignment="Top" IsVisible="False">
+                  <TextBlock Name="TargetStateText" FontSize="12" FontWeight="SemiBold"/>
+                </Border>
+              </Grid>
+
+              <WrapPanel>
+                <Button Name="OpenDesktop" Classes="primary" Content="打开实时桌面" Margin="0,0,10,6"/>
+                <Button Name="ToolsButton" Content="人工工具" Margin="0,0,10,6"/>
+                <Button Name="Disconnect" Classes="end" Content="断开本次人工运维" Margin="0,0,0,6"/>
+              </WrapPanel>
+
+              <!-- Pending Approvals -->
+              <StackPanel Name="Pending" Spacing="8"/>
+
+              <!-- Expandable Manual Tools Subcard -->
+              <Border Name="ToolsPanel" Classes="subcard" IsVisible="False">
+                <StackPanel Spacing="14">
+                  <StackPanel Spacing="8">
+                    <TextBlock Text="人工命令执行" FontSize="14.5" FontWeight="SemiBold" Foreground="{DynamicResource DeskInk}"/>
+                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                      <TextBox Name="Command" Watermark="输入 Windows PowerShell 命令" FontFamily="Cascadia Code, Consolas, Microsoft YaHei UI"/>
+                      <Button Grid.Column="1" Name="Run" Classes="primary" Content="执行"/>
+                    </Grid>
+                  </StackPanel>
+
+                  <Border Height="1" Background="{DynamicResource DeskRuleSubtle}"/>
+
+                  <StackPanel Spacing="8">
+                    <TextBlock Text="串口调试终端" FontSize="14.5" FontWeight="SemiBold" Foreground="{DynamicResource DeskInk}"/>
+                    <WrapPanel>
+                      <Button Name="ListPorts" Content="列出串口" Margin="0,0,8,6"/>
+                      <TextBox Name="Port" Width="104" Watermark="COM3" FontFamily="Cascadia Code, Consolas, Microsoft YaHei UI" Margin="0,0,8,6"/>
+                      <TextBox Name="Baud" Width="96" Text="9600" FontFamily="Cascadia Code, Consolas, Microsoft YaHei UI" AutomationProperties.Name="波特率" Margin="0,0,8,6"/>
+                      <CheckBox Name="Writable" Content="允许发送" VerticalAlignment="Center" Margin="2,0,10,6"/>
+                      <Button Name="OpenPort" Content="打开串口" Margin="0,0,0,6"/>
+                    </WrapPanel>
+                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+                      <TextBox Name="SerialText" Watermark="串口文本（发送时自动追加回车）" FontFamily="Cascadia Code, Consolas, Microsoft YaHei UI"/>
+                      <Button Grid.Column="1" Name="WritePort" Classes="primary" Content="发送"/>
+                      <Button Grid.Column="2" Name="ClosePort" Content="关闭串口"/>
+                    </Grid>
+                  </StackPanel>
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </Border>
+
+      </StackPanel>
+    </ScrollViewer>
+    <Expander Grid.Row="2" Name="LogPanel" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch"
+              Background="{DynamicResource DeskCardSubtle}" BorderThickness="0" CornerRadius="0" MinHeight="44" Padding="28,0,28,14">
+      <Expander.Header>
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <PathIcon Data="M13,3 A9,9 0 1 1 4.5,15 H6.6 A7,7 0 1 0 7.3,8 H10 V10 H4 V4 H6 V6.1 A9,9 0 0 1 13,3 Z M12,7 H14 V11.5 L17,13.2 L16,14.9 L12,12.6 Z" Width="16" Height="16"
+                    Foreground="{DynamicResource DeskSubtle}"/>
+          <TextBlock Text="操作记录" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"/>
+        </StackPanel>
+      </Expander.Header>
+      <TextBox Name="Log" Watermark="暂无操作记录" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" Height="150"
+               FontFamily="Cascadia Code, Consolas, Microsoft YaHei UI" FontSize="12.5"/>
+    </Expander>
   </Grid>
 </Window>

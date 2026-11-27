@@ -91,14 +91,14 @@ impl LifecycleTicker {
     pub fn advance(&mut self, now: f64, animate: bool) {
         if !animate {
             self.shown.extend(self.pending.drain(..));
-            while self.shown.len() > 3 {
+            while self.shown.len() > 5 {
                 self.shown.pop_front();
             }
             self.transition = None;
             return;
         }
         if self.transition.is_some_and(|start| now - start >= 0.32) {
-            while self.shown.len() > 3 {
+            while self.shown.len() > 5 {
                 self.shown.pop_front();
             }
             self.transition = None;
@@ -111,7 +111,7 @@ impl LifecycleTicker {
         }
     }
 
-    /// 返回最多四行；第四行只在滚入期间使用，并由绘制区裁剪。
+    /// 返回最多六行；第六行只在滚入期间使用，并由绘制区裁剪。
     #[must_use]
     pub fn rows(&self) -> &VecDeque<LifecycleEvent> {
         &self.shown
@@ -174,12 +174,12 @@ mod tests {
                 .iter()
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
-            vec![5, 6, 7]
+            vec![3, 4, 5, 6, 7]
         );
         ticker.ingest(&events);
         ticker.advance(10.0, true);
         assert!(!ticker.moving());
-        assert_eq!(ticker.rows().len(), 3);
+        assert_eq!(ticker.rows().len(), 5);
     }
 
     #[test]

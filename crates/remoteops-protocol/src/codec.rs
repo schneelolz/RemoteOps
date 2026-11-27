@@ -134,6 +134,7 @@ mod tests {
             credential_encryption_public_key: String::new(),
             credential_encryption_key_id: String::new(),
             mac_address: None,
+            supports_mixed_pairing_code: true,
             supports_agent_shutdown: false,
         }))
         .expect("Agent Hello 应可序列化");
@@ -143,7 +144,12 @@ mod tests {
             "protocol_version".to_owned(),
             crate::LEGACY_PROTOCOL_VERSION.into(),
         );
-        for key in ["target_context", "pairing_mode", "managed_enrollment"] {
+        for key in [
+            "target_context",
+            "pairing_mode",
+            "managed_enrollment",
+            "supports_mixed_pairing_code",
+        ] {
             object.remove(key);
         }
         let ClientHello::Agent(legacy) =
@@ -152,6 +158,7 @@ mod tests {
             panic!("应为Agent")
         };
         assert_eq!(legacy.pairing_mode, crate::PairingMode::AutoPerBoot);
+        assert!(!legacy.supports_mixed_pairing_code);
         assert!(legacy.target_context.is_none() && legacy.managed_enrollment.is_none());
         let mut missing_boot_id = value.clone();
         missing_boot_id.as_object_mut().unwrap().remove("boot_id");

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using Avalonia;
@@ -20,9 +21,44 @@ public partial class ViewerWindow : Window
     private long epoch,view;
     private WindowState restoreState = WindowState.Normal;
     private WindowState beforeFullscreen = WindowState.Normal;
-    private bool writable, originalPixels, clipboardSupported;
+    private bool writable, originalPixels;
+    private bool? clipboardSupported;
     private readonly string deviceKey;
+    private string pictureMode="auto";
+    private string transportBackend="auto";
     private int encodedWidth,encodedHeight;
+    private readonly DispatcherTimer statsTimer=new(){Interval=TimeSpan.FromSeconds(1)};
+    private long windowStart, lastSample;
+    private int presented, queuedFrames;
+    private double queueTime, decodeTime, receivedRate;
+    private int? captureRate;
+
+    private void ToggleStatistics(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if(sender is MenuItem item) PerformancePanel.IsVisible=item.IsChecked;
+    }
+
+    internal void SetStatistics(JsonElement e)
+    {
+        lastSample=Stopwatch.GetTimestamp();
+        receivedRate=e.GetProperty("receive").GetDouble();
+        queuedFrames=e.GetProperty("queued").GetInt32();
+        captureRate=e.TryGetProperty("capture",out var c) && c.ValueKind==JsonValueKind.Number && c.TryGetInt32(out var fps) ? fps : null;
+    }
+
+    private void RefreshStatistics()
+    {
+        var seconds=Stopwatch.GetElapsedTime(windowStart).TotalSeconds;
+        bool fresh=lastSample!=0 && Stopwatch.GetElapsedTime(lastSample)<TimeSpan.FromSeconds(4);
+        string capture=fresh && captureRate.HasValue ? captureRate.Value.ToString() : "—";
+        string receive=fresh ? receivedRate.ToString("F1") : "—";
+        string waiting=fresh ? queuedFrames.ToString() : "—";
+        var display=seconds>0 ? presented/seconds : 0;
+        string decoded=presented>0 ? (decodeTime/presented).ToString("F1") : "—";
+        string pending=presented>0 ? (queueTime/presented).ToString("F1") : "—";
+        PerformanceText.Text=$"采集 {capture}  ·  接收 {receive}  ·  显示 {display:F1} FPS\n解码 {decoded} ms  ·  界面排队 {pending} ms  ·  解码队列 {waiting} 帧";
+        windowStart=Stopwatch.GetTimestamp(); presented=0; queueTime=decodeTime=0;
+    }
     private readonly DispatcherTimer moveTimer=new(){Interval=TimeSpan.FromMilliseconds(16)};
     private (int x,int y)? pendingMove;
     private readonly HashSet<Key> pressed = [];
@@ -30,7 +66,9 @@ public partial class ViewerWindow : Window
 
     internal ViewerWindow(DesktopCore core,string session,string name,bool writable,string deviceKey)
     {
-        InitializeComponent();this.core=core;Session=session;this.writable=writable;this.deviceKey=deviceKey;
+        InitializeComponent();
+        statsTimer.Tick+=(_,_)=>RefreshStatistics();
+        this.core=core;Session=session;this.writable=writable;this.deviceKey=deviceKey;
         ClipboardShare.IsChecked=DesktopPreferences.ClipboardEnabled(deviceKey);
         ClipboardShare.IsCheckedChanged+=(_,_)=>{
             var enabled=ClipboardShare.IsChecked==true;
@@ -39,7 +77,7 @@ public partial class ViewerWindow : Window
             SyncClipboard();
         };
         UpdateClipboard();
-        SizeChanged+=(_,e)=>ArrangeToolbar(e.NewSize.Width);
+        Toolbar.SizeChanged+=(_,e)=>ArrangeToolbar(e.NewSize.Width);
         moveTimer.Tick+=(_,_)=>FlushMove();
         Title=$"实时桌面 · {name} · v{Program.DisplayVersion}"; NameLabel.Text=name;
         Opened+=(_,_)=>Start();
@@ -81,14 +119,42 @@ public partial class ViewerWindow : Window
             if(!controlled || Coordinates(e.GetPosition(CanvasArea),false) is not {} p)return;
             Move(p);Input(new {Wheel=new {delta=(short)Math.Clamp(Math.Round(e.Delta.Y*120),short.MinValue,short.MaxValue)}});e.Handled=true;
         };
-        CanvasArea.KeyDown+=(_,e)=>SendKey(e,true);
-        CanvasArea.KeyUp+=(_,e)=>SendKey(e,false);
+        // 在画布上先处理远端按键，避免 Tab、空格和回车触发本地工具栏。
+        CanvasArea.AddHandler(InputElement.KeyDownEvent, (_, e) => SendKey(e, true), Avalonia.Interactivity.RoutingStrategies.Tunnel);
+        CanvasArea.AddHandler(InputElement.KeyUpEvent, (_, e) => SendKey(e, false), Avalonia.Interactivity.RoutingStrategies.Tunnel);
         KeyDown+=(_,e)=>{if(e.Key==Key.F11 && !controlled){SetFullscreen();e.Handled=true;}};
+    }
+
+    private void SelectBackend(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if(sender is not MenuItem {Tag:string choice} || choice == transportBackend)return;
+        transportBackend = choice;
+        SetBackendChecks();
+        Start();
+    }
+    private void SetBackendChecks()
+    {
+        BackendAuto.IsChecked=transportBackend=="auto";
+        BackendTcp.IsChecked=transportBackend=="tcp";
+        BackendRtc.IsChecked=transportBackend=="minirtc";
+        BackendCrossDesk.IsChecked=transportBackend=="crossdesk";
+    }
+
+    private void SelectQuality(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if(sender is not MenuItem {Tag:string mode} item || PictureQuality.Flyout is not MenuFlyout menu)return;
+        if(pictureMode!=mode && opened && !Post(new {op="quality",session=Session,view,quality=mode}))return;
+        pictureMode=mode;
+        foreach(var entry in menu.Items.OfType<MenuItem>().Where(entry=>entry.Tag is string))entry.IsChecked=entry==item;
+        PictureQuality.Content="画质 · "+(mode=="high"?"高清":item.Header);
     }
 
     private void ArrangeToolbar(double width)
     {
-        bool narrow=width<890;
+        var actionWidth=ToolbarActions.Children.Where(child=>child.IsVisible).Sum(child=>child.DesiredSize.Width);
+        if(actionWidth<=0)return;
+        bool narrow=width-actionWidth<315;
+        Grid.SetColumnSpan(ToolbarIdentity,narrow?2:1);
         Grid.SetColumn(ToolbarActions,narrow?0:1);
         Grid.SetColumnSpan(ToolbarActions,narrow?2:1);
         Grid.SetRow(ToolbarActions,narrow?1:0);
@@ -97,20 +163,28 @@ public partial class ViewerWindow : Window
 
     internal void SetClipboardSupport(bool supported)
     {
+        if(clipboardSupported==supported)return;
         clipboardSupported=supported;
-        UpdateClipboard();
+        SyncClipboard();
     }
     private void UpdateClipboard()
     {
-        ClipboardShare.IsEnabled=clipboardSupported && OperatingSystem.IsWindows();
-        var hint=!clipboardSupported?"需要控制端、Agent 和 Relay 均支持共享剪贴板":
-            !controlled?"观察模式下暂停共享":ClipboardShare.IsChecked==true?"双向复制文本和文件":"剪贴板共享已关闭";
-        ToolTip.SetTip(ClipboardShare,hint);
+        bool windows=OperatingSystem.IsWindows();
+        ClipboardShare.IsEnabled=windows;
+        string status=!windows?"此平台不支持剪贴板共享":
+            ClipboardShare.IsChecked!=true?"剪贴板共享已关闭":
+            clipboardSupported==false?"当前连接未提供剪贴板共享":
+            clipboardSupported==null?"正在确认剪贴板能力":
+            !controlled || !writable?"剪贴板将在控制模式下共享":"已允许双向复制文本和文件；两端更新后也可复制图片";
+        ClipboardState.Text=status;
+        ClipboardState.IsVisible=ClipboardShare.IsChecked==true && clipboardSupported==false;
+        ToolTip.SetTip(ClipboardShare,status);
+        Avalonia.Automation.AutomationProperties.SetHelpText(ClipboardShare,status);
     }
     private void SyncClipboard()
     {
         UpdateClipboard();
-        if(clipboardSupported && controlled && writable)
+        if(clipboardSupported==true && controlled && writable && !pending && epoch>0)
             Post(new {op="clipboard",session=Session,view,epoch,enabled=ClipboardShare.IsChecked==true});
     }
 
@@ -249,9 +323,13 @@ public partial class ViewerWindow : Window
     private void Start()
     {
         Stop(true);
+        SetBackendChecks();
         Info.Text="正在准备本机观看组件";Mode.Text=Info.Text;Overlay.IsVisible=true;Retry.IsVisible=false;
         var cts=new CancellationTokenSource();
         cancellation=cts;
+        lastSample=0; presented=0; queueTime=decodeTime=0; captureRate=null;
+        windowStart=Stopwatch.GetTimestamp();
+        RefreshStatistics(); statsTimer.Start();
         var token=cts.Token;
         view=Interlocked.Increment(ref nextView);
         long attempt=view;
@@ -264,14 +342,22 @@ public partial class ViewerWindow : Window
             using var decoder=new DesktopDecoder();
             var packet=new byte[2*1024*1024];var pixels=new byte[1920*1080*4];
             Dispatcher.UIThread.Invoke(()=>{
-                if(!token.IsCancellationRequested && !closed)opened=Post(new {op="open",session=Session,view=attempt});
+                if(!token.IsCancellationRequested && !closed)opened=Post(new {op="open",session=Session,view=attempt,quality=pictureMode,backend=transportBackend});
             });
             while(!token.IsCancellationRequested){
                 int count=core.ReadFrame(attempt,packet);
                 if(count<0)throw new InvalidOperationException("媒体读取失败");
                 if(count==0){Thread.Sleep(4);continue;}
+                long beforeDecode=Stopwatch.GetTimestamp();
                 if(!decoder.Decode(packet,count,pixels,out int w,out int h))continue;
-                Dispatcher.UIThread.Invoke(()=>{if(!token.IsCancellationRequested && !closed)Present(pixels,w,h);});
+                long ready=Stopwatch.GetTimestamp();
+                Dispatcher.UIThread.Invoke(()=>{
+                    if(token.IsCancellationRequested || closed || view!=attempt)return;
+                    queueTime+=Stopwatch.GetElapsedTime(ready).TotalMilliseconds;
+                    decodeTime+=Stopwatch.GetElapsedTime(beforeDecode,ready).TotalMilliseconds;
+                    Present(pixels,w,h);
+                    presented++;
+                });
             }
         }catch(Exception e){
             Dispatcher.UIThread.Post(()=>{if(!token.IsCancellationRequested && !closed){Stop(true);Failure(e.Message);}});
@@ -333,9 +419,10 @@ public partial class ViewerWindow : Window
     }
     private void Stop(bool notify)
     {
+        statsTimer.Stop(); PerformanceText.Text="等待实时画面";
         cancellation?.Cancel();cancellation?.Dispose();cancellation=null;
         if(opened && notify){try{core.Post(new {op="end",session=Session,view});}catch(InvalidOperationException){}}
-        clipboardSupported=false;UpdateClipboard();
+        clipboardSupported=null;UpdateClipboard();
         CancelMove();view=0;
         opened=controlled=pending=hasFrame=false;epoch=0;pressed.Clear();buttons.Clear();UpdateModeButtons();
         encodedWidth=encodedHeight=0;Resolution.Text="";Route.Text="";SizeCanvas();Screen.Source=null;bitmap?.Dispose();bitmap=null;

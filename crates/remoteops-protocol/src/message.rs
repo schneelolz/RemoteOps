@@ -118,6 +118,9 @@ pub struct AgentHello {
     /// Agent 主机的高置信度 MAC 地址；无法可靠判断时为空。
     #[serde(default)]
     pub mac_address: Option<String>,
+    /// 能否接收大小写通用的九位字母数字短码；旧 Agent 缺省使用数字码。
+    #[serde(default)]
+    pub supports_mixed_pairing_code: bool,
     /// 是否支持由 Relay 管理员远程请求 Agent 优雅退出。
     #[serde(default)]
     pub supports_agent_shutdown: bool,
@@ -172,6 +175,15 @@ pub enum ClientHello {
 /// Relay 接受 Agent 后颁发的信息。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentWelcome {
+    /// 已发布组件的版本目录，旧 Relay 可以省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_catalog: Option<crate::release::ReleaseCatalog>,
+    /// 当前 Relay 允许现场撤销本设备的 AI 配对；旧版本缺省关闭。
+    #[serde(default)]
+    pub allow_agent_ai_disconnect: bool,
+    /// Relay 允许现场按绑定独立断开人工运维。
+    #[serde(default)]
+    pub allow_agent_human_disconnect: bool,
     /// Relay 已为本次启动启用测试控制码。
     #[serde(default)]
     pub test_key_accepted: bool,
@@ -387,6 +399,9 @@ pub struct ReleaseSessionResult {
 /// Relay 向 Agent 声明当前唯一有权发送请求的 Controller 绑定。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ControllerBinding {
+    /// Relay 核实本次配对的 MCP 安装与设备授权；旧 Relay 省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_grant: Option<bool>,
     /// 绑定的逻辑会话。
     pub session_id: SessionId,
     /// Controller 实例标识。
@@ -639,6 +654,9 @@ pub enum WireMessage {
     AgentLeaseRenewed(AgentLeaseRenewed),
     /// Controller 连接就绪。
     ControllerWelcome {
+        /// Relay 当前发布的版本目录。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release_catalog: Option<crate::release::ReleaseCatalog>,
         /// Relay 支持在配对前核对目标设备身份。
         #[serde(default)]
         test_pairing_supported: bool,
@@ -819,6 +837,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             resource_tools_schema_version: Some(1),
             tool_center_schema_version: Some(1),
+            release_catalog: None,
             global_guide: Some(guide.clone()),
         };
         let decoded: WireMessage =
@@ -853,6 +872,9 @@ mod tests {
         };
         assert!(!format!("{enrollment:?}").contains(&enrollment.token));
         let value = serde_json::to_value(super::AgentWelcome {
+            release_catalog: None,
+            allow_agent_ai_disconnect: false,
+            allow_agent_human_disconnect: false,
             test_key_accepted: false,
             pairing_code: None,
             pairing_mode: super::PairingMode::ManagedOnDemand,
@@ -874,6 +896,7 @@ mod tests {
     #[test]
     fn controller_binding_modes_round_trip_and_legacy_defaults_to_none() {
         let mut binding = ControllerBinding {
+            installation_grant: None,
             session_id: SessionId::new(),
             controller_instance_id: ControllerInstanceId::new(),
             owner_id: ControllerOwnerId::new(),

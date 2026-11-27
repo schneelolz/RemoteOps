@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { Download } from "@lucide/vue";
 import * as c from "../services/operations";
 import EmptyState from "../components/EmptyState.vue";
+
 const rows = computed(() =>
   c.auditLogs.filter(
     (a) =>
@@ -18,6 +20,7 @@ const rows = computed(() =>
   ),
 );
 const actions = computed(() => [...new Set(c.auditLogs.map((a) => a.action))]);
+
 function exportRows() {
   const quote = (value: unknown) =>
     '"' + String(value ?? "").replace(/"/g, '""') + '"';
@@ -54,34 +57,64 @@ function exportRows() {
     <header class="page-header">
       <div>
         <h1 class="page-title" tabindex="-1">审计日志</h1>
-        <p class="page-desc">查看最近 200 条管理事件，导出当前筛选结果。</p>
+        <p class="page-desc">
+          查看最近 200 条管理与安全事件，支持按条件筛选并导出 CSV。
+        </p>
       </div>
-      <button class="btn btn-secondary" @click="exportRows">导出 CSV</button>
+      <div class="page-header-actions">
+        <button
+          class="btn btn-secondary"
+          :disabled="!rows.length"
+          @click="exportRows"
+        >
+          <Download :size="16" aria-hidden="true" />
+          <span>导出 CSV</span>
+        </button>
+      </div>
     </header>
-    <div class="tools-toolbar">
-      <div class="input-group">
-        <label for="audit-search" class="input-label">搜索日志</label
-        ><input
+
+    <div class="filter-toolbar tools-toolbar">
+      <div class="input-group toolbar-search">
+        <label for="audit-search" class="input-label">搜索日志</label>
+        <input
           id="audit-search"
           v-model="c.state.filters.keyword"
           class="input"
           type="search"
+          placeholder="搜索操作人、目标或详情…"
         />
       </div>
-      <label
-        >操作类型<select v-model="c.state.filters.auditType" class="input">
+      <div class="input-group toolbar-select">
+        <label for="audit-type-filter" class="input-label">操作类型</label>
+        <select
+          id="audit-type-filter"
+          v-model="c.state.filters.auditType"
+          class="select"
+        >
           <option value="ALL">全部操作</option>
           <option v-for="action in actions" :key="action">{{ action }}</option>
-        </select></label
-      ><label
-        >结果<select v-model="c.state.filters.auditResult" class="input">
+        </select>
+      </div>
+      <div class="input-group toolbar-select">
+        <label for="audit-result-filter" class="input-label">执行结果</label>
+        <select
+          id="audit-result-filter"
+          v-model="c.state.filters.auditResult"
+          class="select"
+        >
           <option value="ALL">全部结果</option>
           <option value="SUCCESS">成功</option>
           <option value="FAILED">失败</option>
-        </select></label
-      >
+        </select>
+      </div>
     </div>
+
     <section class="table-container">
+      <div class="table-header-bar">
+        <span class="table-helper-text"
+          >共 <strong>{{ rows.length }}</strong> 条审计记录</span
+        >
+      </div>
       <div v-if="rows.length" class="table-wrapper">
         <table class="ops-table audit-table">
           <thead>
@@ -96,20 +129,36 @@ function exportRows() {
           </thead>
           <tbody>
             <tr v-for="(a, i) in rows" :key="i">
-              <td>{{ a.time }}</td>
+              <td class="font-mono">{{ a.time }}</td>
               <td>
-                {{ a.operator }}
-                <div class="table-secondary-text">{{ a.ip }}</div>
+                <div class="table-primary-text">{{ a.operator }}</div>
+                <div class="table-secondary-text font-mono">{{ a.ip }}</div>
               </td>
-              <td>{{ a.action }}</td>
+              <td>
+                <span class="tag">{{ a.action }}</span>
+              </td>
               <td class="font-mono">{{ a.target }}</td>
-              <td>{{ a.result === "SUCCESS" ? "成功" : "失败" }}</td>
+              <td>
+                <span
+                  class="badge"
+                  :class="
+                    a.result === 'SUCCESS' ? 'badge-online' : 'badge-danger'
+                  "
+                >
+                  <span class="badge-dot" aria-hidden="true"></span>
+                  {{ a.result === "SUCCESS" ? "成功" : "失败" }}
+                </span>
+              </td>
               <td>{{ a.details }}</td>
             </tr>
           </tbody>
         </table>
       </div>
-      <EmptyState v-else title="暂无匹配日志" />
+      <EmptyState
+        v-else
+        title="暂无匹配日志"
+        description="尝试清除筛选关键字或切换操作类型。"
+      />
     </section>
   </div>
 </template>

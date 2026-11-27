@@ -3647,6 +3647,10 @@ mod tests {
             Ok(("123-456-789".to_owned(), Some("客户 A".to_owned())))
         );
         assert_eq!(
+            pairing_request("a2c-d3e-f4g", ""),
+            Ok(("A2C-D3E-F4G".to_owned(), None))
+        );
+        assert_eq!(
             pairing_request("123-456-789", "   "),
             Ok(("123-456-789".to_owned(), None))
         );

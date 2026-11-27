@@ -21,7 +21,7 @@ namespace roclip {
 using Bytes = std::vector<unsigned char>;
 constexpr size_t MaxPacket = 256 * 1024;
 constexpr ULONG BlockSize = 64 * 1024;
-enum Kind : unsigned char { Text=1, Files, Pull, Block, Clear };
+enum Kind : unsigned char { Text=1, Files, Pull, Block, Clear, Hello, Update, ImageStart, ImageChunk };
 struct Entry {std::wstring name; uint64_t size;};
 
 // 私有线格式为固定宽度小端整数和带长度的 UTF-8 字符串。

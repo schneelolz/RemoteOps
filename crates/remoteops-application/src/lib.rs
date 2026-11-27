@@ -398,6 +398,7 @@ struct ClientInner {
     // 每次握手重新采集，不从协议18本身推断资源能力。
     resource_tools_schema_version: AtomicU64,
     tool_center: tool_center_client::ToolCenterClientState,
+    release_catalog: std::sync::RwLock<Option<remoteops_protocol::release::ReleaseCatalog>>,
     global_guide: Arc<std::sync::RwLock<GlobalGuide>>,
     guide_pending:
         Mutex<BTreeMap<RequestId, oneshot::Sender<Result<GlobalGuide, ApplicationError>>>>,
@@ -505,6 +506,7 @@ impl RelayClient {
             transport_generation: AtomicU64::new(0),
             resource_tools_schema_version: AtomicU64::new(0),
             tool_center: tool_center_client::ToolCenterClientState::default(),
+            release_catalog: std::sync::RwLock::default(),
             global_guide: Arc::new(std::sync::RwLock::new(GlobalGuide::default())),
             guide_pending: Mutex::new(BTreeMap::new()),
             tcp_open_pending: Mutex::new(BTreeMap::new()),
@@ -541,6 +543,12 @@ impl RelayClient {
     #[must_use]
     pub fn is_connected(&self) -> bool {
         *self.inner.connected.borrow()
+    }
+
+    /// 查询当前在线 Relay 公告的已发布版本及与本机的关系。
+    pub fn published_version(&self, product: &str, local: &str) -> Option<(String, &'static str)> {
+        if !self.is_connected() { return None; }
+        self.inner.release_catalog.read().ok()?.as_ref()?.compare(product, std::env::consts::OS, std::env::consts::ARCH, local).map(|(v,s)| (v.to_owned(),s))
     }
 
     /// 返回最近一次由 Relay 确认的全局操作指引。
@@ -1400,6 +1408,19 @@ impl RelayClient {
                 None,
             )
             .await?;
+        self.release_session_request(session_id).await?;
+        Ok(result)
+    }
+
+    /// 仅解除发起方的临时配对，保留其他角色的终端和串口。
+    pub async fn release_binding(&self, session_id: SessionId) -> Result<(), ApplicationError> {
+        if self.inner.managed_pairings.lock().await.contains_key(&session_id) {
+            return Err(ApplicationError::Transport("此受管授权需要通过管理端结束".into()));
+        }
+        self.release_session_request(session_id).await
+    }
+
+    async fn release_session_request(&self, session_id: SessionId) -> Result<(), ApplicationError> {
         let request_id = RequestId::new();
         let (sender, receiver) = oneshot::channel();
         self.inner
@@ -1448,7 +1469,7 @@ impl RelayClient {
             "connection_closed",
             "会话已关闭，未完成操作不再等待远端结果",
         );
-        Ok(result)
+        Ok(())
     }
 
     /// 实时读取指定会话的安全上下文；不会调用图形 Provider。
@@ -1730,7 +1751,9 @@ where
             resource_tools_schema_version,
             tool_center_schema_version,
             global_guide,
+            release_catalog,
         } if protocol_version == PROTOCOL_VERSION => {
+            *inner.release_catalog.write().unwrap_or_else(std::sync::PoisonError::into_inner) = release_catalog;
             inner.desktop_version.store(u64::from(desktop_version.unwrap_or(0)), Ordering::Release);
             inner.bridge_protocol_version.store(
                 u64::from(bridge_protocol_version.unwrap_or(0)),
@@ -2893,6 +2916,7 @@ mod tests {
             transport_generation: AtomicU64::new(0),
             resource_tools_schema_version: AtomicU64::new(0),
             tool_center: tool_center_client::ToolCenterClientState::default(),
+            release_catalog: std::sync::RwLock::default(),
             global_guide: Arc::new(std::sync::RwLock::new(GlobalGuide::default())),
             guide_pending: Mutex::new(BTreeMap::new()),
             tcp_open_pending: Mutex::new(BTreeMap::new()),

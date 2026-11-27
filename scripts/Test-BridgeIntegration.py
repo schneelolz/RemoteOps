@@ -98,7 +98,7 @@ class Rpc:
 
 def structured(result):
     if result.get('isError'):
-        reason = re.sub(r'[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}|\b\d{3}-?\d{3}-?\d{3}\b', '<redacted>', json.dumps(result, ensure_ascii=False))
+        reason = re.sub(r'[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}|\b(?=[A-Za-z0-9-]*[0-9])[A-Za-z0-9]{3}-?[A-Za-z0-9]{3}-?[A-Za-z0-9]{3}\b', '<redacted>', json.dumps(result, ensure_ascii=False))
         raise RuntimeError('mcp_tool_rejected:' + reason[:1200])
     if 'structuredContent' in result:
         return result['structuredContent']

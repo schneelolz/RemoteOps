@@ -43,6 +43,9 @@ impl Inbox {
     pub(super) fn next(&self) -> Option<Command> {
         self.0.lock().unwrap().commands.pop_front()
     }
+    pub(super) fn heartbeat_time(&self) -> Instant {
+        self.0.lock().unwrap().heartbeat
+    }
     pub(super) fn live(&self) -> bool {
         self.0.lock().unwrap().heartbeat.elapsed() < LEASE
     }

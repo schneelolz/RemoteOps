@@ -1137,14 +1137,6 @@ fn enabled(app: &App, id: i32, value: bool) {
     }
 }
 
-fn display_code(code: &str) -> String {
-    if code.len() == 9 && code.bytes().all(|value| value.is_ascii_digit()) {
-        format!("{}-{}-{}", &code[..3], &code[3..6], &code[6..])
-    } else {
-        code.to_owned()
-    }
-}
-
 #[allow(clippy::too_many_lines)] // 呈现模型到已有控件的映射，不包含后台决策。
 fn update(app: &App, snapshot: &ProductSnapshot) {
     let counters_changed = {
@@ -1216,10 +1208,7 @@ fn update(app: &App, snapshot: &ProductSnapshot) {
             write(
                 app,
                 CODE,
-                &snapshot
-                    .code
-                    .as_deref()
-                    .map_or_else(|| "··· ··· ···".to_owned(), display_code),
+                snapshot.code.as_deref().unwrap_or("··· ··· ···"),
             );
             write(app, EXPIRY, &snapshot.countdown);
             enabled(app, COPY, snapshot.can_copy);

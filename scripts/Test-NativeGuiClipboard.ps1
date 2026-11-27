@@ -136,8 +136,8 @@ public sealed class RemoteOpsClipboardLease : IDisposable {
     public sealed class Comparison {public bool Opened,OwnerKnown,HasText,Matches,MatchesSynthetic;}
     public static bool MatchesControlCode(string value,string expected) {
         return value!=null&&expected!=null
-            &&System.Text.RegularExpressions.Regex.IsMatch(expected,"\\A[0-9]{9}\\z")
-            &&System.Text.RegularExpressions.Regex.IsMatch(value,"\\A(?:[0-9]{9}|[0-9]{3}-[0-9]{3}-[0-9]{3})\\z")
+            &&System.Text.RegularExpressions.Regex.IsMatch(expected,"\\A(?=[A-Z0-9]*[0-9])[A-Z0-9]{9}\\z")
+            &&System.Text.RegularExpressions.Regex.IsMatch(value,"\\A(?:[A-Z0-9]{9}|[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3})\\z")
             &&value.Replace("-","")==expected;
     }
     public static Comparison Compare(string expected,int target) {
@@ -192,6 +192,7 @@ function Wait-OwnerDelay($Lease){$wait=[Diagnostics.Stopwatch]::StartNew();while
 function Output-Sequence([string]$Text){$highest=-1;foreach($match in [regex]::Matches($Text,'CLIPBOARD_PARALLEL_ROW_(\d+)_(\d+)')){$highest=[math]::Max($highest,100*[int]$match.Groups[1].Value+[int]$match.Groups[2].Value)};return $highest}
 function Test-ControlCodeComparison {
     <# .SYNOPSIS 仅比较合成字符串，不访问剪贴板。 #>
+    if(-not [RemoteOpsClipboardLease]::MatchesControlCode('A2C-D3E-F4G','A2CD3EF4G')){throw 'mixed_code_grouped_clipboard_failed'}
     foreach($sample in @('123456789','123-456-789')){if(-not [RemoteOpsClipboardLease]::MatchesControlCode($sample,'123456789')){throw 'control_code_positive_self_test_failed'}}
     foreach($sample in @('prefix123456789','123456789suffix','123 456 789','123-45-6789','12345678','1234567890',"123456789`n",'１２３４５６７８９','123-456-780','')){if([RemoteOpsClipboardLease]::MatchesControlCode($sample,'123456789')){throw 'control_code_negative_self_test_failed'}}
     if([RemoteOpsClipboardLease]::MatchesControlCode('123-456-789','123-456-789')){throw 'control_code_expected_format_self_test_failed'}

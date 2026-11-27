@@ -23,6 +23,13 @@ mod direct;
 mod inbox;
 use inbox::{Command, Inbox};
 
+pub(super) fn crossdesk_available() -> bool {
+    cfg!(feature = "paired-human-desktop")
+        && option_env!("REMOTEOPS_CROSSDESK_CAPTURE_SHA256").is_some_and(|s| s.len() == 64)
+        && std::env::current_exe().is_ok_and(|p| p.with_file_name("remoteops-crossdesk-native.dll").is_file())
+        && remoteops_desktop_media::minirtc::Peer::crossdesk_available()
+}
+
 fn log_desktop(sink: Option<&super::AgentEventSink>, message: &str) {
     super::emit_agent_event(sink, super::AgentEvent::OperationLog(super::AgentOperationLog {
         repetition: None, request_id: None, occurred_at: chrono::Utc::now(),
@@ -124,9 +131,11 @@ impl Manager {
                     .await??;
                     write_frame(&mut conn, &WireMessage::DesktopMedia(ticket)).await?;
                     #[cfg(feature = "paired-human-desktop")]
+                    let attempt = remoteops_protocol::desktop::lan::diagnostic_id(stream);
+                    #[cfg(feature = "paired-human-desktop")]
                     direct::transfer(&mut conn, &mut video, request, lan_keys, &route_changed, |action| {
                         let _ = notify.send(WireMessage::Desktop(DesktopEvent { session, stream, action }));
-                    }).await?;
+                    }, |text| log_desktop(transport_log.as_ref(), &format!("私网 #{attempt} · {text}"))).await?;
                     #[cfg(not(feature = "paired-human-desktop"))]
                     while let Some(data) = video.recv().await {
                         tokio::time::timeout(LEASE, remoteops_protocol::desktop::write_video(&mut conn, &data)).await??;
@@ -284,6 +293,10 @@ fn capture(
     log: Option<&super::AgentEventSink>,
     #[cfg(feature = "paired-human-desktop")] direct_input: &mut mpsc::Receiver<(u64, Input)>,
 ) -> Result<(), &'static str> {
+    // 上一条流的 Win32 停止按钮销毁后，下一条流才能创建自己的现场窗口。
+    static CAPTURE_WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _exclusive_host = CAPTURE_WINDOW.lock().unwrap_or_else(|err| err.into_inner());
+    if stop.load(Ordering::Acquire) || !commands.live() { return Ok(()); }
     let notify = |action| {
         out.send(WireMessage::Desktop(DesktopEvent {
             session,
@@ -296,13 +309,26 @@ fn capture(
     let mut host = Host::open_paired()?;
     #[cfg(not(feature = "paired-human-desktop"))]
     let mut host = Host::open()?;
+    log_desktop(log, if host.is_rdp() { "现场共享窗口已就绪（RDP 会话）" } else { "现场共享窗口已就绪（本地控制台）" });
+    let mut first_frame_sent = false;
+    let mut capture_window = Instant::now();
+    let mut captures = 0u32;
     let (mut quality, mut fps, mut bitrate) = (Quality::High, 30_u8, 6_000_000_u32);
     let (mut last_sent, mut next_frame) = (None::<Instant>, Instant::now());
     let mut congestion = AdaptiveRate::default();
     let mut window = Instant::now();
     let mut geometry = None;
     let mut epoch = 0_u64;
+    let mut rtc = None::<remoteops_desktop_media::minirtc::Peer>;
+    let crossdesk_capable = crossdesk_available();
+    let mut using_crossdesk = false;
+    let mut rtc_heartbeat = commands.heartbeat_time();
+    let mut rtc_connected = false;
+    let mut rtc_primary = false;
+    let mut rtc_attempted = false;
+    let rtc_capable = cfg!(feature = "paired-human-desktop") && remoteops_desktop_media::minirtc::available();
     let mut controlling = false;
+    let mut releasing = false;
     let mut requested = false;
     let mut request_time = Instant::now();
     let mut route_seen = 0;
@@ -321,12 +347,18 @@ fn capture(
         }
         if requested && !controlling && request_time.elapsed() >= Duration::from_secs(30) {
             requested = false;
-            host.request_control(false);
+            releasing = true;
+        }
+        if releasing {
+            clipboard = None;
+            if !host.request_control(false) {
+                // 物理键仍按下时保留心跳，暂停处理输入，并在同一现场线程重试。
+                std::thread::sleep(Duration::from_millis(8));
+                continue;
+            }
             epoch += 1;
-            notify(Action::Control {
-                enabled: false,
-                epoch,
-            })?;
+            notify(Action::Control { enabled: false, epoch })?;
+            releasing = false;
         }
         if status == 3 && requested && !controlling && geometry.is_some() {
             controlling = true;
@@ -338,11 +370,8 @@ fn capture(
         } else if controlling && status != 3 {
             requested = false;
             controlling = false;
-            epoch += 1;
-            notify(Action::Control {
-                enabled: false,
-                epoch,
-            })?;
+            releasing = true;
+            continue;
         }
         let current_route = route.load(Ordering::Acquire);
         if current_route != route_seen {
@@ -350,13 +379,64 @@ fn capture(
             encoder = None;
             requested = false;
             controlling = false;
-            if !host.request_control(false) { break; }
-            epoch += 1;
-            notify(Action::Control { enabled: false, epoch })?;
+            releasing = true;
+            continue;
         }
         if !controlling || clipboard.as_ref().is_some_and(|c| c.0!=epoch) { clipboard=None; }
+        if let Some(worker) = &rtc {
+            use remoteops_desktop_media::minirtc::Event;
+            let current_heartbeat = commands.heartbeat_time();
+            if using_crossdesk && current_heartbeat != rtc_heartbeat && worker.heartbeat() {
+                rtc_heartbeat = current_heartbeat;
+            }
+            match worker.poll() {
+                Some(Event::Ready) => rtc_connected = true,
+                Some(Event::Signal(s)) if using_crossdesk => notify(Action::CrossDeskOffer(remoteops_protocol::desktop::rtc::Signal(s)))?,
+                Some(Event::Signal(s)) => notify(Action::RtcSignal(remoteops_protocol::desktop::rtc::Signal(s)))?,
+                Some(Event::Failed) => {
+                    rtc = None;
+                    rtc_connected = false;
+                    rtc_primary = false;
+                    encoder = None;
+                    notify(if using_crossdesk { Action::CrossDeskStop } else { Action::RtcStop })?;
+                }
+                _ => {}
+            }
+        }
         let mut recovery = None;
         match commands.next() {
+            Some(Command::Wire(Action::CrossDeskGrant(ticket))) if crossdesk_capable && !rtc_attempted => {
+                rtc_attempted = true;
+                if let Ok(worker) = remoteops_desktop_media::minirtc::Peer::start_crossdesk(true,&ticket)
+                    && host.select_crossdesk_capture().is_ok() {
+                    using_crossdesk = true;
+                    rtc = Some(worker);
+                } else {
+                    notify(Action::CrossDeskStop)?;
+                    log_desktop(log, "CrossDesk 无法启动，继续使用 TCP");
+                }
+            }
+            Some(Command::Wire(Action::CrossDeskReady)) if using_crossdesk && rtc.is_some() => rtc_primary = true,
+            Some(Command::Wire(Action::CrossDeskStop)) if using_crossdesk => {
+                rtc = None; rtc_connected = false; rtc_primary = false; encoder = None;
+            }
+            Some(Command::Wire(Action::RtcGranted(grant))) if rtc_capable && !rtc_attempted => {
+                rtc_attempted = true;
+                match remoteops_desktop_media::minirtc::Peer::start(true, &stream.to_string(), &grant) {
+                    Ok(worker) => rtc = Some(worker),
+                    Err(_) => { notify(Action::RtcStop)?; log_desktop(log, "MiniRTC 组件无法启动，使用 TCP"); }
+                }
+            }
+            Some(Command::Wire(Action::RtcSignal(s))) if !using_crossdesk => {
+                if let Some(worker) = &rtc && !worker.signal(s.0) {
+                    rtc = None; rtc_connected = false; rtc_primary = false; encoder = None;
+                    notify(Action::RtcStop)?;
+                }
+            }
+            Some(Command::Wire(Action::RtcReady)) if !using_crossdesk && rtc_connected => rtc_primary = true,
+            Some(Command::Wire(Action::RtcStop)) if !using_crossdesk => {
+                rtc = None; rtc_connected = false; rtc_primary = false; encoder = None;
+            }
             #[cfg(feature = "paired-human-desktop")]
             Some(Command::Wire(Action::LanPermit {epoch:seen})) if controlling && seen == epoch => direct_permit=Some(seen),
             #[cfg(feature = "paired-human-desktop")]
@@ -385,15 +465,12 @@ fn capture(
                 if !enabled || (geometry.is_some() && seen == epoch) {
                     requested = enabled;
                     request_time = Instant::now();
-                    if !host.request_control(enabled) {
-                        recovery=Some("现场暂时无法接管键鼠");
-                    } else if !enabled {
+                    if !enabled {
                         controlling = false;
-                        epoch += 1;
-                        notify(Action::Control {
-                            enabled: false,
-                            epoch,
-                        })?;
+                        releasing = true;
+                        continue;
+                    } else if !host.request_control(true) {
+                        recovery=Some("现场暂时无法接管键鼠");
                     }
                 }
             }
@@ -416,10 +493,9 @@ fn capture(
         if let Some(reason)=recovery {
             requested=false;
             controlling=false;
-            host.request_control(false);
-            epoch+=1;
-            notify(Action::Control {enabled:false,epoch})?;
-            log_desktop(log, &format!("{reason}，已释放键鼠并切回观察"));
+            releasing = true;
+            log_desktop(log, &format!("{reason}，正在释放键鼠"));
+            continue;
         }
         if !controlling || clipboard.as_ref().is_some_and(|c|c.0!=epoch) { clipboard=None; }
         if let Some((_,id,local))=&mut clipboard {
@@ -443,19 +519,31 @@ fn capture(
             }
             if full { continue; }
             if let Some((w, h, pw, ph)) = host.capture(&mut pixels, mw as i32, mh as i32)? {
+                captures += 1;
                 if geometry != Some((pw, ph)) {
-                    geometry = Some((pw, ph));
-                    epoch += 1;
                     requested = false;
                     controlling = false;
-                    host.request_control(false);
+                    if !host.request_control(false) {
+                        releasing = true;
+                        continue;
+                    }
+                    geometry = Some((pw, ph));
+                    epoch += 1;
                     notify(Action::Geometry {
                         epoch,
                         width: pw as u32,
                         height: ph as u32,
                         lan: cfg!(feature = "paired-human-desktop"),
                         clipboard: cfg!(feature = "paired-human-desktop"),
+                        mini_rtc: rtc_capable,
+                        crossdesk: crossdesk_capable,
                     })?;
+                }
+                if rtc_connected && commands.live() && !stop.load(Ordering::Acquire) {
+                    if let Some(worker) = &rtc {
+                        worker.frame(w as u32, h as u32, &pixels[..w as usize * h as usize * 4]);
+                    }
+                    if rtc_primary { continue; }
                 }
                 let settings = (w, h, fps, bitrate);
                 if encoder.as_ref().is_none_or(|(s, _)| *s != settings) {
@@ -470,9 +558,21 @@ fn capture(
                     .1
                     .encode(&pixels[..w as usize * h as usize * 4], &mut compressed)?;
                 if n > 0 && !stop.load(Ordering::Acquire) && commands.live() {
+                    let mut packet = compressed[..n].to_vec();
+                    let elapsed = capture_window.elapsed();
+                    if elapsed >= Duration::from_secs(1) {
+                        let fps = (f64::from(captures) / elapsed.as_secs_f64()).round() as u8;
+                        remoteops_protocol::desktop::fps::stamp(&mut packet, fps);
+                        capture_window = Instant::now();
+                        captures = 0;
+                    }
                     frames
-                        .try_send(compressed[..n].to_vec())
+                        .try_send(packet)
                         .map_err(|_| "桌面视频连接已关闭")?;
+                    if !first_frame_sent {
+                        first_frame_sent = true;
+                        log_desktop(log, "首帧已编码并进入发送队列");
+                    }
                 }
             }
         }

@@ -50,6 +50,7 @@ async fn agent_connect(
             credential_encryption_public_key: String::new(),
             credential_encryption_key_id: String::new(),
             mac_address: None,
+            supports_mixed_pairing_code: false,
             supports_agent_shutdown: false,
         })),
     )

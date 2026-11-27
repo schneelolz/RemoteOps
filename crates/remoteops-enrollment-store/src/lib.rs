@@ -23,7 +23,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const APPLICATION_ID: i64 = 0x524f_454e;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const GRANT_DOMAIN: &[u8] = b"remoteops-setup-grant-v1\0";
 const INSTALLATION_DOMAIN: &[u8] = b"remoteops-installation-v1\0";
 
@@ -137,14 +137,22 @@ impl EnrollmentStore {
                 [owner_id.to_string()],
             )?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if application == APPLICATION_ID && version == 1 {
             transaction.execute_batch(
                 "ALTER TABLE enrollment_clients ADD COLUMN tool_management INTEGER NOT NULL DEFAULT 0 CHECK (tool_management IN (0, 1));",
             )?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if application != APPLICATION_ID || version != SCHEMA_VERSION {
+        } else if application != APPLICATION_ID || !(2..=SCHEMA_VERSION).contains(&version) {
             return Err(corrupt("unsupported enrollment database schema"));
+        }
+        if version < 3 {
+            transaction.execute_batch(
+                "CREATE TABLE enrollment_device_grants (
+                    installation_id TEXT NOT NULL REFERENCES enrollment_clients(installation_id) ON DELETE CASCADE,
+                    agent_id TEXT NOT NULL,
+                    PRIMARY KEY (installation_id, agent_id)
+                ) WITHOUT ROWID;",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         let persisted_owner: String = transaction.query_row(
             "SELECT value FROM enrollment_meta WHERE key = 'owner_id'",
@@ -172,6 +180,69 @@ impl EnrollmentStore {
             connection: Mutex::new(connection),
             owner_id,
         })
+    }
+
+    /// 清除已经失去身份连续性的设备授权。
+    ///
+    /// # Errors
+    /// 无法清除时拒绝注册替代设备。
+    pub fn forget_device_grants(&self, agent: Uuid) -> Result<(), StoreError> {
+        self.connection()?.execute("DELETE FROM enrollment_device_grants WHERE agent_id = ?1", [agent.to_string()])?;
+        Ok(())
+    }
+
+    /// 返回指定安装已授权的设备。
+    ///
+    /// # Errors
+    /// 无法读取授权时返回错误。
+    pub fn list_device_grants(&self, installation: Uuid) -> Result<Vec<Uuid>, StoreError> {
+        let connection = self.connection()?;
+        let mut query = connection.prepare(
+            "SELECT agent_id FROM enrollment_device_grants JOIN enrollment_clients USING (installation_id)
+             WHERE installation_id = ?1 AND revoked = 0 ORDER BY agent_id",
+        )?;
+        query.query_map([installation.to_string()], |row| row.get::<_, String>(0))?
+            .map(|id| Uuid::parse_str(&id?).map_err(|_| corrupt("invalid device grant")))
+            .collect()
+    }
+
+    /// 检查指定安装与设备组合的有效授权。
+    ///
+    /// # Errors
+    /// 数据库不可用时返回错误。
+    pub fn has_device_grant(&self, installation: Uuid, agent: Uuid) -> Result<bool, StoreError> {
+        Ok(self.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM enrollment_device_grants JOIN enrollment_clients USING (installation_id)
+             WHERE installation_id = ?1 AND agent_id = ?2 AND revoked = 0)",
+            params![installation.to_string(), agent.to_string()], |row| row.get(0),
+        )?)
+    }
+
+    /// 增删单台设备的授权，返回持久化记录是否改变。
+    ///
+    /// # Errors
+    /// 拒绝空设备、未登记或已撤销的安装，存储失败时回滚。
+    pub fn set_device_grant(&self, installation: Uuid, agent: Uuid, enabled: bool) -> Result<bool, StoreError> {
+        if agent.is_nil() {
+            return Err(StoreError::InvalidInput("device must not be nil".into()));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM enrollment_clients WHERE installation_id = ?1 AND revoked = 0)",
+            [installation.to_string()], |row| row.get(0),
+        )?;
+        if !active {
+            return Err(StoreError::InvalidInput("installation is unknown or revoked".into()));
+        }
+        let sql = if enabled {
+            "INSERT INTO enrollment_device_grants (installation_id, agent_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING"
+        } else {
+            "DELETE FROM enrollment_device_grants WHERE installation_id = ?1 AND agent_id = ?2"
+        };
+        let changed = transaction.execute(sql, params![installation.to_string(), agent.to_string()])? > 0;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {

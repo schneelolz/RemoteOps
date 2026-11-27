@@ -293,6 +293,13 @@ impl TargetContext {
     /// 产品、宿主和桌面事实必须明确；未识别、空白或混合的禁用原因均不重试。
     #[must_use]
     pub fn visual_probe_allowed(&self) -> bool {
+        self.facts.interactive_desktop == CapabilityAvailability::Available
+            && self.visual_status_refresh_allowed()
+    }
+
+    /// 允许同一交互宿主更新已知的图形状态。已锁定的桌面可以报告解锁，图形操作仍按最新事实判断。
+    #[must_use]
+    pub fn visual_status_refresh_allowed(&self) -> bool {
         if self.validate().is_err()
             || self.product_id.is_empty()
             || self.product_id == "unknown"
@@ -300,7 +307,7 @@ impl TargetContext {
                 self.run_mode,
                 AgentRunMode::Interactive | AgentRunMode::Console
             )
-            || self.facts.interactive_desktop != CapabilityAvailability::Available
+            || self.facts.interactive_desktop == CapabilityAvailability::Unknown
             || self.facts.observed_at <= DateTime::<Utc>::UNIX_EPOCH
             || self.facts.source.is_empty()
             || self.facts.source == "unknown"

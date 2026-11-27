@@ -1,31 +1,65 @@
 <Application xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" x:Class="RemoteOps.Desktop.App">
   <Application.Resources>
-    <ResourceDictionary><ResourceDictionary.ThemeDictionaries>
+    <ResourceDictionary>
+      <ResourceDictionary.ThemeDictionaries>
         <ResourceDictionary x:Key="Light">
-          <SolidColorBrush x:Key="DeskSurface" Color="#F7F9FA"/>
-          <SolidColorBrush x:Key="DeskBar" Color="#F1F5F7"/>
-          <SolidColorBrush x:Key="DeskSide" Color="#E9EFF2"/>
-          <SolidColorBrush x:Key="DeskInk" Color="#152733"/>
-          <SolidColorBrush x:Key="DeskSubtle" Color="#465C68"/>
-          <SolidColorBrush x:Key="DeskRule" Color="#CFDCE1"/>
-          <SolidColorBrush x:Key="DeskAccent" Color="#076D77"/>
-          <SolidColorBrush x:Key="DeskHover" Color="#075B66"/>
-          <SolidColorBrush x:Key="DeskDanger" Color="#9B292B"/>
-          <SolidColorBrush x:Key="DeskDangerSurface" Color="#FBE4E3"/>
+          <SolidColorBrush x:Key="DeskSurface" Color="#F3F6FB"/>
+          <SolidColorBrush x:Key="DeskCard" Color="#FFFFFF"/>
+          <SolidColorBrush x:Key="DeskCardSubtle" Color="#F8FAFC"/>
+          <SolidColorBrush x:Key="DeskBar" Color="#FFFFFF"/>
+          <SolidColorBrush x:Key="DeskSide" Color="#EEF2F8"/>
+          <SolidColorBrush x:Key="DeskInk" Color="#0F172A"/>
+          <SolidColorBrush x:Key="DeskSubtle" Color="#475569"/>
+          <SolidColorBrush x:Key="DeskRule" Color="#D8E0EC"/>
+          <SolidColorBrush x:Key="DeskRuleSubtle" Color="#E6ECF5"/>
+          <SolidColorBrush x:Key="DeskConnectSurface" Color="#E7EFFF"/>
+          <SolidColorBrush x:Key="DeskConnectBorder" Color="#CBDCFF"/>
+          <SolidColorBrush x:Key="DeskAccent" Color="#2563EB"/>
+          <SolidColorBrush x:Key="DeskHover" Color="#1D4ED8"/>
+          <SolidColorBrush x:Key="DeskAccentSoft" Color="#DBEAFE"/>
+          <SolidColorBrush x:Key="DeskAccentInk" Color="#1E40AF"/>
+          <SolidColorBrush x:Key="DeskButtonBg" Color="#FFFFFF"/>
+          <SolidColorBrush x:Key="DeskButtonHover" Color="#F1F5F9"/>
+          <SolidColorBrush x:Key="DeskButtonBorder" Color="#CBD5E1"/>
+          <SolidColorBrush x:Key="DeskSuccessBg" Color="#ECFDF5"/>
+          <SolidColorBrush x:Key="DeskSuccessInk" Color="#047857"/>
+          <SolidColorBrush x:Key="DeskWarnBg" Color="#FFFBEB"/>
+          <SolidColorBrush x:Key="DeskWarnBorder" Color="#FDE68A"/>
+          <SolidColorBrush x:Key="DeskDanger" Color="#B91C1C"/>
+          <SolidColorBrush x:Key="DeskDangerSurface" Color="#FEF2F2"/>
+          <SolidColorBrush x:Key="DeskDangerBorder" Color="#FECACA"/>
+          <SolidColorBrush x:Key="DeskDangerHover" Color="#FEE2E2"/>
         </ResourceDictionary>
         <ResourceDictionary x:Key="Dark">
-          <SolidColorBrush x:Key="DeskSurface" Color="#191E24"/>
-          <SolidColorBrush x:Key="DeskBar" Color="#232A31"/>
-          <SolidColorBrush x:Key="DeskSide" Color="#1E252C"/>
-          <SolidColorBrush x:Key="DeskInk" Color="#F1F6F8"/>
-          <SolidColorBrush x:Key="DeskSubtle" Color="#B6C6CF"/>
-          <SolidColorBrush x:Key="DeskRule" Color="#38434D"/>
-          <SolidColorBrush x:Key="DeskAccent" Color="#10777C"/>
-          <SolidColorBrush x:Key="DeskHover" Color="#13696F"/>
-          <SolidColorBrush x:Key="DeskDanger" Color="#FFB3AD"/>
-          <SolidColorBrush x:Key="DeskDangerSurface" Color="#482D32"/>
+          <SolidColorBrush x:Key="DeskSurface" Color="#0E141F"/>
+          <SolidColorBrush x:Key="DeskCard" Color="#151E2E"/>
+          <SolidColorBrush x:Key="DeskCardSubtle" Color="#111927"/>
+          <SolidColorBrush x:Key="DeskBar" Color="#131B29"/>
+          <SolidColorBrush x:Key="DeskSide" Color="#111825"/>
+          <SolidColorBrush x:Key="DeskInk" Color="#F1F5F9"/>
+          <SolidColorBrush x:Key="DeskSubtle" Color="#9FB0C7"/>
+          <SolidColorBrush x:Key="DeskRule" Color="#283548"/>
+          <SolidColorBrush x:Key="DeskRuleSubtle" Color="#1E293B"/>
+          <SolidColorBrush x:Key="DeskConnectSurface" Color="#202E49"/>
+          <SolidColorBrush x:Key="DeskConnectBorder" Color="#35476B"/>
+          <SolidColorBrush x:Key="DeskAccent" Color="#2563EB"/>
+          <SolidColorBrush x:Key="DeskHover" Color="#3B82F6"/>
+          <SolidColorBrush x:Key="DeskAccentSoft" Color="#1E3A5F"/>
+          <SolidColorBrush x:Key="DeskAccentInk" Color="#DBEAFE"/>
+          <SolidColorBrush x:Key="DeskButtonBg" Color="#1C2739"/>
+          <SolidColorBrush x:Key="DeskButtonHover" Color="#243248"/>
+          <SolidColorBrush x:Key="DeskButtonBorder" Color="#33435A"/>
+          <SolidColorBrush x:Key="DeskSuccessBg" Color="#102C24"/>
+          <SolidColorBrush x:Key="DeskSuccessInk" Color="#6EE7B7"/>
+          <SolidColorBrush x:Key="DeskWarnBg" Color="#2D2312"/>
+          <SolidColorBrush x:Key="DeskWarnBorder" Color="#5C441B"/>
+          <SolidColorBrush x:Key="DeskDanger" Color="#FCA5A5"/>
+          <SolidColorBrush x:Key="DeskDangerSurface" Color="#351C22"/>
+          <SolidColorBrush x:Key="DeskDangerBorder" Color="#5D2B35"/>
+          <SolidColorBrush x:Key="DeskDangerHover" Color="#47232B"/>
         </ResourceDictionary>
-    </ResourceDictionary.ThemeDictionaries></ResourceDictionary>
+      </ResourceDictionary.ThemeDictionaries>
+    </ResourceDictionary>
   </Application.Resources>
   <Application.Styles>
     <FluentTheme/>
@@ -35,14 +69,202 @@
       <Setter Property="Background" Value="{DynamicResource DeskSurface}"/>
       <Setter Property="Foreground" Value="{DynamicResource DeskInk}"/>
     </Style>
-    <Style Selector="Button"><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="MinHeight" Value="38"/><Setter Property="Padding" Value="14,6"/><Setter Property="CornerRadius" Value="5"/></Style>
-    <Style Selector="Button.tool"><Setter Property="MinHeight" Value="34"/><Setter Property="Padding" Value="11,4"/><Setter Property="Background" Value="Transparent"/><Setter Property="Foreground" Value="{DynamicResource DeskInk}"/><Setter Property="BorderThickness" Value="0"/></Style>
-    <Style Selector="Button.primary"><Setter Property="Background" Value="{DynamicResource DeskAccent}"/><Setter Property="Foreground" Value="White"/></Style>
-    <Style Selector="Button.primary:pointerover /template/ ContentPresenter"><Setter Property="Background" Value="{DynamicResource DeskHover}"/><Setter Property="Foreground" Value="White"/></Style>
-    <Style Selector="TextBlock.muted"><Setter Property="Foreground" Value="{DynamicResource DeskSubtle}"/><Setter Property="TextWrapping" Value="Wrap"/></Style>
-    <Style Selector="Button.end"><Setter Property="Background" Value="{DynamicResource DeskDangerSurface}"/><Setter Property="Foreground" Value="{DynamicResource DeskDanger}"/></Style>
-    <Style Selector="TextBox"><Setter Property="MinHeight" Value="38"/></Style>
-    <Style Selector="TextBox[AcceptsReturn=false]"><Setter Property="VerticalContentAlignment" Value="Center"/></Style>
-    <Style Selector="ListBox#Devices ListBoxItem"><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="Padding" Value="12,10"/></Style>
+
+    <!-- Cards & Sections -->
+    <Style Selector="Border.card">
+      <Setter Property="Background" Value="{DynamicResource DeskCard}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskRule}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="10"/>
+      <Setter Property="Padding" Value="20,18"/>
+    </Style>
+    <Style Selector="Border.subcard">
+      <Setter Property="Background" Value="{DynamicResource DeskCardSubtle}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskRuleSubtle}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="14,12"/>
+    </Style>
+    <Style Selector="Border.segment-group">
+      <Setter Property="Background" Value="{DynamicResource DeskCardSubtle}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskRule}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="3"/>
+    </Style>
+    <Style Selector="Border.pill">
+      <Setter Property="Background" Value="{DynamicResource DeskAccentSoft}"/>
+      <Setter Property="CornerRadius" Value="99"/>
+      <Setter Property="Padding" Value="10,3"/>
+    </Style>
+    <Style Selector="Border.dialog-header">
+      <Setter Property="Background" Value="{DynamicResource DeskBar}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskRule}"/>
+      <Setter Property="BorderThickness" Value="0,0,0,1"/>
+      <Setter Property="Padding" Value="24,18"/>
+    </Style>
+    <Style Selector="Border.dialog-footer">
+      <Setter Property="Background" Value="{DynamicResource DeskCardSubtle}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskRule}"/>
+      <Setter Property="BorderThickness" Value="0,1,0,0"/>
+      <Setter Property="Padding" Value="24,14"/>
+    </Style>
+    <Style Selector="Border.warn-card">
+      <Setter Property="Background" Value="{DynamicResource DeskWarnBg}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskWarnBorder}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="14,12"/>
+    </Style>
+    <Style Selector="Border.state-online">
+      <Setter Property="Background" Value="{DynamicResource DeskSuccessBg}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskSuccessBg}"/>
+    </Style>
+    <Style Selector="Border.state-online TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource DeskSuccessInk}"/>
+    </Style>
+    <Style Selector="Border.state-online-limited">
+      <Setter Property="Background" Value="{DynamicResource DeskAccentSoft}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskAccentSoft}"/>
+    </Style>
+    <Style Selector="Border.state-online-limited TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource DeskAccentInk}"/>
+    </Style>
+    <Style Selector="Border.state-offline">
+      <Setter Property="Background" Value="{DynamicResource DeskCardSubtle}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskRule}"/>
+    </Style>
+    <Style Selector="Border.state-offline TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource DeskSubtle}"/>
+    </Style>
+
+    <!-- Buttons -->
+    <Style Selector="Button">
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="HorizontalContentAlignment" Value="Center"/>
+      <Setter Property="MinHeight" Value="38"/>
+      <Setter Property="Padding" Value="14,6"/>
+      <Setter Property="CornerRadius" Value="7"/>
+      <Setter Property="Background" Value="{DynamicResource DeskButtonBg}"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskInk}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskButtonBorder}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="FontWeight" Value="Medium"/>
+    </Style>
+    <Style Selector="Button:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource DeskButtonHover}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskButtonBorder}"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskInk}"/>
+    </Style>
+
+    <Style Selector="Button.tool">
+      <Setter Property="MinHeight" Value="34"/>
+      <Setter Property="Padding" Value="11,4"/>
+      <Setter Property="CornerRadius" Value="6"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskInk}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="BorderBrush" Value="Transparent"/>
+    </Style>
+    <Style Selector="Button.tool:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource DeskButtonHover}"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskInk}"/>
+    </Style>
+    <Style Selector="Button.tool:disabled /template/ ContentPresenter">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderBrush" Value="Transparent"/>
+      <Setter Property="Opacity" Value="0.45"/>
+    </Style>
+
+    <Style Selector="Button.primary">
+      <Setter Property="Background" Value="{DynamicResource DeskAccent}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskAccent}"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style Selector="Button.primary PathIcon">
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="Button.primary:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource DeskHover}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskHover}"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="Button.tool.primary">
+      <Setter Property="Background" Value="{DynamicResource DeskAccent}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskAccent}"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style Selector="Button.tool.primary PathIcon">
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="Button.tool.primary:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource DeskHover}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskHover}"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+
+    <Style Selector="Button.end">
+      <Setter Property="Background" Value="{DynamicResource DeskDangerSurface}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskDangerBorder}"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskDanger}"/>
+    </Style>
+    <Style Selector="Button.end PathIcon">
+      <Setter Property="Foreground" Value="{DynamicResource DeskDanger}"/>
+    </Style>
+    <Style Selector="Button.end:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource DeskDangerHover}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskDangerBorder}"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskDanger}"/>
+    </Style>
+
+    <!-- Typography -->
+    <Style Selector="TextBlock.muted">
+      <Setter Property="Foreground" Value="{DynamicResource DeskSubtle}"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+    </Style>
+
+    <!-- Inputs -->
+    <Style Selector="TextBox">
+      <Setter Property="MinHeight" Value="38"/>
+      <Setter Property="CornerRadius" Value="7"/>
+      <Setter Property="Background" Value="{DynamicResource DeskCard}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskButtonBorder}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="12,6"/>
+    </Style>
+    <Style Selector="TextBox[AcceptsReturn=false]">
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+
+    <!-- Expander -->
+    <Style Selector="Expander">
+      <Setter Property="Background" Value="{DynamicResource DeskCard}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource DeskRule}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="10"/>
+    </Style>
+
+    <!-- 已配对设备列表 -->
+    <Style Selector="ListBox#Devices ListBoxItem">
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="Padding" Value="12,10"/>
+      <Setter Property="Margin" Value="0,0,0,4"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskInk}"/>
+    </Style>
+    <Style Selector="ListBox#Devices ListBoxItem:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource DeskButtonHover}"/>
+    </Style>
+    <Style Selector="ListBox#Devices ListBoxItem:selected /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource DeskAccentSoft}"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskAccentInk}"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style Selector="ListBox#Devices ListBoxItem:selected:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource DeskAccentSoft}"/>
+      <Setter Property="Foreground" Value="{DynamicResource DeskAccentInk}"/>
+    </Style>
   </Application.Styles>
 </Application>

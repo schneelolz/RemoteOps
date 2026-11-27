@@ -115,7 +115,7 @@ impl ActivityView {
             .rows()
             .iter()
             .rev()
-            .take(3)
+            .take(5)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -132,7 +132,7 @@ impl ActivityView {
         }
     }
 
-    /// 绘制区固定三行；只滚动生命周期短文案，绝不直接绘制远端输出。
+    /// 绘制区固定五行；只滚动生命周期短文案，绝不直接绘制远端输出。
     pub(crate) fn draw(
         &self,
         hdc: HDC,
@@ -142,7 +142,7 @@ impl ActivityView {
         language: NativeLanguage,
         dark: bool,
     ) {
-        let line = i32::try_from((22 * dpi) / 96).unwrap_or(22).max(1);
+        let line = ((rect.bottom - rect.top) / 5).max(1);
         let saved = unsafe { SaveDC(hdc) };
         if saved == 0 {
             return;
@@ -194,7 +194,7 @@ impl ActivityView {
                 left: rect.left - offset as i32,
                 top: rect.top
                     + ((index as f64
-                        + if rows.len() > 3 {
+                        + if rows.len() > 5 {
                             -progress
                         } else if index + 1 == rows.len() {
                             1.0 - progress

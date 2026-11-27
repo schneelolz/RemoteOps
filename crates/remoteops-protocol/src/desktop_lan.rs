@@ -15,7 +15,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
-    time::timeout,
+    time::{Instant, timeout_at},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
@@ -24,12 +24,21 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 /// 单次握手完成的双向桌面套接字。
 pub type Socket = TlsStream<TcpStream>;
 
+/// 返回单次开窗的短诊断编号，供双方关联日志。
+pub fn diagnostic_id(stream: remoteops_domain::RequestId) -> String {
+    format!("{:08x}", stream.as_uuid().as_fields().0)
+}
+
 /// 本窗口专用证书及私钥，握手后立即释放配置。
 pub struct Identity {
     cert: CertificateDer<'static>,
     key: PrivatePkcs8KeyDer<'static>,
 }
 impl Identity {
+    /// 在同一流的两种握手方向复用已通过控制链核对的身份。
+    pub fn for_reverse(&self) -> Self {
+        Self { cert: self.cert.clone(), key: self.key.clone_key() }
+    }
     /// 生成新密钥。
     pub fn new() -> io::Result<Self> {
         let signed =
@@ -97,42 +106,123 @@ pub async fn accept(
     id: Identity,
     cert: Vec<u8>,
 ) -> io::Result<Socket> {
+    accept_observed(listener, peer, id, cert, |_| {}).await
+}
+
+/// 对预期来源的首次 TCP 接入报告一次，认证失败仍可在原期限内重试。
+pub async fn accept_observed(
+    listener: TcpListener,
+    peer: Ipv4Addr,
+    id: Identity,
+    cert: Vec<u8>,
+    connected: impl FnOnce(SocketAddr),
+) -> io::Result<Socket> {
+    accept_with_deadline(listener, peer, id, cert, Duration::from_secs(6), connected).await
+}
+
+/// 在协商约定的期限内接入指定私网对端。
+pub async fn accept_with_deadline(
+    listener: TcpListener, peer: Ipv4Addr, id: Identity, cert: Vec<u8>,
+    wait: Duration, connected: impl FnOnce(SocketAddr),
+) -> io::Result<Socket> {
     let expected = cert.clone();
     let verifier = WebPkiClientVerifier::builder(Arc::new(roots(cert)?))
         .build()
-        .map_err(io::Error::other)?;
+        .map_err(|_| io::Error::other("TLS 客户端验证器初始化失败"))?;
     let cfg = ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(vec![id.cert], id.key.into())
-        .map_err(io::Error::other)?;
+        .map_err(|_| io::Error::other("TLS 服务端证书初始化失败"))?;
     let tls = TlsAcceptor::from(Arc::new(cfg));
-    timeout(Duration::from_secs(6), async move {
-        loop {
-            let (tcp, addr) = listener.accept().await?;
-            if addr.ip() != peer {
+    let deadline = Instant::now() + wait;
+    let mut connected = Some(connected);
+    let mut last_failure = io::Error::new(
+        io::ErrorKind::TimedOut,
+        "等待 TCP 超时，未收到预期控制端连接",
+    );
+    loop {
+        if Instant::now() >= deadline {
+            return Err(last_failure);
+        }
+        let Ok(incoming) = timeout_at(deadline, listener.accept()).await else {
+            return Err(last_failure);
+        };
+        let (tcp, addr) = incoming.map_err(|e| io::Error::new(e.kind(), "接收 TCP 连接失败"))?;
+        if addr.ip() != peer {
+            if connected.is_some() {
+                last_failure = io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "仅收到其他地址的 TCP 连接，未收到预期控制端连接",
+                );
+            }
+            continue;
+        }
+        if let Some(report) = connected.take() {
+            report(addr);
+        }
+        tcp.set_nodelay(true)
+            .map_err(|e| io::Error::new(e.kind(), "TCP 套接字配置失败"))?;
+        let handshake_deadline = deadline.min(Instant::now() + TIMEOUT);
+        let mut socket = match timeout_at(handshake_deadline, tls.accept(tcp)).await {
+            Err(_) => {
+                last_failure = io::Error::new(io::ErrorKind::TimedOut, "TLS 握手超时");
                 continue;
             }
-            tcp.set_nodelay(true)?;
-            if let Ok(Ok(mut socket)) = timeout(TIMEOUT, tls.accept(tcp)).await {
-                if socket
-                    .get_ref()
-                    .1
-                    .peer_certificates()
-                    .and_then(|p| p.first())
-                    .is_none_or(|p| p.as_ref() != expected)
-                {
-                    continue;
-                }
-                socket.write_u8(1).await?;
-                socket.flush().await?;
-                return Ok(socket.into());
+            Ok(Err(e)) => {
+                last_failure = io::Error::new(e.kind(), "TLS 握手或客户端证书验证失败");
+                continue;
             }
+            Ok(Ok(socket)) => socket,
+        };
+        if socket
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|p| p.first())
+            .is_none_or(|p| p.as_ref() != expected)
+        {
+            last_failure = io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "控制端证书与本次配对不匹配",
+            );
+            continue;
         }
-    })
-    .await?
+        timeout_at(deadline, async {
+            socket.write_u8(1).await?;
+            socket.flush().await
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS 端点确认发送超时"))?
+        .map_err(|e| io::Error::new(e.kind(), "TLS 端点确认发送失败"))?;
+        return Ok(socket.into());
+    }
 }
+
+fn tcp_failure(kind: io::ErrorKind) -> io::Error {
+    let message = match kind {
+        io::ErrorKind::TimedOut => "TCP 连接超时",
+        io::ErrorKind::ConnectionRefused => "TCP 连接被拒绝",
+        io::ErrorKind::PermissionDenied => "本机拒绝 TCP 连接",
+        io::ErrorKind::HostUnreachable | io::ErrorKind::NetworkUnreachable => {
+            "TCP 目标或网络不可达"
+        }
+        _ => "TCP 连接失败",
+    };
+    io::Error::new(kind, message)
+}
+
 /// 绑定共同网段的出站网卡，验证 Agent 临时证书并完成双向认证。
 pub async fn connect(address: SocketAddrV4, id: Identity, cert: Vec<u8>) -> io::Result<Socket> {
+    connect_observed(address, id, cert, |_| {}).await
+}
+
+/// 在 TCP 连接建立后、验证服务端证书之前报告实际本地端点。
+pub async fn connect_observed(
+    address: SocketAddrV4,
+    id: Identity,
+    cert: Vec<u8>,
+    connected: impl FnOnce(SocketAddr),
+) -> io::Result<Socket> {
     if address.port() < 1024 {
         return Err(io::Error::other("直连端口无效"));
     }
@@ -142,30 +232,50 @@ pub async fn connect(address: SocketAddrV4, id: Identity, cert: Vec<u8>) -> io::
         .ok_or_else(|| io::Error::other("目的地址不在本机私网"))?;
     let expected = cert.clone();
     let cfg = ClientConfig::builder()
-        .with_root_certificates(roots(cert)?)
+        .with_root_certificates(roots(cert).map_err(|_| io::Error::other("TLS 服务端证书无效"))?)
         .with_client_auth_cert(vec![id.cert], id.key.into())
-        .map_err(io::Error::other)?;
-    timeout(TIMEOUT, async move {
-        let tcp = TcpSocket::new_v4()?;
-        tcp.bind(SocketAddr::from((ip, 0)))?;
-        let tcp = tcp.connect(address.into()).await?;
-        tcp.set_nodelay(true)?;
-        let mut socket = TlsConnector::from(Arc::new(cfg))
-            .connect(ServerName::try_from(NAME).unwrap(), tcp)
-            .await?;
-        if socket
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|p| p.first())
-            .is_none_or(|p| p.as_ref() != expected)
-            || socket.read_u8().await? != 1
-        {
-            return Err(io::Error::other("桌面端点认证失败"));
-        }
-        Ok(socket.into())
-    })
-    .await?
+        .map_err(|_| io::Error::other("TLS 客户端证书初始化失败"))?;
+    let deadline = Instant::now() + TIMEOUT;
+    let tcp = TcpSocket::new_v4().map_err(|e| io::Error::new(e.kind(), "无法创建 TCP 套接字"))?;
+    tcp.bind(SocketAddr::from((ip, 0)))
+        .map_err(|e| io::Error::new(e.kind(), "无法绑定所选私网网卡"))?;
+    let tcp = timeout_at(deadline, tcp.connect(address.into()))
+        .await
+        .map_err(|_| tcp_failure(io::ErrorKind::TimedOut))?
+        .map_err(|e| tcp_failure(e.kind()))?;
+    if let Ok(local) = tcp.local_addr() {
+        connected(local);
+    }
+    tcp.set_nodelay(true)
+        .map_err(|e| io::Error::new(e.kind(), "TCP 套接字配置失败"))?;
+    let connector = TlsConnector::from(Arc::new(cfg));
+    let mut socket = timeout_at(
+        deadline,
+        connector.connect(ServerName::try_from(NAME).unwrap(), tcp),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS 握手超时"))?
+    .map_err(|e| io::Error::new(e.kind(), "TLS 握手或服务端证书验证失败"))?;
+    if socket
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|p| p.first())
+        .is_none_or(|p| p.as_ref() != expected)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Agent 证书与本次配对不匹配",
+        ));
+    }
+    let ack = timeout_at(deadline, socket.read_u8())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS 端点确认超时"))?
+        .map_err(|e| io::Error::new(e.kind(), "TLS 认证未获 Agent 确认"))?;
+    if ack != 1 {
+        return Err(io::Error::other("TLS 端点确认无效"));
+    }
+    Ok(socket.into())
 }
 
 /// 直连下行零长度包是保活，其他包沿用原 H.264 访问单元。
@@ -205,6 +315,52 @@ pub async fn read_input(r: &mut (impl AsyncRead + Unpin)) -> io::Result<(u64, In
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tcp_timeout_and_refusal_have_distinct_labels() {
+        assert_eq!(
+            tcp_failure(io::ErrorKind::TimedOut).to_string(),
+            "TCP 连接超时"
+        );
+        assert_eq!(
+            tcp_failure(io::ErrorKind::ConnectionRefused).to_string(),
+            "TCP 连接被拒绝"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "需要配置私有 IPv4 网卡"]
+    async fn live_diagnostics_distinguish_refusal_from_tls_timeout() {
+        let ip = addresses()[0];
+        let bound = TcpSocket::new_v4().unwrap();
+        bound.bind((ip, 0).into()).unwrap();
+        let SocketAddr::V4(addr) = bound.local_addr().unwrap() else {
+            panic!()
+        };
+        let cert = Identity::new().unwrap().certificate();
+        let error = connect_observed(addr, Identity::new().unwrap(), cert.clone(), |_| {
+            panic!("未建立 TCP")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "TCP 连接被拒绝");
+        let listener = bound.listen(1).unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let client = tokio::spawn(connect_observed(
+            addr,
+            Identity::new().unwrap(),
+            cert,
+            |local| {
+                sent.send(local).unwrap();
+            },
+        ));
+        let (_held_socket, source) = listener.accept().await.unwrap();
+        assert_eq!(received.await.unwrap(), source);
+        assert_eq!(
+            client.await.unwrap().unwrap_err().to_string(),
+            "TLS 握手超时"
+        );
+    }
+
     #[test]
     fn public_and_off_subnet_addresses_are_excluded() {
         let ip = Ipv4Addr::new(192, 168, 0, 2);

@@ -1,0 +1,25 @@
+services:
+  turn:
+    image: coturn/coturn@sha256:974824bdefa8759b7aa4508daf5066fdd9f5411e925055b6132fb2904aecca01
+    container_name: remoteops-turn
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        test -s /etc/coturn/turnserver.conf
+        grep -qx use-auth-secret /etc/coturn/turnserver.conf
+        grep -Eq "^static-auth-secret=[0-9a-f]{64}$$" /etc/coturn/turnserver.conf
+        exec turnserver -c /etc/coturn/turnserver.conf --pidfile=/tmp/turnserver.pid
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

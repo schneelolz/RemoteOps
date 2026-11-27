@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $pairingCodeValue = $PairingCode.Trim()
-if ($pairingCodeValue -notmatch '^\d{3}-\d{3}-\d{3}$') {
+if ($pairingCodeValue -notmatch '^(?=[A-Za-z0-9-]*[0-9])[A-Za-z0-9]{3}-[A-Za-z0-9]{3}-[A-Za-z0-9]{3}$') {
     throw '没有取得有效的 RemoteOps 九位临时控制码'
 }
 if ($Alias -notmatch '^[A-Za-z0-9._-]{1,64}$') {
@@ -108,7 +108,7 @@ try {
         $diagnostic = $diagnostic.Replace($controllerToken, '[redacted-token]')
         $diagnostic = [regex]::Replace(
             $diagnostic,
-            '\b\d{3}-\d{3}-\d{3}\b|\b\d{9}\b',
+            '(?i)\b(?=[a-z0-9-]*[0-9])[a-z0-9]{3}-?[a-z0-9]{3}-?[a-z0-9]{3}\b',
             '[redacted-code]'
         )
         $diagnostic = [regex]::Replace(
@@ -133,7 +133,7 @@ try {
     $safeResult = $result.Replace($controllerToken, '[redacted-token]')
     $safeResult = [regex]::Replace(
         $safeResult,
-        '\b\d{3}-\d{3}-\d{3}\b',
+        '(?i)\b(?=[a-z0-9-]*[0-9])[a-z0-9]{3}-?[a-z0-9]{3}-?[a-z0-9]{3}\b',
         '[redacted]'
     )
     $parsed = $safeResult | ConvertFrom-Json -ErrorAction Stop

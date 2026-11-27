@@ -181,6 +181,7 @@ impl SetupArgs {
                 .read_to_string(&mut input)?;
         }
         let setup = SetupDocument::decode(&input)?;
+        crate::check_product_endpoint(&setup.relay, &setup.server_name)?;
         if self.setup_preview {
             println!(
                 "{}",
@@ -894,6 +895,7 @@ mod tests {
                     resource_tools_schema_version: None,
                     tool_center_schema_version: None,
                     protocol_version: PROTOCOL_VERSION,
+                    release_catalog: None,
                     global_guide: None,
                 },
             )

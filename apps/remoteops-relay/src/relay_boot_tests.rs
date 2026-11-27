@@ -77,6 +77,49 @@ fn boot_test_hello(
     value
 }
 
+#[tokio::test]
+async fn short_code_capability_preserves_existing_lease_and_handles_agent_downgrade() {
+    let relay = relay(Duration::minutes(10));
+    let agent = AgentInstanceId::new();
+    let mut hello = hello(agent, None);
+    let (sender, _receiver) = test_channel();
+    let register = |hello| relay.register_agent(hello, sender.clone());
+    let first = register(hello.clone()).await.unwrap();
+    let numeric = first.welcome.pairing_code.unwrap();
+    assert!(numeric.as_str().bytes().all(|b| b.is_ascii_digit()));
+    assert!(relay.commit_agent_resume(agent, first.connection_generation).await);
+    relay.finalize_agent_resume(agent, first.connection_generation).await.unwrap();
+    hello.resume_token = Some(first.welcome.resume_token);
+    hello.supports_mixed_pairing_code = true;
+    let same_boot = register(hello.clone()).await.unwrap();
+    assert_eq!(same_boot.welcome.pairing_code.as_ref(), Some(&numeric));
+    assert!(relay.commit_agent_resume(agent, same_boot.connection_generation).await);
+    relay.finalize_agent_resume(agent, same_boot.connection_generation).await.unwrap();
+    hello.resume_token = Some(same_boot.welcome.resume_token);
+    hello.boot_id = AgentBootId::new();
+    let upgraded = register(hello.clone()).await.unwrap();
+    let mixed = upgraded.welcome.pairing_code.unwrap();
+    assert!(mixed.is_mixed_short());
+    assert!(!mixed.as_str().contains(['I', 'O']));
+    assert!(relay.commit_agent_resume(agent, upgraded.connection_generation).await);
+    relay.finalize_agent_resume(agent, upgraded.connection_generation).await.unwrap();
+    let (controller, generation, _rx) = register_controller(&relay, ControllerKind::Human).await;
+    let request = PairRequest {
+        pairing_code: Some(AccessCode::parse(mixed.display_grouped().to_ascii_lowercase()).unwrap()),
+        request_id: RequestId::new(),
+        expected_agent_id: Some(agent),
+        expected_session_id: None,
+        connection_resume_token: None,
+        permission_mode: PermissionMode::ApprovalRequired,
+    };
+    assert!(relay.pair_controller(controller, generation, request).await.connection.is_some());
+    hello.resume_token = Some(upgraded.welcome.resume_token);
+    hello.supports_mixed_pairing_code = false;
+    let fallback = register(hello).await.unwrap();
+    assert!(fallback.welcome.pairing_code.unwrap().as_str().bytes().all(|b| b.is_ascii_digit()));
+    assert!(!relay.state.lock().await.pairing_index.contains_key(&mixed));
+}
+
 async fn boot_seed_runtime(
     relay: &Relay,
     agent_id: AgentInstanceId,
@@ -111,6 +154,7 @@ async fn boot_seed_runtime(
     state.in_flight.insert(
         request_id,
         InFlightRequest {
+            context_query: None,
             binding_token: binding.binding_token.clone(),
             agent_id,
             session_id,
@@ -595,6 +639,7 @@ async fn start_test_pairing_agent(
 ) -> (AgentRegistration, mpsc::Receiver<WireMessage>, SessionId) {
     let mut hello = boot_test_hello(agent_id, boot, token);
     hello.test_key_fingerprint = fingerprint.map(str::to_owned);
+    hello.supports_mixed_pairing_code = true;
     let (sender, receiver) = test_channel();
     let registration = relay.register_agent(hello, sender).await.unwrap();
     assert!(
@@ -626,6 +671,7 @@ async fn test_pairing_resumes_across_agent_and_relay_restarts() {
         start_test_pairing_agent(&relay, agent, boot, None, Some(&key)).await;
     assert!(first.welcome.test_key_accepted);
     let code = first.welcome.pairing_code.clone().unwrap();
+    assert!(code.is_mixed_short());
     relay
         .mark_agent_disconnected(agent, first.connection_generation)
         .await;

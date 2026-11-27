@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, watch } from "vue";
 import { useRoute } from "vue-router";
+import { Plus, Upload, RefreshCw } from "@lucide/vue";
 import * as c from "../services/operations";
 import type { Catalog, ManagedTool, SyncStatus } from "../models";
 import EmptyState from "../components/EmptyState.vue";
+
 const route = useRoute(),
   tc = c.state.toolCenter;
 const section = computed(() => String(route.params.section || "settings"));
@@ -114,6 +116,14 @@ function platformStatus(t: ManagedTool) {
       ? "有失败记录"
       : "尚未验证";
 }
+function platformBadgeClass(t: ManagedTool) {
+  const status = platformStatus(t);
+  return status === "有通过记录"
+    ? "badge-online"
+    : status === "有失败记录"
+      ? "badge-danger"
+      : "badge-offline";
+}
 </script>
 <template>
   <div
@@ -125,7 +135,7 @@ function platformStatus(t: ManagedTool) {
         v-for="s in c.TOOL_SECTIONS"
         :key="s[0]"
         :to="'/tools/' + s[0]"
-        class="btn"
+        class="btn btn-sm"
         :class="section === s[0] ? 'btn-primary' : 'btn-secondary'"
         >{{ s[1] }}</RouterLink
       >
@@ -158,21 +168,34 @@ function platformStatus(t: ManagedTool) {
           :disabled="disabled"
           @click="c.openToolCenterEditor()"
         >
-          新增工具</button
-        ><button
+          <Plus :size="16" aria-hidden="true" />
+          <span>新增工具</span>
+        </button>
+        <button
           class="btn btn-secondary"
           :disabled="tc.busy || tc.loading"
           @click="c.refreshToolsData()"
         >
-          {{ tc.loading ? "正在读取…" : "刷新" }}
+          <RefreshCw :size="15" aria-hidden="true" />
+          <span>{{ tc.loading ? "正在读取…" : "刷新" }}</span>
         </button>
       </div>
     </header>
     <p v-if="tc.error" class="mcp-error" role="alert">{{ tc.error }}</p>
-    <template v-if="section === 'settings'"
-      ><section class="card tools-policy">
+
+    <template v-if="section === 'settings'">
+      <section class="card tools-policy">
         <div>
-          <h2 class="section-title">工具分发与运行</h2>
+          <div class="card-title-row">
+            <h2 class="section-title">工具分发与运行</h2>
+            <span
+              class="badge"
+              :class="catalog?.enabled ? 'badge-online' : 'badge-offline'"
+            >
+              <span class="badge-dot" aria-hidden="true"></span>
+              {{ catalog?.enabled ? "已开启" : "已关闭" }}
+            </span>
+          </div>
           <p class="section-desc">
             {{
               catalog?.enabled
@@ -187,8 +210,8 @@ function platformStatus(t: ManagedTool) {
             }}。未验证不代表不兼容，测试记录只覆盖实际系统与接口。
           </p>
         </div>
-        <label class="tool-permission"
-          ><input
+        <label class="tool-permission permission-pill">
+          <input
             type="checkbox"
             role="switch"
             aria-label="工具中心全局开关"
@@ -203,15 +226,18 @@ function platformStatus(t: ManagedTool) {
                 '全局开关已更新',
               )
             "
-          />{{ catalog?.enabled ? "已开启" : "已关闭" }}</label
-        >
+          />
+          <span>{{ catalog?.enabled ? "已开启" : "已关闭" }}</span>
+        </label>
       </section>
+
       <section class="card tools-guide">
         <div class="tools-guide-heading">
           <h2 class="section-title">全局介绍与选择指南</h2>
           <button
             v-if="tc.guideDraft === null"
-            class="btn btn-secondary"
+            id="tool-guide-edit"
+            class="btn btn-secondary btn-sm"
             :disabled="disabled"
             @click="c.editToolGuide()"
           >
@@ -222,11 +248,11 @@ function platformStatus(t: ManagedTool) {
           catalog?.guide_markdown || "尚未填写全局说明。"
         }}</pre>
         <form v-else @submit="c.saveToolGuide">
-          <label class="input-label" for="tool-guide-input">全局说明</label
-          ><textarea
+          <label class="input-label" for="tool-guide-input">全局说明</label>
+          <textarea
             id="tool-guide-input"
             v-model="tc.guideDraft"
-            class="input tools-guide-input"
+            class="input font-mono tools-guide-input"
             rows="14"
             :disabled="tc.busy"
           />
@@ -241,47 +267,52 @@ function platformStatus(t: ManagedTool) {
           </p>
           <div class="tools-guide-actions">
             <button
+              id="tool-guide-template"
               type="button"
               class="btn btn-secondary"
               :disabled="tc.busy || !!tc.guideDraft"
               @click="c.useToolGuideTemplate()"
             >
-              填入模板</button
-            ><button
+              填入模板
+            </button>
+            <button
               type="button"
               class="btn btn-secondary"
               :disabled="tc.busy"
               @click="c.cancelToolGuide()"
             >
-              取消</button
-            ><button type="submit" class="btn btn-primary" :disabled="tc.busy">
+              取消
+            </button>
+            <button type="submit" class="btn btn-primary" :disabled="tc.busy">
               {{ tc.busy ? "正在保存…" : "保存说明" }}
             </button>
           </div>
         </form>
-      </section></template
-    >
-    <template v-else-if="section === 'sync'"
-      ><section class="tools-sync-section">
-        <h2 id="tools-sync-title" class="section-title">工具目录同步</h2>
-        <p class="section-desc">
-          目录版本 {{ catalog?.revision ?? "尚未读取" }}。已同步表示 Agent
-          已应用当前工具配置；工具包运行时按需下载。
-        </p>
+      </section>
+    </template>
+
+    <template v-else-if="section === 'sync'">
+      <section class="tools-sync-section">
         <div class="tools-sync-summary">
-          <span v-for="(label, key) in labels" :key="key"
-            >{{ label }}<strong>{{ counts[key] }}</strong></span
+          <span
+            v-for="(label, key) in labels"
+            :key="key"
+            class="sync-stat-chip"
           >
+            <span class="sync-stat-label">{{ label }}</span>
+            <strong class="font-mono">{{ counts[key] }}</strong>
+          </span>
         </div>
-        <div class="tools-toolbar">
-          <div class="input-group">
-            <label for="tools-node-search" class="input-label">搜索节点</label
-            ><input
+
+        <div class="filter-toolbar tools-toolbar">
+          <div class="input-group toolbar-search">
+            <label for="tools-node-search" class="input-label">搜索节点</label>
+            <input
               id="tools-node-search"
               class="input"
               type="search"
               :value="tc.nodeKeyword"
-              placeholder="节点名称或标识"
+              placeholder="搜索节点名称或 Agent 标识…"
               @input="
                 c.filterToolNodes(
                   ($event.target as HTMLInputElement).value,
@@ -290,10 +321,11 @@ function platformStatus(t: ManagedTool) {
               "
             />
           </div>
-          <label
-            >同步状态<select
+          <div class="input-group toolbar-select">
+            <label for="tools-node-filter" class="input-label">同步状态</label>
+            <select
               id="tools-node-filter"
-              class="input"
+              class="select"
               :value="tc.nodeFilter"
               @change="
                 c.filterToolNodes(
@@ -306,10 +338,17 @@ function platformStatus(t: ManagedTool) {
               <option v-for="(label, key) in labels" :key="key" :value="key">
                 {{ label }}
               </option>
-            </select></label
-          >
+            </select>
+          </div>
         </div>
+
         <div class="table-container tools-sync-container">
+          <div class="table-header-bar">
+            <span class="table-helper-text">
+              目录版本 <strong>#{{ catalog?.revision ?? "尚未读取" }}</strong> ·
+              工具包运行时按需下载
+            </span>
+          </div>
           <div
             class="table-wrapper tools-sync-scroll"
             role="region"
@@ -328,7 +367,9 @@ function platformStatus(t: ManagedTool) {
               <tbody>
                 <tr v-for="n in rows" :key="n.agent_instance_id">
                   <td>
-                    <strong>{{ n.hostname || n.agent_instance_id }}</strong>
+                    <strong class="table-primary-text">{{
+                      n.hostname || n.agent_instance_id
+                    }}</strong>
                   </td>
                   <td>
                     <span
@@ -338,12 +379,18 @@ function platformStatus(t: ManagedTool) {
                           ? 'badge-online'
                           : n.sync_status === 'apply_failed'
                             ? 'badge-danger'
-                            : 'badge-info'
+                            : n.sync_status === 'offline'
+                              ? 'badge-offline'
+                              : 'badge-info'
                       "
-                      >{{ labels[n.sync_status] }}</span
                     >
+                      <span class="badge-dot" aria-hidden="true"></span>
+                      {{ labels[n.sync_status] }}
+                    </span>
                   </td>
-                  <td>{{ n.applied_revision ?? "尚未确认" }}</td>
+                  <td class="font-mono">
+                    {{ n.applied_revision ?? "尚未确认" }}
+                  </td>
                   <td>{{ notes[n.sync_status] }}</td>
                 </tr>
                 <tr v-if="!rows.length">
@@ -361,13 +408,14 @@ function platformStatus(t: ManagedTool) {
             >
             <div>
               <button
-                class="btn btn-secondary"
+                class="btn btn-secondary btn-sm"
                 :disabled="page <= 1"
                 @click="changePage(-1)"
               >
-                上一页</button
-              ><button
-                class="btn btn-secondary"
+                上一页
+              </button>
+              <button
+                class="btn btn-secondary btn-sm"
                 :disabled="page >= pages"
                 @click="changePage(1)"
               >
@@ -376,34 +424,39 @@ function platformStatus(t: ManagedTool) {
             </div>
           </footer>
         </div>
-      </section></template
-    >
-    <template v-else
-      ><div class="tools-toolbar">
-        <div class="input-group">
-          <label for="tools-search" class="input-label">搜索工具</label
-          ><input
+      </section>
+    </template>
+
+    <template v-else>
+      <div class="filter-toolbar tools-toolbar">
+        <div class="input-group toolbar-search">
+          <label for="tools-search" class="input-label">搜索工具</label>
+          <input
             id="tools-search"
             v-model="tc.keyword"
             class="input"
             type="search"
-            placeholder="名称、标识或用途"
+            placeholder="搜索名称、标识或用途…"
           />
         </div>
-        <label
-          >启用状态<select id="tools-filter" v-model="tc.filter" class="input">
+        <div class="input-group toolbar-select">
+          <label for="tools-filter" class="input-label">启用状态</label>
+          <select id="tools-filter" v-model="tc.filter" class="select">
             <option value="all">全部工具</option>
             <option value="enabled">已启用</option>
             <option value="disabled">未启用</option>
-          </select></label
-        ><button
+          </select>
+        </div>
+        <button
           class="btn btn-secondary"
           :disabled="disabled"
           @click="c.openToolPackageImport()"
         >
-          上传 / 导入包
+          <Upload :size="15" aria-hidden="true" />
+          <span>上传 / 导入包</span>
         </button>
       </div>
+
       <section class="table-container">
         <div v-if="tools.length" class="table-wrapper">
           <table class="ops-table tools-table">
@@ -420,12 +473,15 @@ function platformStatus(t: ManagedTool) {
             <tbody>
               <tr v-for="t in visibleTools" :key="t.id">
                 <td>
-                  <strong>{{ t.name }}</strong>
-                  <div class="table-secondary-text">{{ t.id }}</div>
+                  <strong class="table-primary-text">{{ t.name }}</strong>
+                  <div class="table-secondary-text font-mono">{{ t.id }}</div>
                   <p class="tools-purpose">{{ t.purpose }}</p>
                 </td>
                 <td>
-                  {{ t.versions.length }} 个版本 / {{ packages(t).length }} 个包
+                  <div class="table-primary-text">
+                    {{ t.versions.length }} 个版本 /
+                    {{ packages(t).length }} 个包
+                  </div>
                   <div class="table-secondary-text">
                     {{
                       [
@@ -447,20 +503,23 @@ function platformStatus(t: ManagedTool) {
                         ? 'badge-online'
                         : 'badge-info'
                     "
-                    >{{
+                  >
+                    {{
                       packages(t).length &&
                       packages(t).every((p) => p.file_verified)
                         ? "校验通过"
                         : "待校验"
-                    }}</span
-                  >
+                    }}
+                  </span>
                 </td>
                 <td>
-                  <span class="badge badge-info">{{ platformStatus(t) }}</span>
+                  <span class="badge" :class="platformBadgeClass(t)">{{
+                    platformStatus(t)
+                  }}</span>
                 </td>
                 <td>
-                  <label class="tool-permission"
-                    ><input
+                  <label class="tool-permission">
+                    <input
                       type="checkbox"
                       :aria-label="'启用' + t.name"
                       :checked="t.enabled"
@@ -476,8 +535,9 @@ function platformStatus(t: ManagedTool) {
                           '工具启用状态已更新',
                         )
                       "
-                    />{{ t.enabled ? "已启用" : "未启用" }}</label
-                  >
+                    />
+                    <span>{{ t.enabled ? "已启用" : "未启用" }}</span>
+                  </label>
                 </td>
                 <td>
                   <div class="action-row">
@@ -485,8 +545,9 @@ function platformStatus(t: ManagedTool) {
                       class="btn btn-secondary btn-sm"
                       @click="c.selectManagedTool(t.id)"
                     >
-                      详情</button
-                    ><button
+                      详情
+                    </button>
+                    <button
                       class="btn btn-secondary btn-sm"
                       :disabled="disabled"
                       @click="c.openToolCenterEditor(t.id)"
@@ -513,24 +574,27 @@ function platformStatus(t: ManagedTool) {
             {{ toolPages }} 页</span
           >
           <div>
-            <label class="page-size-label"
-              >每页<select
+            <label class="page-size-label">
+              <span>每页</span>
+              <select
                 v-model.number="tc.listPageSize"
-                class="input"
+                class="select"
                 aria-label="每页工具数"
               >
                 <option :value="20">20 项</option>
                 <option :value="50">50 项</option>
                 <option :value="100">100 项</option>
-              </select></label
-            ><button
-              class="btn btn-secondary"
+              </select>
+            </label>
+            <button
+              class="btn btn-secondary btn-sm"
               :disabled="toolPage <= 1"
               @click="changeToolPage(-1)"
             >
-              上一页</button
-            ><button
-              class="btn btn-secondary"
+              上一页
+            </button>
+            <button
+              class="btn btn-secondary btn-sm"
               :disabled="toolPage >= toolPages"
               @click="changeToolPage(1)"
             >
@@ -539,15 +603,19 @@ function platformStatus(t: ManagedTool) {
           </div>
         </footer>
       </section>
+
       <details v-if="catalog?.audit?.length" class="card tools-audit">
-        <summary>最近工具管理记录</summary>
+        <summary>
+          最近工具管理记录（{{ catalog.audit.slice(0, 20).length }} 条）
+        </summary>
         <ul>
           <li v-for="(a, i) in catalog.audit.slice(0, 20)" :key="i">
-            {{ c.formatApiDate(a.created_at) }} · {{ a.actor }} ·
-            {{ a.action }} · {{ a.result }}（修订 {{ a.revision }}）
+            <span class="font-mono">{{ c.formatApiDate(a.created_at) }}</span> ·
+            <strong>{{ a.actor }}</strong> · {{ a.action }} ·
+            {{ a.result }}（修订 {{ a.revision }}）
           </li>
         </ul>
-      </details></template
-    >
+      </details>
+    </template>
   </div>
 </template>

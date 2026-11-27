@@ -916,6 +916,7 @@ impl RemoteOpsAgentApp {
             AgentEvent::Connected {
                 pairing_code,
                 lease_expires_at,
+                ..
             } => {
                 self.pairing_code = Some(pairing_code);
                 self.pairing_code_expires_at = Some(lease_expires_at);
@@ -2619,11 +2620,8 @@ fn setup_error_message(error: &str) -> String {
 
 /// 将控制码统一显示为连字符分隔的三位一组，和复制值保持一致。
 fn display_pairing_code(code: &str) -> String {
-    let digits: String = code.chars().filter(char::is_ascii_digit).collect();
-    if digits.len() == 9 {
-        return format!("{}-{}-{}", &digits[..3], &digits[3..6], &digits[6..]);
-    }
-    code.to_owned()
+    remoteops_domain::PairingCode::parse(code)
+        .map_or_else(|_| code.to_owned(), |value| value.display_grouped())
 }
 
 /// 返回控制码距离租约到期的剩余秒数；已过期时返回 None。
@@ -2975,6 +2973,8 @@ fn spawn_live(
 /// 演示使用与真实连接相同的绑定状态驱动权限展示。
 fn demo_controller_binding() -> AgentControllerBinding {
     AgentControllerBinding {
+        installation_authorized: false,
+        disconnect_target: None,
         owner_id: remoteops_domain::ControllerOwnerId::new(),
         controller_kind: ControllerKind::Ai,
         permission_mode: remoteops_domain::PermissionMode::ApprovalRequired,
@@ -3022,6 +3022,7 @@ fn spawn_demo(
                 .min(120);
             std::thread::sleep(Duration::from_secs(loading_seconds));
             event_sender.send(AgentEvent::Connected {
+                latest_update: None,
                 pairing_code: "482-915-307".to_owned(),
                 lease_expires_at: Utc::now() + chrono::Duration::minutes(10),
             });
@@ -3828,6 +3829,7 @@ mod tests {
     fn pairing_code_display_and_countdown_are_stable() {
         assert_eq!(display_pairing_code("482-915-307"), "482-915-307");
         assert_eq!(display_pairing_code("pending"), "pending");
+        assert_eq!(display_pairing_code("a2cd3ef4g"), "A2C-D3E-F4G");
         assert_eq!(format_countdown(599), "09:59");
         assert_eq!(format_countdown(3_661), "1:01:01");
 
@@ -5146,6 +5148,7 @@ mod tests {
             assert!(app.controller_bindings.is_empty());
             assert_eq!(app.controller_control_mode_label(), None);
             app.apply_event(AgentEvent::Connected {
+                latest_update: None,
                 pairing_code: "test".into(),
                 lease_expires_at: Utc::now(),
             });

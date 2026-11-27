@@ -37,7 +37,7 @@ if (-not $setupMode -and -not $UpgradeExisting) {
     throw '新安装必须提供 SetupFile、SetupCode 或 SetupStdin；已有安装请使用 UpgradeExisting。'
 }
 
-$mcpVersion = '0.2.0-preview.32'
+$mcpVersion = '0.2.0-preview.36'
 $credentialPromptVersion = '0.2.0-preview.7'
 $sourceExecutable = Join-Path $PSScriptRoot 'remoteops-controller-mcp.exe'
 $sourceCredentialPrompt = Join-Path $PSScriptRoot 'remoteops-credential-prompt.exe'

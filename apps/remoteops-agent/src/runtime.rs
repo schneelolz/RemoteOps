@@ -160,6 +160,8 @@ struct VisualState {
 
 #[derive(Clone)]
 pub(crate) struct RuntimeBoundary {
+    // 仅建议控制端询问当前操作者，不能代替会话授权。
+    pub session_approval_offer: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub host_business: Option<Arc<dyn super::HostBusinessProvider>>,
     pub context: Arc<TargetContext>,
     pub policy: AgentCapabilityPolicy,
@@ -175,6 +177,7 @@ pub(crate) struct RuntimeBoundary {
 impl Default for RuntimeBoundary {
     fn default() -> Self {
         Self {
+            session_approval_offer: None,
             context: Arc::new(TargetContext::default()),
             policy: AgentCapabilityPolicy::default(),
             resources: None,
@@ -209,6 +212,25 @@ impl RuntimeBoundary {
 
     pub fn snapshot(&self) -> TargetContext {
         let mut context = self.latest_context();
+        context.capabilities.retain(|v| v.capability != "managed_install_grant_v1");
+        #[cfg(feature = "managed-install-grant")]
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "managed_install_grant_v1".into(),
+            status: CapabilityAvailability::Available,
+            reasons: vec![],
+        });
+        context.capabilities.retain(|v| v.capability != "session_approval_offer_v1");
+        if let Some(pref) = &self.session_approval_offer {
+            context.capabilities.push(TargetCapabilityStatus {
+                capability: "session_approval_offer_v1".into(),
+                status: if pref.load(std::sync::atomic::Ordering::SeqCst) && !self.policy.read_only() {
+                    CapabilityAvailability::Available
+                } else {
+                    CapabilityAvailability::Unavailable
+                },
+                reasons: vec![],
+            });
+        }
         context
             .capabilities
             .retain(|status| status.capability != "host_business_v1");
@@ -932,6 +954,16 @@ pub(crate) fn visual_operations() -> Vec<RemoteOperation> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_approval_offer_reads_the_live_site_preference() {
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let boundary = super::RuntimeBoundary { session_approval_offer: Some(enabled.clone()), ..Default::default() };
+        let offer = || boundary.snapshot().capabilities.into_iter().find(|v| v.capability == "session_approval_offer_v1").unwrap().status;
+        assert_eq!(offer(), CapabilityAvailability::Available);
+        enabled.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(offer(), CapabilityAvailability::Unavailable);
+    }
+
     #[test]
     fn language_switch_is_live_and_isolated_from_other_targets_and_visual_cache() {
         let selected = super::AgentUiLanguage::default();

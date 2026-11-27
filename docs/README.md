@@ -4,9 +4,11 @@
 
 架构边界和审查结论见：[架构说明](ARCHITECTURE.md) · [代码审查报告](CODE_REVIEW.md)。
 
-RemoteOps `0.2.0-preview.5` 当前源码候选不内置公共 Relay 地址；该版本计划作为首个 GitHub Technical Preview。部署者必须通过配置文件、环境变量或命令行参数提供自己的 Relay；公网 CA 使用系统可信根，私有 CA 可以配置 PEM，Agent GUI 也支持人工核对并固定 SHA-256 指纹。
+公共发行版连接部署者配置的 Relay。公网 CA 使用系统信任库，私有 CA 可配置 PEM，Agent GUI 也支持人工核对并固定证书指纹。部署步骤见 [Relay 部署说明](Relay部署说明.md)。
 
-公开开发状态、当前门禁和未来阶段见 [项目状态](PROJECT_STATUS.md) 与 [路线图](ROADMAP.md)。图形化能力暂不进入第一阶段，调研结果见 [Visual Provider 调研](VISUAL_PROVIDER_RESEARCH.md)。
+Windows 人工运维端使用现场控制码配对，打开桌面后默认观察，可在工具栏切换到控制。「自动」优先尝试局域网直连，直连不可用时可经 MiniRTC 中继传输，UDP 中断后在同一窗口恢复 TCP。中继部署条件见 [TURN 配置](../deploy/turn/README.md)。
+
+其他开发阶段和早期调研见 [项目状态](PROJECT_STATUS.md)、[路线图](ROADMAP.md) 和 [Visual Provider 调研](VISUAL_PROVIDER_RESEARCH.md)。
 
 ## 安装和使用
 

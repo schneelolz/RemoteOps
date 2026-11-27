@@ -2,14 +2,14 @@
 name: remoteops
 description: 仅在用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，使用 RemoteOps MCP 连接和诊断现场 Agent。普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不触发本 Skill；看不到 RemoteOps MCP 工具时必须报告当前任务未加载 RemoteOps MCP，禁止改用 Computer Use 或声称已操作远端。
 metadata:
-  version: "0.1.10"
+  version: "0.1.11"
 ---
 
 # RemoteOps 远程诊断
 
 ## 路由规则
 
-- 用户明确称九位数字为 RemoteOps 控制码或配对码时，必须优先使用 RemoteOps MCP。
+- 用户明确提供 RemoteOps 九位控制码或配对码（字母数字混合或纯数字，支持三段输入，字母不分大小写）时，必须优先使用 RemoteOps MCP。
 - 用户明确要求通过 RemoteOps 执行远程操作时，使用 RemoteOps MCP；未明确要求 RemoteOps 的普通服务器、云主机、跳板机、SSH 或其他远程运维任务，继续使用用户指定的常规工具和流程。
 - 不要把 RemoteOps 当成远程桌面。RemoteOps 任务看不到 RemoteOps MCP 工具时，立即说明“当前任务未加载 RemoteOps MCP”，请用户确认安装后完全退出并重新打开 Codex，再新建任务；不要声称已经连接、检查、修改或重启远程电脑。
 

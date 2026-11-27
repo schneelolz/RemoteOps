@@ -2,6 +2,10 @@
 use std::fmt;
 #[path = "desktop_clipboard.rs"]
 pub mod clipboard;
+#[path = "desktop_fps.rs"]
+pub mod fps;
+#[path = "desktop_rtc.rs"]
+pub mod rtc;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 #[cfg(feature = "desktop-lan")]
@@ -106,11 +110,45 @@ pub enum Action {
         lan: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         clipboard: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        mini_rtc: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        crossdesk: bool,
     },
+    /// 仅能力协商成功后，面板为当前流申请 TURN 媒体。
+    RtcRequest,
+    /// Relay 分别向已认证的两端提供各自的临时凭据。
+    RtcGranted(rtc::TurnGrant),
+    /// 当前桌面流内有界的媒体信令。
+    RtcSignal(rtc::Signal),
+    /// 放弃可选媒体链并回到原媒体连接。
+    RtcStop,
+    /// 运维端已收到 MiniRTC 视频关键帧，可以暂停 TCP 视频。
+    RtcReady,
+    /// 已配对的运维端在支持 CrossDesk 的现场流上申请一次性观看票据。
+    CrossDeskRequest,
+    /// 绑定当前会话和桌面流的观看票据。键鼠权限仍须现场回执。
+    CrossDeskGrant(Ticket),
+    /// 上游一次性会合信息只经已鉴权的现场控制链交给本流运维端。
+    CrossDeskOffer(rtc::Signal),
+    /// 运维端已显示本后端的首个关键帧。
+    CrossDeskReady,
+    /// 放弃当前流的 CrossDesk 媒体，回到原有画面。
+    CrossDeskStop,
     /// 已配对面板提供本机候选地址和本流临时客户端证书。
-    LanRequest { addresses: Vec<Ipv4Addr>, certificate: Vec<u8> },
+    LanRequest {
+        addresses: Vec<Ipv4Addr>, certificate: Vec<u8>,
+        /// 已绑定本机私网地址的一次性反向监听端点。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reverse: Vec<SocketAddrV4>,
+    },
     /// Agent 回答所选端点和本流临时服务端证书。
-    LanOffer { address: SocketAddrV4, certificate: Vec<u8> },
+    LanOffer {
+        address: SocketAddrV4, certificate: Vec<u8>,
+        /// Agent 选中的反向端点。旧版缺省仅尝试正向连接。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reverse: Option<SocketAddrV4>,
+    },
     /// Relay 对 Agent 确认的当代人工租约签发直连输入许可。
     LanPermit { epoch: u64 },
     /// 请求或确认人工桌面输入租约；来自 Agent 的回执才解锁面板。

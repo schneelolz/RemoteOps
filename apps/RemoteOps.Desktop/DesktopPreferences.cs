@@ -9,8 +9,9 @@ namespace RemoteOps.Desktop;
 // 保存本机的界面偏好，与连接参数及凭据独立。
 internal sealed record DesktopPreferences(string Theme = "auto", HashSet<string>? ClipboardOff = null)
 {
-    internal static readonly string FilePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RemoteOps", "appearance.json");
+    // 窗口冒烟测试可为当前进程指定独立的偏好文件。
+    internal static readonly string FilePath = AppContext.GetData("RemoteOps.Desktop.AppearancePath") as string
+        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RemoteOps", "appearance.json");
 
     internal static DesktopPreferences Load()
     {
@@ -56,6 +57,27 @@ internal sealed record DesktopPreferences(string Theme = "auto", HashSet<string>
             };
     }
 
+    internal static string RequestedTheme => Application.Current?.RequestedThemeVariant switch
+    {
+        var theme when theme == ThemeVariant.Light => "light",
+        var theme when theme == ThemeVariant.Dark => "dark",
+        _ => "auto"
+    };
+
+    internal static bool SetTheme(string theme)
+    {
+        try
+        {
+            Change(preferences => preferences with { Theme = theme });
+            return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            Apply(theme);
+            return false;
+        }
+    }
+
     internal static bool ClipboardEnabled(string device) => !(Load().ClipboardOff?.Contains(device) ?? false);
 
     internal static void SaveClipboard(string device, bool enabled) => Change(current =>
@@ -85,20 +107,15 @@ public sealed class AppearanceButton : Button
             var item = new MenuItem { Header = label, ToggleType = MenuItemToggleType.Radio };
             item.Click += (_, _) =>
             {
-                try { DesktopPreferences.Change(p => p with { Theme = id }); }
-                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-                {
-                    DesktopPreferences.Apply(id);
-                    ToolTip.SetTip(this, "本次已切换，偏好写入失败");
-                }
+                var saved = DesktopPreferences.SetTheme(id);
+                ToolTip.SetTip(this, saved ? "选择自动、浅色或深色外观" : "本次已切换，偏好写入失败");
             };
             choices.Add(id, item);
             menu.Items.Add(item);
         }
         menu.Opening += (_, _) =>
         {
-            var selected = DesktopPreferences.Load().Theme;
-            if (!choices.ContainsKey(selected)) selected = "auto";
+            var selected = DesktopPreferences.RequestedTheme;
             foreach (var (id, item) in choices) item.IsChecked = id == selected;
         };
         Flyout = menu;

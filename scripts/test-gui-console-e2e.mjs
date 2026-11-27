@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Windows 回环验收：所有原始输出只留内存，持久结果只含检查项与初始化阶段。
+import { consoleCode } from './test-pairing-code-support.mjs';
 import { spawn } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
@@ -135,9 +136,7 @@ class Mcp {
 }
 
 function codeFrom(state) {
-  const match = state.stdout.match(/控制码[：:]\s*([0-9][0-9 -]{7,14}[0-9])/);
-  const code = match?.[1].replace(/\D/g, '');
-  return code?.length === 9 ? code : undefined;
+  return consoleCode(state.stdout);
 }
 
 const succeeded = result => !result?.isError && result?.status === 'completed'

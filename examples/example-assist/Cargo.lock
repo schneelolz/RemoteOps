@@ -3282,7 +3282,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remoteops-agent"
-version = "0.2.0-preview.42"
+version = "0.2.0-preview.43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3301,6 +3301,7 @@ dependencies = [
  "remoteops-resources",
  "remoteops-serial",
  "remoteops-visual",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -3314,7 +3315,7 @@ dependencies = [
 
 [[package]]
 name = "remoteops-agent-gui"
-version = "0.2.0-preview.35"
+version = "0.2.0-preview.36"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3453,6 +3454,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
+ "uuid",
  "x509-parser",
  "zeroize",
 ]

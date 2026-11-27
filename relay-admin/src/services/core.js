@@ -90,7 +90,7 @@ const sessionColumnDefinitions = [
   { key: "connectionStatus", label: "连接状态" },
   { key: "agentHostname", label: "Agent 计算机名" },
   { key: "agentMacAddress", label: "Agent MAC 地址" },
-  { key: "controller", label: "MCP 计算机名" },
+  { key: "controller", label: "控制端" },
   { key: "controllerMacAddress", label: "MCP MAC 地址" },
   { key: "controlMode", label: "控制权限" },
   { key: "lastHeartbeat", label: "最后心跳" },
@@ -265,6 +265,18 @@ function applyApiData(overview, identity, rawAgents, rawSessions, rawAudit) {
         controllerInstanceId: String(
           String((ai || human)?.controller_instance_id || "-"),
         ),
+        controllerInstanceIds: bindings
+          .map((binding) =>
+            String(binding?.controller_instance_id || "").trim(),
+          )
+          .filter(Boolean),
+        controllerHostnames: bindings
+          .map((binding) =>
+            String(
+              binding?.hostname || binding?.controller_hostname || "",
+            ).trim(),
+          )
+          .filter(Boolean),
         humanController: String(
           human
             ? `Connected (${String(human.controller_instance_id).slice(0, 8)})`
@@ -290,10 +302,12 @@ function applyApiData(overview, identity, rawAgents, rawSessions, rawAudit) {
         inflightRequests: session.in_flight_requests || 0,
         generation: session.connection_generation || 0,
         leaseExpire: formatApiDate(session.lease_expires_at),
-        isClosed: bindings.length === 0,
+        isClosed: bindings.length === 0 && session.state !== "online",
         status:
           bindings.length === 0
-            ? "CLOSED"
+            ? session.state === "online"
+              ? "WAITING"
+              : "CLOSED"
             : session.state === "online"
               ? "ACTIVE"
               : "DEGRADED",
@@ -522,6 +536,85 @@ function filteredAgents() {
           String(value).toLowerCase().includes(keyword),
         )),
   );
+}
+
+function hasActiveSessionFilters() {
+  return Boolean(
+    String(state.filters.keyword || "").trim() ||
+    state.filters.status !== "ALL" ||
+    state.filters.controllerType !== "ALL" ||
+    state.filters.permissionMode !== "ALL",
+  );
+}
+
+function clearSessionFilters() {
+  state.filters.keyword = "";
+  state.filters.status = "ALL";
+  state.filters.controllerType = "ALL";
+  state.filters.permissionMode = "ALL";
+}
+
+function filteredSessions() {
+  const keyword = String(state.filters.keyword || "")
+    .trim()
+    .toLowerCase();
+  return sessions.filter((s) => {
+    const matchesKeyword =
+      !keyword ||
+      [
+        s.id,
+        s.agentName,
+        s.controllerHostname,
+        s.controllerName,
+        s.humanController,
+        s.controllerInstanceId,
+        ...(s.controllerInstanceIds || []),
+        ...(s.controllerHostnames || []),
+      ].some((value) =>
+        String(value || "")
+          .toLowerCase()
+          .includes(keyword),
+      );
+    return (
+      matchesKeyword &&
+      (state.filters.status === "ALL" || s.status === state.filters.status) &&
+      (state.filters.controllerType === "ALL" ||
+        s.controllerType === state.filters.controllerType) &&
+      (state.filters.permissionMode === "ALL" ||
+        s.permissionMode === state.filters.permissionMode)
+    );
+  });
+}
+
+function hasBoundSessions() {
+  return sessions.some((s) => s.status === "ACTIVE" || s.status === "DEGRADED");
+}
+
+function isControllerWaitingForPairing() {
+  return relayInfo.connectedControllers > 0 && !hasBoundSessions();
+}
+
+function sessionEmptyState(considerFilters = true) {
+  if (considerFilters && hasActiveSessionFilters()) {
+    return {
+      title: "暂无匹配会话",
+      description: "当前搜索或筛选条件未命中会话，可清除筛选查看全部记录。",
+      showClearFilters: true,
+    };
+  }
+  if (isControllerWaitingForPairing()) {
+    return {
+      title: "控制端已连接，等待配对设备",
+      description:
+        "当前已有控制端接入 Relay，待现场 Agent 配对后将显示对应会话。",
+      showClearFilters: false,
+    };
+  }
+  return {
+    title: "暂无匹配会话",
+    description: "调整筛选条件或等待 Agent 与 Controller 建立连接。",
+    showClearFilters: false,
+  };
 }
 
 function selectAgent(id, checked) {
@@ -776,6 +869,12 @@ export {
   snapshotAgent,
   reconcileAgentSelection,
   filteredAgents,
+  hasActiveSessionFilters,
+  clearSessionFilters,
+  filteredSessions,
+  hasBoundSessions,
+  isControllerWaitingForPairing,
+  sessionEmptyState,
   selectAgent,
   selectVisibleAgents,
   openAgentShutdown,

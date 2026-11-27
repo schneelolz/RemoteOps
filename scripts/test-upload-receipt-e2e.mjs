@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // 仅回环、真实 CLI Agent/Relay/MCP 的上传回执验收；无 GUI、SSH 或外部目标。
+import { consoleCode, shortCode } from './test-pairing-code-support.mjs';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
@@ -277,9 +278,9 @@ async function main(options) {
     const agent = start(executables.agent, ['--config', config], envFor('agent'));
     const pairing = await until('fixture_agent_pairing_ready', () => {
       if (agent.ended) throw fail('agent_ended');
-      return /控制码[：:]\s*(\d[\d -]{7,14}\d)/u.exec(agent.stdout)?.[1]?.replace(/\D/g, '');
+      return consoleCode(agent.stdout);
     }, 60000);
-    check('fixture_pairing_code_only_in_memory', /^\d{9}$/.test(pairing));
+    check('fixture_pairing_code_only_in_memory', Boolean(shortCode(pairing)));
     const mcpConfig = path.join(directories['mcp-local'], 'mcp-config.json');
     await fs.writeFile(mcpConfig, '{}', { flag: 'wx' });
     const transport = start(executables.mcp, ['--config', mcpConfig, '--relay', address, '--server-name', 'localhost',

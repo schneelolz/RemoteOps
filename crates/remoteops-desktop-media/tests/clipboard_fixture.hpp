@@ -7,7 +7,7 @@ inline std::recursive_mutex guard;
 inline UINT format=0;inline HANDLE memory=nullptr;inline IDataObject* object=nullptr;
 inline std::atomic<DWORD> sequence{1};
 inline void clear(){
-    if(memory){GlobalFree(memory);memory=nullptr;}
+    if(memory){if(format==CF_BITMAP)DeleteObject(memory);else GlobalFree(memory);memory=nullptr;}
     if(object){object->Release();object=nullptr;}
     format=0;++sequence;
 }

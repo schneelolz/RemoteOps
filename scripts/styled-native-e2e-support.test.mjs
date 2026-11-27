@@ -1,8 +1,17 @@
 import test from 'node:test';
+import {consoleCode, shortCode} from './test-pairing-code-support.mjs';
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {parseDesktopArguments, normalizeTlsFingerprint, sameTlsFingerprint, summarizeApplicationReport, collectApplicationReport, classifyCleanQualityExit, evaluateProcessOutputPrivacy} from './styled-native-e2e-support.mjs';
+
+test('支持数字码与三段混合码，拒绝提示文案及非 ASCII 字符', () => {
+  assert.equal(shortCode('123-456-789'), '123456789');
+  assert.equal(consoleCode('控制码：a2c-d3e-f4g'), 'A2CD3EF4G');
+  assert.equal(shortCode('undefined'), undefined);
+  assert.equal(shortCode('A2C-D3E-F4ı'), undefined);
+  assert.equal(consoleCode('控制码：A2CD3EF4G5'), undefined);
+});
 
 const defaults = {agent:'', relay:'', mcp:'', python:'', output:'', 'expected-hash':'', scenario:'all', askpass:'', plink:'plink.exe', 'ui-client':'client.ps1'};
 const argumentsFor = scenario => ['--agent','candidate.exe','--relay','relay.exe','--mcp','mcp.exe','--python','python.exe','--output','result.json','--expected-hash','a'.repeat(64),'--scenario',scenario];

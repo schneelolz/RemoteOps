@@ -310,7 +310,7 @@ try {
             }
             $pairingMatch = [regex]::Match(
                 $agentText,
-                '([0-9]{3}-[0-9]{3}-[0-9]{3})'
+                '((?=[A-Z0-9-]*[0-9])[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3})'
             )
             if ($pairingMatch.Success) {
                 $pairingCode = $pairingMatch.Groups[1].Value
@@ -489,7 +489,7 @@ try {
     }
     $registrationCountBeforeRestart = [regex]::Matches(
         $agentTextBeforeRestart,
-        '([0-9]{3}-[0-9]{3}-[0-9]{3})'
+        '((?=[A-Z0-9-]*[0-9])[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3})'
     ).Count
 
     Stop-OwnedProcess -Process $relayProcess
@@ -541,7 +541,7 @@ try {
         }
         $registrationsAfterRestart = [regex]::Matches(
             $agentTextAfterRestart,
-            '([0-9]{3}-[0-9]{3}-[0-9]{3})'
+            '((?=[A-Z0-9-]*[0-9])[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3})'
         )
         if ($registrationsAfterRestart.Count -gt $registrationCountBeforeRestart) {
             $latestPairingCode = $registrationsAfterRestart[
@@ -598,7 +598,7 @@ try {
         }
         $resumedPairingMatch = [regex]::Match(
             $agentResumeText,
-            '([0-9]{3}-[0-9]{3}-[0-9]{3})'
+            '((?=[A-Z0-9-]*[0-9])[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3})'
         )
         if ($resumedPairingMatch.Success) {
             $newBootPairingCode = $resumedPairingMatch.Groups[1].Value

@@ -430,6 +430,8 @@ mod tests {
         confirmed.source = Some(ControlSource::Local);
         state.observe(&AgentEvent::ControllerBindingsChanged {
             bindings: vec![AgentControllerBinding {
+                installation_authorized: false,
+                disconnect_target: None,
                 control_state: Some(confirmed.clone()),
                 owner_id: ControllerOwnerId::new(),
                 controller_kind: remoteops_protocol::ControllerKind::Ai,
@@ -519,6 +521,8 @@ mod tests {
         };
         state.command("full", &control);
         let replacement = AgentControllerBinding {
+            installation_authorized: false,
+            disconnect_target: None,
             control_state: Some(binding()),
             owner_id: ControllerOwnerId::new(),
             controller_kind: remoteops_protocol::ControllerKind::Ai,

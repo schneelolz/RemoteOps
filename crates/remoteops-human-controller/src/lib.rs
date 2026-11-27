@@ -15,6 +15,8 @@ type Video = Arc<Mutex<VideoBuffer>>;
 struct VideoBuffer {
     stream: Option<RequestId>,
     view: u64,
+    received: u32,
+    capture: Option<(u8, std::time::Instant)>,
     packets: VecDeque<Vec<u8>>,
 }
 impl VideoBuffer {
@@ -22,6 +24,8 @@ impl VideoBuffer {
         self.view = view;
         self.stream = stream;
         self.packets.clear();
+        self.received = 0;
+        self.capture = None;
     }
 }
 struct Client {
@@ -53,7 +57,9 @@ pub unsafe extern "C" fn ro_start_config(config:*const c_char) -> *mut std::ffi:
     let worker = thread::Builder::new().name("human-session".into()).spawn(move || {
         let result = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()
             .map_err(anyhow::Error::from).and_then(|rt| rt.block_on(session::run(config,rx,out.clone(),buffers,shutdown,overflow)));
-        if let Err(error) = result { let _ = out.try_send(message("error",&error.to_string())); }
+        if let Err(error) = result {
+            let _ = out.try_send(serde_json::json!({"kind":"connection","online":false,"retry":true,"text":error.to_string()}));
+        }
     });
     let Ok(worker) = worker else { return std::ptr::null_mut() };
     Box::into_raw(Box::new(Client { commands:tx, release, events, video, stop:Some(stop), worker:Some(worker) })).cast()

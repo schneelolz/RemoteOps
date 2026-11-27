@@ -7,6 +7,7 @@ mod admin;
 mod enrollment;
 mod portal;
 mod relay;
+mod turn;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -25,6 +26,12 @@ use crate::relay::Relay;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
+    /// MiniRTC TURN 凭据签发配置。缺省时 TCP 媒体照常工作。
+    #[arg(long, env = "REMOTEOPS_TURN_CONFIG")]
+    turn_config: Option<PathBuf>,
+    /// 经发布核验的产品版本目录 JSON。缺省时不公告版本。
+    #[arg(long, env = "REMOTEOPS_RELEASE_CATALOG")]
+    release_catalog: Option<PathBuf>,
     /// TLS 业务监听地址。
     #[arg(long, env = "REMOTEOPS_RELAY_BIND", default_value = "0.0.0.0:7443")]
     bind: String,
@@ -150,6 +157,19 @@ async fn main() -> anyhow::Result<()> {
         || Duration::minutes(args.lease_minutes.max(1)),
         |seconds| Duration::seconds(i64::try_from(seconds.max(1)).unwrap_or(i64::MAX)),
     );
+    let optional_config = |specified: Option<PathBuf>, filename: &str| -> anyhow::Result<Option<PathBuf>> {
+        if specified.is_some() { return Ok(specified); }
+        let adjacent = args.state_file.with_file_name(filename);
+        Ok(adjacent.try_exists()?.then_some(adjacent))
+    };
+    let issuer = optional_config(args.turn_config, "turn-issuer.json")?
+        .as_deref().map(turn::Issuer::load).transpose()?;
+    let catalog = optional_config(args.release_catalog, "release-catalog.json")?.as_ref().map(|path| -> anyhow::Result<_> {
+        anyhow::ensure!(std::fs::metadata(path)?.len() <= 131_072, "版本目录文件过大");
+        let catalog: remoteops_protocol::release::ReleaseCatalog = serde_json::from_slice(&std::fs::read(path)?)?;
+        catalog.validate().map_err(anyhow::Error::msg)?;
+        Ok(catalog)
+    }).transpose().context("读取已发布版本目录失败")?;
     let relay = Arc::new(
         Relay::new_with_state_path(
             lease_lifetime,
@@ -164,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
                 "无法加载或初始化 Relay 状态文件 {}",
                 args.state_file.display()
             )
-        })?,
+        })?.with_release_catalog(catalog).with_turn(issuer),
     );
     relay
         .initialize_admin_password(

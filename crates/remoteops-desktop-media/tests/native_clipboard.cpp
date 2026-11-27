@@ -32,6 +32,95 @@ static void publish(HWND window,UINT format,const void* data,size_t size) {
     auto h=GlobalAlloc(GMEM_MOVEABLE,size);auto p=GlobalLock(h);memcpy(p,data,size);GlobalUnlock(h);
     require(SetClipboardData(format,h)!=nullptr,"set clipboard");CloseClipboard();
 }
+static Bytes update(uint64_t revision,uint64_t seen,Bytes payload) {
+    Bytes packet{Update};put(packet,revision);put(packet,seen);
+    packet.insert(packet.end(),payload.begin(),payload.end());return packet;
+}
+static void imageRegression(HWND owner) {
+    auto ch=ro_clip_new();
+    next(ch,Hello);submit(ch,{Hello});
+    Bytes old{Text};putString(old,"previous remote text");
+    submit(ch,update(1,0,old));
+    until([&]{return !!IsClipboardFormatAvailable(CF_UNICODETEXT);},"seed text");
+    BITMAPINFO info{};
+    auto& header=info.bmiHeader;header.biSize=sizeof(header);header.biWidth=400;header.biHeight=-240;
+    header.biPlanes=1;header.biBitCount=32;
+    void* bits=nullptr;
+    auto bitmap=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);
+    require(bitmap && bits,"create screenshot");
+    uint32_t value=1;
+    Bytes pixels(400*240*4);
+    for(size_t i=0;i<pixels.size();i+=4){
+        value=1664525*value+1013904223;
+        memcpy(pixels.data()+i,&value,3);pixels[i+3]=255;
+    }
+    memcpy(bits,pixels.data(),pixels.size());
+    until([&]{return !!OpenClipboard(owner);},"open image clipboard");
+    require(EmptyClipboard() && SetClipboardData(CF_BITMAP,bitmap),"copy screenshot");CloseClipboard();
+    auto offer=next(ch,Update);Reader r{offer};auto local=r.number<uint64_t>();
+    require(r.number<uint64_t>()==1 && offer[r.at++]==ImageStart,"image takes precedence over old text");
+    auto total=r.number<uint32_t>();require(total>BlockSize,"multi-block screenshot");
+    Bytes png;
+    while(png.size()<total){
+        auto block=next(ch,ImageChunk);Reader part{block};
+        require(part.number<uint64_t>()==local && part.number<uint32_t>()==png.size(),"image offset");
+        png.insert(png.end(),block.begin()+part.at,block.end());
+    }
+    require(png.size()==total,"exact image length");
+    auto start=[&](uint64_t revision,uint64_t acknowledged){
+        Bytes payload{ImageStart};put<uint32_t>(payload,total);submit(ch,update(revision,acknowledged,payload));
+    };
+    auto chunk=[&](uint64_t revision,size_t offset){
+        Bytes b{ImageChunk};put(b,revision);put<uint32_t>(b,static_cast<uint32_t>(offset));
+        const auto count=std::min<size_t>(BlockSize,png.size()-offset);
+        b.insert(b.end(),png.begin()+offset,png.begin()+offset+count);submit(ch,b);
+    };
+    submit(ch,update(2,0,old));
+    for(int i=0;i<15;++i)tick();
+    require(IsClipboardFormatAvailable(CF_BITMAP),"stale remote text overwrote local image");
+    start(3,local);
+    for(size_t at=0;at<total;at+=BlockSize)chunk(3,at);
+    until([&]{
+        if(!OpenClipboard(owner))return false;
+        auto h=GetClipboardData(CF_DIB);
+        auto dib=h?static_cast<const BITMAPINFOHEADER*>(GlobalLock(h)):nullptr;
+        bool ok=dib && dib->biWidth==400 && dib->biHeight==-240 &&
+            !memcmp(dib+1,pixels.data(),pixels.size());
+        if(dib)GlobalUnlock(h);CloseClipboard();return ok;
+    },"paste screenshot as DIB with exact pixels");
+    for(int i=0;i<10;++i)tick();require(take(ch).empty(),"image feedback loop");
+    start(4,local);chunk(4,0);
+    for(int i=0;i<8;++i)tick();
+    const wchar_t newer[]=L"last local copy";
+    publish(owner,CF_UNICODETEXT,newer,sizeof(newer));
+    auto selected=next(ch,Update);Reader changed{selected};
+    require(changed.number<uint64_t>()>local,"new local copy has a fresh revision");
+    for(size_t at=BlockSize;at<total;at+=BlockSize)chunk(4,at);
+    for(int i=0;i<40;++i)tick();
+    require(IsClipboardFormatAvailable(CF_UNICODETEXT),"stale image replaced new local copy");
+    // 部分应用只发布注册的 PNG 格式。验证这条输入路径及停用时取消尚未完成的图片。
+    publish(owner,RegisterClipboardFormatW(L"PNG"),png.data(),png.size());
+    auto pngOffer=next(ch,Update);Reader registered{pngOffer};
+    auto current=registered.number<uint64_t>();
+    registered.number<uint64_t>();
+    require(pngOffer[registered.at++]==ImageStart,"registered PNG clipboard format");
+    auto wireSize=registered.number<uint32_t>();
+    Bytes roundTrip;
+    while(roundTrip.size()<wireSize){
+        auto b=next(ch,ImageChunk);Reader block{b};
+        require(block.number<uint64_t>()==current && block.number<uint32_t>()==roundTrip.size(),"registered PNG chunk");
+        roundTrip.insert(roundTrip.end(),b.begin()+block.at,b.end());
+    }
+    require(roundTrip.size()>=png.size() && std::equal(png.begin(),png.end(),roundTrip.begin()),"registered PNG data");
+    start(5,current);chunk(5,0);
+    for(int i=0;i<8;++i)tick();
+    ro_clip_free(ch);
+    publish(owner,CF_UNICODETEXT,newer,sizeof(newer));
+    for(int i=0;i<20;++i)tick();
+    require(IsClipboardFormatAvailable(CF_UNICODETEXT),"disabled clipboard changed by cancelled transfer");
+    puts("PASS registered PNG and revocation in the middle of an image");
+    puts("PASS bitmap copy, multi-block PNG, exact remote paste, stale text, newer local copy and no image echo");
+}
 int wmain(){
     try {
         auto name=L"RemoteOpsClipboardTest"+std::to_wstring(GetCurrentProcessId());
@@ -102,6 +191,7 @@ int wmain(){
         ReleaseStgMedium(&m);object->Release();
         for(int i=0;i<20;++i)tick();
         std::filesystem::remove(path);
-        puts("PASS revocation invalidates existing file streams");return 0;
+        puts("PASS revocation invalidates existing file streams");
+        imageRegression(owner);return 0;
     }catch(const std::exception& e){fprintf(stderr,"FAIL %s (Win32 %lu)\n",e.what(),GetLastError());return 1;}
 }

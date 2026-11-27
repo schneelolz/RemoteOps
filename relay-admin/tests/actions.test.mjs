@@ -386,3 +386,210 @@ test("详情转编辑保存后重新读取工具，并回到原详情", async ()
   assert.equal(c.state.activeModal, "toolDetails");
   assert.equal(c.state.toolCenter.snapshot.tools[0].name, "保存后名称");
 });
+
+test("会话列表控制端表头统一为“控制端”", () => {
+  const { c } = fixture();
+  const col = c.sessionColumnDefinitions.find(
+    (item) => item.key === "controller",
+  );
+  assert.equal(col?.label, "控制端");
+});
+
+test("双绑定会话可按人工与 MCP 完整 UUID、短 ID 和主机名搜索，无关 UUID 命中 0 条", () => {
+  const { c } = fixture();
+  const humanUuid = "11111111-2222-3333-4444-aaaaaaaaaaaa";
+  const mcpUuid = "55555555-6666-7777-8888-bbbbbbbbbbbb";
+  const unrelatedUuid = "99999999-9999-9999-9999-999999999999";
+
+  c.applyApiData(
+    {
+      version: "0.2.0-preview.5",
+      uptime_seconds: 120,
+      online_agents: 1,
+      active_sessions: 1,
+      connected_controllers: 2,
+      pending_approvals: 0,
+      in_flight_requests: 0,
+      owner_id: "00000000-0000-0000-0000-000000000001",
+    },
+    {},
+    [
+      {
+        agent_instance_id: "agent-dual-1",
+        hostname: "FIELD-DUAL-01",
+        state: "online",
+        session_id: "sess-dual-1",
+      },
+    ],
+    [
+      {
+        session_id: "sess-dual-1",
+        agent_instance_id: "agent-dual-1",
+        hostname: "FIELD-DUAL-01",
+        state: "online",
+        permission_mode: "approval_required",
+        controller_bindings: [
+          {
+            kind: "ai",
+            controller_instance_id: mcpUuid,
+            hostname: "MCP-HOST-DEV",
+          },
+          {
+            kind: "human",
+            controller_instance_id: humanUuid,
+            hostname: "OPS-LAPTOP-01",
+          },
+        ],
+      },
+    ],
+    [],
+  );
+
+  for (const query of [
+    humanUuid,
+    `  ${humanUuid.toUpperCase()}  `,
+    mcpUuid,
+    "11111111",
+    "55555555",
+    "MCP-HOST-DEV",
+    "OPS-LAPTOP-01",
+  ]) {
+    c.state.filters.keyword = query;
+    const matched = c.filteredSessions();
+    assert.equal(matched.length, 1, `查询 ${query} 应命中双绑定会话`);
+    assert.equal(matched[0].id, "sess-dual-1");
+  }
+
+  c.state.filters.keyword = unrelatedUuid;
+  assert.equal(c.filteredSessions().length, 0);
+});
+
+test("会话空状态区分控制端待配对与筛选排除，清除筛选恢复列表", () => {
+  const { c } = fixture();
+
+  // 场景 1：已有控制端连接、尚无设备绑定会话且未设置筛选
+  c.clearSessionFilters();
+  c.applyApiData(
+    {
+      version: "0.2.0-preview.5",
+      uptime_seconds: 60,
+      online_agents: 0,
+      active_sessions: 0,
+      connected_controllers: 1,
+      pending_approvals: 0,
+      in_flight_requests: 0,
+    },
+    {},
+    [],
+    [],
+    [],
+  );
+  const waiting = c.sessionEmptyState(true);
+  assert.equal(waiting.title, "控制端已连接，等待配对设备");
+  assert.equal(waiting.showClearFilters, false);
+
+  // 场景 2：存在会话但被搜索或筛选排除，提供清除筛选并可恢复
+  c.applyApiData(
+    {
+      version: "0.2.0-preview.5",
+      uptime_seconds: 60,
+      online_agents: 1,
+      active_sessions: 1,
+      connected_controllers: 1,
+      pending_approvals: 0,
+      in_flight_requests: 0,
+    },
+    {},
+    [],
+    [
+      {
+        session_id: "sess-only-1",
+        agent_instance_id: "agent-1",
+        hostname: "FIELD-01",
+        state: "online",
+        controller_bindings: [
+          {
+            kind: "human",
+            controller_instance_id: "aaaaaaaa-1111-2222-3333-444444444444",
+          },
+        ],
+      },
+    ],
+    [],
+  );
+  c.state.filters.keyword = "no-match-uuid";
+  assert.equal(c.filteredSessions().length, 0);
+  const filteredEmpty = c.sessionEmptyState(true);
+  assert.equal(filteredEmpty.title, "暂无匹配会话");
+  assert.equal(filteredEmpty.showClearFilters, true);
+
+  c.clearSessionFilters();
+  assert.equal(c.filteredSessions().length, 1);
+});
+
+test("在线无绑定 Agent 显示为待配对，离线无绑定保留为已关闭，且待配对状态同步反映控制端等待配对", () => {
+  const { c } = fixture();
+  c.clearSessionFilters();
+  c.applyApiData(
+    {
+      version: "0.2.0-preview.5",
+      uptime_seconds: 90,
+      online_agents: 1,
+      active_sessions: 0,
+      connected_controllers: 1,
+      pending_approvals: 0,
+      in_flight_requests: 0,
+    },
+    {},
+    [
+      {
+        agent_instance_id: "agent-online-unbound",
+        hostname: "FIELD-ONLINE-UNBOUND",
+        state: "online",
+        session_id: "sess-online-unbound",
+      },
+      {
+        agent_instance_id: "agent-offline-closed",
+        hostname: "FIELD-OFFLINE-CLOSED",
+        state: "offline",
+        session_id: "sess-offline-closed",
+      },
+    ],
+    [
+      {
+        session_id: "sess-online-unbound",
+        agent_instance_id: "agent-online-unbound",
+        hostname: "FIELD-ONLINE-UNBOUND",
+        state: "online",
+        role: "unbound",
+        controller_bindings: [],
+      },
+      {
+        session_id: "sess-offline-closed",
+        agent_instance_id: "agent-offline-closed",
+        hostname: "FIELD-OFFLINE-CLOSED",
+        state: "offline",
+        role: "unbound",
+        controller_bindings: [],
+      },
+    ],
+    [],
+  );
+
+  const onlineUnbound = c.sessions.find(
+    (item) => item.id === "sess-online-unbound",
+  );
+  const offlineClosed = c.sessions.find(
+    (item) => item.id === "sess-offline-closed",
+  );
+  assert.equal(onlineUnbound?.status, "WAITING");
+  assert.equal(onlineUnbound?.isClosed, false);
+  assert.equal(offlineClosed?.status, "CLOSED");
+  assert.equal(offlineClosed?.isClosed, true);
+
+  assert.equal(c.hasBoundSessions(), false);
+  assert.equal(c.isControllerWaitingForPairing(), true);
+  const empty = c.sessionEmptyState(true);
+  assert.equal(empty.title, "控制端已连接，等待配对设备");
+  assert.equal(empty.showClearFilters, false);
+});

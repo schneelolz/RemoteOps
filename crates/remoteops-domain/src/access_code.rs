@@ -48,6 +48,12 @@ impl AccessCode {
         self.0.len() == 36
     }
 
+    /// 是否为需新版 Agent 才能接收的字母数字短码。
+    #[must_use]
+    pub fn is_mixed_short(&self) -> bool {
+        !self.is_long() && self.0.bytes().any(|byte| byte.is_ascii_alphabetic())
+    }
+
     /// 短码分组，长码保留标准格式。
     #[must_use]
     pub fn display_grouped(&self) -> String {
