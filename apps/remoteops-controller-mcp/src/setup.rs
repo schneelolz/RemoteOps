@@ -493,6 +493,20 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     }
     result
 }
+// 欢迎帧只在 Relay 验证凭据后返回。可选的配对和桌面能力随 Relay 版本变化。
+fn verify_controller_welcome(message: &WireMessage) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(
+            message,
+            WireMessage::ControllerWelcome {
+                protocol_version: PROTOCOL_VERSION,
+                ..
+            }
+        ),
+        "Relay 未确认此安装的 AI Controller 身份"
+    );
+    Ok(())
+}
 async fn check_relay(response: &RedeemResponse, path: &Path, secret: &str) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(15), async {
         let tls = if response.relay_ca_pem.is_some() {
@@ -516,14 +530,7 @@ async fn check_relay(response: &RedeemResponse, path: &Path, secret: &str) -> an
             })),
         )
         .await?;
-        match read_frame::<WireMessage, _>(&mut stream).await? {
-            WireMessage::ControllerWelcome {
-                test_pairing_supported: false,
-                protocol_version: PROTOCOL_VERSION,
-                ..
-            } => Ok(()),
-            _ => bail!("Relay 未确认此安装的 AI Controller 身份"),
-        }
+        verify_controller_welcome(&read_frame::<WireMessage, _>(&mut stream).await?)
     })
     .await
     .context("Relay 连接自检超时")?
@@ -590,6 +597,28 @@ mod tests {
 
     /// Opt-in native coverage; never contacts a Relay or enumerates credentials.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn onboarding_checks_welcome_and_protocol_independently_of_pairing_capability() {
+        for supported in [false, true] {
+            for version in [PROTOCOL_VERSION, PROTOCOL_VERSION - 1] {
+                let frame = serde_json::from_value(serde_json::json!({
+                    "type": "controller_welcome",
+                    "payload": {"protocol_version": version, "test_pairing_supported": supported}
+                }))
+                .unwrap();
+                assert_eq!(
+                    verify_controller_welcome(&frame).is_ok(),
+                    version == PROTOCOL_VERSION
+                );
+            }
+        }
+        let other = WireMessage::Heartbeat {
+            sent_at: chrono::Utc::now(),
+            controller_modes: vec![],
+        };
+        assert!(verify_controller_welcome(&other).is_err());
+    }
+
     #[test]
     #[ignore = "writes and deletes one isolated dummy entry in the native OS credential store"]
     fn native_os_credential_store_round_trip() -> anyhow::Result<()> {
