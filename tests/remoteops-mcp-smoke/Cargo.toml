@@ -19,7 +19,7 @@ LegalCopyright = "Copyright (c) RemoteOps contributors"
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true
-rmcp = { version = "3.0.1", features = ["client", "transport-child-process"] }
+rmcp = { version = "3.12.0", features = ["client", "transport-child-process"] }
 serde_json.workspace = true
 tokio.workspace = true
 

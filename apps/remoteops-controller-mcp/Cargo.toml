@@ -33,7 +33,7 @@ remoteops-application = { path = "../../crates/remoteops-application" }
 remoteops-audit = { path = "../../crates/remoteops-audit" }
 remoteops-domain = { path = "../../crates/remoteops-domain" }
 remoteops-protocol = { path = "../../crates/remoteops-protocol" }
-rmcp = { version = "3.0.1", features = ["elicitation", "server", "transport-io"] }
+rmcp = { version = "3.12.0", features = ["elicitation", "server", "transport-io"] }
 schemars = "1.0"
 jsonschema = { version = "0.33", default-features = false }
 serde.workspace = true

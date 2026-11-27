@@ -401,7 +401,11 @@ pub(crate) fn extract(archive: &Path, target: &Path, digest: &str) -> Result<()>
         let mut entry = archive
             .by_index(index)
             .map_err(|_| ResourceError::before("invalid_zip", "无法读取 ZIP 条目"))?;
-        let raw = entry.name().trim_end_matches('/').to_owned();
+        let raw = entry
+            .name()
+            .map_err(|_| ResourceError::before("invalid_zip", "无法解码 ZIP 条目名称"))?
+            .trim_end_matches('/')
+            .to_owned();
         if !safe_relative(&raw)
             || raw.eq_ignore_ascii_case(RECEIPT)
             || !paths.insert(raw.to_ascii_lowercase())
@@ -520,7 +524,10 @@ fn archive_hashes(path: &Path) -> Result<BTreeMap<String, String>> {
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|_| ResourceError::before("cache_corrupt", "缓存原始 ZIP 条目名称无效"))?
+            .into_owned();
         if !safe_relative(&name) {
             return Err(ResourceError::before(
                 "cache_corrupt",
@@ -700,7 +707,8 @@ mod tests {
 
     #[test]
     fn startup_integrity_detects_modification_and_extra_file() {
-        let archive = archive("bin/tool.exe", b"test");
+        let name = "bin/诊断工具.exe";
+        let archive = archive(name, b"test");
         let directory = tempfile::tempdir().unwrap();
         let root = tempfile::Builder::new()
             .tempdir_in(directory.path())
@@ -709,9 +717,9 @@ mod tests {
         fs::copy(archive.path(), root.path().with_extension("zip")).unwrap();
         extract(archive.path(), root.path(), &digest).unwrap();
         verify(root.path(), &digest).unwrap();
-        fs::write(root.path().join("bin/tool.exe"), b"changed").unwrap();
+        fs::write(root.path().join(name), b"changed").unwrap();
         assert!(verify(root.path(), &digest).is_err());
-        fs::write(root.path().join("bin/tool.exe"), b"test").unwrap();
+        fs::write(root.path().join(name), b"test").unwrap();
         fs::write(root.path().join("extra"), b"x").unwrap();
         assert!(verify(root.path(), &digest).is_err());
     }

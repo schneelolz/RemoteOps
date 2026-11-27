@@ -117,8 +117,8 @@ try {
             $webDeclarationValid = $declaredWeb.file -ceq 'companion-web-inputs.json' -and $declaredWeb.sha256 -ceq (Get-Hash $webPath)
         }
         Add-Check '额外后台输入单独声明' $webDeclarationValid ([ordered]@{ file = 'companion-web-inputs.json'; sha256 = (Get-Hash $webPath); agent_base_inputs_unchanged = $true })
-    
-    
+
+
     } else {
         $webFiles = @($source.base_inputs.files | Where-Object file -Like 'relay-admin-prototype/*')
         Add-Check '后台输入纳入统一快照' ($webFiles.Count -ge 5 -and @($webFiles | Where-Object file -CEQ 'relay-admin-prototype/tools.js').Count -eq 1) ([ordered]@{ count = $webFiles.Count; same_base_inputs = $true })

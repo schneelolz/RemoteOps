@@ -4845,7 +4845,7 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.runtime_tool_router())]
 impl ServerHandler for RemoteOpsMcp {
-    fn get_info(&self) -> rmcp::model::ServerInfo {
+    fn get_info(&self) -> rmcp::model::ServerConfig {
         let guide = self.client.global_guide();
         let dynamic = if guide.markdown.is_empty() {
             "Relay 当前没有可用的全局指引正文。可调用 refresh_global_guide 读取状态和最新内容。"
@@ -4856,7 +4856,7 @@ impl ServerHandler for RemoteOpsMcp {
                 guide.revision, guide.markdown
             )
         };
-        rmcp::model::ServerInfo::new(
+        rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build(),
