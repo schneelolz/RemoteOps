@@ -5001,7 +5001,7 @@ fn serial_output_for_remote_event(bytes: &[u8]) -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 async fn detect_environment_profile(device: &SystemDevice) -> EnvironmentProfile {
     detect_environment_profile_inner(device, true, AgentCapabilityPolicy::default()).await
 }

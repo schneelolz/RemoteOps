@@ -167,7 +167,7 @@ fn write_report(path: &std::path::Path, report: &Report) -> std::io::Result<()> 
     std::fs::write(path, bytes)
 }
 /// 启动独立通用 Win32 候选。
-#[must_use]
+#[must_use = "将启动结果作为进程退出码返回"]
 pub fn run_default() -> ExitCode {
     run_impl(None, ProductOptions::default())
 }
@@ -184,14 +184,14 @@ pub struct ProductOptions {
 
 /// 使用产品自身的身份、固定端点与配置启动共享 Win32 界面。
 #[cfg(feature = "agent-runtime")]
-#[must_use]
+#[must_use = "将启动结果作为进程退出码返回"]
 pub fn run(profile: remoteops_product::ProductProfile) -> ExitCode {
     run_with_options(profile, ProductOptions::default())
 }
 
 /// 使用同一 Win32 产品宿主及由产品提供的可信资源运行。
 #[cfg(feature = "agent-runtime")]
-#[must_use]
+#[must_use = "将启动结果作为进程退出码返回"]
 pub fn run_with_options(
     profile: remoteops_product::ProductProfile,
     options: ProductOptions,

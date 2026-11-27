@@ -3610,7 +3610,7 @@ fn launch_gui(
 }
 
 /// Launch the default product through the same public host.
-#[must_use]
+#[must_use = "将启动结果作为进程退出码返回"]
 pub fn run_default() -> std::process::ExitCode {
     let profile = ProductProfile {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -3619,7 +3619,7 @@ pub fn run_default() -> std::process::ExitCode {
     run(profile, GuiOptions::remoteops())
 }
 /// 按启动参数运行同一产品的 GUI 或无图形控制台。
-#[must_use]
+#[must_use = "将启动结果作为进程退出码返回"]
 pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCode {
     let command_line: Vec<_> = std::env::args_os().collect();
     let cli_requested = console_startup::console_requested(command_line.iter().cloned());

@@ -171,9 +171,8 @@ struct ResolvedArgs {
 fn check_product_endpoint(relay: &str, server: &str) -> anyhow::Result<()> {
     if let Some(expected) = option_env!("REMOTEOPS_PRODUCT_RELAY")
         && (!relay.eq_ignore_ascii_case(expected)
-            || !Some(server)
-                .zip(option_env!("REMOTEOPS_PRODUCT_TLS_NAME"))
-                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)))
+            || option_env!("REMOTEOPS_PRODUCT_TLS_NAME")
+                .is_none_or(|expected_name| !server.eq_ignore_ascii_case(expected_name)))
     {
         bail!("连接配置与定制版的 Relay 或 TLS 服务名不匹配");
     }
