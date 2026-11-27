@@ -12,7 +12,13 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         build.flag("/utf-8").flag("/EHsc");
     }
-    for source in ["native/codec.cpp", "native/host.cpp", "native/view.cpp", "native/clipboard.cpp", "native/clipboard_ole.cpp"] {
+    for source in [
+        "native/codec.cpp",
+        "native/host.cpp",
+        "native/view.cpp",
+        "native/clipboard.cpp",
+        "native/clipboard_ole.cpp",
+    ] {
         println!("cargo:rerun-if-changed={source}");
         build.file(source);
     }

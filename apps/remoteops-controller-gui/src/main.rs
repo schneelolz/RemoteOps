@@ -480,9 +480,9 @@ impl RemoteOpsApp {
             demo_scroll_initialized: false,
             toast: None,
             #[cfg(windows)]
-            desktop_active: Default::default(),
+            desktop_active: std::collections::HashSet::new(),
             #[cfg(windows)]
-            desktop_errors: Default::default(),
+            desktop_errors: std::collections::HashMap::new(),
             serial_workbench: SerialWorkbench::default(),
         }
     }
@@ -518,7 +518,9 @@ impl RemoteOpsApp {
             #[cfg(windows)]
             BackendEvent::DesktopEnded(id, error) => {
                 self.desktop_active.remove(&id);
-                if let Some(message) = error { self.desktop_errors.insert(id, message); }
+                if let Some(message) = error {
+                    self.desktop_errors.insert(id, message);
+                }
             }
             BackendEvent::Connected(connected) => {
                 self.connected = connected;
@@ -1235,7 +1237,10 @@ impl RemoteOpsApp {
     #[allow(clippy::too_many_lines)]
     fn render_header(&mut self, ui: &mut Ui, palette: Palette) {
         #[cfg(windows)]
-        if let Some(message) = self.selected_session.and_then(|id| self.desktop_errors.get(&id)) {
+        if let Some(message) = self
+            .selected_session
+            .and_then(|id| self.desktop_errors.get(&id))
+        {
             ui.label(format!("实时桌面未能继续 · {message}"));
         }
         card(
@@ -1340,18 +1345,30 @@ impl RemoteOpsApp {
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     #[cfg(windows)]
-                    if let Some(target) = self.selected_connection().filter(|c|
-                        c.state == ConnectionState::Online && c.environment.tools.iter()
-                            .any(|t| t.name == "remoteops-desktop-v1" && t.available))
-                    {
+                    if let Some(target) = self.selected_connection().filter(|c| {
+                        c.state == ConnectionState::Online
+                            && c.environment
+                                .tools
+                                .iter()
+                                .any(|t| t.name == "remoteops-desktop-v1" && t.available)
+                    }) {
                         let id = target.session_id;
                         let title = target.hostname.clone();
                         let active = self.desktop_active.contains(&id);
-                        let label = if active { "桌面已打开" } else if self.desktop_errors.contains_key(&id) { "重试实时桌面" } else { "实时桌面" };
+                        let label = if active {
+                            "桌面已打开"
+                        } else if self.desktop_errors.contains_key(&id) {
+                            "重试实时桌面"
+                        } else {
+                            "实时桌面"
+                        };
                         if ui.add_enabled(!active, egui::Button::new(label)).clicked() {
                             self.desktop_errors.remove(&id);
                             self.desktop_active.insert(id);
-                            self.send(BackendCommand::OpenDesktop { session_id: id, title });
+                            self.send(BackendCommand::OpenDesktop {
+                                session_id: id,
+                                title,
+                            });
                         }
                     }
 

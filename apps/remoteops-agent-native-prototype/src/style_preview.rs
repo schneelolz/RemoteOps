@@ -3,6 +3,7 @@
 #![allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
 use std::{
@@ -13,15 +14,12 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::*,
-    Graphics::{
-        Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
-        Gdi::*,
-    },
+    Graphics::Gdi::*,
     System::{
         LibraryLoader::GetModuleHandleW,
         Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     },
-    UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
 };
 
 mod business;
@@ -33,19 +31,26 @@ mod observer_data;
 mod observer_demo;
 mod readonly_view;
 mod render_plan;
+mod theme_draw;
 use observer_data::ObserverData;
 use observer_demo::Category;
 use render_plan::{ControlSpec, ControlWork, PageFrame};
+use theme_draw::{Palette, palette, rgb};
 mod scroll_geometry;
 
 const MAIN_CLASS: &str = "RemoteOpsStylePreviewMain";
 const DIALOG_CLASS: &str = "RemoteOpsStylePreviewDialog";
 const OBS_CLASS: &str = "RemoteOpsStylePreviewObserver";
-const MAIN_HEIGHT: i32 = 424;
-const MAIN_FOOTER_TOP: i32 = MAIN_HEIGHT - 53;
+const MAIN_WIDTH: i32 = 480;
+const MAIN_HEIGHT: i32 = 440;
+const CODE_COPY_GAP: i32 = 16;
+const CODE_COPY_SIZE: i32 = 32;
+const MAIN_FOOTER_TOP: i32 = MAIN_HEIGHT - 48;
 const MAIN_FOOTER_BUTTON_Y: i32 = MAIN_FOOTER_TOP + 8;
 const TIMER: usize = 71;
 const REBUILD_PAGE: u32 = WM_APP + 41;
+const BUTTON_SUBCLASS: usize = 0x524F_5042;
+const CHECKBOX_SUBCLASS: usize = 0x524F_5043;
 #[derive(Clone, Copy)]
 enum NativeFailure {
     WindowCallback,
@@ -111,6 +116,7 @@ fn finish_report(
 // SDK STATIC_STYLES：避免为两个样式值额外启用 SystemServices。
 const SS_CENTER: u32 = 1;
 const SS_LEFT: u32 = 0;
+const SS_RIGHT: u32 = 2;
 const SS_CENTERIMAGE: u32 = 0x200;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -180,57 +186,6 @@ impl Default for State {
             relay: "relay.example.test:7443".into(),
             full: false,
             default_full: false,
-        }
-    }
-}
-#[derive(Clone, Copy)]
-struct Palette {
-    bg: u32,
-    surface: u32,
-    content: u32,
-    scroll_thumb: u32,
-    scroll_hot: u32,
-    text: u32,
-    secondary: u32,
-    border: u32,
-    accent: u32,
-    success: u32,
-    danger: u32,
-    danger_bg: u32,
-}
-const fn rgb(rect: u32, g: u32, b: u32) -> u32 {
-    rect | (g << 8) | (b << 16)
-}
-fn palette(dark: bool) -> Palette {
-    if dark {
-        Palette {
-            bg: rgb(24, 28, 35),
-            surface: rgb(31, 36, 44),
-            content: rgb(17, 21, 28),
-            scroll_thumb: rgb(101, 117, 138),
-            scroll_hot: rgb(145, 163, 188),
-            text: rgb(242, 244, 248),
-            secondary: rgb(174, 184, 200),
-            border: rgb(57, 65, 77),
-            accent: rgb(20, 105, 245),
-            success: rgb(29, 211, 98),
-            danger: rgb(249, 107, 119),
-            danger_bg: rgb(46, 30, 37),
-        }
-    } else {
-        Palette {
-            bg: rgb(247, 248, 250),
-            surface: rgb(237, 241, 246),
-            content: rgb(255, 255, 255),
-            scroll_thumb: rgb(125, 139, 157),
-            scroll_hot: rgb(84, 102, 125),
-            text: rgb(24, 32, 44),
-            secondary: rgb(86, 99, 119),
-            border: rgb(205, 213, 224),
-            accent: rgb(15, 103, 242),
-            success: rgb(13, 165, 75),
-            danger: rgb(214, 32, 58),
-            danger_bg: rgb(255, 237, 241),
         }
     }
 }
@@ -314,6 +269,7 @@ struct Panel {
     font_dpi: Cell<u32>,
     layout: Cell<Option<LayoutStamp>>,
     title_dark: Cell<Option<i32>>,
+    hovered_control: Cell<HWND>,
 }
 impl Panel {
     fn app(&self) -> &App {
@@ -555,18 +511,18 @@ fn wide(state: &str) -> Vec<u16> {
 }
 fn size(kind: Kind) -> (i32, i32) {
     match kind {
-        Kind::Main => (480, MAIN_HEIGHT),
-        Kind::Details => (440, 270),
-        Kind::Permissions => (420, 340),
-        Kind::Grant => (440, 245),
-        Kind::Exit => (440, 300),
-        Kind::Setup => (640, 420),
-        Kind::Tls => (560, 330),
-        Kind::Observer => (800, 470),
-        Kind::About => (400, 248),
-        Kind::Licenses => (680, 430),
+        Kind::Main => (MAIN_WIDTH, MAIN_HEIGHT),
+        Kind::Details => (460, 294),
+        Kind::Permissions => (440, 356),
+        Kind::Grant => (440, 252),
+        Kind::Exit => (440, 292),
+        Kind::Setup => (620, 382),
+        Kind::Tls => (560, 336),
+        Kind::Observer => (820, 490),
+        Kind::About => (420, 268),
+        Kind::Licenses => (680, 440),
         #[cfg(feature = "agent-runtime")]
-        Kind::TestKey => (448, 172),
+        Kind::TestKey => (456, 184),
     }
 }
 fn window_title(app: &App, kind: Kind) -> String {
@@ -657,6 +613,7 @@ fn create_panel(app: &App, kind: Kind, owner: HWND) -> HWND {
             font_dpi: Cell::new(0),
             layout: Cell::new(None),
             title_dark: Cell::new(None),
+            hovered_control: Cell::new(null_mut()),
         });
         let ptr = &raw const *panel;
         let class = match kind {
@@ -666,7 +623,18 @@ fn create_panel(app: &App, kind: Kind, owner: HWND) -> HWND {
         };
         let title = window_title(app, kind);
         let (w, h) = size(kind);
-        let (w, h) = if kind == Kind::Setup && app.state.borrow().product.as_ref().is_some_and(|p| !p.endpoint_editable) { (392, 192) } else { (w, h) };
+        let (w, h) = if kind == Kind::Setup
+            && app
+                .state
+                .borrow()
+                .product
+                .as_ref()
+                .is_some_and(|p| !p.endpoint_editable)
+        {
+            (408, 210)
+        } else {
+            (w, h)
+        };
         let h = if kind == Kind::Details && app.state.borrow().product.is_some() {
             if app
                 .state
@@ -675,9 +643,9 @@ fn create_panel(app: &App, kind: Kind, owner: HWND) -> HWND {
                 .as_ref()
                 .is_some_and(|p| !p.endpoint_editable)
             {
-                h - 6
+                h - 14
             } else {
-                h + 30
+                h + 22
             }
         } else {
             h
@@ -836,7 +804,7 @@ fn close_panel_raw(panel: &Panel) {
 fn make_fonts(panel: &Panel) -> Vec<HFONT> {
     if panel.font_dpi.get() == panel.dpi.get() {
         let fonts = panel.fonts.borrow();
-        if fonts.len() == 5 && fonts.iter().all(|font| !font.is_null()) {
+        if fonts.len() == 6 && fonts.iter().all(|font| !font.is_null()) {
             return vec![];
         }
     }
@@ -845,9 +813,10 @@ fn make_fonts(panel: &Panel) -> Vec<HFONT> {
         for (height, weight, face) in [
             (14, 400, "Microsoft YaHei UI"),
             (19, 600, "Microsoft YaHei UI"),
-            (43, 700, "Consolas"),
+            (40, 700, "Consolas"),
             (12, 400, "Microsoft YaHei UI"),
-            (14, 400, "Consolas"),
+            (13, 400, "Consolas"),
+            (13, 600, "Microsoft YaHei UI"),
         ] {
             new.push(CreateFontW(
                 -panel.px(height),
@@ -870,6 +839,214 @@ fn make_fonts(panel: &Panel) -> Vec<HFONT> {
         panel.font_dpi.set(panel.dpi.get());
         // 幸存控件切换字体、过期控件销毁后，才能释放旧字体。
         old
+    }
+}
+
+unsafe extern "system" fn button_subclass(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    _id: usize,
+    data: usize,
+) -> LRESULT {
+    unsafe {
+        let panel_ptr = data as *const Panel;
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_MOUSEMOVE => {
+                if !panel_ptr.is_null() {
+                    let panel = &*panel_ptr;
+                    if panel.hovered_control.get() != hwnd {
+                        panel.hovered_control.set(hwnd);
+                        let mut track = TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: hwnd,
+                            dwHoverTime: 0,
+                        };
+                        TrackMouseEvent(&raw mut track);
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                }
+                DefSubclassProc(hwnd, msg, w, l)
+            }
+            WM_MOUSELEAVE => {
+                if !panel_ptr.is_null() {
+                    let panel = &*panel_ptr;
+                    if panel.hovered_control.get() == hwnd {
+                        panel.hovered_control.set(null_mut());
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                }
+                DefSubclassProc(hwnd, msg, w, l)
+            }
+            WM_SETCURSOR => {
+                if IsWindowEnabled(hwnd) != 0 {
+                    SetCursor(LoadCursorW(null_mut(), IDC_HAND));
+                    return 1;
+                }
+                DefSubclassProc(hwnd, msg, w, l)
+            }
+            WM_NCDESTROY => {
+                if !panel_ptr.is_null() {
+                    let panel = &*panel_ptr;
+                    if panel.hovered_control.get() == hwnd {
+                        panel.hovered_control.set(null_mut());
+                    }
+                }
+                RemoveWindowSubclass(hwnd, Some(button_subclass), BUTTON_SUBCLASS);
+                DefSubclassProc(hwnd, msg, w, l)
+            }
+            _ => DefSubclassProc(hwnd, msg, w, l),
+        }
+    }
+}
+
+unsafe extern "system" fn checkbox_subclass(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    _id: usize,
+    data: usize,
+) -> LRESULT {
+    unsafe {
+        let panel_ptr = data as *const Panel;
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_MOUSEMOVE => {
+                if !panel_ptr.is_null() {
+                    let panel = &*panel_ptr;
+                    if panel.hovered_control.get() != hwnd {
+                        panel.hovered_control.set(hwnd);
+                        let mut track = TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: hwnd,
+                            dwHoverTime: 0,
+                        };
+                        TrackMouseEvent(&raw mut track);
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                }
+                DefSubclassProc(hwnd, msg, w, l)
+            }
+            WM_MOUSELEAVE => {
+                if !panel_ptr.is_null() {
+                    let panel = &*panel_ptr;
+                    if panel.hovered_control.get() == hwnd {
+                        panel.hovered_control.set(null_mut());
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                }
+                DefSubclassProc(hwnd, msg, w, l)
+            }
+            WM_SETCURSOR => {
+                if IsWindowEnabled(hwnd) != 0 {
+                    SetCursor(LoadCursorW(null_mut(), IDC_HAND));
+                    return 1;
+                }
+                DefSubclassProc(hwnd, msg, w, l)
+            }
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &raw mut ps);
+                if !panel_ptr.is_null() {
+                    paint_custom_checkbox(&*panel_ptr, hwnd, hdc);
+                }
+                EndPaint(hwnd, &raw const ps);
+                0
+            }
+            WM_PRINTCLIENT => {
+                if !panel_ptr.is_null() && w != 0 {
+                    paint_custom_checkbox(&*panel_ptr, hwnd, w as HDC);
+                }
+                0
+            }
+            BM_SETCHECK | WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE | WM_LBUTTONUP | WM_KEYUP => {
+                let res = DefSubclassProc(hwnd, msg, w, l);
+                InvalidateRect(hwnd, null(), 0);
+                res
+            }
+            WM_NCDESTROY => {
+                if !panel_ptr.is_null() {
+                    let panel = &*panel_ptr;
+                    if panel.hovered_control.get() == hwnd {
+                        panel.hovered_control.set(null_mut());
+                    }
+                }
+                RemoveWindowSubclass(hwnd, Some(checkbox_subclass), CHECKBOX_SUBCLASS);
+                DefSubclassProc(hwnd, msg, w, l)
+            }
+            _ => DefSubclassProc(hwnd, msg, w, l),
+        }
+    }
+}
+
+fn paint_custom_checkbox(panel: &Panel, hwnd: HWND, target_dc: HDC) {
+    unsafe {
+        let mut rect = RECT::default();
+        GetClientRect(hwnd, &raw mut rect);
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        let Some(mut surface) = theme_draw::Surface::new(target_dc, w, h) else {
+            return;
+        };
+        let c = panel.app().colors();
+        let checked = SendMessageW(hwnd, BM_GETCHECK, 0, 0) != 0;
+        let hovered = panel.hovered_control.get() == hwnd;
+        let focused = GetFocus() == hwnd;
+        let disabled = IsWindowEnabled(hwnd) == 0;
+        // 复选框位于控制权限卡片内部，圆角外底色与卡片严格一致。
+        surface.clear(c.card);
+        let side = (panel.px(18) as f32)
+            .min(w as f32 - 2.0)
+            .min(h as f32 - 2.0)
+            .max(12.0);
+        let bx = (w as f32 - side) * 0.5;
+        let by = (h as f32 - side) * 0.5;
+        let radius = (panel.px(5) as f32).max(3.0);
+        let (fill_color, border_color) = if checked {
+            let fill = if disabled {
+                c.border
+            } else if hovered {
+                c.accent_hover
+            } else {
+                c.accent
+            };
+            (fill, fill)
+        } else {
+            let fill = if hovered && !disabled {
+                c.btn_hover
+            } else {
+                c.content
+            };
+            let border = if focused {
+                c.accent
+            } else if hovered && !disabled {
+                c.border_hover
+            } else {
+                c.border
+            };
+            (fill, border)
+        };
+        surface.draw_rounded_rect(
+            bx,
+            by,
+            side,
+            side,
+            radius,
+            fill_color,
+            border_color,
+            if focused && !checked { 1.5 } else { 1.0 },
+            0.0,
+            None,
+        );
+        if checked {
+            surface.draw_checkmark(bx, by, side, (side * 0.13).max(1.7), rgb(255, 255, 255));
+        }
+        surface.blit(target_dc, 0, 0);
     }
 }
 struct AddedControl {
@@ -1018,14 +1195,48 @@ fn label(
         if id == 306 {
             13_u32
         } else {
-            (if center { SS_CENTER } else { SS_LEFT }) | match id { 300 => SS_CENTERIMAGE, 427 => SS_CENTERIMAGE | 0x100, _ => 0 }
+            (if id == 305 {
+                SS_RIGHT
+            } else if center {
+                SS_CENTER
+            } else {
+                SS_LEFT
+            }) | match id {
+                224 | 300 | 302 | 303 | 305 | 342 | 343 | 346 | 347 => SS_CENTERIMAGE,
+                344 if panel.kind == Kind::Main => SS_CENTERIMAGE,
+                427 => SS_CENTERIMAGE | 0x100,
+                _ => 0,
+            }
         },
         font,
     );
 }
+// 配对码含两个分隔符。按当前等宽字体量取整行，避免 DPI 或字体回退导致复制键偏移。
+fn code_row(panel: &Panel) -> (i32, i32) {
+    let mut size = SIZE::default();
+    let font = panel.fonts.borrow()[2];
+    let measured = unsafe {
+        let hwnd = panel.hwnd.get();
+        let dc = GetDC(hwnd);
+        let previous = SelectObject(dc, font);
+        let ok = GetTextExtentPoint32W(dc, wide("000-000-000").as_ptr(), 11, &raw mut size);
+        SelectObject(dc, previous);
+        ReleaseDC(hwnd, dc);
+        ok != 0
+    };
+    let dpi = i32::try_from(panel.dpi.get()).unwrap_or(96).max(1);
+    let width = if measured {
+        (size.cx * 96 + dpi - 1) / dpi + 2
+    } else {
+        250
+    };
+    let left = (MAIN_WIDTH - width - CODE_COPY_GAP - CODE_COPY_SIZE) / 2;
+    (left, width)
+}
+
 fn button(panel: &Panel, id: i32, text: &str, x: i32, y: i32, w: i32, h: i32) {
     let text = business::text_for(panel, id, text);
-    add(
+    let added = add(
         panel,
         id,
         "BUTTON",
@@ -1035,8 +1246,22 @@ fn button(panel: &Panel, id: i32, text: &str, x: i32, y: i32, w: i32, h: i32) {
         w,
         h,
         WS_TABSTOP | BS_OWNERDRAW as u32,
-        if matches!(id, 307..=309 | 338) { 3 } else { 0 },
+        if matches!(id, 307..=309 | 324..=329 | 338 | 341 | 345) {
+            3
+        } else {
+            0
+        },
     );
+    if added.fresh && !added.hwnd.is_null() {
+        unsafe {
+            let _ = SetWindowSubclass(
+                added.hwnd,
+                Some(button_subclass),
+                BUTTON_SUBCLASS,
+                std::ptr::from_ref(panel) as usize,
+            );
+        }
+    }
 }
 #[allow(clippy::too_many_arguments)] // 静态布局声明保持坐标、样式和控件 ID 就地可读。
 fn edit(panel: &Panel, id: i32, text: &str, x: i32, y: i32, w: i32, h: i32, readonly: bool) {
@@ -1063,7 +1288,11 @@ fn edit(panel: &Panel, id: i32, text: &str, x: i32, y: i32, w: i32, h: i32, read
         w,
         h,
         style,
-        if panel.kind == Kind::Observer { 4 } else { 0 },
+        if panel.kind == Kind::Observer || matches!(id, 311 | 524 | 551) {
+            4
+        } else {
+            0
+        },
     );
     let hwnd = added.hwnd;
     let started = Instant::now();
@@ -1163,17 +1392,11 @@ fn build(panel: &Panel) {
             SetWindowTextW(panel.hwnd.get(), wide(&title).as_ptr());
         }
     }
-    // DWM 不支持该属性时保留系统行为；颜色快照不跨原生调用持有借用。
-    let dark = i32::from(app.colors().bg == palette(true).bg);
+    // DWM 亮暗标题栏与边框配色同步，切换主题时立即刷新非客户区。
+    let colors = app.colors();
+    let dark = i32::from(colors.dark);
     if panel.title_dark.get() != Some(dark) {
-        unsafe {
-            DwmSetWindowAttribute(
-                panel.hwnd.get(),
-                DWMWA_USE_IMMERSIVE_DARK_MODE.cast_unsigned(),
-                (&raw const dark).cast(),
-                std::mem::size_of::<i32>() as u32,
-            );
-        }
+        theme_draw::apply_window_chrome(panel.hwnd.get(), colors);
         panel.title_dark.set(Some(dark));
     }
     let state = app.snapshot();
@@ -1207,26 +1430,93 @@ fn build(panel: &Panel) {
         #[cfg(feature = "agent-runtime")]
         Kind::TestKey => test_key::build(panel),
         Kind::Main if !state.logs => {
-            label(panel, 343, t("AI 工程师\r\n未连接", "AI engineer\r\nOffline"), 30, 8, 96, 44, 0, false);
-            label(panel, 344, t("人工运维\r\n未连接", "Operator\r\nOffline"), 212, 8, 92, 44, 0, false);
-            button(panel, 341, t("断开", "End"), 129, 14, 52, 31);
-            button(panel, 345, t("断开", "End"), 310, 14, 52, 31);
-            label(panel, 300, "", 137, 189, 323, 24, 3, false);
+            let (code_x, code_width) = code_row(panel);
+            label(
+                panel,
+                343,
+                t("AI 工程师", "AI engineer"),
+                33,
+                10,
+                133,
+                23,
+                5,
+                false,
+            );
+            label(
+                panel,
+                344,
+                t("人工运维", "Operator"),
+                205,
+                10,
+                128,
+                23,
+                5,
+                false,
+            );
+            let action_offset = if state.english { 66 } else { 45 };
+            label(
+                panel,
+                346,
+                if state.connected {
+                    t("已连接", "Connected")
+                } else {
+                    t("未连接", "Offline")
+                },
+                33,
+                32,
+                action_offset,
+                22,
+                3,
+                false,
+            );
+            label(
+                panel,
+                347,
+                t("未连接", "Offline"),
+                205,
+                32,
+                action_offset,
+                22,
+                3,
+                false,
+            );
+            button(panel, 341, t("断开", "End"), 33 + action_offset, 31, 38, 24);
+            button(
+                panel,
+                345,
+                t("断开", "End"),
+                205 + action_offset,
+                31,
+                38,
+                24,
+            );
             unsafe {
                 ShowWindow(panel.control(341), SW_HIDE);
                 ShowWindow(panel.control(345), SW_HIDE);
             }
-            button(panel, 301, t("设置", "Settings"), 378, 13, 84, 34);
+            button(panel, 301, t("设置", "Settings"), 376, 16, 84, 34);
+
             label(
                 panel,
                 302,
-                t("临时控制码", "Temporary pairing code"),
-                28,
-                72,
-                424,
+                t("临时控制码", "Pairing code"),
+                38,
+                86,
+                140,
                 22,
                 0,
-                true,
+                false,
+            );
+            label(
+                panel,
+                305,
+                t("剩余 09:46", "Expires in 09:46"),
+                180,
+                86,
+                262,
+                22,
+                3,
+                false,
             );
             label(
                 panel,
@@ -1236,10 +1526,10 @@ fn build(panel: &Panel) {
                 } else {
                     "--- --- ---"
                 },
-                59,
-                100,
-                314,
-                54,
+                code_x,
+                116,
+                code_width,
+                48,
                 2,
                 true,
             );
@@ -1251,37 +1541,44 @@ fn build(panel: &Panel) {
                 } else {
                     t("复制", "Copy")
                 },
-                381,
-                109,
-                32,
-                31,
+                code_x + code_width + CODE_COPY_GAP,
+                124,
+                CODE_COPY_SIZE,
+                CODE_COPY_SIZE,
             );
-            label(
-                panel,
-                305,
-                t("09:46 后失效", "Expires in 09:46"),
-                28,
-                153,
-                424,
-                21,
-                3,
-                true,
-            );
+
             label(
                 panel,
                 342,
                 t("操作动态", "Activity"),
                 20,
-                189,
-                115,
-                22,
-                0,
+                198,
+                110,
+                26,
+                5,
                 false,
             );
-            label(panel, 306, "", 20, 218, 440, 110, 3, false);
-            label(panel, 312, "", 20, 343, 442, 26, 3, false);
-            button(panel, 307, t("连接详情", "Details"), 16, MAIN_FOOTER_BUTTON_Y, 99, 32);
-            button(panel, 308, t("实时日志", "Logs"), 121, MAIN_FOOTER_BUTTON_Y, 99, 32);
+            label(panel, 300, "", 132, 198, 328, 26, 3, false);
+            label(panel, 306, "", 20, 234, 440, 130, 0, false);
+            label(panel, 312, "", 20, 368, 440, 18, 3, false);
+            button(
+                panel,
+                307,
+                t("连接详情", "Details"),
+                14,
+                MAIN_FOOTER_BUTTON_Y,
+                90,
+                32,
+            );
+            button(
+                panel,
+                308,
+                t("实时日志", "Logs"),
+                121,
+                MAIN_FOOTER_BUTTON_Y,
+                90,
+                32,
+            );
             button(
                 panel,
                 338,
@@ -1290,26 +1587,34 @@ fn build(panel: &Panel) {
                 } else {
                     t("操作实况", "Observer")
                 },
-                226,
+                228,
                 MAIN_FOOTER_BUTTON_Y,
-                99,
+                91,
                 32,
             );
-            button(panel, 309, t("退出 Agent", "Exit Agent"), 366, MAIN_FOOTER_BUTTON_Y, 98, 32);
+            button(
+                panel,
+                309,
+                t("退出 Agent", "Exit Agent"),
+                363,
+                MAIN_FOOTER_BUTTON_Y,
+                103,
+                32,
+            );
         }
         Kind::Main => {
             label(
                 panel,
                 340,
                 t("实时日志", "Activity log"),
-                23,
-                23,
+                20,
+                18,
                 280,
-                30,
+                28,
                 1,
                 false,
             );
-            button(panel, 310, t("返回", "Back"), 390, 22, 73, 32);
+            button(panel, 310, t("返回", "Back"), 386, 17, 78, 30);
             let filters = [
                 t("全部", "All"),
                 t("运行中", "Running"),
@@ -1321,14 +1626,14 @@ fn build(panel: &Panel) {
                 button(
                     panel,
                     324 + i32::try_from(i).unwrap_or(0),
-                    &format!("{}{}", if state.filter == i { "● " } else { "" }, name),
-                    23 + i32::try_from(i).unwrap_or(0) * 76,
-                    70,
-                    70,
-                    30,
+                    name,
+                    20 + i32::try_from(i).unwrap_or(0) * 71,
+                    58,
+                    66,
+                    28,
                 );
             }
-            button(panel, 329, t("清空", "Clear"), 397, 70, 66, 30);
+            button(panel, 329, t("清空", "Clear"), 394, 58, 70, 28);
             let rows = [
                 "12:00:01  [demo-01]  信息  系统就绪 · 等待连接",
                 "12:00:04  [demo-02]  运行中  正在执行合成命令",
@@ -1348,36 +1653,36 @@ fn build(panel: &Panel) {
                 }]
                 .to_owned()
             };
-            edit(panel, 311, &text, 18, 117, 445, 263, true);
+            edit(panel, 311, &text, 16, 98, 448, 326, true);
         }
         Kind::Details => {
             label(
                 panel,
                 400,
                 t("连接详情", "Connection details"),
-                20,
-                17,
-                360,
-                30,
+                22,
+                16,
+                380,
+                28,
                 1,
                 false,
             );
             let details_offset = if state.product.as_ref().is_some_and(|p| !p.endpoint_editable) {
-                36
+                38
             } else {
                 0
             };
             for (id, y, name, value) in [
-                (401, 65, t("Relay 地址", "Relay"), state.relay.as_str()),
+                (401, 66, t("Relay 地址", "Relay"), state.relay.as_str()),
                 (
                     403,
-                    101,
+                    104,
                     t("运行权限", "Privileges"),
                     t("普通用户 · 界面演示", "Standard user · demo"),
                 ),
                 (
                     405,
-                    137,
+                    142,
                     t("接收目录", "Receive folder"),
                     "C:\\演示 文件\\RemoteOps",
                 ),
@@ -1386,24 +1691,24 @@ fn build(panel: &Panel) {
                     continue;
                 }
                 let y = y - details_offset;
-                label(panel, id, name, 20, y, 100, 23, 3, false);
+                label(panel, id, name, 34, y, 96, 22, 3, false);
                 if id == 405 && state.product.is_some() {
                     // 完整接收路径允许原生选择和水平滚动，不将长路径截成不可取回的标签。
-                    edit(panel, 406, value, 120, y - 4, 300, 30, false);
+                    edit(panel, 406, value, 134, y - 4, 292, 28, false);
                     unsafe {
                         SendMessageW(panel.control(406), EM_SETREADONLY, 1, 0);
                     }
                 } else {
-                    label(panel, id + 1, value, 120, y, 300, 23, 3, false);
+                    label(panel, id + 1, value, 134, y, 292, 22, 3, false);
                 }
             }
             label(
                 panel,
                 407,
                 t("可用能力", "Capabilities"),
-                20,
-                175 - details_offset,
-                100,
+                34,
+                180 - details_offset,
+                96,
                 22,
                 3,
                 false,
@@ -1412,31 +1717,31 @@ fn build(panel: &Panel) {
                 panel,
                 408,
                 "Shell  ·  SSH  ·  Console",
-                120,
-                175 - details_offset,
-                300,
+                134,
+                180 - details_offset,
+                292,
                 22,
                 3,
                 false,
             );
             if state.product.is_some() {
-                label(panel, 410, "", 20, 205 - details_offset, 400, 30, 3, false);
+                label(panel, 410, "", 22, 222 - details_offset, 416, 22, 3, false);
                 button(
                     panel,
                     337,
                     t("操作实况", "Observer"),
                     20,
-                    248 - details_offset,
-                    130,
+                    264 - details_offset,
+                    126,
                     34,
                 );
                 button(
                     panel,
                     323,
                     t("打开接收目录", "Open folder"),
-                    160,
-                    248 - details_offset,
-                    130,
+                    156,
+                    264 - details_offset,
+                    136,
                     34,
                 );
             } else {
@@ -1445,8 +1750,8 @@ fn build(panel: &Panel) {
                     337,
                     t("打开操作观察窗", "Open observer"),
                     20,
-                    218,
-                    190,
+                    244,
+                    184,
                     34,
                 );
             }
@@ -1454,8 +1759,12 @@ fn build(panel: &Panel) {
                 panel,
                 409,
                 t("关闭", "Close"),
-                320,
-                if state.product.is_some() { 248 - details_offset } else { 218 },
+                340,
+                if state.product.is_some() {
+                    264 - details_offset
+                } else {
+                    244
+                },
                 100,
                 34,
             );
@@ -1465,10 +1774,10 @@ fn build(panel: &Panel) {
                 panel,
                 420,
                 t("控制权限", "Control permissions"),
-                20,
+                24,
                 18,
-                370,
-                30,
+                392,
+                28,
                 1,
                 false,
             );
@@ -1479,10 +1788,10 @@ fn build(panel: &Panel) {
                     "由本机用户决定工程师可以执行的操作。",
                     "Choose the operations allowed for the engineer.",
                 ),
-                20,
-                62,
-                380,
-                45,
+                24,
+                52,
+                392,
+                34,
                 0,
                 false,
             );
@@ -1490,17 +1799,17 @@ fn build(panel: &Panel) {
                 panel,
                 422,
                 t("逐项确认", "Confirm each action"),
-                20,
-                118,
-                180,
-                38,
+                24,
+                96,
+                190,
+                44,
             );
-            button(panel, 423, t("完全控制", "Full control"), 220, 118, 180, 38);
+            button(panel, 423, t("完全控制", "Full control"), 226, 96, 190, 44);
             unsafe {
                 EnableWindow(panel.control(422), i32::from(state.connected));
                 EnableWindow(panel.control(423), i32::from(state.connected));
             }
-            add(
+            let checkbox = add(
                 panel,
                 424,
                 "BUTTON",
@@ -1512,14 +1821,34 @@ fn build(panel: &Panel) {
                         "Allow full control by default (demo)",
                     ),
                 ),
+                38,
+                168,
                 20,
-                181,
-                18,
-                30,
+                22,
                 BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
                 0,
             );
-            label(panel, 427, t("以后默认允许完全控制", "Allow full control by default"), 41, 181, 359, 30, 0, false);
+            if checkbox.fresh && !checkbox.hwnd.is_null() {
+                unsafe {
+                    let _ = SetWindowSubclass(
+                        checkbox.hwnd,
+                        Some(checkbox_subclass),
+                        CHECKBOX_SUBCLASS,
+                        std::ptr::from_ref(panel) as usize,
+                    );
+                }
+            }
+            label(
+                panel,
+                427,
+                t("以后默认允许完全控制", "Allow full control by default"),
+                66,
+                164,
+                336,
+                30,
+                0,
+                false,
+            );
             unsafe {
                 SendMessageW(
                     panel.control(424),
@@ -1544,24 +1873,24 @@ fn build(panel: &Panel) {
                         "Current: confirm each action (demo)",
                     )
                 },
-                20,
-                227,
-                380,
-                45,
+                38,
+                224,
+                364,
+                48,
                 3,
                 false,
             );
-            button(panel, 425, t("完成", "Done"), 290, 286, 110, 36);
+            button(panel, 425, t("完成", "Done"), 306, 306, 110, 34);
         }
         Kind::Grant => {
             label(
                 panel,
                 440,
                 t("允许完全控制？", "Allow full control?"),
+                66,
                 22,
-                22,
-                390,
-                30,
+                350,
+                28,
                 1,
                 false,
             );
@@ -1572,25 +1901,25 @@ fn build(panel: &Panel) {
                     "工程师将可以执行命令、SSH 和串口操作。\r\n此处仅演示确认过程，不会授予实际权限。",
                     "The engineer may run commands, SSH and console operations.\r\nThis preview does not grant real permissions.",
                 ),
-                22,
-                77,
-                396,
-                85,
+                38,
+                78,
+                364,
+                84,
                 0,
                 false,
             );
-            button(panel, 442, t("取消", "Cancel"), 155, 188, 122, 36);
-            button(panel, 443, t("确认允许", "Allow"), 290, 188, 128, 36);
+            button(panel, 442, t("取消", "Cancel"), 172, 200, 112, 34);
+            button(panel, 443, t("确认允许", "Allow"), 296, 200, 120, 34);
         }
         Kind::Exit => {
             label(
                 panel,
                 460,
                 t("确认退出 RemoteOps？", "Exit RemoteOps?"),
-                24,
-                24,
-                390,
-                34,
+                66,
+                22,
+                350,
+                28,
                 1,
                 false,
             );
@@ -1601,32 +1930,32 @@ fn build(panel: &Panel) {
                     "退出后，工程师将无法继续连接此电脑。\r\n\r\n当前没有实际会话；此预览只展示确认样式。\r\n请在真实维护工作结束后再退出 Agent。",
                     "The engineer will no longer be able to connect.\r\n\r\nNo real session is active in this preview.\r\nExit the Agent after maintenance is complete.",
                 ),
-                24,
-                81,
-                392,
-                124,
+                38,
+                78,
+                364,
+                114,
                 0,
                 false,
             );
-            button(panel, 462, t("继续运行", "Keep running"), 152, 236, 136, 40);
-            button(panel, 463, t("确认退出", "Exit"), 300, 236, 116, 40);
+            button(panel, 462, t("继续运行", "Keep running"), 166, 236, 124, 36);
+            button(panel, 463, t("确认退出", "Exit"), 302, 236, 114, 36);
         }
         Kind::Setup if state.product.as_ref().is_some_and(|p| !p.endpoint_editable) => {
-            label(panel, 500, "", 20, 16, 352, 32, 1, false);
-            label(panel, 503, "", 20, 58, 352, 35, 0, false);
-            label(panel, 504, "", 20, 94, 352, 46, 3, false);
-            button(panel, 505, t("取消", "Cancel"), 166, 146, 82, 32);
-            button(panel, 506, t("重新连接", "Reconnect"), 256, 146, 116, 32);
+            label(panel, 500, "", 24, 18, 360, 28, 1, false);
+            label(panel, 503, "", 36, 66, 336, 34, 0, false);
+            label(panel, 504, "", 36, 102, 336, 36, 3, false);
+            button(panel, 505, t("取消", "Cancel"), 182, 162, 86, 32);
+            button(panel, 506, t("重新连接", "Reconnect"), 278, 162, 108, 32);
         }
         Kind::Setup => {
             label(
                 panel,
                 500,
                 t("欢迎使用 RemoteOps", "Welcome to RemoteOps"),
-                32,
-                25,
-                520,
-                34,
+                26,
+                20,
+                568,
+                30,
                 1,
                 false,
             );
@@ -1634,14 +1963,14 @@ fn build(panel: &Panel) {
                 panel,
                 501,
                 t("Relay 地址", "Relay address"),
-                32,
-                98,
-                122,
-                28,
-                0,
+                42,
+                78,
+                160,
+                22,
+                5,
                 false,
             );
-            edit(panel, 502, &state.relay, 170, 91, 438, 36, false);
+            edit(panel, 502, &state.relay, 42, 106, 536, 36, false);
             label(
                 panel,
                 503,
@@ -1649,11 +1978,11 @@ fn build(panel: &Panel) {
                     "填写组织提供的中继地址，保存后显示临时控制码。\r\n本窗口是样式演示，不会建立连接或保存配置。",
                     "Enter the relay address provided by your organization.\r\nThis preview neither connects nor saves configuration.",
                 ),
-                32,
-                151,
-                576,
-                62,
-                0,
+                42,
+                156,
+                536,
+                46,
+                3,
                 false,
             );
             label(
@@ -1663,25 +1992,25 @@ fn build(panel: &Panel) {
                     "工具由已连接中继统一管理。",
                     "Tools are managed by the connected relay.",
                 ),
-                32,
-                232,
-                576,
-                62,
-                0,
+                42,
+                224,
+                536,
+                46,
+                3,
                 false,
             );
-            label(panel, 504, "", 32, 315, 576, 34, 3, false);
-            button(panel, 507, "中文", 32, 364, 72, 36);
-            button(panel, 508, "English", 114, 364, 90, 36);
-            button(panel, 505, t("取消", "Cancel"), 344, 364, 100, 38);
+            label(panel, 504, "", 26, 298, 568, 22, 3, false);
+            button(panel, 507, "中文", 24, 336, 72, 32);
+            button(panel, 508, "English", 102, 336, 86, 32);
+            button(panel, 505, t("取消", "Cancel"), 346, 336, 94, 32);
             button(
                 panel,
                 506,
                 t("模拟连接", "Preview connection"),
-                458,
-                364,
-                150,
-                38,
+                450,
+                336,
+                146,
+                32,
             );
         }
         Kind::Tls => {
@@ -1689,10 +2018,10 @@ fn build(panel: &Panel) {
                 panel,
                 520,
                 t("确认中继服务器证书", "Confirm relay certificate"),
-                24,
-                23,
-                490,
-                33,
+                66,
+                20,
+                432,
+                28,
                 1,
                 false,
             );
@@ -1704,10 +2033,10 @@ fn build(panel: &Panel) {
                     "Verify this fingerprint using a trusted channel.",
                 ),
                 24,
-                76,
+                64,
                 512,
-                29,
-                0,
+                24,
+                3,
                 false,
             );
             edit(
@@ -1715,23 +2044,23 @@ fn build(panel: &Panel) {
                 524,
                 "Relay: relay.example.test\r\nSHA256: DEMO-ONLY-0123-4567-89AB-CDEF\r\n此指纹仅为合成样式示例，不连接真实服务器。",
                 24,
-                116,
+                96,
                 512,
-                105,
+                152,
                 true,
             );
-            button(panel, 521, t("取消连接", "Cancel"), 24, 261, 140, 40);
-            button(panel, 522, t("仅信任本次", "Trust once"), 180, 261, 164, 40);
+            button(panel, 521, t("取消连接", "Cancel"), 24, 282, 130, 36);
+            button(panel, 522, t("仅信任本次", "Trust once"), 168, 282, 156, 36);
             button(
                 panel,
                 523,
                 t("信任并保存（演示）", "Trust and save (demo)"),
-                360,
-                261,
-                176,
-                40,
+                338,
+                282,
+                198,
+                36,
             );
-            button(panel, 525, "×", 507, 19, 28, 28);
+            button(panel, 525, "×", 510, 18, 28, 28);
         }
         Kind::Observer => {
             let mut rect = RECT::default();
@@ -1744,30 +2073,28 @@ fn build(panel: &Panel) {
                 panel,
                 201,
                 t("操作实况", "Activity"),
-                16,
-                8,
-                100,
-                29,
+                18,
+                12,
+                96,
+                28,
                 1,
                 false,
             );
-            label(
-                panel,
-                224,
-                t("只读", "Read only"),
-                130,
-                14,
-                110,
-                20,
-                3,
-                false,
-            );
+            label(panel, 224, t("只读", "Read only"), 122, 17, 56, 18, 3, true);
             if state.product.is_none() {
-                button(panel, 220, t("演示并发", "Run demo"), w - 232, 8, 102, 32);
-                button(panel, 221, t("全部结束", "Finish all"), w - 122, 8, 102, 32);
+                button(panel, 220, t("演示并发", "Run demo"), w - 234, 11, 102, 30);
+                button(
+                    panel,
+                    221,
+                    t("全部结束", "Finish all"),
+                    w - 122,
+                    11,
+                    104,
+                    30,
+                );
             }
-            let extra = (w - 32 - 5 * 8 - 6 * 70 - 44) / 6;
-            let mut x = 16;
+            let extra = (w - 36 - 5 * 8 - 6 * 70 - 44) / 6;
+            let mut x = 18;
             for index in 0..6 {
                 let width = 70 + extra + if index == 2 { 44 } else { 0 };
                 let id = 210 + index;
@@ -1776,9 +2103,9 @@ fn build(panel: &Panel) {
                     id,
                     &observer_filter_text(&state, id),
                     x,
-                    42,
+                    50,
                     width,
-                    34,
+                    32,
                 );
                 x += width + 8;
             }
@@ -1786,10 +2113,10 @@ fn build(panel: &Panel) {
                 panel,
                 222,
                 &observer_status(&state),
-                16,
-                82,
-                w - 32,
-                22,
+                18,
+                88,
+                w - 36,
+                20,
                 3,
                 false,
             );
@@ -1798,9 +2125,9 @@ fn build(panel: &Panel) {
                 202,
                 &observer_rebuild_text(&state, previous_output.as_deref(), selected),
                 16,
-                111,
+                114,
                 w - 32,
-                h - 163,
+                h - 174,
                 true,
             );
             if let Some(roles) = previous_roles {
@@ -1810,8 +2137,8 @@ fn build(panel: &Panel) {
                 panel,
                 223,
                 &observer_empty_text(&state),
-                28,
-                123,
+                32,
+                128,
                 w - 72,
                 24,
                 3,
@@ -1831,10 +2158,10 @@ fn build(panel: &Panel) {
                 panel,
                 203,
                 &observer_count(&state),
-                20,
-                h - 37,
-                w - 366,
-                25,
+                18,
+                h - 33,
+                w - 356,
+                22,
                 3,
                 false,
             );
@@ -1846,24 +2173,24 @@ fn build(panel: &Panel) {
                 } else {
                     t("暂停显示", "Pause view")
                 },
-                w - 326,
-                h - 43,
-                90,
-                35,
+                w - 322,
+                h - 40,
+                96,
+                32,
             );
             button(
                 panel,
                 206,
                 t("返回最新", "Latest"),
-                w - 224,
-                h - 43,
-                110,
-                35,
+                w - 216,
+                h - 40,
+                104,
+                32,
             );
-            button(panel, 205, t("关闭", "Close"), w - 102, h - 43, 82, 35);
+            button(panel, 205, t("关闭", "Close"), w - 102, h - 40, 84, 32);
         }
         Kind::About => {
-            label(panel, 540, "RemoteOps", 80, 22, 296, 30, 1, false);
+            label(panel, 540, "RemoteOps", 82, 20, 314, 28, 1, false);
             label(
                 panel,
                 543,
@@ -1872,10 +2199,10 @@ fn build(panel: &Panel) {
                     t("界面预览", "UI preview"),
                     env!("CARGO_PKG_VERSION")
                 ),
-                80,
-                55,
-                296,
-                22,
+                82,
+                50,
+                314,
+                20,
                 3,
                 false,
             );
@@ -1886,17 +2213,17 @@ fn build(panel: &Panel) {
                     "用于确认窗口样式与操作布局。\r\n本预览不建立连接，也不更改现有配置。",
                     "Preview window styles and interactions.\r\nNo connections or configuration changes are made.",
                 ),
-                24,
-                110,
-                352,
-                60,
+                38,
+                102,
+                344,
+                72,
                 0,
                 false,
             );
             if state.legal_notices.is_some() {
-                button(panel, 544, t("组件与许可", "Licenses"), 24, 192, 180, 34);
+                button(panel, 544, t("组件与许可", "Licenses"), 24, 218, 152, 34);
             }
-            button(panel, 541, t("知道了", "OK"), 268, 192, 108, 34);
+            button(panel, 541, t("知道了", "OK"), 288, 218, 108, 34);
         }
         Kind::Licenses => {
             label(
@@ -1905,7 +2232,7 @@ fn build(panel: &Panel) {
                 t("组件与许可 · 只读", "Components and licenses · Read only"),
                 20,
                 14,
-                630,
+                640,
                 28,
                 1,
                 false,
@@ -1920,8 +2247,8 @@ fn build(panel: &Panel) {
                 318,
                 true,
             );
-            button(panel, 553, t("上一页", "Previous"), 20, 382, 100, 34);
-            button(panel, 554, t("下一页", "Next"), 130, 382, 100, 34);
+            button(panel, 553, t("上一页", "Previous"), 20, 392, 98, 32);
+            button(panel, 554, t("下一页", "Next"), 128, 392, 98, 32);
             let pages = state
                 .legal_pages
                 .as_ref()
@@ -1931,9 +2258,9 @@ fn build(panel: &Panel) {
                 555,
                 &format!("{} / {}", state.legal_page + 1, pages),
                 244,
-                390,
+                398,
                 240,
-                24,
+                22,
                 3,
                 false,
             );
@@ -1941,7 +2268,7 @@ fn build(panel: &Panel) {
                 EnableWindow(panel.control(553), i32::from(state.legal_page > 0));
                 EnableWindow(panel.control(554), i32::from(state.legal_page + 1 < pages));
             }
-            button(panel, 552, t("关闭", "Close"), 558, 382, 102, 34);
+            button(panel, 552, t("关闭", "Close"), 558, 392, 102, 32);
         }
     }
     let declare_elapsed = controls_started.elapsed();
@@ -2022,7 +2349,12 @@ fn menu(panel: &Panel) {
                 wide(name).as_ptr(),
             );
         }
-        AppendMenuW(menu, MF_POPUP, language as usize, wide(t("语言", "Language")).as_ptr());
+        AppendMenuW(
+            menu,
+            MF_POPUP,
+            language as usize,
+            wide(t("语言", "Language")).as_ptr(),
+        );
         let appearance = CreatePopupMenu();
         for (id, name, theme) in [
             (5010, t("跟随系统", "System"), Theme::System),
@@ -2036,7 +2368,12 @@ fn menu(panel: &Panel) {
                 wide(name).as_ptr(),
             );
         }
-        AppendMenuW(menu, MF_POPUP, appearance as usize, wide(t("外观", "Appearance")).as_ptr());
+        AppendMenuW(
+            menu,
+            MF_POPUP,
+            appearance as usize,
+            wide(t("外观", "Appearance")).as_ptr(),
+        );
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(
             menu,
@@ -2046,6 +2383,19 @@ fn menu(panel: &Panel) {
         );
         AppendMenuW(menu, MF_STRING, 5021, wide(t("版本信息", "About")).as_ptr());
         if let Some(product) = &state.product {
+            if app
+                .business
+                .borrow()
+                .as_ref()
+                .is_some_and(|business| business.demo)
+            {
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    5035,
+                    wide(t("演示双连接", "Preview both connections")).as_ptr(),
+                );
+            }
             if product.endpoint_editable {
                 AppendMenuW(
                     menu,
@@ -2591,8 +2941,8 @@ fn loading_feedback(panel: &Panel) {
         product.tls.is_some(),
         started.elapsed(),
     );
-    if value(panel.control(305)) != text {
-        panel.text(305, &text);
+    if value(panel.control(300)) != text {
+        panel.text(300, &text);
     }
 }
 fn activity_tick(panel: &Panel) {
@@ -2614,13 +2964,13 @@ fn activity_tick(panel: &Panel) {
     if repaint {
         unsafe {
             InvalidateRect(panel.control(306), null(), 0);
-            let dot = RECT {
-                left: panel.px(18),
-                top: panel.px(24),
-                right: panel.px(30),
-                bottom: panel.px(36),
+            let header = RECT {
+                left: panel.px(16),
+                top: panel.px(12),
+                right: panel.px(364),
+                bottom: panel.px(58),
             };
-            InvalidateRect(panel.hwnd.get(), &raw const dot, 0);
+            InvalidateRect(panel.hwnd.get(), &raw const header, 0);
         }
     }
 }
@@ -2674,141 +3024,36 @@ fn fill(hdc: HDC, rect: &RECT, color: u32) {
         DeleteObject(brush);
     }
 }
-fn round(hdc: HDC, rect: RECT, bg: u32, border: u32, radius: i32) {
-    unsafe {
-        let brush = CreateSolidBrush(bg);
-        let pen = CreatePen(PS_SOLID, 1, border);
-        let previous_brush = SelectObject(hdc, brush);
-        let previous_pen = SelectObject(hdc, pen);
-        RoundRect(
-            hdc,
-            rect.left,
-            rect.top,
-            rect.right,
-            rect.bottom,
-            radius,
-            radius,
-        );
-        SelectObject(hdc, previous_brush);
-        SelectObject(hdc, previous_pen);
-        DeleteObject(brush);
-        DeleteObject(pen);
+fn button_outside_bg(panel: &Panel, id: i32, c: Palette) -> u32 {
+    match (panel.kind, id) {
+        (Kind::Main, 304) => c.code_surface(),
+        (Kind::Main, 307..=309 | 338)
+        | (Kind::Details, 337 | 323 | 409)
+        | (Kind::Permissions, 425)
+        | (Kind::Grant, 442 | 443)
+        | (Kind::Exit, 462 | 463)
+        | (Kind::Setup, 505..=508)
+        | (Kind::Tls, 521..=523)
+        | (Kind::Observer, 204..=206)
+        | (Kind::About, 541 | 544)
+        | (Kind::Licenses, 552..=554) => c.footer_bg,
+        #[cfg(feature = "agent-runtime")]
+        (Kind::TestKey, 102 | 106) => c.footer_bg,
+        _ => c.bg,
     }
 }
-// 简单线性图标由 GDI 绘制，按钮文本仍保留给原生 UIA。
-fn draw_icon(panel: &Panel, hdc: HDC, id: i32, rect: RECT, color: u32) {
-    unsafe {
-        let unit = panel.px(1).max(1);
-        let side = panel.px(17);
-        let x = (rect.left + rect.right - side) / 2;
-        let y = (rect.top + rect.bottom - side) / 2;
-        let pen = CreatePen(PS_SOLID, unit, color);
-        let old_pen = SelectObject(hdc, pen);
-        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        let line = |x1, y1, x2, y2| {
-            MoveToEx(hdc, x + panel.px(x1), y + panel.px(y1), null_mut());
-            LineTo(hdc, x + panel.px(x2), y + panel.px(y2));
-        };
-        match id {
-            301 => {
-                // 使用 Windows 自带的设置字形，随 DPI 缩放。
-                let name = wide("Segoe MDL2 Assets");
-                let font = CreateFontW(
-                    -panel.px(17),
-                    0,
-                    0,
-                    0,
-                    400,
-                    0,
-                    0,
-                    0,
-                    1,
-                    0,
-                    0,
-                    5,
-                    0,
-                    name.as_ptr(),
-                );
-                let previous = SelectObject(hdc, font);
-                let mut bounds = rect;
-                DrawTextW(
-                    hdc,
-                    wide("\u{E713}").as_ptr(),
-                    -1,
-                    &raw mut bounds,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                );
-                SelectObject(hdc, previous);
-                DeleteObject(font);
-            }
-            304 => {
-                Rectangle(
-                    hdc,
-                    x + panel.px(1),
-                    y + panel.px(1),
-                    x + panel.px(12),
-                    y + panel.px(12),
-                );
-                Rectangle(
-                    hdc,
-                    x + panel.px(5),
-                    y + panel.px(5),
-                    x + panel.px(16),
-                    y + panel.px(16),
-                );
-            }
-            307 => {
-                for row in [3, 8, 13] {
-                    line(1, row, 3, row);
-                    line(6, row, 16, row);
-                }
-            }
-            308 => {
-                line(3, 1, 11, 1);
-                line(11, 1, 15, 5);
-                line(15, 5, 15, 16);
-                line(15, 16, 3, 16);
-                line(3, 16, 3, 1);
-                line(10, 1, 10, 6);
-                line(10, 6, 15, 6);
-                line(6, 9, 12, 9);
-                line(6, 12, 12, 12);
-            }
-            338 => {
-                Rectangle(hdc, x, y + panel.px(1), x + panel.px(17), y + panel.px(16));
-                line(3, 5, 7, 8);
-                line(7, 8, 3, 11);
-                line(9, 12, 14, 12);
-            }
-            309 => {
-                Ellipse(
-                    hdc,
-                    x + panel.px(1),
-                    y + panel.px(1),
-                    x + panel.px(16),
-                    y + panel.px(16),
-                );
-                line(5, 5, 12, 12);
-                line(12, 5, 5, 12);
-            }
-            _ => {}
-        }
-        SelectObject(hdc, old_pen);
-        SelectObject(hdc, old_brush);
-        DeleteObject(pen);
-        if id == 308 {
-            let dot = CreateSolidBrush(panel.app().colors().accent);
-            let old = SelectObject(hdc, dot);
-            Ellipse(
-                hdc,
-                rect.right - panel.px(9),
-                rect.top + panel.px(3),
-                rect.right - panel.px(4),
-                rect.top + panel.px(8),
-            );
-            SelectObject(hdc, old);
-            DeleteObject(dot);
-        }
+
+fn button_glyph(id: i32, copied: bool) -> Option<&'static str> {
+    match id {
+        301 => Some("\u{E713}"),
+        304 if copied => Some("\u{E73E}"),
+        304 => Some("\u{E8C8}"),
+        307 => Some("\u{E8FD}"),
+        308 => Some("\u{E8A5}"),
+        338 => Some("\u{E756}"),
+        309 => Some("\u{E7E8}"),
+        310 => Some("\u{E72B}"),
+        _ => None,
     }
 }
 
@@ -2817,11 +3062,30 @@ fn draw_button(panel: &Panel, di: &DRAWITEMSTRUCT) {
         let app = panel.app();
         let c = app.colors();
         let id = i32::try_from(di.CtlID).unwrap_or(0);
-        let danger = matches!(id, 341 | 345 | 463);
-        let primary = matches!(id, 102 | 304 | 443 | 506 | 523);
+        let state = app.state.borrow();
+        let disabled = di.itemState & ODS_DISABLED != 0;
+        let pressed = di.itemState & ODS_SELECTED != 0;
+        let hovered = !disabled && panel.hovered_control.get() == di.hwndItem;
+        let focused = di.itemState & ODS_FOCUS != 0 && di.itemState & ODS_NOFOCUSRECT == 0;
+
+        let danger_solid = id == 463;
+        let flat_main = panel.kind == Kind::Main && matches!(id, 301 | 307..=309 | 338 | 341 | 345);
+        let ghost_close = id == 525;
+        let copy_copied = id == 304 && state.copied.is_some();
+        let primary = matches!(id, 102 | 304 | 409 | 425 | 443 | 506 | 523 | 541);
         let viewer_open = id == 338 && app.observer_visible();
+        let log_filter_active = (324..=328).contains(&id) && state.filter == (id - 324) as usize;
+        let lang_active = (id == 507 && !state.english) || (id == 508 && state.english);
+        let perm_active = if matches!(id, 422 | 423) && !disabled {
+            let is_full = state.product.as_ref().map_or(state.full, |p| {
+                p.control_summary.contains("完全")
+                    || p.control_summary.to_ascii_lowercase().contains("full")
+            });
+            (id == 422 && !is_full) || (id == 423 && is_full)
+        } else {
+            false
+        };
         let (category_selected, category_running) = if (210..=215).contains(&id) {
-            let state = app.state.borrow();
             let category = observer_category(id);
             (
                 state.observer_demo.selected() == category,
@@ -2831,108 +3095,326 @@ fn draw_button(panel: &Panel, di: &DRAWITEMSTRUCT) {
         } else {
             (false, false)
         };
-        let disabled = di.itemState & ODS_DISABLED != 0;
-        let pressed = di.itemState & ODS_SELECTED != 0;
-        let bg = if danger {
-            c.danger_bg
-        } else if primary {
-            c.accent
-        } else if category_selected {
-            c.bg
-        } else {
-            c.surface
-        };
-        let fg = if disabled {
-            c.secondary
-        } else if danger {
-            c.danger
-        } else if primary {
-            rgb(255, 255, 255)
-        } else {
-            c.text
-        };
-        let mut rect = di.rcItem;
-        round(
-            di.hDC,
-            rect,
-            if pressed { c.border } else { bg },
-            if danger {
-                c.danger
-            } else if primary || viewer_open || category_selected {
-                c.accent
+        let unread_logs = id == 308 && state.product.as_ref().is_some_and(|p| p.unread > 0);
+        let selected_chip =
+            viewer_open || category_selected || log_filter_active || lang_active || perm_active;
+        drop(state);
+
+        let (bg, border, fg) = if disabled {
+            (c.card_subtle, c.border_subtle, c.muted)
+        } else if copy_copied {
+            (
+                c.success,
+                c.success,
+                if c.dark { c.bg } else { rgb(0, 28, 10) },
+            )
+        } else if danger_solid {
+            let fill = if pressed {
+                c.danger_solid_pressed
+            } else if hovered {
+                c.danger_solid_hover
             } else {
-                c.border
-            },
-            panel.px(8),
+                c.danger_solid
+            };
+            (fill, fill, rgb(255, 255, 255))
+        } else if flat_main {
+            let fill = if pressed {
+                c.btn_pressed
+            } else if hovered {
+                c.btn_hover
+            } else {
+                button_outside_bg(panel, id, c)
+            };
+            let ink = if (hovered || pressed) && matches!(id, 309 | 341 | 345) {
+                c.danger
+            } else if matches!(id, 341 | 345) || selected_chip {
+                c.accent_text
+            } else {
+                c.secondary
+            };
+            (fill, fill, ink)
+        } else if primary {
+            let fill = if pressed {
+                c.accent_pressed
+            } else if hovered {
+                c.accent_hover
+            } else {
+                c.accent
+            };
+            (fill, fill, rgb(255, 255, 255))
+        } else if ghost_close {
+            let fill = if pressed {
+                c.btn_pressed
+            } else if hovered {
+                c.btn_hover
+            } else {
+                c.bg
+            };
+            let bdr = if hovered || pressed { c.border } else { c.bg };
+            (fill, bdr, if hovered { c.text } else { c.secondary })
+        } else if selected_chip {
+            let fill = if pressed {
+                c.btn_pressed
+            } else {
+                c.accent_soft
+            };
+            (fill, c.accent_border, c.accent_text)
+        } else {
+            let fill = if pressed {
+                c.btn_pressed
+            } else if hovered {
+                c.btn_hover
+            } else {
+                c.btn_bg
+            };
+            let bdr = if hovered { c.border_hover } else { c.border };
+            (fill, bdr, c.text)
+        };
+
+        let outside_bg = button_outside_bg(panel, id, c);
+        let w = di.rcItem.right - di.rcItem.left;
+        let h = di.rcItem.bottom - di.rcItem.top;
+        let Some(mut surface) = theme_draw::Surface::new(di.hDC, w, h) else {
+            return;
+        };
+        surface.clear(outside_bg);
+        let radius = if matches!(id, 341 | 345 | 324..=329) {
+            panel.px(7) as f32
+        } else {
+            panel.px(8) as f32
+        };
+        let border_w = if selected_chip && !disabled {
+            1.35
+        } else {
+            1.0
+        };
+        let top_hl =
+            if c.dark && !disabled && !primary && !danger_solid && !ghost_close && !flat_main {
+                Some(c.card_highlight)
+            } else {
+                None
+            };
+        surface.draw_rounded_rect(
+            0.5,
+            0.5,
+            (w as f32 - 1.0).max(1.0),
+            (h as f32 - 1.0).max(1.0),
+            radius,
+            bg,
+            border,
+            border_w,
+            0.0,
+            top_hl,
         );
+
+        let mut text_rect = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
         if category_running {
-            let brush = CreateSolidBrush(c.success);
-            let pen = CreatePen(PS_SOLID, 1, c.success);
-            let old_brush = SelectObject(di.hDC, brush);
-            let old_pen = SelectObject(di.hDC, pen);
-            let middle = i32::midpoint(rect.top, rect.bottom);
-            Ellipse(
-                di.hDC,
-                rect.left + panel.px(7),
-                middle - panel.px(3),
-                rect.left + panel.px(13),
-                middle + panel.px(3),
+            let cy = h as f32 * 0.5;
+            let cx = panel.px(11) as f32;
+            surface.draw_glow_dot(
+                cx,
+                cy,
+                panel.px(3) as f32,
+                panel.px(6) as f32,
+                c.success,
+                if c.dark { 0.4 } else { 0.25 },
             );
-            SelectObject(di.hDC, old_brush);
-            SelectObject(di.hDC, old_pen);
-            DeleteObject(brush);
-            DeleteObject(pen);
-            rect.left += panel.px(12);
+            text_rect.left += panel.px(14);
         }
         let text = value(di.hwndItem);
-        SetBkMode(di.hDC, TRANSPARENT.cast_signed());
-        SetTextColor(di.hDC, fg);
-        let font = panel.fonts.borrow()[if matches!(id, 307..=309 | 338) { 3 } else { 0 }];
-        let old = SelectObject(di.hDC, font);
-        let icon_only = id == 304 && text != "✓";
-        if matches!(id, 301 | 304 | 307..=309 | 338) && text != "✓" {
-            let mut icon_rect = rect;
-            if matches!(id, 301 | 307..=309 | 338) {
-                // 图标与文字作为一组居中，短标签不会留下过大的间距。
+        let mem_dc = surface.hdc();
+        SetBkMode(mem_dc, TRANSPARENT.cast_signed());
+        SetTextColor(mem_dc, fg);
+        let font_idx = if matches!(id, 307..=309 | 324..=329 | 338 | 341 | 345) {
+            3
+        } else if selected_chip || primary || danger_solid {
+            5
+        } else {
+            0
+        };
+        let font = panel.fonts.borrow()[font_idx];
+        let old = SelectObject(mem_dc, font);
+        let icon_only = id == 304;
+        if let Some(glyph) = button_glyph(id, copy_copied || text == "✓") {
+            let glyph_px = if matches!(id, 301 | 304) {
+                panel.px(15)
+            } else {
+                panel.px(14)
+            };
+            if icon_only {
+                theme_draw::draw_icon_glyph(mem_dc, text_rect, glyph, glyph_px, fg);
+            } else {
                 let mut extent = SIZE::default();
                 let text_wide = wide(&text);
                 if GetTextExtentPoint32W(
-                    di.hDC,
+                    mem_dc,
                     text_wide.as_ptr(),
-                    i32::try_from(text_wide.len() - 1).unwrap_or(i32::MAX),
+                    i32::try_from(text_wide.len().saturating_sub(1)).unwrap_or(i32::MAX),
                     &raw mut extent,
                 ) == 0
                 {
-                    extent.cx = (rect.right - rect.left - panel.px(39)).max(0);
+                    extent.cx = (w - panel.px(34)).max(0);
                 }
-                let side = panel.px(17);
-                let gap = panel.px(6);
-                let left = rect.left + (rect.right - rect.left - side - gap - extent.cx) / 2;
-                icon_rect.left = left;
-                icon_rect.right = left + side;
-                rect.left = icon_rect.right + gap;
-                rect.right = rect.left + extent.cx;
+                let side = glyph_px + panel.px(2);
+                let gap = panel.px(5);
+                let total_w = side + gap + extent.cx;
+                let left = text_rect.left
+                    + ((text_rect.right - text_rect.left - total_w) / 2).max(panel.px(4));
+                let icon_rect = RECT {
+                    left,
+                    top: text_rect.top,
+                    right: left + side,
+                    bottom: text_rect.bottom,
+                };
+                text_rect.left = icon_rect.right + gap;
+                text_rect.right = (text_rect.left + extent.cx + panel.px(2)).min(w - panel.px(4));
+                theme_draw::draw_icon_glyph(mem_dc, icon_rect, glyph, glyph_px, fg);
+                DrawTextW(
+                    mem_dc,
+                    text_wide.as_ptr(),
+                    -1,
+                    &raw mut text_rect,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
             }
-            draw_icon(panel, di.hDC, id, icon_rect, fg);
+        } else if perm_active && !disabled {
+            let text_wide = wide(&text);
+            let mut extent = SIZE::default();
+            let _ = GetTextExtentPoint32W(
+                mem_dc,
+                text_wide.as_ptr(),
+                i32::try_from(text_wide.len().saturating_sub(1)).unwrap_or(i32::MAX),
+                &raw mut extent,
+            );
+            let dot_d = panel.px(7);
+            let gap = panel.px(7);
+            let total_w = dot_d + gap + extent.cx;
+            let start_x = text_rect.left
+                + ((text_rect.right - text_rect.left - total_w) / 2).max(panel.px(8));
+            surface.draw_circle(
+                (start_x + dot_d / 2) as f32,
+                h as f32 * 0.5,
+                panel.px(3) as f32,
+                c.accent,
+                1.0,
+            );
+            text_rect.left = start_x + dot_d + gap;
+            text_rect.right = (text_rect.left + extent.cx + panel.px(2)).min(w - panel.px(4));
+            DrawTextW(
+                mem_dc,
+                text_wide.as_ptr(),
+                -1,
+                &raw mut text_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        } else {
+            let text_wide = wide(&text);
+            DrawTextW(
+                mem_dc,
+                text_wide.as_ptr(),
+                -1,
+                &raw mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
         }
-        DrawTextW(
-            di.hDC,
-            wide(if icon_only { "" } else { &text }).as_ptr(),
-            -1,
-            &raw mut rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
-        SelectObject(di.hDC, old);
-        if di.itemState & ODS_FOCUS != 0 && di.itemState & ODS_NOFOCUSRECT == 0 {
-            let mut focus_rect = di.rcItem;
-            focus_rect.left += 3;
-            focus_rect.top += 3;
-            focus_rect.right -= 3;
-            focus_rect.bottom -= 3;
-            DrawFocusRect(di.hDC, &raw const focus_rect);
+        SelectObject(mem_dc, old);
+
+        if unread_logs {
+            surface.draw_circle(
+                (w - panel.px(8)) as f32,
+                panel.px(7) as f32,
+                panel.px(3) as f32,
+                c.danger,
+                1.0,
+            );
         }
+        if focused {
+            surface.draw_focus_ring(
+                2.0,
+                2.0,
+                (w as f32 - 4.0).max(1.0),
+                (h as f32 - 4.0).max(1.0),
+                (radius - 1.5).max(2.0),
+                if primary || danger_solid {
+                    rgb(255, 255, 255)
+                } else {
+                    c.accent
+                },
+                1.5,
+            );
+        }
+        surface.blit(di.hDC, di.rcItem.left, di.rcItem.top);
     }
 }
+
+fn paint_footer_bar(
+    surface: &mut theme_draw::Surface,
+    width: i32,
+    height: i32,
+    top: i32,
+    c: Palette,
+) {
+    let top = top.clamp(0, height);
+    if top < height {
+        surface.draw_rounded_rect(
+            0.0,
+            top as f32,
+            width as f32,
+            (height - top) as f32,
+            0.0,
+            c.footer_bg,
+            c.footer_bg,
+            0.0,
+            0.0,
+            None,
+        );
+        surface.draw_hline(0, width, top, c.border_subtle);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_header_badge(
+    surface: &mut theme_draw::Surface,
+    x: i32,
+    y: i32,
+    size: i32,
+    fill: u32,
+    border: u32,
+    glyph: &str,
+    glyph_px: i32,
+    glyph_color: u32,
+) {
+    surface.draw_rounded_rect(
+        x as f32,
+        y as f32,
+        size as f32,
+        size as f32,
+        size as f32 * 0.5,
+        fill,
+        border,
+        1.0,
+        0.0,
+        None,
+    );
+    theme_draw::draw_icon_glyph(
+        surface.hdc(),
+        RECT {
+            left: x,
+            top: y,
+            right: x + size,
+            bottom: y + size,
+        },
+        glyph,
+        glyph_px,
+        glyph_color,
+    );
+}
+
 fn paint(panel: &Panel) {
     let started = Instant::now();
     unsafe {
@@ -2941,90 +3423,312 @@ fn paint(panel: &Panel) {
         let mut rect = RECT::default();
         GetClientRect(panel.hwnd.get(), &raw mut rect);
         let c = panel.app().colors();
-        fill(hdc, &rect, c.bg);
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        let subtle_shadow = if c.dark { 0.0 } else { 0.04 };
+        let card_hl = c.dark.then_some(c.card_highlight);
+
+        if let Some(mut surface) = theme_draw::Surface::new(hdc, w, h) {
+            surface.clear(c.bg);
+            match panel.kind {
+                Kind::Main if !panel.app().state.borrow().logs => {
+                    let state = panel.app().state.borrow();
+                    let roles = state
+                        .product
+                        .as_ref()
+                        .map_or((state.connected, false), |p| {
+                            (p.ai_connected, p.human_connected)
+                        });
+                    drop(state);
+                    for (x, connected) in [(24, roles.0), (196, roles.1)] {
+                        surface.draw_circle(
+                            panel.px(x) as f32,
+                            panel.px(22) as f32,
+                            panel.px(3) as f32,
+                            if connected { c.success } else { c.muted },
+                            1.0,
+                        );
+                    }
+                    let divider = RECT {
+                        left: panel.px(174),
+                        top: panel.px(17),
+                        right: panel.px(174) + 1,
+                        bottom: panel.px(50),
+                    };
+                    fill(surface.hdc(), &divider, c.border_subtle);
+                    surface.draw_rounded_rect(
+                        panel.px(20) as f32,
+                        panel.px(74) as f32,
+                        panel.px(MAIN_WIDTH - 40) as f32,
+                        panel.px(108) as f32,
+                        panel.px(9) as f32,
+                        c.code_surface(),
+                        c.code_surface(),
+                        0.0,
+                        0.0,
+                        None,
+                    );
+                    surface.draw_hline(panel.px(20), panel.px(460), panel.px(231), c.border_subtle);
+                    paint_footer_bar(&mut surface, w, h, panel.px(MAIN_FOOTER_TOP), c);
+                }
+                Kind::Main => {}
+                Kind::Details => {
+                    let state = panel.app().state.borrow();
+                    let editable = state.product.as_ref().is_none_or(|p| p.endpoint_editable);
+                    let is_product = state.product.is_some();
+                    drop(state);
+                    let offset = if editable { 0 } else { 38 };
+                    let card_h = 160 - offset;
+                    surface.draw_rounded_rect(
+                        panel.px(20) as f32,
+                        panel.px(54) as f32,
+                        panel.px(420) as f32,
+                        panel.px(card_h) as f32,
+                        panel.px(10) as f32,
+                        c.card,
+                        c.border_subtle,
+                        1.0,
+                        subtle_shadow,
+                        card_hl,
+                    );
+                    let dividers: &[i32] = if editable {
+                        &[95, 133, 171]
+                    } else {
+                        &[95, 133]
+                    };
+                    for &dy in dividers {
+                        surface.draw_hline(
+                            panel.px(34),
+                            panel.px(426),
+                            panel.px(dy),
+                            c.border_subtle,
+                        );
+                    }
+                    let footer_y = if is_product { 250 - offset } else { 230 };
+                    paint_footer_bar(&mut surface, w, h, panel.px(footer_y), c);
+                }
+                Kind::Permissions => {
+                    // 默认控制权限开关卡片
+                    surface.draw_rounded_rect(
+                        panel.px(24) as f32,
+                        panel.px(156) as f32,
+                        panel.px(392) as f32,
+                        panel.px(46) as f32,
+                        panel.px(10) as f32,
+                        c.card,
+                        c.border_subtle,
+                        1.0,
+                        subtle_shadow,
+                        card_hl,
+                    );
+                    // 当前状态摘要卡片
+                    surface.draw_rounded_rect(
+                        panel.px(24) as f32,
+                        panel.px(214) as f32,
+                        panel.px(392) as f32,
+                        panel.px(66) as f32,
+                        panel.px(10) as f32,
+                        c.card_subtle,
+                        c.border_subtle,
+                        1.0,
+                        0.0,
+                        None,
+                    );
+                    paint_footer_bar(&mut surface, w, h, panel.px(292), c);
+                }
+                Kind::Grant => {
+                    paint_header_badge(
+                        &mut surface,
+                        panel.px(24),
+                        panel.px(18),
+                        panel.px(32),
+                        c.warning_soft,
+                        c.warning_border,
+                        "\u{E7BA}",
+                        panel.px(16),
+                        c.warning,
+                    );
+                    surface.draw_rounded_rect(
+                        panel.px(24) as f32,
+                        panel.px(66) as f32,
+                        panel.px(392) as f32,
+                        panel.px(108) as f32,
+                        panel.px(10) as f32,
+                        c.warning_soft,
+                        c.warning_border,
+                        1.0,
+                        0.0,
+                        None,
+                    );
+                    paint_footer_bar(&mut surface, w, h, panel.px(186), c);
+                }
+                Kind::Exit => {
+                    paint_header_badge(
+                        &mut surface,
+                        panel.px(24),
+                        panel.px(18),
+                        panel.px(32),
+                        c.danger_bg,
+                        c.danger_border,
+                        "\u{E7E8}",
+                        panel.px(15),
+                        c.danger,
+                    );
+                    surface.draw_rounded_rect(
+                        panel.px(24) as f32,
+                        panel.px(66) as f32,
+                        panel.px(392) as f32,
+                        panel.px(138) as f32,
+                        panel.px(10) as f32,
+                        c.card,
+                        c.border_subtle,
+                        1.0,
+                        subtle_shadow,
+                        card_hl,
+                    );
+                    paint_footer_bar(&mut surface, w, h, panel.px(220), c);
+                }
+                Kind::Setup => {
+                    let fixed = panel
+                        .app()
+                        .state
+                        .borrow()
+                        .product
+                        .as_ref()
+                        .is_some_and(|p| !p.endpoint_editable);
+                    if fixed {
+                        surface.draw_rounded_rect(
+                            panel.px(24) as f32,
+                            panel.px(56) as f32,
+                            panel.px(360) as f32,
+                            panel.px(86) as f32,
+                            panel.px(10) as f32,
+                            c.card,
+                            c.border_subtle,
+                            1.0,
+                            subtle_shadow,
+                            card_hl,
+                        );
+                        paint_footer_bar(&mut surface, w, h, panel.px(150), c);
+                    } else {
+                        surface.draw_rounded_rect(
+                            panel.px(24) as f32,
+                            panel.px(62) as f32,
+                            panel.px(572) as f32,
+                            panel.px(226) as f32,
+                            panel.px(12) as f32,
+                            c.card,
+                            c.border_subtle,
+                            1.0,
+                            subtle_shadow,
+                            card_hl,
+                        );
+                        if !panel.control(502).is_null() {
+                            let focused = GetFocus() == panel.control(502);
+                            surface.draw_rounded_rect(
+                                panel.px(42) as f32,
+                                panel.px(106) as f32,
+                                panel.px(536) as f32,
+                                panel.px(36) as f32,
+                                panel.px(8) as f32,
+                                c.content,
+                                if focused { c.accent } else { c.border },
+                                if focused { 1.5 } else { 1.0 },
+                                0.0,
+                                None,
+                            );
+                        }
+                        surface.draw_hline(
+                            panel.px(42),
+                            panel.px(578),
+                            panel.px(212),
+                            c.border_subtle,
+                        );
+                        paint_footer_bar(&mut surface, w, h, panel.px(322), c);
+                    }
+                }
+                Kind::Tls => {
+                    paint_header_badge(
+                        &mut surface,
+                        panel.px(24),
+                        panel.px(17),
+                        panel.px(32),
+                        c.accent_soft,
+                        c.accent_border,
+                        "\u{E83D}",
+                        panel.px(16),
+                        c.accent_text,
+                    );
+                    paint_footer_bar(&mut surface, w, h, panel.px(268), c);
+                }
+                Kind::Observer => {
+                    // 只读徽章背景（内边距留足，避免静态文本背景覆盖圆角边框）
+                    surface.draw_rounded_rect(
+                        panel.px(116) as f32,
+                        panel.px(15) as f32,
+                        panel.px(68) as f32,
+                        panel.px(22) as f32,
+                        panel.px(6) as f32,
+                        c.accent_soft,
+                        c.accent_border,
+                        1.0,
+                        0.0,
+                        None,
+                    );
+                    paint_footer_bar(&mut surface, w, h, h - panel.px(52), c);
+                }
+                Kind::About => {
+                    surface.draw_rounded_rect(
+                        panel.px(24) as f32,
+                        panel.px(20) as f32,
+                        panel.px(46) as f32,
+                        panel.px(46) as f32,
+                        panel.px(10) as f32,
+                        c.card,
+                        c.border_subtle,
+                        1.0,
+                        subtle_shadow,
+                        card_hl,
+                    );
+                    let icon = LoadIconW(panel.app().instance, std::ptr::without_provenance(1));
+                    DrawIconEx(
+                        surface.hdc(),
+                        panel.px(30),
+                        panel.px(26),
+                        icon,
+                        panel.px(34),
+                        panel.px(34),
+                        0,
+                        null_mut(),
+                        DI_NORMAL,
+                    );
+                    surface.draw_rounded_rect(
+                        panel.px(24) as f32,
+                        panel.px(88) as f32,
+                        panel.px(372) as f32,
+                        panel.px(100) as f32,
+                        panel.px(10) as f32,
+                        c.card,
+                        c.border_subtle,
+                        1.0,
+                        subtle_shadow,
+                        card_hl,
+                    );
+                    paint_footer_bar(&mut surface, w, h, panel.px(204), c);
+                }
+                Kind::Licenses => {
+                    paint_footer_bar(&mut surface, w, h, panel.px(380), c);
+                }
+                #[cfg(feature = "agent-runtime")]
+                Kind::TestKey => {}
+            }
+            surface.blit(hdc, 0, 0);
+        } else {
+            fill(hdc, &rect, c.bg);
+        }
         #[cfg(feature = "agent-runtime")]
         if panel.kind == Kind::TestKey {
             test_key::paint(panel, hdc, c);
-        }
-        if panel.kind == Kind::Main && !panel.app().state.borrow().logs {
-            round(
-                hdc,
-                RECT {
-                    left: panel.px(16),
-                    top: panel.px(59),
-                    right: panel.px(464),
-                    bottom: panel.px(183),
-                },
-                c.surface,
-                c.border,
-                panel.px(10),
-            );
-            fill(
-                hdc,
-                &RECT {
-                    left: 0,
-                    top: panel.px(MAIN_FOOTER_TOP),
-                    right: rect.right,
-                    bottom: panel.px(MAIN_FOOTER_TOP) + 1,
-                },
-                c.border,
-            );
-            let state = panel.app().state.borrow();
-            let roles = state.product.as_ref().map_or((state.connected, false), |p| (p.ai_connected, p.human_connected));
-            for (x, connected) in [(16, roles.0), (198, roles.1)] {
-                let color = if connected { c.success } else { c.secondary };
-                let brush = CreateSolidBrush(color);
-                let pen = CreatePen(PS_SOLID, 1, color);
-                let old = SelectObject(hdc, brush);
-                let old_pen = SelectObject(hdc, pen);
-                Ellipse(hdc, panel.px(x), panel.px(17), panel.px(x + 8), panel.px(25));
-                SelectObject(hdc, old);
-                SelectObject(hdc, old_pen);
-                DeleteObject(brush);
-                DeleteObject(pen);
-            }
-        }
-        if panel.kind == Kind::Setup && !panel.control(502).is_null() {
-            round(
-                hdc,
-                RECT {
-                    left: panel.px(170),
-                    top: panel.px(91),
-                    right: panel.px(608),
-                    bottom: panel.px(127),
-                },
-                c.bg,
-                if GetFocus() == panel.control(502) {
-                    c.accent
-                } else {
-                    c.border
-                },
-                panel.px(8),
-            );
-        }
-        if panel.kind == Kind::About {
-            let icon = LoadIconW(panel.app().instance, std::ptr::without_provenance(1));
-            DrawIconEx(
-                hdc,
-                panel.px(24),
-                panel.px(26),
-                icon,
-                panel.px(40),
-                panel.px(40),
-                0,
-                null_mut(),
-                DI_NORMAL,
-            );
-            fill(
-                hdc,
-                &RECT {
-                    left: panel.px(24),
-                    top: panel.px(92),
-                    right: panel.px(376),
-                    bottom: panel.px(92) + 1,
-                },
-                c.border,
-            );
         }
         readonly_view::paint_frames(panel, hdc);
         EndPaint(panel.hwnd.get(), &raw const ps);
@@ -3076,7 +3780,12 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
             WM_COMMAND => {
                 let id = i32::from((w & 0xffff) as u16);
                 let notification = (w >> 16) & 0xffff;
-                if panel.kind == Kind::Permissions && id == 427 && notification == 0 && l != 0 && panel.control(427) == l as HWND {
+                if panel.kind == Kind::Permissions
+                    && id == 427
+                    && notification == 0
+                    && l != 0
+                    && panel.control(427) == l as HWND
+                {
                     SendMessageW(panel.control(424), BM_CLICK, 0, 0);
                     return 0;
                 }
@@ -3084,7 +3793,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 if panel.kind == Kind::Main
                     && l == 0
                     && notification == 0
-                    && matches!(id, 5001 | 5002 | 5010..=5012 | 5020..=5022 | 5030..=5034 | 5040..=5046)
+                    && matches!(id, 5001 | 5002 | 5010..=5012 | 5020..=5022 | 5030..=5035 | 5040..=5046)
                 {
                     command_menu(panel, id);
                     return 0;
@@ -3103,7 +3812,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
             WM_LBUTTONDOWN if panel.kind == Kind::Setup && !panel.control(502).is_null() => {
                 let x = i32::from(l as u16);
                 let y = i32::from((l >> 16) as u16);
-                if x >= panel.px(170) && x < panel.px(608) && y >= panel.px(91) && y < panel.px(127)
+                if x >= panel.px(42) && x < panel.px(578) && y >= panel.px(106) && y < panel.px(142)
                 {
                     SetFocus(panel.control(502));
                 }
@@ -3127,7 +3836,8 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                     {
                         let app = panel.app();
                         let state = app.state.borrow();
-                        fill(item.hDC, &item.rcItem, app.colors().bg);
+                        let c = app.colors();
+                        fill(item.hDC, &item.rcItem, c.bg);
                         state.activity_view.draw(
                             item.hDC,
                             item.rcItem,
@@ -3138,7 +3848,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                             } else {
                                 remoteops_agent_desktop_host::NativeLanguage::Chinese
                             },
-                            app.colors().bg == palette(true).bg,
+                            c.dark,
                         );
                     } else {
                         draw_button(panel, item);
@@ -3151,12 +3861,29 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 let hdc = w as HDC;
                 let id = GetDlgCtrlID(l as HWND);
                 let text_view = readonly_view::contains(l as HWND);
-                let content = text_view || matches!(id, 101 | 223);
-                let code_card = matches!(id, 302 | 303 | 305);
-                let bg = if content {
+                let state = panel.app().state.borrow();
+                let fixed_setup = state.product.as_ref().is_some_and(|p| !p.endpoint_editable);
+                drop(state);
+                let bg = if text_view || matches!(id, 101 | 223 | 502) {
                     c.content
-                } else if code_card {
-                    c.surface
+                } else if panel.kind == Kind::Main && matches!(id, 302 | 303 | 305) {
+                    c.code_surface()
+                } else if id == 224 {
+                    c.accent_soft
+                } else if id == 441 {
+                    c.warning_soft
+                } else if id == 426 {
+                    c.card_subtle
+                } else if matches!(id, 300 | 342) {
+                    c.bg
+                } else if matches!(
+                    id,
+                    302 | 303 | 305 | 401..=408 | 424 | 427 | 461 | 501 | 503 | 509 | 542
+                ) || (id == 504 && fixed_setup)
+                {
+                    c.card
+                } else if matches!(id, 105 | 203 | 555) {
+                    c.footer_bg
                 } else {
                     c.bg
                 };
@@ -3164,9 +3891,15 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 SetBkColor(hdc, bg);
                 SetTextColor(
                     hdc,
-                    if matches!(
+                    if id == 224 {
+                        c.accent_text
+                    } else if matches!(
                         id,
-                        302 | 305
+                        105 | 300
+                            | 346
+                            | 347
+                            | 302
+                            | 305
                             | 312
                             | 401
                             | 403
@@ -3175,11 +3908,13 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                             | 421
                             | 426
                             | 503
+                            | 509
+                            | 526
                             | 203
                             | 222
                             | 223
-                            | 224
                             | 543
+                            | 555
                     ) {
                         c.secondary
                     } else if id == 306 {
@@ -3190,14 +3925,16 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                         c.text
                     },
                 );
-                if content || code_card {
-                    // 内容区画刷使用系统 DC_BRUSH，不为重绘额外分配对象。
+                if bg == c.bg {
+                    if c.dark {
+                        panel.app().dark as isize
+                    } else {
+                        panel.app().light as isize
+                    }
+                } else {
+                    // 卡片/容器底色画刷使用系统 DC_BRUSH，不为重绘额外分配对象。
                     SetDCBrushColor(hdc, bg);
                     GetStockObject(DC_BRUSH) as isize
-                } else if c.bg == palette(true).bg {
-                    panel.app().dark as isize
-                } else {
-                    panel.app().light as isize
                 }
             }
             WM_GETMINMAXINFO if panel.kind == Kind::Observer => {

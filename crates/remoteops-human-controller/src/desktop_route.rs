@@ -28,11 +28,19 @@ impl RoutePlan {
             "tcp" => (false, None),
             _ => (true, None),
         };
-        Self { waiting_for_lan, upgrade }
+        Self {
+            waiting_for_lan,
+            upgrade,
+        }
     }
 
     // 仅在首条 Geometry 上取双方共同支持的路线；返回缺少的后端供界面说明。
-    pub(super) fn negotiate(&mut self, lan: bool, mini_rtc: bool, crossdesk: bool) -> Option<RtcBackend> {
+    pub(super) fn negotiate(
+        &mut self,
+        lan: bool,
+        mini_rtc: bool,
+        crossdesk: bool,
+    ) -> Option<RtcBackend> {
         self.waiting_for_lan &= lan;
         match self.upgrade {
             Some(RtcBackend::MiniRtc) if !mini_rtc => self.upgrade.take(),
@@ -43,7 +51,11 @@ impl RoutePlan {
 
     // 一个桌面流最多申请一次媒体升级。LAN 已连接时，继续保留断线后的候选。
     pub(super) fn take_upgrade(&mut self) -> Option<RtcBackend> {
-        if self.waiting_for_lan { None } else { self.upgrade.take() }
+        if self.waiting_for_lan {
+            None
+        } else {
+            self.upgrade.take()
+        }
     }
 }
 
@@ -79,7 +91,11 @@ mod tests {
 
     #[test]
     fn manual_routes_skip_lan_and_never_try_a_different_rtc_backend() {
-        for (name, expected) in [("tcp", None), ("minirtc", Some(MiniRtc)), ("crossdesk", Some(CrossDesk))] {
+        for (name, expected) in [
+            ("tcp", None),
+            ("minirtc", Some(MiniRtc)),
+            ("crossdesk", Some(CrossDesk)),
+        ] {
             let mut plan = RoutePlan::new(name);
             assert!(!plan.waiting_for_lan);
             assert_eq!(plan.take_upgrade(), expected);

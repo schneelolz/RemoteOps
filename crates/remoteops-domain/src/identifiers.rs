@@ -190,7 +190,10 @@ mod tests {
         assert_eq!(mixed.as_str(), "A2CD3EF4G");
         assert_eq!(mixed.display_grouped(), "A2C-D3E-F4G");
         assert_eq!(serde_json::to_string(&mixed).unwrap(), r#""A2CD3EF4G""#);
-        assert_eq!(serde_json::from_str::<PairingCode>(r#""a2cd3ef4g""#).unwrap(), mixed);
+        assert_eq!(
+            serde_json::from_str::<PairingCode>(r#""a2cd3ef4g""#).unwrap(),
+            mixed
+        );
         assert!(serde_json::from_str::<PairingCode>(r#""短码""#).is_err());
     }
 }

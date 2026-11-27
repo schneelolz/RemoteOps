@@ -19,14 +19,17 @@ pub struct ReleaseEntry {
     pub product: String,
     /// 编译目标操作系统，如 windows。
     pub os: String,
-    /// 编译目标架构，如 x86_64。
+    /// 编译目标架构，如 `x86_64`。
     pub arch: String,
-    /// 已发布的 SemVer 版本。
+    /// 已发布的 `SemVer` 版本。
     pub version: String,
 }
 
 impl ReleaseCatalog {
     /// 校验目录容量、版本和选择条件唯一性。
+    ///
+    /// # Errors
+    /// 条目过多、产品或版本无效、或同一产品和平台重复出现时返回错误。
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.schema_version != 1 || self.releases.len() > 256 {
             return Err("版本目录格式或条目数量无效");

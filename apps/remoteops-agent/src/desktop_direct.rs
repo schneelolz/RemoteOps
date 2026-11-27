@@ -41,7 +41,9 @@ async fn negotiate(
     };
     let id = lan::Identity::new().map_err(|_| io::Error::other("TLS 临时身份创建失败"))?;
     report(&format!("监听 {address}，等待控制端 {peer}"));
-    let reverse = reverse.into_iter().find(|addr| addr.ip() == &peer && addr.port() >= 1024);
+    let reverse = reverse
+        .into_iter()
+        .find(|addr| addr.ip() == &peer && addr.port() >= 1024);
     let reverse_identity = reverse.map(|_| id.for_reverse());
     notify(Action::LanOffer {
         reverse,
@@ -145,27 +147,66 @@ mod tests {
     async fn reverse_connection_after_forward_timeout_authenticates_and_keeps_relay() {
         let addresses = lan::addresses();
         let (viewer, peer) = lan::listen(&addresses).await.unwrap();
-        let SocketAddr::V4(endpoint) = viewer.local_addr().unwrap() else { panic!() };
+        let SocketAddr::V4(endpoint) = viewer.local_addr().unwrap() else {
+            panic!()
+        };
         let id = lan::Identity::new().unwrap();
         let (req, request) = oneshot::channel();
         let (offer, mut offers) = mpsc::unbounded_channel();
-        req.send(Action::LanRequest { addresses:vec![peer], certificate:id.certificate(), reverse:vec![endpoint] }).unwrap();
+        req.send(Action::LanRequest {
+            addresses: vec![peer],
+            certificate: id.certificate(),
+            reverse: vec![endpoint],
+        })
+        .unwrap();
         let (mut relay, mut output) = tokio::io::duplex(128);
         let (frames, mut input) = mpsc::channel(2);
         let (keys, mut received) = mpsc::channel(2);
         let route = std::sync::Arc::new(AtomicU64::new(0));
         let active = route.clone();
         let worker = tokio::spawn(async move {
-            transfer(&mut relay,&mut input,request,keys,&active,|a| {offer.send(a).unwrap();},|_|{}).await.unwrap();
+            transfer(
+                &mut relay,
+                &mut input,
+                request,
+                keys,
+                &active,
+                |a| {
+                    offer.send(a).unwrap();
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
         });
-        let Some(Action::LanOffer {address,certificate,reverse})=offers.recv().await else { panic!() };
-        assert_eq!(reverse,Some(endpoint));
+        let Some(Action::LanOffer {
+            address,
+            certificate,
+            reverse,
+        }) = offers.recv().await
+        else {
+            panic!()
+        };
+        assert_eq!(reverse, Some(endpoint));
         frames.send(b"relay".to_vec()).await.unwrap();
-        assert_eq!(read_video(&mut output).await.unwrap(),b"relay");
-        let mut socket=lan::accept_with_deadline(viewer,*address.ip(),id,certificate,Duration::from_secs(12),|_|{}).await.unwrap();
-        while route.load(Ordering::Acquire)!=1 { tokio::task::yield_now().await; }
-        lan::write_input(&mut socket, 7, Input::Release).await.unwrap();
-        assert_eq!(received.recv().await.unwrap(),(7,Input::Release));
+        assert_eq!(read_video(&mut output).await.unwrap(), b"relay");
+        let mut socket = lan::accept_with_deadline(
+            viewer,
+            *address.ip(),
+            id,
+            certificate,
+            Duration::from_secs(12),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        while route.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+        lan::write_input(&mut socket, 7, Input::Release)
+            .await
+            .unwrap();
+        assert_eq!(received.recv().await.unwrap(), (7, Input::Release));
         drop(socket);
         drop(frames);
         worker.await.unwrap();
@@ -257,7 +298,8 @@ mod tests {
             .unwrap();
             let Some(Action::LanOffer {
                 address,
-                certificate, ..
+                certificate,
+                ..
             }) = offers_rx.recv().await
             else {
                 panic!()

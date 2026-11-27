@@ -50,6 +50,7 @@ fn received_visual_request(rx: &mut mpsc::Receiver<WireMessage>, id: RequestId) 
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines, reason = "按顺序验证同一会话的完整生命周期")]
 async fn visual_context_refresh_routes_screenshot_and_still_enforces_lock_and_revocation() {
     use remoteops_domain::CapabilityAvailability;
     let relay = relay(Duration::minutes(10));

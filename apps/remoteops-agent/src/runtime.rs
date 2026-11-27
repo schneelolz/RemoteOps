@@ -210,20 +210,25 @@ impl RuntimeBoundary {
         }
     }
 
-    pub fn snapshot(&self) -> TargetContext {
-        let mut context = self.latest_context();
-        context.capabilities.retain(|v| v.capability != "managed_install_grant_v1");
+    fn update_host_capabilities(&self, context: &mut TargetContext) {
+        context
+            .capabilities
+            .retain(|v| v.capability != "managed_install_grant_v1");
         #[cfg(feature = "managed-install-grant")]
         context.capabilities.push(TargetCapabilityStatus {
             capability: "managed_install_grant_v1".into(),
             status: CapabilityAvailability::Available,
             reasons: vec![],
         });
-        context.capabilities.retain(|v| v.capability != "session_approval_offer_v1");
+        context
+            .capabilities
+            .retain(|v| v.capability != "session_approval_offer_v1");
         if let Some(pref) = &self.session_approval_offer {
             context.capabilities.push(TargetCapabilityStatus {
                 capability: "session_approval_offer_v1".into(),
-                status: if pref.load(std::sync::atomic::Ordering::SeqCst) && !self.policy.read_only() {
+                status: if pref.load(std::sync::atomic::Ordering::SeqCst)
+                    && !self.policy.read_only()
+                {
                     CapabilityAvailability::Available
                 } else {
                     CapabilityAvailability::Unavailable
@@ -248,6 +253,11 @@ impl RuntimeBoundary {
                 vec!["host_business_disabled".into()]
             },
         });
+    }
+
+    pub fn snapshot(&self) -> TargetContext {
+        let mut context = self.latest_context();
+        self.update_host_capabilities(&mut context);
         context.facts = native_facts();
         context
             .capabilities
@@ -957,8 +967,19 @@ mod tests {
     #[test]
     fn session_approval_offer_reads_the_live_site_preference() {
         let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let boundary = super::RuntimeBoundary { session_approval_offer: Some(enabled.clone()), ..Default::default() };
-        let offer = || boundary.snapshot().capabilities.into_iter().find(|v| v.capability == "session_approval_offer_v1").unwrap().status;
+        let boundary = super::RuntimeBoundary {
+            session_approval_offer: Some(enabled.clone()),
+            ..Default::default()
+        };
+        let offer = || {
+            boundary
+                .snapshot()
+                .capabilities
+                .into_iter()
+                .find(|v| v.capability == "session_approval_offer_v1")
+                .unwrap()
+                .status
+        };
         assert_eq!(offer(), CapabilityAvailability::Available);
         enabled.store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(offer(), CapabilityAvailability::Unavailable);

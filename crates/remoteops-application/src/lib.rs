@@ -546,9 +546,18 @@ impl RelayClient {
     }
 
     /// 查询当前在线 Relay 公告的已发布版本及与本机的关系。
+    #[must_use]
     pub fn published_version(&self, product: &str, local: &str) -> Option<(String, &'static str)> {
-        if !self.is_connected() { return None; }
-        self.inner.release_catalog.read().ok()?.as_ref()?.compare(product, std::env::consts::OS, std::env::consts::ARCH, local).map(|(v,s)| (v.to_owned(),s))
+        if !self.is_connected() {
+            return None;
+        }
+        self.inner
+            .release_catalog
+            .read()
+            .ok()?
+            .as_ref()?
+            .compare(product, std::env::consts::OS, std::env::consts::ARCH, local)
+            .map(|(v, s)| (v.to_owned(), s))
     }
 
     /// 返回最近一次由 Relay 确认的全局操作指引。
@@ -605,7 +614,8 @@ impl RelayClient {
     /// 检查当前中继的人工桌面能力。
     #[must_use]
     pub fn supports_desktop(&self) -> bool {
-        self.is_connected() && self.inner.config.controller_kind == ControllerKind::Human
+        self.is_connected()
+            && self.inner.config.controller_kind == ControllerKind::Human
             && self.inner.desktop_version.load(Ordering::Acquire) == 1
     }
 
@@ -616,18 +626,33 @@ impl RelayClient {
     }
 
     /// 发送人工面板事件。每条事件还须由中继按当前绑定核验。
-    pub async fn desktop_command(&self, event: remoteops_protocol::desktop::DesktopEvent) -> Result<(), ApplicationError> {
+    pub async fn desktop_command(
+        &self,
+        event: remoteops_protocol::desktop::DesktopEvent,
+    ) -> Result<(), ApplicationError> {
         if !self.supports_desktop() {
-            return Err(ApplicationError::Transport("当前连接无法打开人工桌面".into()));
+            return Err(ApplicationError::Transport(
+                "当前连接无法打开人工桌面".into(),
+            ));
         }
         self.send_wire(WireMessage::Desktop(event)).await
     }
 
     /// 复用当前控制端的 TLS 信任配置，接入一次性媒体通道。
-    pub async fn desktop_media(&self, ticket: remoteops_protocol::desktop::Ticket) -> Result<impl AsyncRead + Unpin + Send + 'static, ApplicationError> {
-        let mut stream = connect_tls(&self.inner.config.relay_address, &self.inner.config.server_name, self.inner.tls_config.clone())
-            .await.map_err(|e| ApplicationError::Transport(e.to_string()))?;
-        write_frame(&mut stream, &WireMessage::DesktopMedia(ticket)).await.map_err(|e| ApplicationError::Transport(e.to_string()))?;
+    pub async fn desktop_media(
+        &self,
+        ticket: remoteops_protocol::desktop::Ticket,
+    ) -> Result<impl AsyncRead + Unpin + Send + 'static, ApplicationError> {
+        let mut stream = connect_tls(
+            &self.inner.config.relay_address,
+            &self.inner.config.server_name,
+            self.inner.tls_config.clone(),
+        )
+        .await
+        .map_err(|e| ApplicationError::Transport(e.to_string()))?;
+        write_frame(&mut stream, &WireMessage::DesktopMedia(ticket))
+            .await
+            .map_err(|e| ApplicationError::Transport(e.to_string()))?;
         Ok(stream)
     }
 
@@ -1414,8 +1439,16 @@ impl RelayClient {
 
     /// 仅解除发起方的临时配对，保留其他角色的终端和串口。
     pub async fn release_binding(&self, session_id: SessionId) -> Result<(), ApplicationError> {
-        if self.inner.managed_pairings.lock().await.contains_key(&session_id) {
-            return Err(ApplicationError::Transport("此受管授权需要通过管理端结束".into()));
+        if self
+            .inner
+            .managed_pairings
+            .lock()
+            .await
+            .contains_key(&session_id)
+        {
+            return Err(ApplicationError::Transport(
+                "此受管授权需要通过管理端结束".into(),
+            ));
         }
         self.release_session_request(session_id).await
     }
@@ -1753,8 +1786,13 @@ where
             global_guide,
             release_catalog,
         } if protocol_version == PROTOCOL_VERSION => {
-            *inner.release_catalog.write().unwrap_or_else(std::sync::PoisonError::into_inner) = release_catalog;
-            inner.desktop_version.store(u64::from(desktop_version.unwrap_or(0)), Ordering::Release);
+            *inner
+                .release_catalog
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = release_catalog;
+            inner
+                .desktop_version
+                .store(u64::from(desktop_version.unwrap_or(0)), Ordering::Release);
             inner.bridge_protocol_version.store(
                 u64::from(bridge_protocol_version.unwrap_or(0)),
                 Ordering::Release,
@@ -2133,7 +2171,9 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
         return;
     }
     match message {
-        WireMessage::Desktop(event) => { let _ = inner.desktop_events.send(event); }
+        WireMessage::Desktop(event) => {
+            let _ = inner.desktop_events.send(event);
+        }
         message @ (WireMessage::TcpForwardV2(_)
         | WireMessage::TcpForwardPolicyResponse { .. }
         | WireMessage::TcpForwardData { .. }

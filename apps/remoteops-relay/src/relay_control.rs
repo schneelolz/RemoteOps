@@ -132,7 +132,12 @@ enum RequestOrigin {
 
 impl Relay {
     /// 持久化设备授权，并在同一把状态锁下使已有自动授权及其修订号失效。
-    pub(crate) async fn set_device_grant(&self, installation: uuid::Uuid, device: uuid::Uuid, enabled: bool) -> Result<bool, remoteops_enrollment_store::StoreError> {
+    pub(crate) async fn set_device_grant(
+        &self,
+        installation: uuid::Uuid,
+        device: uuid::Uuid,
+        enabled: bool,
+    ) -> Result<bool, remoteops_enrollment_store::StoreError> {
         use remoteops_enrollment_store::StoreError;
         let mut state = self.state.lock().await;
         let agent = AgentInstanceId::from_uuid(device);
@@ -140,15 +145,30 @@ impl Relay {
         if enabled && session.is_none() {
             return Err(StoreError::InvalidInput("unknown Agent device".into()));
         }
-        let changed = self.enrollment_store()?.set_device_grant(installation, device, enabled)?;
+        let changed = self
+            .enrollment_store()?
+            .set_device_grant(installation, device, enabled)?;
         if !enabled && let Some(session) = session {
-            let matches = state.session_bindings.get(&session).and_then(|b| b.ai.as_ref())
-                .is_some_and(|b| b.installation_grant == Some(true) && active_controller(&state, b.controller_id, b.controller_generation)
-                    .is_some_and(|c| c.installation_id == Some(installation)));
-            if matches && let Some(binding) = state.session_bindings.get_mut(&session).and_then(|b| b.ai.as_mut()) {
+            let matches = state
+                .session_bindings
+                .get(&session)
+                .and_then(|b| b.ai.as_ref())
+                .is_some_and(|b| {
+                    b.installation_grant == Some(true)
+                        && active_controller(&state, b.controller_id, b.controller_generation)
+                            .is_some_and(|c| c.installation_id == Some(installation))
+                });
+            if matches
+                && let Some(binding) = state
+                    .session_bindings
+                    .get_mut(&session)
+                    .and_then(|b| b.ai.as_mut())
+            {
                 binding.installation_grant = Some(false);
                 if let Some(current) = binding.control_state.as_mut()
-                    && (current.source == Some(ControlSource::LocalDefault) || current.initialization_pending) {
+                    && (current.source == Some(ControlSource::LocalDefault)
+                        || current.initialization_pending)
+                {
                     if current.source == Some(ControlSource::LocalDefault) {
                         current.mode = ControllerControlMode::StepByStep;
                         current.source = None;
@@ -162,8 +182,14 @@ impl Relay {
             }
         }
         if changed {
-            super::append_audit(&mut state, "installation_device_grant", session.map(|s| s.to_string()), true, "admin",
-                &format!("installation={installation} device={device} enabled={enabled}"));
+            super::append_audit(
+                &mut state,
+                "installation_device_grant",
+                session.map(|s| s.to_string()),
+                true,
+                "admin",
+                &format!("installation={installation} device={device} enabled={enabled}"),
+            );
             let _ = self.persist_state_locked(&state);
         }
         Ok(changed)
@@ -312,14 +338,34 @@ impl Relay {
                 }
             };
             let grant_valid = match origin {
-                RequestOrigin::Agent(agent, _) if request.source == Some(ControlSource::LocalDefault) => {
-                    state.session_bindings.get(&request.session_id).and_then(|b| b.ai.as_ref()).is_some_and(|b| {
-                        (b.installation_grant.is_none() && state.agents.get(&agent).is_some_and(|a| !super::supports_installation_grants(&a.hello))) || (b.installation_grant == Some(true)
-                            && current.as_ref().is_some_and(|s| s.initialization_pending)
-                            && active_controller(&state, b.controller_id, b.controller_generation)
-                                .and_then(|c| c.installation_id).is_some_and(|id|
-                                    self.enrollment_store().and_then(|store| store.has_device_grant(id, agent.as_uuid())).unwrap_or(false)))
-                    })
+                RequestOrigin::Agent(agent, _)
+                    if request.source == Some(ControlSource::LocalDefault) =>
+                {
+                    state
+                        .session_bindings
+                        .get(&request.session_id)
+                        .and_then(|b| b.ai.as_ref())
+                        .is_some_and(|b| {
+                            (b.installation_grant.is_none()
+                                && state.agents.get(&agent).is_some_and(|a| {
+                                    !super::supports_installation_grants(&a.hello)
+                                }))
+                                || (b.installation_grant == Some(true)
+                                    && current.as_ref().is_some_and(|s| s.initialization_pending)
+                                    && active_controller(
+                                        &state,
+                                        b.controller_id,
+                                        b.controller_generation,
+                                    )
+                                    .and_then(|c| c.installation_id)
+                                    .is_some_and(|id| {
+                                        self.enrollment_store()
+                                            .and_then(|store| {
+                                                store.has_device_grant(id, agent.as_uuid())
+                                            })
+                                            .unwrap_or(false)
+                                    }))
+                        })
                 }
                 _ => true,
             };

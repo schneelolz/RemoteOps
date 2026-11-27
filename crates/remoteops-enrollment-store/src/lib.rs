@@ -187,7 +187,10 @@ impl EnrollmentStore {
     /// # Errors
     /// 无法清除时拒绝注册替代设备。
     pub fn forget_device_grants(&self, agent: Uuid) -> Result<(), StoreError> {
-        self.connection()?.execute("DELETE FROM enrollment_device_grants WHERE agent_id = ?1", [agent.to_string()])?;
+        self.connection()?.execute(
+            "DELETE FROM enrollment_device_grants WHERE agent_id = ?1",
+            [agent.to_string()],
+        )?;
         Ok(())
     }
 
@@ -201,7 +204,8 @@ impl EnrollmentStore {
             "SELECT agent_id FROM enrollment_device_grants JOIN enrollment_clients USING (installation_id)
              WHERE installation_id = ?1 AND revoked = 0 ORDER BY agent_id",
         )?;
-        query.query_map([installation.to_string()], |row| row.get::<_, String>(0))?
+        query
+            .query_map([installation.to_string()], |row| row.get::<_, String>(0))?
             .map(|id| Uuid::parse_str(&id?).map_err(|_| corrupt("invalid device grant")))
             .collect()
     }
@@ -222,7 +226,12 @@ impl EnrollmentStore {
     ///
     /// # Errors
     /// 拒绝空设备、未登记或已撤销的安装，存储失败时回滚。
-    pub fn set_device_grant(&self, installation: Uuid, agent: Uuid, enabled: bool) -> Result<bool, StoreError> {
+    pub fn set_device_grant(
+        &self,
+        installation: Uuid,
+        agent: Uuid,
+        enabled: bool,
+    ) -> Result<bool, StoreError> {
         if agent.is_nil() {
             return Err(StoreError::InvalidInput("device must not be nil".into()));
         }
@@ -233,14 +242,17 @@ impl EnrollmentStore {
             [installation.to_string()], |row| row.get(0),
         )?;
         if !active {
-            return Err(StoreError::InvalidInput("installation is unknown or revoked".into()));
+            return Err(StoreError::InvalidInput(
+                "installation is unknown or revoked".into(),
+            ));
         }
         let sql = if enabled {
             "INSERT INTO enrollment_device_grants (installation_id, agent_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING"
         } else {
             "DELETE FROM enrollment_device_grants WHERE installation_id = ?1 AND agent_id = ?2"
         };
-        let changed = transaction.execute(sql, params![installation.to_string(), agent.to_string()])? > 0;
+        let changed =
+            transaction.execute(sql, params![installation.to_string(), agent.to_string()])? > 0;
         transaction.commit()?;
         Ok(changed)
     }

@@ -1,7 +1,7 @@
 //! 原生 EDIT 的共享外观：保留标准滚动、输入与无障碍消息，只适配框体和非客户区绘制。
 use super::line_measure_cache::LineMeasureCache;
 use super::scroll_geometry::{ViewMetrics, layout};
-use super::{Panel, fill, round, value, wide};
+use super::{Panel, fill, value, wide};
 use std::{
     cell::{Cell, RefCell},
     ptr::{null, null_mut},
@@ -539,7 +539,17 @@ pub(super) fn paint_frames(panel: &Panel, dc: HDC) {
     for hwnd in handles {
         if let Some(ptr) = state(hwnd) {
             let frame = unsafe { (*ptr).frame.get() };
-            round(dc, frame, colors.content, colors.border, panel.px(8));
+            super::theme_draw::draw_aa_card(
+                dc,
+                frame,
+                colors.bg,
+                colors.content,
+                colors.border,
+                panel.px(10) as f32,
+                1.0,
+                if colors.dark { 0.0 } else { 0.04 },
+                None,
+            );
         }
     }
 }
@@ -717,7 +727,17 @@ fn scrollbar(dc: HDC, hwnd: HWND, view: &View, vertical: bool, origin: &RECT) ->
                     bottom: center + (side + 1) / 2,
                 }
             };
-            round(dc, thumb, thumb_color, thumb_color, side);
+            super::theme_draw::draw_aa_card(
+                dc,
+                thumb,
+                colors.content,
+                thumb_color,
+                thumb_color,
+                (side as f32) * 0.5,
+                0.0,
+                0.0,
+                None,
+            );
         }
         // 两端箭头沿用系统真实命中区，用低对比小折线提示，不隐藏仍可操作的区域。
         let pen = CreatePen(PS_SOLID, panel.px(1).max(1), colors.scroll_thumb);

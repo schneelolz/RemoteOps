@@ -1,48 +1,72 @@
-use super::{Events,Video,ReleaseSignal,desktop::Desktop,message,tools::Tools};
-use anyhow::{Result,Context,bail};
-use remoteops_application::{ControllerKind,RelayClient,RelayClientConfig};
-use remoteops_domain::{ConnectionState,ControllerInstanceId,PairingCode,PermissionMode,SessionId};
-use serde_json::{Value,json};
-use std::{env,path::PathBuf,time::Duration};
-use tokio::sync::{mpsc,oneshot};
+use super::{Events, ReleaseSignal, Video, desktop::Desktop, message, tools::Tools};
+use anyhow::{Context, Result, bail};
+use remoteops_application::{ControllerKind, RelayClient, RelayClientConfig};
+use remoteops_domain::{
+    ConnectionState, ControllerInstanceId, PairingCode, PermissionMode, SessionId,
+};
+use serde_json::{Value, json};
+use std::{env, path::PathBuf, time::Duration};
+use tokio::sync::{mpsc, oneshot};
 
-fn config(v:&Value)->Result<RelayClientConfig>{
-    let field=|key:&str,env_name:&str| v[key].as_str().filter(|s|!s.is_empty()).map(str::to_owned)
-        .or_else(||env::var(env_name).ok().filter(|s|!s.is_empty()));
-    Ok(RelayClientConfig{
-        relay_address:field("relay","REMOTEOPS_RELAY").context("请设置 Relay 地址")?,
-        server_name:field("server","REMOTEOPS_SERVER_NAME").context("请设置 TLS 服务名")?,
-        ca_certificate:field("ca","REMOTEOPS_CA_CERT").map(PathBuf::from),
-        tls_fingerprint:None,
-        audit_log:Some(remoteops_audit::default_audit_log_path()),
-        controller_kind:ControllerKind::Human,
-        owner_id:field("owner","REMOTEOPS_CONTROLLER_OWNER_ID").context("请配置人工身份所属 Owner")?.parse().context("Owner 格式不正确")?,
-        permission_mode:PermissionMode::ApprovalRequired,
-        authentication_token:field("token","REMOTEOPS_HUMAN_CONTROLLER_TOKEN").context("请配置人工控制端凭据")?,
-        reconnect_delay:Duration::from_secs(2),
+fn config(v: &Value) -> Result<RelayClientConfig> {
+    let field = |key: &str, env_name: &str| {
+        v[key]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| env::var(env_name).ok().filter(|s| !s.is_empty()))
+    };
+    Ok(RelayClientConfig {
+        relay_address: field("relay", "REMOTEOPS_RELAY").context("请设置 Relay 地址")?,
+        server_name: field("server", "REMOTEOPS_SERVER_NAME").context("请设置 TLS 服务名")?,
+        ca_certificate: field("ca", "REMOTEOPS_CA_CERT").map(PathBuf::from),
+        tls_fingerprint: None,
+        audit_log: Some(remoteops_audit::default_audit_log_path()),
+        controller_kind: ControllerKind::Human,
+        owner_id: field("owner", "REMOTEOPS_CONTROLLER_OWNER_ID")
+            .context("请配置人工身份所属 Owner")?
+            .parse()
+            .context("Owner 格式不正确")?,
+        permission_mode: PermissionMode::ApprovalRequired,
+        authentication_token: field("token", "REMOTEOPS_HUMAN_CONTROLLER_TOKEN")
+            .context("请配置人工控制端凭据")?,
+        reconnect_delay: Duration::from_secs(2),
     })
 }
-fn device(c:&remoteops_domain::ConnectionDescriptor, connected:bool, desktop:bool)->Value {
+fn device(c: &remoteops_domain::ConnectionDescriptor, connected: bool, desktop: bool) -> Value {
     json!({"session":c.session_id,"device_id":c.agent_instance_id,"name":c.display_name(),"hostname":c.hostname,"online":connected && c.state==ConnectionState::Online,
         "desktop":desktop && c.environment.tools.iter().any(|t|t.name=="remoteops-desktop-v1" && t.available),
         "writable":c.permission_mode!=PermissionMode::ReadOnly})
 }
-async fn devices(client:&RelayClient)->Value {
-    let connected=client.is_connected();
-    let items=client.list_connections().await.iter().map(|c|device(c,connected,client.supports_desktop())).collect::<Vec<_>>();
+async fn devices(client: &RelayClient) -> Value {
+    let connected = client.is_connected();
+    let items = client
+        .list_connections()
+        .await
+        .iter()
+        .map(|c| device(c, connected, client.supports_desktop()))
+        .collect::<Vec<_>>();
     json!({"kind":"devices","items":items})
 }
-pub(super) async fn run(options:Value,mut commands:mpsc::Receiver<Value>,out:Events,video:Video,mut stop:oneshot::Receiver<()>,release:ReleaseSignal)->Result<()> {
-    let config=config(&options)?;
-    let connect=RelayClient::connect(config,ControllerInstanceId::new());
-    let client=tokio::select!{_= &mut stop=>return Ok(()),r=connect=>r?};
-    let (tools_tx,mut tools_rx)=mpsc::channel::<Value>(16);
-    let tool_client=client.clone();let tool_out=out.clone();
-    let mut events=client.subscribe_events();
-    let tools=tokio::spawn(async move{
-        let mut state=Tools::default();
-        loop{
-            tokio::select!{
+pub(super) async fn run(
+    options: Value,
+    mut commands: mpsc::Receiver<Value>,
+    out: Events,
+    video: Video,
+    mut stop: oneshot::Receiver<()>,
+    release: ReleaseSignal,
+) -> Result<()> {
+    let config = config(&options)?;
+    let connect = RelayClient::connect(config, ControllerInstanceId::new());
+    let client = tokio::select! {_= &mut stop=>return Ok(()),r=connect=>r?};
+    let (tools_tx, mut tools_rx) = mpsc::channel::<Value>(16);
+    let tool_client = client.clone();
+    let tool_out = out.clone();
+    let mut events = client.subscribe_events();
+    let tools = tokio::spawn(async move {
+        let mut state = Tools::default();
+        loop {
+            tokio::select! {
                 cmd=tools_rx.recv()=>{
                     let Some(cmd)=cmd else {break};
                     let action=async {
@@ -76,13 +100,15 @@ pub(super) async fn run(options:Value,mut commands:mpsc::Receiver<Value>,out:Eve
             }
         }
     });
-    let mut desktop:Option<Desktop>=None;
-    let mut timer=tokio::time::interval(Duration::from_secs(1));
-    let mut prev=Value::Null;
-    let mut online=None;
-    loop{
-        if desktop.as_ref().is_some_and(Desktop::finished){desktop=None}
-        tokio::select!{
+    let mut desktop: Option<Desktop> = None;
+    let mut timer = tokio::time::interval(Duration::from_secs(1));
+    let mut prev = Value::Null;
+    let mut online = None;
+    loop {
+        if desktop.as_ref().is_some_and(Desktop::finished) {
+            desktop = None
+        }
+        tokio::select! {
             _=&mut stop=>break,
             _=timer.tick()=>{
                 let current=client.is_connected();
@@ -111,9 +137,8 @@ pub(super) async fn run(options:Value,mut commands:mpsc::Receiver<Value>,out:Eve
                         }
                         Some("end"|"disconnect")=>{
                             let session:SessionId=serde_json::from_value(cmd["session"].clone())?;
-                            if desktop.as_ref().is_some_and(|d|d.session==session && (cmd["op"]=="disconnect" || cmd["view"].as_u64().unwrap_or(0)==d.view)) {
-                                if let Some(d)=desktop.take(){d.end().await;}
-                            }
+                            if desktop.as_ref().is_some_and(|d|d.session==session && (cmd["op"]=="disconnect" || cmd["view"].as_u64().unwrap_or(0)==d.view))
+                                && let Some(d)=desktop.take(){d.end().await;}
                             if cmd["op"]=="disconnect"{tools_tx.try_send(cmd.clone()).context("人工工具忙")?;}
                         }
                         Some("quality")=>{
@@ -124,11 +149,10 @@ pub(super) async fn run(options:Value,mut commands:mpsc::Receiver<Value>,out:Eve
                         }
                         Some("input"|"control"|"release"|"clipboard")=>{
                             let session:SessionId=serde_json::from_value(cmd["session"].clone())?;
-                            if let Some(d)=desktop.as_ref().filter(|d|d.session==session && cmd["view"].as_u64().unwrap_or(0)==d.view) {
-                                if d.commands.try_send(cmd.clone()).is_err(){
+                            if let Some(d)=desktop.as_ref().filter(|d|d.session==session && cmd["view"].as_u64().unwrap_or(0)==d.view)
+                                && d.commands.try_send(cmd.clone()).is_err(){
                                     release.send_replace(Some((d.session,d.view)));
                                 }
-                            }
                         }
                         _=>{tools_tx.try_send(cmd.clone()).context("人工工具忙")?;}
                     }
@@ -138,7 +162,10 @@ pub(super) async fn run(options:Value,mut commands:mpsc::Receiver<Value>,out:Eve
             }
         }
     }
-    if let Some(d)=desktop{d.end().await;}
-    tools.abort();let _=tools.await;
+    if let Some(d) = desktop {
+        d.end().await;
+    }
+    tools.abort();
+    let _ = tools.await;
     Ok(())
 }

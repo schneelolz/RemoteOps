@@ -135,11 +135,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - name: Check MCP on macOS host
+      - name: Build RemoteOpsBridge and check MCP on macOS
         run: |
+          cargo build --locked -p remoteops-bridge
           cargo check -p remoteops-controller-mcp --locked
           cargo test -p remoteops-controller-mcp --locked
-          bash -n deploy/controller-mcp/macos/*.sh scripts/Build-MacosMcp.sh
+          for script in deploy/controller-mcp/macos/*.sh scripts/Build-MacosMcp.sh; do bash -n "$script" || exit 1; done
       - name: Test isolated macOS native credential store round trip
         timeout-minutes: 2
         run: cargo test -p remoteops-controller-mcp --locked setup::tests::native_os_credential_store_round_trip -- --ignored --exact --test-threads=1

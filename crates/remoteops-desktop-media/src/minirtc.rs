@@ -50,32 +50,38 @@ impl Peer {
     pub fn start(sender: bool, stream: &str, grant: &TurnGrant) -> io::Result<Self> {
         let path = worker_path()?;
         let init = serde_json::json!({"sender":sender,"stream":stream,"grant":grant});
-        Self::spawn(path,option_env!("REMOTEOPS_MINIRTC_SHA256"), &init)
+        Self::spawn(path, option_env!("REMOTEOPS_MINIRTC_SHA256"), &init)
     }
 
     /// 两端都从本地构建配置读取私有信令地址。网络消息不能覆盖信令主机。
     pub fn start_crossdesk(sender: bool, ticket: &Ticket) -> io::Result<Self> {
-        let address = option_env!("REMOTEOPS_CROSSDESK_SIGNAL_HOST").filter(|s| !s.is_empty())
+        let address = option_env!("REMOTEOPS_CROSSDESK_SIGNAL_HOST")
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| io::Error::other("缺少私有 CrossDesk 信令主机"))?;
-        let port = option_env!("REMOTEOPS_CROSSDESK_SIGNAL_PORT").and_then(|s|s.parse::<u16>().ok())
-            .filter(|p| *p > 0).ok_or_else(|| io::Error::other("缺少私有 CrossDesk 信令端口"))?;
+        let port = option_env!("REMOTEOPS_CROSSDESK_SIGNAL_PORT")
+            .and_then(|s| s.parse::<u16>().ok())
+            .filter(|p| *p > 0)
+            .ok_or_else(|| io::Error::other("缺少私有 CrossDesk 信令端口"))?;
         let path = std::env::current_exe()?.with_file_name("remoteops-crossdesk.exe");
         let logs = std::env::temp_dir().join("RemoteOps-CrossDesk-Logs");
         std::fs::create_dir_all(&logs)?;
         let init = serde_json::json!({"sender":sender,"ticket":ticket,"host":address,"port":port,
             "log_directory":logs,"force_turn":option_env!("REMOTEOPS_CROSSDESK_FORCE_TURN")==Some("1")});
-        Self::spawn(path,option_env!("REMOTEOPS_CROSSDESK_SHA256"), &init)
+        Self::spawn(path, option_env!("REMOTEOPS_CROSSDESK_SHA256"), &init)
     }
 
     /// 当前构建与安装目录均提供可验证的私有后端时才协商。
     pub fn crossdesk_available() -> bool {
-        option_env!("REMOTEOPS_CROSSDESK_SHA256").is_some_and(|hash|hash.len()==64)
+        option_env!("REMOTEOPS_CROSSDESK_SHA256").is_some_and(|hash| hash.len() == 64)
             && option_env!("REMOTEOPS_CROSSDESK_SIGNAL_HOST").is_some_and(|host| !host.is_empty())
-            && option_env!("REMOTEOPS_CROSSDESK_SIGNAL_PORT").and_then(|s|s.parse::<u16>().ok()).is_some_and(|p|p>0)
-            && std::env::current_exe().is_ok_and(|p| p.with_file_name("remoteops-crossdesk.exe").is_file())
+            && option_env!("REMOTEOPS_CROSSDESK_SIGNAL_PORT")
+                .and_then(|s| s.parse::<u16>().ok())
+                .is_some_and(|p| p > 0)
+            && std::env::current_exe()
+                .is_ok_and(|p| p.with_file_name("remoteops-crossdesk.exe").is_file())
     }
 
-    fn spawn(path:PathBuf, expected:Option<&str>, init:&serde_json::Value) -> io::Result<Self> {
+    fn spawn(path: PathBuf, expected: Option<&str>, init: &serde_json::Value) -> io::Result<Self> {
         let mut image = OpenOptions::new().read(true).share_mode(1).open(&path)?;
         let mut hash = Sha256::new();
         io::copy(&mut image, &mut hash)?;

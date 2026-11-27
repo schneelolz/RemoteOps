@@ -345,6 +345,19 @@ impl ProductSnapshot {
         kind: lifecycle::LifecycleKind,
         category: Option<ObservationCategory>,
     ) {
+        self.record_lifecycle_at(
+            kind,
+            category,
+            chrono::Local::now().format("%H:%M:%S").to_string(),
+        );
+    }
+
+    fn record_lifecycle_at(
+        &mut self,
+        kind: lifecycle::LifecycleKind,
+        category: Option<ObservationCategory>,
+        local_time: String,
+    ) {
         let sequence = self
             .lifecycle_events
             .back()
@@ -354,6 +367,7 @@ impl ProductSnapshot {
         }
         self.lifecycle_events.push_back(lifecycle::LifecycleEvent {
             sequence,
+            local_time,
             kind,
             category,
         });
@@ -397,10 +411,10 @@ impl ProductSnapshot {
         self.can_copy = self.code.is_some() && remaining.is_none_or(|seconds| seconds > 0);
         self.countdown = match remaining {
             Some(seconds) if seconds > 0 => format!(
-                "{:02}:{:02} {}",
+                "{} {:02}:{:02}",
+                self.t("剩余", "Expires in"),
                 seconds / 60,
-                seconds % 60,
-                self.t("后失效", "remaining")
+                seconds % 60
             ),
             Some(_) => self.t("控制码已失效", "Code expired").to_owned(),
             None => self
@@ -569,6 +583,46 @@ impl ProductHost {
         host
     }
 
+    /// 在显式离线演示中显示双连接和操作动态；不创建控制端绑定。
+    pub fn preview_connected_session(&mut self) {
+        use lifecycle::LifecycleKind;
+        if !self.demo || self.state.phase == ProductPhase::Stopped {
+            return;
+        }
+        self.state.ai_connected = true;
+        self.state.human_connected = true;
+        self.state.code = Some("7KM-4HX-9QF".into());
+        self.refresh_demo_connections();
+        for (kind, category, time) in [
+            (LifecycleKind::Connected, None, "14:31:42"),
+            (LifecycleKind::HumanConnected, None, "14:31:56"),
+            (
+                LifecycleKind::Running,
+                Some(ObservationCategory::PowerShell),
+                "14:32:09",
+            ),
+            (
+                LifecycleKind::Succeeded,
+                Some(ObservationCategory::PowerShell),
+                "14:32:18",
+            ),
+        ] {
+            self.state.record_lifecycle_at(kind, category, time.into());
+        }
+    }
+
+    fn refresh_demo_connections(&mut self) {
+        self.state.controllers =
+            usize::from(self.state.ai_connected) + usize::from(self.state.human_connected);
+        self.state.phase = if self.state.controllers == 0 {
+            ProductPhase::Waiting
+        } else {
+            ProductPhase::Controlled
+        };
+        self.state.revision = self.state.revision.wrapping_add(1);
+        self.refresh_demo_language();
+    }
+
     /// 记录当前进程实际权限，供只读连接详情展示。
     pub fn set_elevated(&mut self, elevated: bool) {
         self.state.elevated = elevated;
@@ -634,7 +688,20 @@ impl ProductHost {
                     self.state.phase = ProductPhase::Stopped;
                     "已停止 · 界面演示".clone_into(&mut self.state.status);
                 }
-                ProductAction::DisconnectAi | ProductAction::DisconnectHuman
+                ProductAction::DisconnectAi if self.state.ai_connected => {
+                    self.state.ai_connected = false;
+                    self.state
+                        .record_lifecycle(lifecycle::LifecycleKind::Disconnected, None);
+                    self.refresh_demo_connections();
+                }
+                ProductAction::DisconnectHuman if self.state.human_connected => {
+                    self.state.human_connected = false;
+                    self.state
+                        .record_lifecycle(lifecycle::LifecycleKind::HumanDisconnected, None);
+                    self.refresh_demo_connections();
+                }
+                ProductAction::DisconnectAi
+                | ProductAction::DisconnectHuman
                 | ProductAction::RequestControl { .. }
                 | ProductAction::SaveDefaultControl { .. } => {
                     return Err("界面演示未连接控制端".to_owned());
@@ -664,13 +731,19 @@ impl ProductHost {
             self.state.t("界面演示", "UI demonstration"),
             self.state.version
         );
-        self.state.status = self
-            .state
-            .t(
+        self.state.status = match (self.state.ai_connected, self.state.human_connected) {
+            (true, true) => self.state.t(
+                "AI 工程师与人工运维已连接",
+                "AI engineer and operator connected",
+            ),
+            (true, false) => self.state.t("AI 工程师已连接", "AI engineer connected"),
+            (false, true) => self.state.t("人工运维已连接", "Operator connected"),
+            (false, false) => self.state.t(
                 "等待工程师连接 · 界面演示",
                 "Waiting for engineer · UI demonstration",
-            )
-            .to_owned();
+            ),
+        }
+        .to_owned();
         self.state.activity = self
             .state
             .t("系统就绪 · 等待操作", "Ready · waiting for operations")
@@ -847,6 +920,31 @@ mod tests {
         assert!(snapshot.logs.is_empty());
         assert_eq!(snapshot.running_count, 1);
         assert_eq!(snapshot.active_operations, vec![active]);
+    }
+
+    #[test]
+    fn dual_connection_preview_keeps_roles_independent_and_events_timestamped() {
+        let mut host = ProductHost::new(&HostOptions {
+            product_demo: true,
+            ..HostOptions::default()
+        });
+        host.preview_connected_session();
+        let both = host.snapshot();
+        assert!(both.ai_connected && both.human_connected);
+        assert_eq!(both.controllers, 2);
+        assert_eq!(both.lifecycle_events.back().unwrap().local_time, "14:32:18");
+        host.action(ProductAction::DisconnectAi).unwrap();
+        let human = host.snapshot();
+        assert!(!human.ai_connected && human.human_connected);
+        assert_eq!(human.controllers, 1);
+        host.action(ProductAction::DisconnectHuman).unwrap();
+        assert_eq!(host.snapshot().phase, ProductPhase::Waiting);
+        let mut ordinary = ProductHost::new(&HostOptions {
+            self_test: true,
+            ..HostOptions::default()
+        });
+        ordinary.preview_connected_session();
+        assert!(!ordinary.snapshot().ai_connected && !ordinary.snapshot().human_connected);
     }
 
     #[test]

@@ -170,7 +170,10 @@ struct ResolvedArgs {
 // 私有发行版在构建时固定业务地址；公版继续使用现有设置文件。
 fn check_product_endpoint(relay: &str, server: &str) -> anyhow::Result<()> {
     if let Some(expected) = option_env!("REMOTEOPS_PRODUCT_RELAY")
-        && (!relay.eq_ignore_ascii_case(expected) || !Some(server).zip(option_env!("REMOTEOPS_PRODUCT_TLS_NAME")).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)))
+        && (!relay.eq_ignore_ascii_case(expected)
+            || !Some(server)
+                .zip(option_env!("REMOTEOPS_PRODUCT_TLS_NAME"))
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)))
     {
         bail!("连接配置与定制版的 Relay 或 TLS 服务名不匹配");
     }
@@ -1712,11 +1715,17 @@ impl RemoteOpsMcp {
         &self,
         Parameters(_input): Parameters<RefreshGlobalGuideInput>,
     ) -> Json<RemoteOpsInfoOutput> {
-        let product = if option_env!("REMOTEOPS_PRODUCT_RELAY").is_some() { "jlai-mcp" } else { "remoteops-mcp" };
-        let release = self.client.published_version(product, env!("CARGO_PKG_VERSION"));
+        let product = if option_env!("REMOTEOPS_PRODUCT_RELAY").is_some() {
+            "jlai-mcp"
+        } else {
+            "remoteops-mcp"
+        };
+        let release = self
+            .client
+            .published_version(product, env!("CARGO_PKG_VERSION"));
         Json(RemoteOpsInfoOutput {
-            mcp_release_status: release.as_ref().map_or("unknown", |(_,s)| *s).into(),
-            latest_mcp_version: release.map(|(v,_)| v),
+            mcp_release_status: release.as_ref().map_or("unknown", |(_, s)| *s).into(),
+            latest_mcp_version: release.map(|(v, _)| v),
             mcp_version: env!("CARGO_PKG_VERSION").into(),
             protocol: PROTOCOL_VERSION,
             relay_connected: self.client.is_connected(),
@@ -2002,7 +2011,8 @@ impl RemoteOpsMcp {
         message: &str,
         title: &'static str,
     ) -> Result<bool, String> {
-        self.confirm_permission(context, message, title, false).await
+        self.confirm_permission(context, message, title, false)
+            .await
     }
 
     async fn confirm_permission(
@@ -2040,8 +2050,14 @@ impl RemoteOpsMcp {
             )
             .await
             .map_err(|error| elicitation_unavailable_error(&error.to_string()))?;
-        Ok(elicitation_accepted(&response.action) && (!full_session
-            || response.content.as_ref().and_then(|v| v.get("confirmed")).and_then(|v| v.as_bool()) == Some(true)))
+        Ok(elicitation_accepted(&response.action)
+            && (!full_session
+                || response
+                    .content
+                    .as_ref()
+                    .and_then(|v| v.get("confirmed"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)))
     }
 
     async fn confirm_large_transfer(
@@ -2281,23 +2297,47 @@ impl RemoteOpsMcp {
         let session_id = connection.session_id;
         // 现场偏好只触发询问；实际授权仍绑定当前会话、当前版本和操作者确认。
         let can_offer = option_env!("REMOTEOPS_PRODUCT_RELAY").is_some()
-            && !matches!(self.command_mode, CommandMode::Readonly | CommandMode::Approval)
-            && connection.target_context.as_ref().is_some_and(|ctx| ctx.capabilities.iter().any(|v| v.capability == "session_approval_offer_v1"));
+            && !matches!(
+                self.command_mode,
+                CommandMode::Readonly | CommandMode::Approval
+            )
+            && connection.target_context.as_ref().is_some_and(|ctx| {
+                ctx.capabilities
+                    .iter()
+                    .any(|v| v.capability == "session_approval_offer_v1")
+            });
         let mut output = connection_output(connection);
         output.transfer_root = self.transfer_root.display().to_string();
         output.local_transfer_root.clone_from(&output.transfer_root);
         let mut state = self.control_mode_output(session_id).await;
-        if can_offer && state.mode == "step_by_step"
-            && self.client.refresh_target_context(session_id).await.ok().is_some_and(|ctx|
-                ctx.capabilities.iter().any(|v| v.capability == "session_approval_offer_v1" && v.status == remoteops_domain::CapabilityAvailability::Available))
+        if can_offer
+            && state.mode == "step_by_step"
+            && self
+                .client
+                .refresh_target_context(session_id)
+                .await
+                .is_ok_and(|ctx| {
+                    ctx.capabilities.iter().any(|v| {
+                        v.capability == "session_approval_offer_v1"
+                            && v.status == remoteops_domain::CapabilityAvailability::Available
+                    })
+                })
         {
-            match self.set_control_mode(Parameters(SetControlModeInput {
-                session_id: session_id.to_string(), mode: McpControlMode::FullAccess,
-            }), context).await {
+            match self
+                .set_control_mode(
+                    Parameters(SetControlModeInput {
+                        session_id: session_id.to_string(),
+                        mode: McpControlMode::FullAccess,
+                    }),
+                    context,
+                )
+                .await
+            {
                 Ok(Json(granted)) => state = granted,
                 Err(reason) => {
                     state = self.control_mode_output(session_id).await;
-                    state.message = format!("{}。本次配对保留，授权未完成：{reason}", state.message);
+                    state.message =
+                        format!("{}。本次配对保留，授权未完成：{reason}", state.message);
                 }
             }
         }
@@ -2372,11 +2412,21 @@ impl RemoteOpsMcp {
         {
             return Ok(Json(control_output(&expected)));
         }
-        if mode == ControllerControlMode::FullAccess && option_env!("REMOTEOPS_PRODUCT_RELAY").is_some() {
-            let connection = self.client.list_connections().await.into_iter()
-                .find(|entry| entry.session_id == session_id).ok_or("配对已结束")?;
+        if mode == ControllerControlMode::FullAccess
+            && option_env!("REMOTEOPS_PRODUCT_RELAY").is_some()
+        {
+            let connection = self
+                .client
+                .list_connections()
+                .await
+                .into_iter()
+                .find(|entry| entry.session_id == session_id)
+                .ok_or("配对已结束")?;
             let message = format!("是否允许本次连接对 {} 完全控制？", connection.hostname);
-            if !self.confirm_permission(&context, &message, "授权本次连接", true).await? {
+            if !self
+                .confirm_permission(&context, &message, "授权本次连接", true)
+                .await?
+            {
                 return Err("未授权本次连接完全控制".into());
             }
         }

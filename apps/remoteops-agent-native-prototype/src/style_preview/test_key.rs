@@ -2,7 +2,7 @@
 use super::{
     App, Cell, ES_AUTOHSCROLL, ES_READONLY, GetFocus, GetKeyState, HDC, MSG, Palette, Panel, RECT,
     RefCell, State, Theme, VK_CONTROL, VK_RETURN, WM_KEYDOWN, WS_TABSTOP, add, button, clipboard,
-    close_panel, label, round,
+    close_panel, label,
 };
 use remoteops_agent_desktop_host::{NativeAppearance, NativeLanguage, UiFlavor};
 use remoteops_product::ProductProfile;
@@ -103,10 +103,10 @@ pub(super) fn build(panel: &Panel) {
         panel,
         100,
         app.t("测试 GUID", "Test GUID"),
-        18,
-        15,
+        22,
+        16,
         412,
-        26,
+        28,
         1,
         false,
     );
@@ -115,31 +115,60 @@ pub(super) fn build(panel: &Panel) {
         GUID,
         "EDIT",
         &dialog.guid,
-        30,
-        63,
+        34,
+        66,
         388,
-        23,
+        22,
         WS_TABSTOP | (ES_AUTOHSCROLL | ES_READONLY) as u32,
         4,
     );
     let (copy, status) = dialog.feedback_text(app);
-    label(panel, STATUS, status, 18, 121, 208, 38, 3, false);
-    button(panel, CLOSE, app.t("关闭", "Close"), 232, 118, 86, 36);
-    button(panel, COPY, copy, 330, 118, 100, 36);
+    label(panel, STATUS, status, 22, 134, 212, 34, 3, false);
+    button(panel, CLOSE, app.t("关闭", "Close"), 244, 132, 86, 34);
+    button(panel, COPY, copy, 340, 132, 96, 34);
 }
 
 pub(super) fn paint(panel: &Panel, hdc: HDC, colors: Palette) {
-    round(
+    super::theme_draw::draw_aa_card(
         hdc,
         RECT {
-            left: panel.px(18),
-            top: panel.px(51),
-            right: panel.px(430),
-            bottom: panel.px(96),
+            left: panel.px(22),
+            top: panel.px(54),
+            right: panel.px(434),
+            bottom: panel.px(100),
         },
+        colors.bg,
         colors.content,
         colors.border,
-        panel.px(8),
+        panel.px(10) as f32,
+        1.0,
+        if colors.dark { 0.0 } else { 0.04 },
+        None,
+    );
+    let footer_top = panel.px(118);
+    let mut rect = RECT::default();
+    unsafe {
+        super::GetClientRect(panel.hwnd.get(), &raw mut rect);
+    }
+    super::fill(
+        hdc,
+        &RECT {
+            left: 0,
+            top: footer_top,
+            right: rect.right,
+            bottom: rect.bottom,
+        },
+        colors.footer_bg,
+    );
+    super::fill(
+        hdc,
+        &RECT {
+            left: 0,
+            top: footer_top,
+            right: rect.right,
+            bottom: footer_top + 1,
+        },
+        colors.border_subtle,
     );
 }
 

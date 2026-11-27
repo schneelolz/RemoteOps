@@ -753,16 +753,25 @@ impl AgentPermissionControl {
         self.default_full.load(Ordering::SeqCst)
     }
     fn requests_full_on_pair(&self, binding: &ControllerBinding) -> bool {
-        if !self.default_full_control() || binding.controller_kind != remoteops_protocol::ControllerKind::Ai {
+        if !self.default_full_control()
+            || binding.controller_kind != remoteops_protocol::ControllerKind::Ai
+        {
             return false;
         }
         if cfg!(feature = "managed-install-grant") {
             return binding.installation_grant == Some(true)
-                && binding.control_state.as_ref().is_some_and(|s| s.initialization_pending)
-                && self.locally_revoked.read().is_ok_and(|revoked|
-                    revoked.as_ref().is_none_or(|old| old.session_id != binding.session_id));
+                && binding
+                    .control_state
+                    .as_ref()
+                    .is_some_and(|s| s.initialization_pending)
+                && self.locally_revoked.read().is_ok_and(|revoked| {
+                    revoked
+                        .as_ref()
+                        .is_none_or(|old| old.session_id != binding.session_id)
+                });
         }
-        !cfg!(feature = "controller-approved-default") && !self.auto_suppressed.load(Ordering::SeqCst)
+        !cfg!(feature = "controller-approved-default")
+            && !self.auto_suppressed.load(Ordering::SeqCst)
     }
 
     /// 提交现场变更；逐项确认立即抑制本进程自动授权。
@@ -1674,7 +1683,8 @@ async fn run_agent_with_event_sink(
                 && options.visual_enabled
                 && options.capability_policy.visual_allowed()
                 && options.product.endpoint.is_fixed()
-                && options.product.endpoint.endpoint() == (config.relay.as_str(), config.server_name.as_str()))
+                && options.product.endpoint.endpoint()
+                    == (config.relay.as_str(), config.server_name.as_str()))
                 .then(|| desktop::Endpoint {
                     address: config.relay.clone(),
                     name: config.server_name.clone(),
@@ -1764,10 +1774,18 @@ where
     let environment = {
         let mut profile = environment;
         if desktop_endpoint.is_some() {
-            profile.tools.push(remoteops_domain::ToolProfile{name:"remoteops-desktop-v1".into(),available:true,version:Some("1".into())});
+            profile.tools.push(remoteops_domain::ToolProfile {
+                name: "remoteops-desktop-v1".into(),
+                available: true,
+                version: Some("1".into()),
+            });
             #[cfg(feature = "paired-human-desktop")]
             if desktop::crossdesk_available() {
-                profile.tools.push(remoteops_domain::ToolProfile{name:"remoteops-crossdesk-v1".into(),available:true,version:Some("1".into())});
+                profile.tools.push(remoteops_domain::ToolProfile {
+                    name: "remoteops-crossdesk-v1".into(),
+                    available: true,
+                    version: Some("1".into()),
+                });
             }
         }
         profile
@@ -1843,14 +1861,29 @@ where
         registration_started,
     );
     let context = boundary.snapshot();
-    let latest_update = welcome.release_catalog.as_ref().and_then(|catalog|
-        catalog.compare(&context.product_id, std::env::consts::OS, std::env::consts::ARCH, &context.version)
-    ).and_then(|(latest, status)| (status == "update_available").then(|| latest.to_owned()));
+    let latest_update = welcome
+        .release_catalog
+        .as_ref()
+        .and_then(|catalog| {
+            catalog.compare(
+                &context.product_id,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                &context.version,
+            )
+        })
+        .and_then(|(latest, status)| (status == "update_available").then(|| latest.to_owned()));
     if let Some(latest) = &latest_update {
-        emit_agent_event(event_sender, AgentEvent::OperationLog(AgentOperationLog {
-            repetition: None, request_id: None, occurred_at: Utc::now(), level: AgentLogLevel::Info,
-            message: format!("Agent 当前 v{}，可更新至 v{latest}", context.version),
-        }));
+        emit_agent_event(
+            event_sender,
+            AgentEvent::OperationLog(AgentOperationLog {
+                repetition: None,
+                request_id: None,
+                occurred_at: Utc::now(),
+                level: AgentLogLevel::Info,
+                message: format!("Agent 当前 v{}，可更新至 v{latest}", context.version),
+            }),
+        );
     }
     if let Some(code) = &welcome.pairing_code {
         emit_agent_event(
@@ -1939,7 +1972,8 @@ where
     let tcp_forwards =
         tcp_forward::Manager::new(sender.clone(), tcp_sender, agent_instance_id, tcp_enabled);
     #[cfg(all(windows, feature = "desktop-pilot"))]
-    let mut desktop = desktop::Manager::new(desktop_endpoint,sender.clone(),event_sender.cloned());
+    let mut desktop =
+        desktop::Manager::new(desktop_endpoint, sender.clone(), event_sender.cloned());
     let mut tcp_cleanup = interval(Duration::from_secs(1));
     let mut controller_bindings = BTreeMap::<ControllerInstanceId, ControllerBinding>::new();
     let mut default_queries = BTreeMap::<RequestId, (SessionControlState, Instant)>::new();
@@ -1948,7 +1982,9 @@ where
     permission
         .disconnect_supported
         .store(welcome.allow_agent_ai_disconnect, Ordering::SeqCst);
-    permission.human_disconnect_supported.store(welcome.allow_agent_human_disconnect, Ordering::SeqCst);
+    permission
+        .human_disconnect_supported
+        .store(welcome.allow_agent_human_disconnect, Ordering::SeqCst);
     let mut disconnect_requests = permission.disconnect_requests.subscribe();
     let mut requested_disconnect = None;
     let mut control_requests = local_permission_policy
@@ -2036,13 +2072,17 @@ where
             }
             #[cfg(all(windows, feature = "desktop-pilot"))]
             Ok(WireMessage::Desktop(event)) => {
-                let binding=controller_bindings.values().find(|b|b.session_id==event.session && b.controller_kind==remoteops_protocol::ControllerKind::Human);
-                desktop.handle(event,binding,*permission_mode_updates.borrow());
+                let binding = controller_bindings.values().find(|b| {
+                    b.session_id == event.session
+                        && b.controller_kind == remoteops_protocol::ControllerKind::Human
+                });
+                desktop.handle(event, binding, *permission_mode_updates.borrow());
             }
             Ok(WireMessage::ControllerBinding(mut binding)) => {
                 #[cfg(all(windows, feature = "desktop-pilot"))]
                 if let Some(old) = controller_bindings.get(&binding.controller_instance_id)
-                    && (old.binding_token != binding.binding_token || old.permission_mode != binding.permission_mode)
+                    && (old.binding_token != binding.binding_token
+                        || old.permission_mode != binding.permission_mode)
                 {
                     desktop.revoke(&old.binding_token);
                 }
@@ -2096,10 +2136,11 @@ where
                     default_queries
                         .retain(|_, (_, started)| started.elapsed() < Duration::from_secs(5));
                     default_queries.insert(request_id, (state.clone(), Instant::now()));
-                } else if new_binding && let Some(state) = binding
-                    .control_state
-                    .as_ref()
-                    .filter(|state| state.initialization_pending)
+                } else if new_binding
+                    && let Some(state) = binding
+                        .control_state
+                        .as_ref()
+                        .filter(|state| state.initialization_pending)
                 {
                     let _ = sender.send(WireMessage::ControlInitializationComplete {
                         state: state.clone(),
@@ -2163,9 +2204,14 @@ where
                     && result.error.is_none()
                     && let Some(state) = &result.state
                     && same_control_binding(Some(&queried), Some(state))
-                    && controller_bindings.get(&state.controller_id).is_some_and(|binding|
-                        binding.control_state.as_ref() == Some(state)
-                        && local_permission_policy.permission_control.requests_full_on_pair(binding))
+                    && controller_bindings
+                        .get(&state.controller_id)
+                        .is_some_and(|binding| {
+                            binding.control_state.as_ref() == Some(state)
+                                && local_permission_policy
+                                    .permission_control
+                                    .requests_full_on_pair(binding)
+                        })
                     && !boundary.policy.read_only()
                     && matches!(
                         state.mode,
@@ -2205,12 +2251,17 @@ where
             }) => {
                 #[cfg(all(windows, feature = "desktop-pilot"))]
                 desktop.revoke(&binding_token);
-                let human = controller_bindings.values().any(|b| b.session_id == session_id
-                    && b.binding_token == binding_token && b.controller_kind == remoteops_protocol::ControllerKind::Human);
+                let human = controller_bindings.values().any(|b| {
+                    b.session_id == session_id
+                        && b.binding_token == binding_token
+                        && b.controller_kind == remoteops_protocol::ControllerKind::Human
+                });
                 if revoke_controller_binding(&mut controller_bindings, session_id, &binding_token) {
                     publish_execution_bindings(&execution_bindings, &controller_bindings);
                     let locally_requested = requested_disconnect.as_ref() == Some(&binding_token);
-                    if locally_requested { requested_disconnect = None; }
+                    if locally_requested {
+                        requested_disconnect = None;
+                    }
                     if human || locally_requested {
                         abort_pending_tasks_for_session(
                             &tasks,
@@ -2221,7 +2272,13 @@ where
                         )
                         .await;
                     }
-                    close_owned_resources(&shell_sessions, &serial_sessions, session_id, Some(&binding_token)).await;
+                    close_owned_resources(
+                        &shell_sessions,
+                        &serial_sessions,
+                        session_id,
+                        Some(&binding_token),
+                    )
+                    .await;
                     if !controller_bindings
                         .values()
                         .any(|binding| binding.session_id == session_id)
@@ -2428,7 +2485,12 @@ where
                     continue;
                 }
                 #[cfg(all(windows, feature = "desktop-pilot"))]
-                if matches!(request.operation, RemoteOperation::EmergencyStop | RemoteOperation::CloseConnection) {desktop.stop("收到急停或断开连接指令");}
+                if matches!(
+                    request.operation,
+                    RemoteOperation::EmergencyStop | RemoteOperation::CloseConnection
+                ) {
+                    desktop.stop("收到急停或断开连接指令");
+                }
                 if matches!(request.operation, RemoteOperation::EmergencyStop) {
                     abort_pending_tasks(&tasks, Some(&log_observer), "紧急停止，操作已中断").await;
                     close_agent_resources(&shell_sessions, &serial_sessions).await;
@@ -2868,11 +2930,22 @@ fn emit_controller_bindings(
     let bindings = bindings
         .values()
         .map(|binding| AgentControllerBinding {
-            installation_authorized: cfg!(feature = "managed-install-grant") && binding.installation_grant == Some(true),
+            installation_authorized: cfg!(feature = "managed-install-grant")
+                && binding.installation_grant == Some(true),
             disconnect_target: match binding.controller_kind {
-                remoteops_protocol::ControllerKind::Ai => &local_permission_policy.permission_control.disconnect_supported,
-                remoteops_protocol::ControllerKind::Human => &local_permission_policy.permission_control.human_disconnect_supported,
-            }.load(Ordering::SeqCst).then(|| BindingDisconnectTarget {
+                remoteops_protocol::ControllerKind::Ai => {
+                    &local_permission_policy
+                        .permission_control
+                        .disconnect_supported
+                }
+                remoteops_protocol::ControllerKind::Human => {
+                    &local_permission_policy
+                        .permission_control
+                        .human_disconnect_supported
+                }
+            }
+            .load(Ordering::SeqCst)
+            .then(|| BindingDisconnectTarget {
                 kind: binding.controller_kind,
                 session_id: binding.session_id,
                 token: binding.binding_token.clone(),
@@ -5594,13 +5667,18 @@ async fn close_session_resources(
 async fn close_owned_resources(
     shell_sessions: &Arc<Mutex<BTreeMap<ShellId, ShellRuntime>>>,
     serial_sessions: &Arc<Mutex<BTreeMap<SerialSessionId, SerialRuntime>>>,
-    session_id: SessionId, binding: Option<&str>,
+    session_id: SessionId,
+    binding: Option<&str>,
 ) {
     let shells = {
         let mut sessions = shell_sessions.lock().await;
         let ids = sessions
             .iter()
-            .filter_map(|(id, runtime)| (runtime.session_id == session_id && binding.is_none_or(|token| token == runtime.owner_binding)).then_some(*id))
+            .filter_map(|(id, runtime)| {
+                (runtime.session_id == session_id
+                    && binding.is_none_or(|token| token == runtime.owner_binding))
+                .then_some(*id)
+            })
             .collect::<Vec<_>>();
         ids.into_iter()
             .filter_map(|id| sessions.remove(&id))
@@ -5611,7 +5689,11 @@ async fn close_owned_resources(
         let mut sessions = serial_sessions.lock().await;
         let ids = sessions
             .iter()
-            .filter_map(|(id, runtime)| (runtime.session_id == session_id && binding.is_none_or(|token| token == runtime.owner_binding)).then_some(*id))
+            .filter_map(|(id, runtime)| {
+                (runtime.session_id == session_id
+                    && binding.is_none_or(|token| token == runtime.owner_binding))
+                .then_some(*id)
+            })
             .collect::<Vec<_>>();
         ids.into_iter()
             .filter_map(|id| sessions.remove(&id))
@@ -6358,9 +6440,9 @@ mod tests {
             &mut relay_stream,
             &WireMessage::AgentWelcome(AgentWelcome {
                 allow_agent_ai_disconnect: false,
-                    allow_agent_human_disconnect: false,
-                    release_catalog: None,
-                    test_key_accepted: false,
+                allow_agent_human_disconnect: false,
+                release_catalog: None,
+                test_key_accepted: false,
                 pairing_code: Some(AccessCode::parse("123456789").expect("测试控制码应有效")),
                 pairing_mode: remoteops_protocol::PairingMode::AutoPerBoot,
                 managed_target_id: None,
@@ -7059,7 +7141,10 @@ mod tests {
         b.control_state.as_mut().unwrap().initialization_pending = false;
         assert!(!control.requests_full_on_pair(&b));
         b.control_state.as_mut().unwrap().initialization_pending = true;
-        let _ = control.request_control(b.control_state.clone().unwrap(), ControllerControlMode::StepByStep);
+        let _ = control.request_control(
+            b.control_state.clone().unwrap(),
+            ControllerControlMode::StepByStep,
+        );
         b.control_state.as_mut().unwrap().agent_generation += 1;
         assert!(!control.requests_full_on_pair(&b));
     }
@@ -7271,19 +7356,28 @@ mod tests {
         let pairs = BTreeMap::from([(ai_id, ai.clone()), (human_id, human)]);
         let mut requests = policy.permission_control.disconnect_requests.subscribe();
         for supported in [false, true] {
-            policy.permission_control.disconnect_supported.store(supported, Ordering::SeqCst);
+            policy
+                .permission_control
+                .disconnect_supported
+                .store(supported, Ordering::SeqCst);
             emit_controller_bindings(Some(&sink), &pairs, &policy);
             let AgentEvent::ControllerBindingsChanged { bindings } = receiver.try_recv().unwrap()
-            else { panic!("缺少绑定快照"); };
+            else {
+                panic!("缺少绑定快照");
+            };
             for summary in bindings {
-                let eligible = supported && summary.controller_kind == remoteops_protocol::ControllerKind::Ai;
+                let eligible =
+                    supported && summary.controller_kind == remoteops_protocol::ControllerKind::Ai;
                 assert_eq!(summary.disconnect_target.is_some(), eligible);
                 if let Some(target) = summary.disconnect_target {
                     assert!(!format!("{target:?}").contains(&ai.binding_token));
-                    policy.permission_control.disconnect_binding(target).unwrap();
+                    policy
+                        .permission_control
+                        .disconnect_binding(target)
+                        .unwrap();
                     let request = requests.try_recv().unwrap();
                     assert_eq!(request.session_id, session);
-                    assert!(request.token == ai.binding_token);
+                    assert_eq!(request.token, ai.binding_token);
                 }
             }
         }
@@ -7979,17 +8073,23 @@ mod tests {
         let sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let mut state = shell_test_state(sessions.clone());
         let session = SessionId::new();
-        let shell = if cfg!(windows) { ShellKind::Cmd } else { ShellKind::System };
+        let shell = if cfg!(windows) {
+            ShellKind::Cmd
+        } else {
+            ShellKind::System
+        };
         for owner in ["ai", "human"] {
             state.binding_token = owner.to_owned();
-            let (_, opened) = execute_test_shell_request(&state, session, RemoteOperation::OpenShell { shell }).await;
+            let (_, opened) =
+                execute_test_shell_request(&state, session, RemoteOperation::OpenShell { shell })
+                    .await;
             assert!(opened.error_code.is_none());
         }
         close_owned_resources(&sessions, &state.serial_sessions, session, Some("human")).await;
         {
-            let remaining=sessions.lock().await;
+            let remaining = sessions.lock().await;
             assert_eq!(remaining.len(), 1);
-            let ai=remaining.values().next().unwrap();
+            let ai = remaining.values().next().unwrap();
             assert_eq!(ai.owner_binding, "ai");
             assert!(!ai.session.is_closed());
         }

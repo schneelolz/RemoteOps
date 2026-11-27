@@ -123,9 +123,9 @@ pub enum Action {
     RtcSignal(rtc::Signal),
     /// 放弃可选媒体链并回到原媒体连接。
     RtcStop,
-    /// 运维端已收到 MiniRTC 视频关键帧，可以暂停 TCP 视频。
+    /// 运维端已收到 `MiniRTC` 视频关键帧，可以暂停 TCP 视频。
     RtcReady,
-    /// 已配对的运维端在支持 CrossDesk 的现场流上申请一次性观看票据。
+    /// 已配对的运维端在支持 `CrossDesk` 的现场流上申请一次性观看票据。
     CrossDeskRequest,
     /// 绑定当前会话和桌面流的观看票据。键鼠权限仍须现场回执。
     CrossDeskGrant(Ticket),
@@ -133,18 +133,20 @@ pub enum Action {
     CrossDeskOffer(rtc::Signal),
     /// 运维端已显示本后端的首个关键帧。
     CrossDeskReady,
-    /// 放弃当前流的 CrossDesk 媒体，回到原有画面。
+    /// 放弃当前流的 `CrossDesk` 媒体，回到原有画面。
     CrossDeskStop,
     /// 已配对面板提供本机候选地址和本流临时客户端证书。
     LanRequest {
-        addresses: Vec<Ipv4Addr>, certificate: Vec<u8>,
+        addresses: Vec<Ipv4Addr>,
+        certificate: Vec<u8>,
         /// 已绑定本机私网地址的一次性反向监听端点。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reverse: Vec<SocketAddrV4>,
     },
     /// Agent 回答所选端点和本流临时服务端证书。
     LanOffer {
-        address: SocketAddrV4, certificate: Vec<u8>,
+        address: SocketAddrV4,
+        certificate: Vec<u8>,
         /// Agent 选中的反向端点。旧版缺省仅尝试正向连接。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reverse: Option<SocketAddrV4>,
@@ -162,9 +164,17 @@ pub enum Action {
         bitrate: u32,
     },
     /// 当前输入租约下独立开关剪贴板。每次启用使用新的通道标识。
-    ClipboardShare { epoch: u64, channel: RequestId, enabled: bool },
+    ClipboardShare {
+        epoch: u64,
+        channel: RequestId,
+        enabled: bool,
+    },
     /// 已开启的通道上发送有界内容，流、租约和通道均须匹配。
-    ClipboardData { epoch: u64, channel: RequestId, packet: clipboard::Packet },
+    ClipboardData {
+        epoch: u64,
+        channel: RequestId,
+        packet: clipboard::Packet,
+    },
     /// 关闭桌面并释放关联资源。
     Closed,
 }
@@ -208,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_sizes_before_allocation() {
-        for size in [0u32, (MAX_VIDEO_BYTES + 1) as u32] {
+        for size in [0u32, u32::try_from(MAX_VIDEO_BYTES + 1).unwrap()] {
             assert_eq!(
                 read_video(&mut size.to_be_bytes().as_slice())
                     .await

@@ -15,6 +15,10 @@ use tokio::{
     time::{Duration, Instant},
 };
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "各传输能力分别协商，多个后端可同时就绪"
+)]
 pub(super) struct Stream {
     id: RequestId,
     agent: AgentInstanceId,
@@ -56,7 +60,11 @@ pub(super) struct Stream {
 
 impl Stream {
     fn accept_rtc_signal(&mut self, len: usize) -> bool {
-        if !self.rtc_active || !(1..=131_072).contains(&len) || self.rtc_signal_count >= 512 || self.rtc_signal_bytes + len > 2_097_152 {
+        if !self.rtc_active
+            || !(1..=131_072).contains(&len)
+            || self.rtc_signal_count >= 512
+            || self.rtc_signal_bytes + len > 2_097_152
+        {
             return false;
         }
         self.rtc_signal_count += 1;
@@ -176,12 +184,12 @@ impl Relay {
     }
 
     pub(super) fn prune_desktops(&self, state: &mut RelayState) {
-        let stale: Vec<_> = state
+        let expired_sessions: Vec<_> = state
             .desktops
             .iter()
             .filter_map(|(id, s)| (!self.desktop_valid(state, *id, s)).then_some(*id))
             .collect();
-        for id in stale {
+        for id in expired_sessions {
             close(state, id);
         }
     }
@@ -193,6 +201,10 @@ impl Relay {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "同一状态锁内按协议消息穷举桌面状态迁移"
+    )]
     pub(super) async fn desktop_controller(
         &self,
         id: ControllerInstanceId,
@@ -314,9 +326,19 @@ impl Relay {
         }
         if event.action == Action::CrossDeskRequest {
             let agent_supports_crossdesk = state.agents.get(&s.agent).is_some_and(|agent| {
-                agent.hello.environment.tools.iter().any(|tool| tool.name == "remoteops-crossdesk-v1" && tool.available)
+                agent
+                    .hello
+                    .environment
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "remoteops-crossdesk-v1" && tool.available)
             });
-            if s.crossdesk_capable && !s.crossdesk_granted && !s.rtc_active && !s.lan_requested && agent_supports_crossdesk {
+            if s.crossdesk_capable
+                && !s.crossdesk_granted
+                && !s.rtc_active
+                && !s.lan_requested
+                && agent_supports_crossdesk
+            {
                 let s = state.desktops.get_mut(&session).expect("已校验桌面流");
                 s.crossdesk_granted = true;
                 s.crossdesk_active = true;
@@ -328,7 +350,8 @@ impl Relay {
         }
         if let Action::Control { enabled, epoch } = event.action {
             if enabled
-                && (s.releasing_input || s.geometry_epoch != Some(epoch)
+                && (s.releasing_input
+                    || s.geometry_epoch != Some(epoch)
                     || state.session_bindings[&session].permission_mode_for(ControllerKind::Human)
                         == PermissionMode::ReadOnly
                     || state.in_flight.values().any(|r| {
@@ -354,24 +377,48 @@ impl Relay {
         let s = state.desktops.get_mut(&session).expect("已校验桌面流");
         match &event.action {
             Action::Heartbeat => s.controller_seen = Instant::now(),
-            Action::CrossDeskReady if s.crossdesk_active && s.crossdesk_offered => {},
-            Action::CrossDeskStop if s.crossdesk_active => s.crossdesk_active=false,
+            Action::CrossDeskReady if s.crossdesk_active && s.crossdesk_offered => {}
+            Action::CrossDeskStop if s.crossdesk_active => s.crossdesk_active = false,
             Action::RtcRequest if s.rtc_capable && !s.rtc_requested && !s.crossdesk_active => {
-                let Some(issuer) = &self.rtc_turn else { return; };
+                let Some(issuer) = &self.rtc_turn else {
+                    return;
+                };
                 s.rtc_requested = true;
                 s.rtc_active = true;
-                reply(&s.agent_sender, session, s.id, Action::RtcGranted(issuer.grant()));
-                reply(&s.controller_sender, session, s.id, Action::RtcGranted(issuer.grant()));
+                reply(
+                    &s.agent_sender,
+                    session,
+                    s.id,
+                    Action::RtcGranted(issuer.grant()),
+                );
+                reply(
+                    &s.controller_sender,
+                    session,
+                    s.id,
+                    Action::RtcGranted(issuer.grant()),
+                );
                 return;
             }
-            Action::RtcReady if s.rtc_active => {},
+            Action::RtcReady if s.rtc_active => {}
             Action::RtcStop if s.rtc_active => s.rtc_active = false,
-            Action::RtcSignal(signal) if s.accept_rtc_signal(signal.0.len()) => {},
-            Action::LanRequest { addresses, certificate, reverse }
-                if s.lan_capable && !s.crossdesk_active && !s.lan_requested && (1..=8).contains(&addresses.len())
+            Action::RtcSignal(signal) if s.accept_rtc_signal(signal.0.len()) => {}
+            Action::LanRequest {
+                addresses,
+                certificate,
+                reverse,
+            } if s.lan_capable
+                && !s.crossdesk_active
+                && !s.lan_requested
+                && (1..=8).contains(&addresses.len())
                 && addresses.iter().all(std::net::Ipv4Addr::is_private)
-                && reverse.len() <= 8 && reverse.iter().all(|a| a.port() >= 1024 && addresses.contains(a.ip()))
-                && (128..=2048).contains(&certificate.len()) => s.lan_requested = true,
+                && reverse.len() <= 8
+                && reverse
+                    .iter()
+                    .all(|a| a.port() >= 1024 && addresses.contains(a.ip()))
+                && (128..=2048).contains(&certificate.len()) =>
+            {
+                s.lan_requested = true;
+            }
             Action::Settings {
                 quality,
                 fps,
@@ -384,17 +431,37 @@ impl Relay {
                 s.clipboard_channel = None;
                 s.input_epoch = None;
             }
-            Action::ClipboardShare {epoch,channel,enabled} if can_input && s.clipboard_supported && s.input_epoch==Some(*epoch) => {
-                if *enabled { s.clipboard_channel=Some(*channel); }
-                else if s.clipboard_channel==Some(*channel) { s.clipboard_channel=None; } else {return;}
+            Action::ClipboardShare {
+                epoch,
+                channel,
+                enabled,
+            } if can_input && s.clipboard_supported && s.input_epoch == Some(*epoch) => {
+                if *enabled {
+                    s.clipboard_channel = Some(*channel);
+                } else if s.clipboard_channel == Some(*channel) {
+                    s.clipboard_channel = None;
+                } else {
+                    return;
+                }
             }
-            Action::ClipboardData {epoch,channel,packet} if can_input && s.input_epoch==Some(*epoch) && s.clipboard_channel==Some(*channel) && packet.bounded() => {}
+            Action::ClipboardData {
+                epoch,
+                channel,
+                packet,
+            } if can_input
+                && s.input_epoch == Some(*epoch)
+                && s.clipboard_channel == Some(*channel)
+                && packet.bounded() => {}
             Action::Input { epoch, .. } if can_input && s.input_epoch == Some(*epoch) => {}
             _ => return,
         }
         let _ = s.agent_sender.send(WireMessage::Desktop(event));
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "同一状态锁内按协议消息穷举桌面状态迁移"
+    )]
     pub(super) async fn desktop_agent(
         &self,
         id: AgentInstanceId,
@@ -413,49 +480,117 @@ impl Relay {
             close(&mut state, session);
             return;
         }
-        if let Action::Geometry { epoch, .. } | Action::Control { enabled: false, epoch } = &event.action {
+        if let Action::Geometry { epoch, .. }
+        | Action::Control {
+            enabled: false,
+            epoch,
+        } = &event.action
+        {
             if s.geometry_epoch.is_some_and(|previous| *epoch <= previous) {
                 return;
             }
             set_takeover(&mut state, session, false);
         }
         let can_input = Self::can_input(&state, session);
-        let crossdesk_supported = state.desktops.get(&session)
+        let crossdesk_supported = state
+            .desktops
+            .get(&session)
             .and_then(|s| state.agents.get(&s.agent))
-            .is_some_and(|a| a.hello.environment.tools.iter().any(|t| t.available && t.name=="remoteops-crossdesk-v1"));
+            .is_some_and(|a| {
+                a.hello
+                    .environment
+                    .tools
+                    .iter()
+                    .any(|t| t.available && t.name == "remoteops-crossdesk-v1")
+            });
         let s = state.desktops.get_mut(&session).expect("已校验桌面流");
         match &event.action {
             Action::Heartbeat => s.agent_seen = Instant::now(),
-            Action::CrossDeskStop if s.crossdesk_active => s.crossdesk_active=false,
-            Action::CrossDeskOffer(offer) if s.crossdesk_active && !s.crossdesk_offered
-                && offer.0.len()==16 && offer.0.as_bytes()[..9].iter().all(u8::is_ascii_digit)
-                && offer.0.as_bytes()[9]==b'@' && offer.0.as_bytes()[10..].iter().all(u8::is_ascii_alphanumeric)
-                => s.crossdesk_offered=true,
+            Action::CrossDeskStop if s.crossdesk_active => s.crossdesk_active = false,
+            Action::CrossDeskOffer(offer)
+                if s.crossdesk_active
+                    && !s.crossdesk_offered
+                    && offer.0.len() == 16
+                    && offer.0.as_bytes()[..9].iter().all(u8::is_ascii_digit)
+                    && offer.0.as_bytes()[9] == b'@'
+                    && offer.0.as_bytes()[10..]
+                        .iter()
+                        .all(u8::is_ascii_alphanumeric) =>
+            {
+                s.crossdesk_offered = true;
+            }
             Action::RtcStop if s.rtc_active => s.rtc_active = false,
-            Action::RtcSignal(signal) if s.accept_rtc_signal(signal.0.len()) => {},
-            Action::LanOffer { address, certificate, .. }
-                if s.lan_requested && !s.lan_offered && address.ip().is_private()
-                && address.port() >= 1024 && (128..=2048).contains(&certificate.len()) => s.lan_offered = true,
-            Action::ClipboardData {epoch,channel,packet} if can_input && s.input_epoch==Some(*epoch) && s.clipboard_channel==Some(*channel) && packet.bounded() => {}
-            Action::Geometry { epoch, lan, clipboard, mini_rtc, width, height, crossdesk } => {
+            Action::RtcSignal(signal) if s.accept_rtc_signal(signal.0.len()) => {}
+            Action::LanOffer {
+                address,
+                certificate,
+                ..
+            } if s.lan_requested
+                && !s.lan_offered
+                && address.ip().is_private()
+                && address.port() >= 1024
+                && (128..=2048).contains(&certificate.len()) =>
+            {
+                s.lan_offered = true;
+            }
+            Action::ClipboardData {
+                epoch,
+                channel,
+                packet,
+            } if can_input
+                && s.input_epoch == Some(*epoch)
+                && s.clipboard_channel == Some(*channel)
+                && packet.bounded() => {}
+            Action::Geometry {
+                epoch,
+                lan,
+                clipboard,
+                mini_rtc,
+                width,
+                height,
+                crossdesk,
+            } => {
                 s.releasing_input = false;
                 s.crossdesk_capable = *crossdesk;
                 s.rtc_capable = *mini_rtc && self.rtc_turn.is_some();
-                s.clipboard_supported=*clipboard;
-                s.clipboard_channel=None;
+                s.clipboard_supported = *clipboard;
+                s.clipboard_channel = None;
                 s.lan_capable = *lan;
                 s.geometry_epoch = Some(*epoch);
                 s.input_epoch = None;
-                reply(&s.controller_sender, session, s.id, Action::Geometry { epoch: *epoch, width: *width, height: *height, lan: *lan, clipboard: *clipboard, mini_rtc: s.rtc_capable, crossdesk: *crossdesk && crossdesk_supported });
+                reply(
+                    &s.controller_sender,
+                    session,
+                    s.id,
+                    Action::Geometry {
+                        epoch: *epoch,
+                        width: *width,
+                        height: *height,
+                        lan: *lan,
+                        clipboard: *clipboard,
+                        mini_rtc: s.rtc_capable,
+                        crossdesk: *crossdesk && crossdesk_supported,
+                    },
+                );
                 return;
             }
-            Action::Control { enabled, epoch } if !enabled || (can_input && !s.releasing_input && s.geometry_epoch.is_some_and(|previous| *epoch > previous)) => {
+            Action::Control { enabled, epoch }
+                if !enabled
+                    || (can_input
+                        && !s.releasing_input
+                        && s.geometry_epoch.is_some_and(|previous| *epoch > previous)) =>
+            {
                 s.releasing_input = false;
                 s.geometry_epoch = Some(*epoch);
-                s.clipboard_channel=None;
+                s.clipboard_channel = None;
                 s.input_epoch = enabled.then_some(*epoch);
                 if *enabled && s.lan_offered {
-                    reply(&s.agent_sender, session, s.id, Action::LanPermit { epoch: *epoch });
+                    reply(
+                        &s.agent_sender,
+                        session,
+                        s.id,
+                        Action::LanPermit { epoch: *epoch },
+                    );
                 }
             }
             _ => return,

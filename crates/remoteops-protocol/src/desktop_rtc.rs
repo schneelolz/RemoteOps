@@ -1,4 +1,4 @@
-//! 单次人工桌面流的 MiniRTC 媒体协商。键鼠始终走原有人工租约。
+//! 单次人工桌面流的 `MiniRTC` 媒体协商。键鼠始终走原有人工租约。
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

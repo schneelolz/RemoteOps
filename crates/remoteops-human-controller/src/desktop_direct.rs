@@ -17,12 +17,18 @@ use tokio::{
 };
 
 /// MiniRTC 重组 NALU / FU-A 时会在完整 Annex B 访问单元前保留一字节传输头。
+#[cfg(any(windows, test))]
 pub(super) fn normalize_rtc_frame(frame: &mut Vec<u8>) -> bool {
     fn annex_b(bytes: &[u8]) -> bool {
         bytes.starts_with(&[0, 0, 1]) || bytes.starts_with(&[0, 0, 0, 1])
     }
-    if annex_b(frame) { return true; }
-    if frame.split_first().is_some_and(|(header, body)| matches!(header & 0x9f, 1 | 28) && annex_b(body)) {
+    if annex_b(frame) {
+        return true;
+    }
+    if frame
+        .split_first()
+        .is_some_and(|(header, body)| matches!(header & 0x9f, 1 | 28) && annex_b(body))
+    {
         frame.remove(0);
         return true;
     }
@@ -54,8 +60,12 @@ impl Pictures {
             need_idr: true,
         }
     }
+    #[cfg(any(windows, test))]
     pub(super) fn mini_rtc(video: Video, stream: RequestId, route: Arc<AtomicU8>) -> Self {
-        Self { source: 3, ..Self::new(video,stream,false,route) }
+        Self {
+            source: 3,
+            ..Self::new(video, stream, false, route)
+        }
     }
     pub(super) async fn put(&mut self, packet: Vec<u8>) -> Result<()> {
         let capture = remoteops_protocol::desktop::fps::capture_fps(&packet);
@@ -65,7 +75,13 @@ impl Pictures {
             {
                 let mut buffer = self.video.lock().map_err(|_| anyhow!("媒体队列不可用"))?;
                 let generation = self.route.load(Ordering::Acquire);
-                if buffer.stream != Some(self.stream) || (match generation { 1 => 1, 3 => 3, _ => 0 }) != self.source {
+                if buffer.stream != Some(self.stream)
+                    || (match generation {
+                        1 => 1,
+                        3 => 3,
+                        _ => 0,
+                    }) != self.source
+                {
                     return Ok(());
                 }
                 if self.last != Some(generation) {
@@ -76,7 +92,9 @@ impl Pictures {
                 if !counted {
                     counted = true;
                     buffer.received = buffer.received.saturating_add(1);
-                    if let Some(fps) = capture { buffer.capture = Some((fps, std::time::Instant::now())); }
+                    if let Some(fps) = capture {
+                        buffer.capture = Some((fps, std::time::Instant::now()));
+                    }
                 }
                 if self.need_idr {
                     if !is_idr(pending.as_ref().unwrap()) {
@@ -111,9 +129,12 @@ pub(super) struct Peer {
     tasks: JoinSet<()>,
 }
 impl Peer {
+    #[cfg(any(windows, test))]
     pub(super) fn resume_tcp_after_rtc(&self) {
         // 即使此前从 LAN 回过 TCP，也要让解码器等这一轮 TCP 的首个关键帧。
-        let _ = self.route.compare_exchange(3, 4, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self
+            .route
+            .compare_exchange(3, 4, Ordering::AcqRel, Ordering::Acquire);
     }
     pub fn new() -> Self {
         let (keys, input) = mpsc::channel(64);
@@ -127,6 +148,10 @@ impl Peer {
             tasks: JoinSet::new(),
         }
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "每次握手显式绑定地址、临时身份、桌面流和事件接收方"
+    )]
     pub fn connect(
         &mut self,
         address: SocketAddrV4,

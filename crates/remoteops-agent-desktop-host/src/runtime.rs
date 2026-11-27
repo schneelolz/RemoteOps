@@ -13,7 +13,7 @@ use remoteops_agent::{
 use remoteops_domain::{Capability, RequestId, ShellKind};
 use remoteops_product::ProductProfile;
 use remoteops_protocol::{
-    ControllerControlMode, ControllerKind, SessionControlState, connect_tls,
+    ControlSource, ControllerControlMode, ControllerKind, SessionControlState, connect_tls,
     load_native_client_config, load_pinned_client_config, probe_server_certificate,
 };
 use std::{
@@ -639,7 +639,11 @@ impl RuntimeHost {
     }
 
     fn refresh_control_timeout(&mut self, state: &mut ProductSnapshot) {
-        if self.pending_disconnect.as_ref().is_some_and(|(_, start)| start.elapsed() >= Duration::from_secs(6)) {
+        if self
+            .pending_disconnect
+            .as_ref()
+            .is_some_and(|(_, start)| start.elapsed() >= Duration::from_secs(6))
+        {
             self.pending_disconnect = None;
             state.detail = state
                 .t(
@@ -1168,14 +1172,26 @@ impl RuntimeHost {
     }
 
     fn can_change_control(&self) -> bool {
-        self.bindings.iter().find(|b| b.controller_kind == ControllerKind::Ai).is_some_and(|b| {
-            matches!(b.permission_mode, remoteops_domain::PermissionMode::ControllerApproved | remoteops_domain::PermissionMode::FullAccess)
-                && b.control_state.as_ref().is_some_and(|state| !state.initialization_pending && state.mode != ControllerControlMode::ExternalApproval)
-        })
+        self.bindings
+            .iter()
+            .find(|b| b.controller_kind == ControllerKind::Ai)
+            .is_some_and(|b| {
+                matches!(
+                    b.permission_mode,
+                    remoteops_domain::PermissionMode::ControllerApproved
+                        | remoteops_domain::PermissionMode::FullAccess
+                ) && b.control_state.as_ref().is_some_and(|state| {
+                    !state.initialization_pending
+                        && state.mode != ControllerControlMode::ExternalApproval
+                })
+            })
     }
 
     fn update_control(&mut self, state: &mut ProductSnapshot) {
-        let ai = self.bindings.iter().find(|b| b.controller_kind == ControllerKind::Ai);
+        let ai = self
+            .bindings
+            .iter()
+            .find(|b| b.controller_kind == ControllerKind::Ai);
         if state.ai_connected != ai.is_some() {
             state.record_lifecycle(
                 if ai.is_some() {
@@ -1187,9 +1203,26 @@ impl RuntimeHost {
             );
         }
         state.ai_connected = ai.is_some();
-        state.human_connected = self.bindings.iter().any(|b| b.controller_kind == ControllerKind::Human);
+        let human_connected = self
+            .bindings
+            .iter()
+            .any(|b| b.controller_kind == ControllerKind::Human);
+        if state.human_connected != human_connected {
+            state.record_lifecycle(
+                if human_connected {
+                    LifecycleKind::HumanConnected
+                } else {
+                    LifecycleKind::HumanDisconnected
+                },
+                None,
+            );
+        }
+        state.human_connected = human_connected;
         if self.pending_disconnect.as_ref().is_some_and(|(target, _)| {
-            !self.bindings.iter().any(|b| b.disconnect_target.as_ref() == Some(target))
+            !self
+                .bindings
+                .iter()
+                .any(|b| b.disconnect_target.as_ref() == Some(target))
         }) {
             self.pending_disconnect = None;
         }
@@ -1203,7 +1236,10 @@ impl RuntimeHost {
         state.control_summary = current.as_ref().map_or_else(
             || {
                 state
-                    .t("等待 AI 工程师连接后，可切换本次权限", "Connect an AI engineer to change session permissions")
+                    .t(
+                        "等待 AI 工程师连接后，可切换本次权限",
+                        "Connect an AI engineer to change session permissions",
+                    )
                     .to_owned()
             },
             |s| {
@@ -1223,15 +1259,19 @@ impl RuntimeHost {
                 .to_owned()
             },
         );
-        use remoteops_protocol::ControlSource;
         state.control_source = match current.and_then(|s| s.source) {
-            Some(ControlSource::LocalDefault) if ai.is_some_and(|b| b.installation_authorized) =>
-                state.t("管理员已授权此安装", "Administrator authorized this installation"),
+            Some(ControlSource::LocalDefault) if ai.is_some_and(|b| b.installation_authorized) => {
+                state.t(
+                    "管理员已授权此安装",
+                    "Administrator authorized this installation",
+                )
+            }
             Some(ControlSource::LocalDefault) => state.t("现场默认设置", "Local preference"),
             Some(ControlSource::Local) => state.t("现场手动授权", "Granted locally"),
             Some(ControlSource::Mcp) => state.t("控制端手动授权", "Granted by controller"),
             None => "",
-        }.to_owned();
+        }
+        .to_owned();
     }
 
     fn update_status(state: &mut ProductSnapshot) {
@@ -1245,7 +1285,10 @@ impl RuntimeHost {
             ProductPhase::Setup => state.t("首次使用，请配置连接", "Configure the connection"),
             ProductPhase::Connecting => state.t("正在连接", "Connecting"),
             ProductPhase::Waiting => state.t("等待工程师连接", "Waiting for engineer"),
-            ProductPhase::Controlled if state.ai_connected && state.human_connected => state.t("AI 工程师与人工运维已连接","AI engineer and operator connected"),
+            ProductPhase::Controlled if state.ai_connected && state.human_connected => state.t(
+                "AI 工程师与人工运维已连接",
+                "AI engineer and operator connected",
+            ),
             ProductPhase::Controlled if state.ai_connected => {
                 state.t("AI 工程师已连接", "AI engineer connected")
             }
@@ -1410,8 +1453,16 @@ mod tests {
         assert!(state.ai_connected && state.human_connected);
         RuntimeHost::update_status(&mut state);
         assert_eq!(state.status, "AI 工程师与人工运维已连接");
-        assert!(host.action(ProductAction::DisconnectHuman, &mut state).unwrap_err().contains("升级中继"));
-        assert!(host.action(ProductAction::DisconnectAi, &mut state).unwrap_err().contains("升级中继"));
+        assert!(
+            host.action(ProductAction::DisconnectHuman, &mut state)
+                .unwrap_err()
+                .contains("升级中继")
+        );
+        assert!(
+            host.action(ProductAction::DisconnectAi, &mut state)
+                .unwrap_err()
+                .contains("升级中继")
+        );
         assert!(state.ai_connected);
         host.apply(
             AgentEvent::ControllerBindingsChanged {

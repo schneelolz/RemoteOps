@@ -14,7 +14,7 @@ use tokio::{
 struct Media(JoinHandle<()>);
 impl Drop for Media {
     fn drop(&mut self) {
-        self.0.abort()
+        self.0.abort();
     }
 }
 
@@ -23,21 +23,28 @@ pub(super) async fn open(client: RelayClient, session: SessionId, title: String)
     let events = client.desktop_events();
     let runtime = Handle::current();
     let (done, result) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new().name("desktop-viewer".into()).spawn(move || {
-        let opened = (|| {
-            let (mut viewer, decoder) = Viewer::with_decoder(&format!("实时桌面 · {title}"))
-                .map_err(anyhow::Error::msg)?;
-            viewer.status("正在请求现场允许观看", false);
-            let command = |action| DesktopEvent { session, stream, action };
-            runtime.block_on(client.desktop_command(command(Action::Open)))?;
-            let result = run(&runtime, &client, session, stream, viewer, decoder, events);
-            let _ = runtime.block_on(async {
-                tokio::time::timeout(LEASE, client.desktop_command(command(Action::Closed))).await
-            });
-            result
-        })();
-        let _ = done.send(opened);
-    })?;
+    std::thread::Builder::new()
+        .name("desktop-viewer".into())
+        .spawn(move || {
+            let opened = (|| {
+                let (mut viewer, decoder) = Viewer::with_decoder(&format!("实时桌面 · {title}"))
+                    .map_err(anyhow::Error::msg)?;
+                viewer.status("正在请求现场允许观看", false);
+                let command = |action| DesktopEvent {
+                    session,
+                    stream,
+                    action,
+                };
+                runtime.block_on(client.desktop_command(command(Action::Open)))?;
+                let result = run(&runtime, &client, session, stream, viewer, decoder, events);
+                let _ = runtime.block_on(async {
+                    tokio::time::timeout(LEASE, client.desktop_command(command(Action::Closed)))
+                        .await
+                });
+                result
+            })();
+            let _ = done.send(opened);
+        })?;
     result.await.context("观看线程提前退出")?
 }
 
@@ -57,9 +64,9 @@ impl Adaptive {
             }
         } else {
             if measured >= target * 0.87 {
-                self.healthy += 1
+                self.healthy += 1;
             } else {
-                self.healthy = 0
+                self.healthy = 0;
             }
             if self.healthy < 3 {
                 return None;
@@ -81,11 +88,37 @@ fn settings(quality: Quality) -> Action {
     let (_, _, fps, bitrate) = quality.limits();
     Action::Settings {
         quality,
-        fps: fps as u8,
+        fps: u8::try_from(fps).unwrap_or(u8::MAX),
         bitrate,
     }
 }
 
+fn desktop_input(kind: i32, a: i32, b: i32) -> Option<Input> {
+    match kind {
+        0 => Some(Input::Move {
+            x: u16::try_from(a.clamp(0, i32::from(u16::MAX))).ok()?,
+            y: u16::try_from(b.clamp(0, i32::from(u16::MAX))).ok()?,
+        }),
+        1 if (0..=2).contains(&a) => Some(Input::Button {
+            button: u8::try_from(a).ok()?,
+            down: b != 0,
+        }),
+        2 => Some(Input::Wheel {
+            delta: i16::try_from(a.clamp(i32::from(i16::MIN), i32::from(i16::MAX))).ok()?,
+        }),
+        3 if (1..=254).contains(&a) => Some(Input::Key {
+            vk: u8::try_from(a).ok()?,
+            down: b != 0,
+        }),
+        4 => Some(Input::Release),
+        _ => None,
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "原生窗口在一个事件循环内处理租约、显示和键鼠状态"
+)]
 fn run(
     runtime: &Handle,
     client: &RelayClient,
@@ -120,7 +153,7 @@ fn run(
     let mut last_sent = None::<Instant>;
     let mut window = Instant::now();
     let mut count = 0_u32;
-    let mut bytes = 0_usize;
+    let mut bytes = 0.0;
     let mut congested = false;
     let mut adaptive = Adaptive::default();
     let mut auto = true;
@@ -226,41 +259,27 @@ fn run(
                 } else {
                     Action::Settings {
                         quality,
-                        fps: (b as u32).clamp(1, quality.limits().2) as u8,
-                        bitrate: c.clamp(100_000, 12_000_000) as u32,
+                        fps: u8::try_from(
+                            u32::try_from(b).unwrap_or(1).clamp(1, quality.limits().2),
+                        )?,
+                        bitrate: u32::try_from(c.clamp(100_000, 12_000_000))?,
                     }
                 };
                 send(action)?;
                 window = Instant::now();
                 count = 0;
-                bytes = 0;
+                bytes = 0.0;
                 congested = false;
             } else if control {
-                let event = match kind {
-                    0 => Input::Move {
-                        x: a.clamp(0, 65535) as u16,
-                        y: b.clamp(0, 65535) as u16,
-                    },
-                    1 if (0..=2).contains(&a) => Input::Button {
-                        button: a as u8,
-                        down: b != 0,
-                    },
-                    2 => Input::Wheel {
-                        delta: a.clamp(-32768, 32767) as i16,
-                    },
-                    3 if (1..=254).contains(&a) => Input::Key {
-                        vk: a as u8,
-                        down: b != 0,
-                    },
-                    4 => Input::Release,
-                    _ => continue,
+                let Some(event) = desktop_input(kind, a, b) else {
+                    continue;
                 };
                 send(Action::Input { epoch, event })?;
             }
         }
         if let Ok((data, arrived)) = frames.try_recv() {
             congested |= arrived.elapsed() > Duration::from_millis(200);
-            bytes += data.len();
+            bytes += f64::from(u32::try_from(data.len())?);
             if let Some((w, h)) = decoder
                 .decode(&data, &mut image)
                 .map_err(anyhow::Error::msg)?
@@ -289,13 +308,13 @@ fn run(
             viewer.status(
                 &format!(
                     "{mode} · {fps:.1} 帧/秒 · {:.2} Mb/s",
-                    bytes as f64 * 8. / secs / 1e6
+                    bytes * 8. / secs / 1e6
                 ),
                 control,
             );
             window = Instant::now();
             count = 0;
-            bytes = 0;
+            bytes = 0.0;
             congested = false;
         }
         std::thread::sleep(Duration::from_millis(3));
@@ -305,6 +324,20 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_input_clamps_coordinates_and_rejects_unknown_keys() {
+        assert_eq!(
+            desktop_input(0, -5, 90_000),
+            Some(Input::Move { x: 0, y: u16::MAX })
+        );
+        assert_eq!(
+            desktop_input(2, -90_000, 0),
+            Some(Input::Wheel { delta: i16::MIN })
+        );
+        assert_eq!(desktop_input(3, 255, 1), None);
+        assert_eq!(desktop_input(1, -1, 1), None);
+    }
+
     #[test]
     fn auto_requires_sustained_headroom_and_reacts_to_delay() {
         let mut q = Adaptive::default();

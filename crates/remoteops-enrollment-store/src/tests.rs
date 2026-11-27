@@ -1106,25 +1106,55 @@ fn device_grants_migrate_persist_and_match_only_the_enrolled_pair() {
         r.installation_id
     });
     drop(first);
-    Connection::open(db.path()).unwrap().execute_batch("DROP TABLE enrollment_device_grants; PRAGMA user_version = 2;").unwrap();
+    Connection::open(db.path())
+        .unwrap()
+        .execute_batch("DROP TABLE enrollment_device_grants; PRAGMA user_version = 2;")
+        .unwrap();
     let store = EnrollmentStore::open(db.path(), owner).unwrap();
     let devices = [Uuid::new_v4(), Uuid::new_v4()];
-    assert!(store.list_device_grants(installs[0]).unwrap().is_empty());
-    assert!(store.set_device_grant(installs[0], devices[0], true).unwrap());
-    assert!(!store.set_device_grant(installs[0], devices[0], true).unwrap());
+    assert_eq!(
+        store.list_device_grants(installs[0]).unwrap(),
+        [] as [uuid::Uuid; 0]
+    );
+    assert!(
+        store
+            .set_device_grant(installs[0], devices[0], true)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .set_device_grant(installs[0], devices[0], true)
+            .unwrap()
+    );
     drop(store);
     let store = EnrollmentStore::open(db.path(), owner).unwrap();
     for (i, installation) in installs.into_iter().enumerate() {
         for (j, device) in devices.into_iter().enumerate() {
-            assert_eq!(store.has_device_grant(installation, device).unwrap(), (i, j) == (0, 0));
+            assert_eq!(
+                store.has_device_grant(installation, device).unwrap(),
+                (i, j) == (0, 0)
+            );
         }
     }
-    assert_eq!(store.list_device_grants(installs[0]).unwrap(), vec![devices[0]]);
-    assert!(store.set_device_grant(installs[0], devices[0], false).unwrap());
+    assert_eq!(
+        store.list_device_grants(installs[0]).unwrap(),
+        vec![devices[0]]
+    );
+    assert!(
+        store
+            .set_device_grant(installs[0], devices[0], false)
+            .unwrap()
+    );
     assert!(!store.has_device_grant(installs[0], devices[0]).unwrap());
-    store.set_device_grant(installs[0], devices[0], true).unwrap();
+    store
+        .set_device_grant(installs[0], devices[0], true)
+        .unwrap();
     store.forget_device_grants(devices[0]).unwrap();
     assert!(!store.has_device_grant(installs[0], devices[0]).unwrap());
     store.revoke_client(installs[1]).unwrap();
-    assert!(store.set_device_grant(installs[1], devices[0], true).is_err());
+    assert!(
+        store
+            .set_device_grant(installs[1], devices[0], true)
+            .is_err()
+    );
 }

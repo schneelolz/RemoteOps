@@ -138,7 +138,7 @@ public static class StyleProbe {
             @{accepted=$true}
         }
         'Command'{
-            if($ControlId -notin @(5001,5002,5010,5011,5012,5020,5021,5022,5030,5031,5032,5033,5034,5040,5041,5042,5043,5044,5045,5046)){throw 'Preview command not allowed'}
+            if($ControlId -notin @(5001,5002,5010,5011,5012,5020,5021,5022,5030,5031,5032,5033,5034,5035,5040,5041,5042,5043,5044,5045,5046)){throw 'Preview command not allowed'}
             $null=[StyleProbe]::PostMessage($main[0],0x111,[IntPtr]$ControlId,[IntPtr]::Zero);@{accepted=$true}
         }
         'OpenMenu'{$button=Control 301;Focus-OwnWindow $button;$null=[StyleProbe]::PostMessage([IntPtr]$button.Current.NativeWindowHandle,0xf5,[IntPtr]::Zero,[IntPtr]::Zero);@{accepted=$true}}

@@ -126,10 +126,17 @@ pub struct Decoder(Handle);
 impl Decoder {
     /// 建立最高 1080p 的解码器。
     pub fn new() -> Result<Self, String> {
-        Ok(Self(Handle::new(
-            unsafe { ro_codec_new(0, MAX_WIDTH, MAX_HEIGHT, 30, 6_000_000) },
-            ro_codec_free,
-        ).map_err(|_| format!("H.264 解码器初始化失败（HRESULT 0x{:08X}）", unsafe { ro_codec_startup_error() }))?))
+        Ok(Self(
+            Handle::new(
+                unsafe { ro_codec_new(0, MAX_WIDTH, MAX_HEIGHT, 30, 6_000_000) },
+                ro_codec_free,
+            )
+            .map_err(|_| {
+                format!("H.264 解码器初始化失败（HRESULT 0x{:08X}）", unsafe {
+                    ro_codec_startup_error()
+                })
+            })?,
+        ))
     }
     /// 返回完成解码的 BGRA 尺寸，或等待更多输入。
     pub fn decode(
@@ -213,30 +220,40 @@ impl Host {
     /// 已配对的人工桌面从观察开始，键鼠模式由有效会话授权决定。
     pub fn open_paired() -> Result<Self, &'static str> {
         let mut host = Self::from_native(unsafe { ro_host_new_paired() })?;
-        if std::env::var_os("REMOTEOPS_CROSSDESK_CAPTURE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        if std::env::var_os("REMOTEOPS_CROSSDESK_CAPTURE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
             host.select_crossdesk_capture()?;
         }
         Ok(host)
     }
     /// 在现场会话内校验并启用随包交付的 CrossDesk 采集组件。
     pub fn select_crossdesk_capture(&mut self) -> Result<(), &'static str> {
-            let expected = option_env!("REMOTEOPS_CROSSDESK_CAPTURE_SHA256")
-                .ok_or("当前构建未包含 CrossDesk 采集组件")?;
-            use sha2::{Digest, Sha256};
-            use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt};
-            let path = std::env::current_exe().map_err(|_| "无法定位 CrossDesk 采集组件")?
-                .with_file_name("remoteops-crossdesk-native.dll");
-            let mut image = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path)
-                .map_err(|_| "定制包缺少 CrossDesk 采集组件")?;
-            let mut hash = Sha256::new();
-            std::io::copy(&mut image, &mut hash).map_err(|_| "无法读取 CrossDesk 采集组件")?;
-            if !expected.eq_ignore_ascii_case(&format!("{:x}",hash.finalize())) {
-                return Err("CrossDesk 采集组件与定制包的构建摘要不匹配");
-            }
-            let wide = path.as_os_str().encode_wide().chain([0]).collect::<Vec<_>>();
-            if unsafe { ro_host_select_crossdesk(self.0.ptr(), wide.as_ptr()) } == 0 {
-                return Err("CrossDesk 无法在当前会话初始化采集");
-            }
+        let expected = option_env!("REMOTEOPS_CROSSDESK_CAPTURE_SHA256")
+            .ok_or("当前构建未包含 CrossDesk 采集组件")?;
+        use sha2::{Digest, Sha256};
+        use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt};
+        let path = std::env::current_exe()
+            .map_err(|_| "无法定位 CrossDesk 采集组件")?
+            .with_file_name("remoteops-crossdesk-native.dll");
+        let mut image = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .map_err(|_| "定制包缺少 CrossDesk 采集组件")?;
+        let mut hash = Sha256::new();
+        std::io::copy(&mut image, &mut hash).map_err(|_| "无法读取 CrossDesk 采集组件")?;
+        if !expected.eq_ignore_ascii_case(&format!("{:x}", hash.finalize())) {
+            return Err("CrossDesk 采集组件与定制包的构建摘要不匹配");
+        }
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect::<Vec<_>>();
+        if unsafe { ro_host_select_crossdesk(self.0.ptr(), wide.as_ptr()) } == 0 {
+            return Err("CrossDesk 无法在当前会话初始化采集");
+        }
         Ok(())
     }
     /// 返回本次共享是否绑定到 Agent 自身的 RDP 会话。
@@ -289,6 +306,46 @@ impl Host {
         unsafe { ro_host_input(self.0.ptr(), kind, a, b) >= 0 }
     }
 }
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+/// 独立的控制端本机窗口。
+pub struct Viewer(Handle);
+impl Viewer {
+    /// 先在新线程初始化 MTA，再创建可能隐式初始化 COM 的 Win32 控件。
+    pub fn with_decoder(title: &str) -> Result<(Self, Decoder), String> {
+        let decoder = Decoder::new()?;
+        let viewer = Self::open(title).map_err(|_| "无法创建 Windows 桌面观看窗口".to_owned())?;
+        Ok((viewer, decoder))
+    }
+    /// 创建绑定目标标题的原生窗口。
+    pub fn open(title: &str) -> Result<Self, &'static str> {
+        Ok(Self(Handle::new(
+            unsafe { ro_view_new(wide(title).as_ptr()) },
+            ro_view_free,
+        )?))
+    }
+    /// 返回窗口操作；窗口关闭时返回错误。
+    pub fn poll(&mut self) -> Result<Option<[i32; 4]>, &'static str> {
+        let (mut k, mut a, mut b, mut c) = (0, 0, 0, 0);
+        match unsafe { ro_view_poll(self.0.ptr(), &mut k, &mut a, &mut b, &mut c) } {
+            0 => Ok(None),
+            1 => Ok(Some([k, a, b, c])),
+            _ => Err("桌面窗口已关闭"),
+        }
+    }
+    /// 刷新解码画面。
+    pub fn present(&mut self, img: &[u8], w: i32, h: i32) {
+        if image_bytes(w, h).is_some_and(|n| n <= img.len()) {
+            unsafe { ro_view_present(self.0.ptr(), img.as_ptr(), w, h) }
+        }
+    }
+    /// 只在远端确认后启用键鼠区域。
+    pub fn status(&mut self, label: &str, control: bool) {
+        unsafe { ro_view_status(self.0.ptr(), wide(label).as_ptr(), i32::from(control)) }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,13 +363,17 @@ mod tests {
             let failure = Host::open_paired().err();
             unsafe { CoUninitialize() };
             assert_eq!(failure, Some("采集线程的 Windows COM 多线程单元初始化失败"));
-        }).join().unwrap();
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
     #[ignore = "需要已解锁的 Windows 交互桌面"]
     fn quit_message_preserves_the_first_stop_reason() {
-        unsafe extern "system" { fn PostQuitMessage(code: i32); }
+        unsafe extern "system" {
+            fn PostQuitMessage(code: i32);
+        }
         std::thread::spawn(|| {
             let mut host = Host::open_paired().expect("打开观察");
             assert_eq!(host.poll(), 2);
@@ -321,7 +382,9 @@ mod tests {
                 assert_eq!(host.poll(), 0);
                 assert_eq!(host.stop_reason(), "采集线程收到 Windows 退出消息 WM_QUIT");
             }
-        }).join().unwrap();
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
@@ -363,8 +426,11 @@ mod tests {
             let mut received = false;
             for _ in 0..50 {
                 let n = encoder.encode(&input, &mut packet).expect("生成测试帧");
-                if n > 0 && decoder.decode(&packet[..n], &mut pixels).expect("切换画质后解码")
-                    == Some((width, height))
+                if n > 0
+                    && decoder
+                        .decode(&packet[..n], &mut pixels)
+                        .expect("切换画质后解码")
+                        == Some((width, height))
                 {
                     received = true;
                     break;
@@ -386,7 +452,7 @@ mod tests {
         let mut samples = Vec::new();
         for index in 0..65 {
             let level = if index % 20 < 10 { 40 } else { 190 };
-            for p in input.chunks_exact_mut(4) {
+            for p in input.as_chunks_mut::<4>().0 {
                 p.copy_from_slice(&[level, level, level, 255]);
             }
             let n = encoder.encode(&input, &mut packet).expect("合成帧编码");
@@ -406,45 +472,5 @@ mod tests {
             samples.iter().any(|&n| n < 80) && samples.iter().any(|&n| n > 130),
             "亮度变化未到达解码端"
         );
-    }
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
-/// 独立的控制端本机窗口。
-pub struct Viewer(Handle);
-impl Viewer {
-    /// 先在新线程初始化 MTA，再创建可能隐式初始化 COM 的 Win32 控件。
-    pub fn with_decoder(title: &str) -> Result<(Self, Decoder), String> {
-        let decoder = Decoder::new()?;
-        let viewer = Self::open(title).map_err(|_| "无法创建 Windows 桌面观看窗口".to_owned())?;
-        Ok((viewer, decoder))
-    }
-    /// 创建绑定目标标题的原生窗口。
-    pub fn open(title: &str) -> Result<Self, &'static str> {
-        Ok(Self(Handle::new(
-            unsafe { ro_view_new(wide(title).as_ptr()) },
-            ro_view_free,
-        )?))
-    }
-    /// 返回窗口操作；窗口关闭时返回错误。
-    pub fn poll(&mut self) -> Result<Option<[i32; 4]>, &'static str> {
-        let (mut k, mut a, mut b, mut c) = (0, 0, 0, 0);
-        match unsafe { ro_view_poll(self.0.ptr(), &mut k, &mut a, &mut b, &mut c) } {
-            0 => Ok(None),
-            1 => Ok(Some([k, a, b, c])),
-            _ => Err("桌面窗口已关闭"),
-        }
-    }
-    /// 刷新解码画面。
-    pub fn present(&mut self, img: &[u8], w: i32, h: i32) {
-        if image_bytes(w, h).is_some_and(|n| n <= img.len()) {
-            unsafe { ro_view_present(self.0.ptr(), img.as_ptr(), w, h) }
-        }
-    }
-    /// 只在远端确认后启用键鼠区域。
-    pub fn status(&mut self, label: &str, control: bool) {
-        unsafe { ro_view_status(self.0.ptr(), wide(label).as_ptr(), i32::from(control)) }
     }
 }

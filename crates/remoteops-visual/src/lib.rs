@@ -151,20 +151,29 @@ async fn run_desktop_command(
     command.env_remove("REMOTEOPS_VALIDATED_GFX_DLL");
     // 保持只读映像锁直到受监管的子进程结束，避免校验后被替换。
     let _image = if let Some(expected) = option_env!("REMOTEOPS_CROSSDESK_CAPTURE_SHA256") {
-        use std::os::windows::fs::OpenOptionsExt;
         use sha2::{Digest, Sha256};
-        let path = std::env::current_exe().map_err(|e| VisualProviderError::Protocol(e.to_string()))?
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = std::env::current_exe()
+            .map_err(|e| VisualProviderError::Protocol(e.to_string()))?
             .with_file_name("remoteops-crossdesk-native.dll");
-        let mut image = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path)
+        let mut image = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
             .map_err(|_| VisualProviderError::Protocol("定制包缺少 CrossDesk 现场组件".into()))?;
         let mut hasher = Sha256::new();
-        std::io::copy(&mut image, &mut hasher).map_err(|e| VisualProviderError::Protocol(e.to_string()))?;
-        if !expected.eq_ignore_ascii_case(&format!("{:x}",hasher.finalize())) {
-            return Err(VisualProviderError::Rejected("CrossDesk 现场组件摘要不一致".into()));
+        std::io::copy(&mut image, &mut hasher)
+            .map_err(|e| VisualProviderError::Protocol(e.to_string()))?;
+        if !expected.eq_ignore_ascii_case(&format!("{:x}", hasher.finalize())) {
+            return Err(VisualProviderError::Rejected(
+                "CrossDesk 现场组件摘要不一致".into(),
+            ));
         }
         command.env("REMOTEOPS_VALIDATED_GFX_DLL", path);
         Some(image)
-    } else { None };
+    } else {
+        None
+    };
     if let Ok(result) =
         tokio::time::timeout(std::time::Duration::from_secs(30), command.output()).await
     {
@@ -1019,7 +1028,14 @@ if ($env:REMOTEOPS_VALIDATED_GFX_DLL -and $ui -and $env:REMOTEOPS_INCLUDE_UI_TRE
             .unwrap_or(remoteops_domain::VisualSessionState::NoInteractiveDesktop);
         let mut ui_tree = value.get("ui_tree").cloned().filter(|v| !v.is_null());
         if let Some(tree) = ui_tree.as_mut().and_then(serde_json::Value::as_object_mut) {
-            tree.insert("provider".into(), serde_json::json!(if tree.contains_key("crossdesk") {"crossdesk-uia"} else {"windows-native-uia"}));
+            tree.insert(
+                "provider".into(),
+                serde_json::json!(if tree.contains_key("crossdesk") {
+                    "crossdesk-uia"
+                } else {
+                    "windows-native-uia"
+                }),
+            );
             if let Some(snapshot) = upstream_snapshot {
                 tree.insert(
                     "upstream".into(),

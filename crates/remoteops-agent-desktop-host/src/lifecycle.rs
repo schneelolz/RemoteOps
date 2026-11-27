@@ -10,6 +10,10 @@ pub enum LifecycleKind {
     Connected,
     /// 控制端退出或连接中断。
     Disconnected,
+    /// 人工运维接入。
+    HumanConnected,
+    /// 人工运维断开。
+    HumanDisconnected,
     /// 真实任务开始执行。
     Running,
     /// 任务成功结束。
@@ -23,6 +27,8 @@ pub enum LifecycleKind {
 pub struct LifecycleEvent {
     /// 本进程内单调序号，用于一次轮询接收多条事件。
     pub sequence: u64,
+    /// 宿主收到该事件时记录的本地时间，重绘和滚动时不变。
+    pub local_time: String,
     /// 已确认的事件类型。
     pub kind: LifecycleKind,
     /// 已确认的操作分类；连接事件为空。
@@ -35,10 +41,14 @@ impl LifecycleEvent {
     pub fn text(&self, language: NativeLanguage) -> String {
         let english = language == NativeLanguage::English;
         let text = match (self.kind, english) {
-            (LifecycleKind::Connected, false) => "AI工程师已连接",
+            (LifecycleKind::Connected, false) => "AI 工程师已连接",
             (LifecycleKind::Connected, true) => "AI engineer connected",
-            (LifecycleKind::Disconnected, false) => "AI工程师已退出",
+            (LifecycleKind::Disconnected, false) => "AI 工程师已退出",
             (LifecycleKind::Disconnected, true) => "AI engineer disconnected",
+            (LifecycleKind::HumanConnected, false) => "人工运维已连接",
+            (LifecycleKind::HumanConnected, true) => "Operator connected",
+            (LifecycleKind::HumanDisconnected, false) => "人工运维已断开",
+            (LifecycleKind::HumanDisconnected, true) => "Operator disconnected",
             (LifecycleKind::Running, false) => "正在执行操作",
             (LifecycleKind::Running, true) => "Executing operation",
             (LifecycleKind::Succeeded, false) => "操作执行成功",
@@ -157,6 +167,7 @@ mod tests {
     fn event(sequence: u64) -> LifecycleEvent {
         LifecycleEvent {
             sequence,
+            local_time: "12:00:00".into(),
             kind: LifecycleKind::Running,
             category: Some(ObservationCategory::Ssh),
         }

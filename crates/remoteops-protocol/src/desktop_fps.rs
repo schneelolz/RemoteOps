@@ -1,4 +1,4 @@
-//! 把采集帧率写入 H.264 的 user_data_unregistered SEI；旧解码器可跳过该消息。
+//! 把采集帧率写入 H.264 的 `user_data_unregistered` SEI；旧解码器可跳过该消息。
 const PREFIX: &[u8] = b"\x06\x05\x13RemoteOps-FPS-v1";
 
 // 只查看第一个切片之前的 NAL，不扫描压缩像素数据。
@@ -50,6 +50,7 @@ pub fn stamp(packet: &mut Vec<u8>, fps: u8) {
 }
 
 /// 读取已知统计；缺失、截断或来自其他编码器的消息不影响视频。
+#[must_use]
 pub fn capture_fps(packet: &[u8]) -> Option<u8> {
     headers(packet).find_map(|(_, n)| {
         let data = packet[n..].strip_prefix(PREFIX)?;

@@ -25,6 +25,7 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 pub type Socket = TlsStream<TcpStream>;
 
 /// 返回单次开窗的短诊断编号，供双方关联日志。
+#[must_use]
 pub fn diagnostic_id(stream: remoteops_domain::RequestId) -> String {
     format!("{:08x}", stream.as_uuid().as_fields().0)
 }
@@ -36,10 +37,17 @@ pub struct Identity {
 }
 impl Identity {
     /// 在同一流的两种握手方向复用已通过控制链核对的身份。
+    #[must_use]
     pub fn for_reverse(&self) -> Self {
-        Self { cert: self.cert.clone(), key: self.key.clone_key() }
+        Self {
+            cert: self.cert.clone(),
+            key: self.key.clone_key(),
+        }
     }
     /// 生成新密钥。
+    ///
+    /// # Errors
+    /// 生成自签名证书或密钥失败时返回错误。
     pub fn new() -> io::Result<Self> {
         let signed =
             rcgen::generate_simple_self_signed(vec![NAME.into()]).map_err(io::Error::other)?;
@@ -49,6 +57,7 @@ impl Identity {
         })
     }
     /// 返回经控制链交换的公有证书。
+    #[must_use]
     pub fn certificate(&self) -> Vec<u8> {
         self.cert.as_ref().to_vec()
     }
@@ -80,6 +89,7 @@ fn interfaces() -> Vec<(Ipv4Addr, Ipv4Addr)> {
         .collect()
 }
 /// 当前可尝试直连的本机私网 IPv4 地址。
+#[must_use]
 pub fn addresses() -> Vec<Ipv4Addr> {
     interfaces().into_iter().map(|(ip, _)| ip).collect()
 }
@@ -87,6 +97,9 @@ fn same_subnet(local: Ipv4Addr, mask: Ipv4Addr, peer: Ipv4Addr) -> bool {
     peer.is_private() && (u32::from(local) ^ u32::from(peer)) & u32::from(mask) == 0
 }
 /// 仅绑定与已配对控制端候选地址同网段的一张本地网卡。
+///
+/// # Errors
+/// 找不到匹配的私网接口或监听端口绑定失败时返回错误。
 pub async fn listen(peers: &[Ipv4Addr]) -> io::Result<(TcpListener, Ipv4Addr)> {
     let (ip, peer) = interfaces()
         .into_iter()
@@ -100,6 +113,9 @@ pub async fn listen(peers: &[Ipv4Addr]) -> io::Result<(TcpListener, Ipv4Addr)> {
     Ok((TcpListener::bind((ip, 0)).await?, peer))
 }
 /// 核验来源地址与面板一次性客户端证书，只接受一个连接。
+///
+/// # Errors
+/// 证书无效、握手失败或未能在期限内验证对端时返回错误。
 pub async fn accept(
     listener: TcpListener,
     peer: Ipv4Addr,
@@ -110,6 +126,9 @@ pub async fn accept(
 }
 
 /// 对预期来源的首次 TCP 接入报告一次，认证失败仍可在原期限内重试。
+///
+/// # Errors
+/// 与 `accept` 使用相同的证书、地址和超时检查。
 pub async fn accept_observed(
     listener: TcpListener,
     peer: Ipv4Addr,
@@ -121,9 +140,16 @@ pub async fn accept_observed(
 }
 
 /// 在协商约定的期限内接入指定私网对端。
+///
+/// # Errors
+/// 监听或证书配置失败，或在给定期限内没有通过双向验证的连接时返回错误。
 pub async fn accept_with_deadline(
-    listener: TcpListener, peer: Ipv4Addr, id: Identity, cert: Vec<u8>,
-    wait: Duration, connected: impl FnOnce(SocketAddr),
+    listener: TcpListener,
+    peer: Ipv4Addr,
+    id: Identity,
+    cert: Vec<u8>,
+    wait: Duration,
+    connected: impl FnOnce(SocketAddr),
 ) -> io::Result<Socket> {
     let expected = cert.clone();
     let verifier = WebPkiClientVerifier::builder(Arc::new(roots(cert)?))
@@ -212,11 +238,17 @@ fn tcp_failure(kind: io::ErrorKind) -> io::Error {
 }
 
 /// 绑定共同网段的出站网卡，验证 Agent 临时证书并完成双向认证。
+///
+/// # Errors
+/// 地址不在可达的本机私网、TCP 连接失败或双向 TLS 认证失败时返回错误。
 pub async fn connect(address: SocketAddrV4, id: Identity, cert: Vec<u8>) -> io::Result<Socket> {
     connect_observed(address, id, cert, |_| {}).await
 }
 
 /// 在 TCP 连接建立后、验证服务端证书之前报告实际本地端点。
+///
+/// # Errors
+/// 地址、网卡绑定、TCP 连接、超时或证书校验失败时返回相应的 I/O 错误。
 pub async fn connect_observed(
     address: SocketAddrV4,
     id: Identity,
@@ -251,7 +283,7 @@ pub async fn connect_observed(
     let connector = TlsConnector::from(Arc::new(cfg));
     let mut socket = timeout_at(
         deadline,
-        connector.connect(ServerName::try_from(NAME).unwrap(), tcp),
+        connector.connect(ServerName::try_from(NAME).map_err(io::Error::other)?, tcp),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS 握手超时"))?
@@ -279,6 +311,9 @@ pub async fn connect_observed(
 }
 
 /// 直连下行零长度包是保活，其他包沿用原 H.264 访问单元。
+///
+/// # Errors
+/// 读取长度或帧失败、或者对端声明的长度超过帧上限时返回错误。
 pub async fn read_picture(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<Vec<u8>>> {
     let size = r.read_u32().await? as usize;
     if size == 0 {
@@ -293,6 +328,9 @@ pub async fn read_picture(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Option
 }
 
 /// 直连键鼠只传输原有租约代次和有界输入事件。
+///
+/// # Errors
+/// 序列化失败、消息超过单字节长度上限或写入失败时返回错误。
 pub async fn write_input(
     w: &mut (impl AsyncWrite + Unpin),
     epoch: u64,
@@ -305,6 +343,9 @@ pub async fn write_input(
     w.flush().await
 }
 /// 读取单个输入事件，输入通道不能传输开窗、授权或续租命令。
+///
+/// # Errors
+/// 输入流提前结束或消息不能解析为键鼠事件时返回错误。
 pub async fn read_input(r: &mut (impl AsyncRead + Unpin)) -> io::Result<(u64, Input)> {
     let size = usize::from(r.read_u8().await?);
     let mut buf = [0u8; 255];

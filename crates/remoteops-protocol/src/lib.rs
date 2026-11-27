@@ -7,9 +7,9 @@ pub use control::{
     SessionControlState,
 };
 mod credential;
+pub mod desktop;
 mod message;
 pub mod release;
-pub mod desktop;
 pub mod tcp_forward;
 mod tls;
 

@@ -1,11 +1,15 @@
 //! 桌面心跳和媒体独立于命令工具的执行时间。
-use super::{Events,Video};
-use anyhow::{Result,anyhow,bail,Context};
+use super::{Events, Video};
+use anyhow::{Context, Result, anyhow, bail};
 use remoteops_application::RelayClient;
-use remoteops_domain::{RequestId,SessionId};
-use remoteops_protocol::desktop::{Action,DesktopEvent,Input,LEASE,Quality,read_video};
-use serde_json::{Value,json};
-use tokio::{sync::mpsc,task::JoinHandle,time::{Duration,Instant,interval,timeout}};
+use remoteops_domain::{RequestId, SessionId};
+use remoteops_protocol::desktop::{Action, DesktopEvent, Input, LEASE, Quality, read_video};
+use serde_json::{Value, json};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{Duration, Instant, interval, timeout},
+};
 
 #[path = "desktop_direct.rs"]
 mod direct;
@@ -33,47 +37,76 @@ impl PictureMode {
             // 与自动档共用像素和带宽上限，减低帧率，给静态文字留更多编码预算。
             Self::High => (Quality::High, 15, 6_000_000),
         };
-        Action::Settings {quality, fps, bitrate}
+        Action::Settings {
+            quality,
+            fps,
+            bitrate,
+        }
     }
 }
 
 pub(super) struct Desktop {
-    pub session:SessionId,
-    pub view:u64,
-    stop:tokio::sync::oneshot::Sender<()>,
-    pub commands:mpsc::Sender<Value>,
-    pub picture:tokio::sync::watch::Sender<PictureMode>,
-    work:JoinHandle<()>,
+    pub session: SessionId,
+    pub view: u64,
+    stop: tokio::sync::oneshot::Sender<()>,
+    pub commands: mpsc::Sender<Value>,
+    pub picture: tokio::sync::watch::Sender<PictureMode>,
+    work: JoinHandle<()>,
 }
 impl Desktop {
-    pub fn finished(&self)->bool { self.work.is_finished() }
+    pub fn finished(&self) -> bool {
+        self.work.is_finished()
+    }
     pub async fn end(self) {
-        let _=self.stop.send(());
+        let _ = self.stop.send(());
         drop(self.commands);
-        let _=self.work.await;
+        let _ = self.work.await;
     }
 
-    pub fn start(client:RelayClient,session:SessionId,view:u64,initial_picture:PictureMode,backend:&str,out:Events,video:Video,mut release:tokio::sync::watch::Receiver<Option<(SessionId,u64)>>)->Self {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "会话身份、媒体数据与释放信号属于不同通道"
+    )]
+    pub fn start(
+        client: RelayClient,
+        session: SessionId,
+        view: u64,
+        initial_picture: PictureMode,
+        backend: &str,
+        out: Events,
+        video: Video,
+        mut release: tokio::sync::watch::Receiver<Option<(SessionId, u64)>>,
+    ) -> Self {
         let mut routes = RoutePlan::new(backend);
+        #[cfg(windows)]
         let request_rtc = routes.upgrade == Some(RtcBackend::MiniRtc);
+        #[cfg(windows)]
         let request_crossdesk = routes.upgrade == Some(RtcBackend::CrossDesk);
-        let (commands,rx)=mpsc::channel::<Value>(128);
-        let (picture,mut picture_rx)=tokio::sync::watch::channel(initial_picture);
-        let (stop,mut stopped)=tokio::sync::oneshot::channel();
-        let work=tokio::spawn(async move {
-            let stream=RequestId::new();
-            let event=|action| DesktopEvent{session,stream,action};
-            let mut events=client.desktop_events();
-            let status=|state:&str,text:&str,epoch:u64| -> Result<()> {
+        let (commands, rx) = mpsc::channel::<Value>(128);
+        let (picture, mut picture_rx) = tokio::sync::watch::channel(initial_picture);
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let work = tokio::spawn(async move {
+            let stream = RequestId::new();
+            let event = |action| DesktopEvent {
+                session,
+                stream,
+                action,
+            };
+            let mut events = client.desktop_events();
+            let status = |state: &str, text: &str, epoch: u64| -> Result<()> {
                 out.try_send(json!({"kind":"desktop","session":session,"view":view,"state":state,"epoch":epoch,"text":text}))
                     .map_err(|_| anyhow!("控制端状态队列不可用"))
             };
-            let send=|action| {let msg=event(action); let client=&client; async move {
-                timeout(Duration::from_secs(1),client.desktop_command(msg)).await??;
-                Ok::<(),anyhow::Error>(())
-            }};
-            let mut media:Option<JoinHandle<Result<()>>>=None;
-            let mut opened=false;
+            let send = |action| {
+                let msg = event(action);
+                let client = &client;
+                async move {
+                    timeout(Duration::from_secs(1), client.desktop_command(msg)).await??;
+                    Ok::<(), anyhow::Error>(())
+                }
+            };
+            let mut media: Option<JoinHandle<Result<()>>> = None;
+            let mut opened = false;
             let result=async {
                 if !client.supports_desktop(){bail!("当前连接不支持实时桌面")}
                 let mut rx=rx;
@@ -94,9 +127,13 @@ impl Desktop {
                 let mut rtc_tick=interval(Duration::from_millis(4));
                 rtc_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut rtc_deadline=None::<Instant>;
+                #[cfg(windows)]
                 let mut rtc_receiving=false;
+                #[cfg(not(windows))]
+                let rtc_receiving=false;
                 #[cfg(windows)]
                 let mut crossdesk_route=None::<bool>;
+                #[cfg(windows)]
                 let stop_rtc=|| if request_crossdesk {Action::CrossDeskStop} else {Action::RtcStop};
                 let mut identity=None;
                 let mut listeners=std::collections::BTreeMap::new();
@@ -299,7 +336,7 @@ impl Desktop {
                                         });
                                     }
                                 }
-                                Action::Geometry{epoch:next,lan,clipboard:advertised,mini_rtc,crossdesk,..}=>{
+                                Action::Geometry{epoch:next,lan,clipboard:advertised,#[cfg(windows)] mini_rtc,#[cfg(windows)] crossdesk,..}=>{
                                     clip_supported=advertised && cfg!(windows);
                                     let _=out.try_send(json!({"kind":"clipboard_support","session":session,"view":view,"available":clip_supported}));
                                     if !geometry_ready {
@@ -412,15 +449,33 @@ impl Desktop {
                 };
                 Ok::<_,anyhow::Error>(reason)
             }.await;
-            if let Some(task)=media {task.abort(); let _=task.await;}
-            if let Ok(mut v)=video.lock(){v.reset(None,0);}
-            if opened {let _=send(Action::Closed).await;}
+            if let Some(task) = media {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Ok(mut v) = video.lock() {
+                v.reset(None, 0);
+            }
+            if opened {
+                let _ = send(Action::Closed).await;
+            }
             match result {
-                Ok(reason)=>{let _=status("ended",reason,0);}
-                Err(e)=>{let _=status("error",&format!("{e:#}"),0);}
+                Ok(reason) => {
+                    let _ = status("ended", reason, 0);
+                }
+                Err(e) => {
+                    let _ = status("error", &format!("{e:#}"), 0);
+                }
             }
         });
-        Self{session,view,commands,picture,stop,work}
+        Self {
+            session,
+            view,
+            commands,
+            picture,
+            stop,
+            work,
+        }
     }
 }
 
@@ -437,8 +492,10 @@ mod picture_tests {
             ("high", Quality::High, 15, 6_000_000),
         ] {
             let mode: PictureMode = serde_json::from_value(json!(name)).unwrap();
-            assert!(matches!(mode.settings(), Action::Settings {quality:q, fps:f, bitrate:b}
-                if (q,f,b)==(quality,fps,bitrate)));
+            assert!(
+                matches!(mode.settings(), Action::Settings {quality:q, fps:f, bitrate:b}
+                if (q,f,b)==(quality,fps,bitrate))
+            );
         }
     }
 }

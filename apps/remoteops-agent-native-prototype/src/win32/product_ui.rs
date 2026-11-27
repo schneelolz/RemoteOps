@@ -1205,11 +1205,7 @@ fn update(app: &App, snapshot: &ProductSnapshot) {
     write(app, ERROR, error);
     match page {
         Page::Main => {
-            write(
-                app,
-                CODE,
-                snapshot.code.as_deref().unwrap_or("··· ··· ···"),
-            );
+            write(app, CODE, snapshot.code.as_deref().unwrap_or("··· ··· ···"));
             write(app, EXPIRY, &snapshot.countdown);
             enabled(app, COPY, snapshot.can_copy);
             let copied = app

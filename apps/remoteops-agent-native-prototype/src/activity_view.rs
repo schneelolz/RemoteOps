@@ -116,10 +116,7 @@ impl ActivityView {
             .iter()
             .rev()
             .take(5)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|event| event.text(language))
+            .map(|event| format!("{}  {}", event.local_time, event.text(language)))
             .collect::<Vec<_>>()
             .join("\r\n")
     }
@@ -133,6 +130,7 @@ impl ActivityView {
     }
 
     /// 绘制区固定五行；只滚动生命周期短文案，绝不直接绘制远端输出。
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     pub(crate) fn draw(
         &self,
         hdc: HDC,
@@ -142,6 +140,7 @@ impl ActivityView {
         language: NativeLanguage,
         dark: bool,
     ) {
+        let scale = |v: i32| ((i64::from(v) * i64::from(dpi) + 48) / 96) as i32;
         let line = ((rect.bottom - rect.top) / 5).max(1);
         let saved = unsafe { SaveDC(hdc) };
         if saved == 0 {
@@ -153,11 +152,44 @@ impl ActivityView {
             SetBkMode(hdc, TRANSPARENT.cast_signed());
         }
         let rows = self.ticker.rows();
+        if rows.is_empty() {
+            let empty = if language == NativeLanguage::English {
+                "Waiting for activity"
+            } else {
+                "等待操作"
+            };
+            let text: Vec<u16> = empty.encode_utf16().chain(Some(0)).collect();
+            let mut empty_rect = RECT {
+                bottom: rect.top + line,
+                ..rect
+            };
+            unsafe {
+                SetTextColor(
+                    hdc,
+                    if dark {
+                        rgb(160, 173, 191)
+                    } else {
+                        rgb(82, 96, 117)
+                    },
+                );
+                DrawTextW(
+                    hdc,
+                    text.as_ptr(),
+                    -1,
+                    &raw mut empty_rect,
+                    DT_SINGLELINE | DT_NOPREFIX | windows_sys::Win32::Graphics::Gdi::DT_VCENTER,
+                );
+                RestoreDC(hdc, saved);
+            }
+            self.overflow.set(false);
+            return;
+        }
         let progress = if self.motion && !self.paused {
             self.ticker.progress(self.clock)
         } else {
             1.0
         };
+        let text_indent = scale(78);
 
         let mut overflow = false;
         for (index, event) in rows.iter().enumerate() {
@@ -178,7 +210,8 @@ impl ActivityView {
                     &raw mut size,
                 );
             }
-            let excess = (size.cx - (rect.right - rect.left)).max(0);
+            let available_w = (rect.right - rect.left - text_indent).max(1);
+            let excess = (size.cx - available_w).max(0);
             overflow |= excess > 0;
             let offset = if self.motion && !self.paused {
                 marquee_offset(
@@ -190,31 +223,68 @@ impl ActivityView {
                 0.0
             };
             #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-            let mut row = RECT {
-                left: rect.left - offset as i32,
-                top: rect.top
-                    + ((index as f64
-                        + if rows.len() > 5 {
-                            -progress
-                        } else if index + 1 == rows.len() {
-                            1.0 - progress
-                        } else {
-                            0.0
-                        })
-                        * f64::from(line)) as i32,
-                right: rect.right + excess,
-                bottom: rect.bottom + line,
+            let row_top = rect.top
+                + ((rows.len() as f64 - 1.0 - index as f64 - (1.0 - progress)) * f64::from(line))
+                    as i32;
+            let time: Vec<u16> = event.local_time.encode_utf16().chain(Some(0)).collect();
+            let mut stamp = RECT {
+                left: rect.left,
+                top: row_top,
+                right: rect.left + text_indent,
+                bottom: row_top + line,
             };
-            row.bottom = row.top + line;
+            let row_color = if matches!(event.kind, LifecycleKind::Failed) {
+                event_color(event.kind, dark)
+            } else if dark {
+                rgb(219, 227, 236)
+            } else {
+                rgb(36, 48, 65)
+            };
             unsafe {
-                SetTextColor(hdc, event_color(event.kind, dark));
+                SetTextColor(
+                    hdc,
+                    if dark {
+                        rgb(160, 173, 191)
+                    } else {
+                        rgb(82, 96, 117)
+                    },
+                );
+                DrawTextW(
+                    hdc,
+                    time.as_ptr(),
+                    -1,
+                    &raw mut stamp,
+                    DT_SINGLELINE | DT_NOPREFIX | windows_sys::Win32::Graphics::Gdi::DT_VCENTER,
+                );
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let mut row = RECT {
+                left: rect.left + text_indent - offset as i32,
+                top: row_top,
+                right: rect.right + excess,
+                bottom: row_top + line,
+            };
+            unsafe {
+                let clipped = SaveDC(hdc);
+                if clipped == 0 {
+                    continue;
+                }
+                IntersectClipRect(
+                    hdc,
+                    rect.left + text_indent,
+                    rect.top,
+                    rect.right,
+                    rect.bottom,
+                );
+                SetTextColor(hdc, row_color);
                 DrawTextW(
                     hdc,
                     text.as_ptr(),
                     -1,
                     &raw mut row,
-                    DT_SINGLELINE | DT_NOPREFIX,
+                    DT_SINGLELINE | DT_NOPREFIX | windows_sys::Win32::Graphics::Gdi::DT_VCENTER,
                 );
+                RestoreDC(hdc, clipped);
             }
         }
         self.overflow.set(overflow);
@@ -234,12 +304,24 @@ pub(crate) fn animations_enabled() -> bool {
 
 pub(crate) const fn event_color(kind: LifecycleKind, dark: bool) -> u32 {
     match (kind, dark) {
-        (LifecycleKind::Connected | LifecycleKind::Succeeded, false) => rgb(18, 116, 54),
-        (LifecycleKind::Connected | LifecycleKind::Succeeded, true) => rgb(90, 214, 140),
-        (LifecycleKind::Disconnected | LifecycleKind::Failed, false) => rgb(176, 34, 52),
-        (LifecycleKind::Disconnected | LifecycleKind::Failed, true) => rgb(255, 130, 143),
-        (LifecycleKind::Running, false) => rgb(22, 88, 183),
-        (LifecycleKind::Running, true) => rgb(112, 176, 255),
+        (
+            LifecycleKind::Connected | LifecycleKind::HumanConnected | LifecycleKind::Succeeded,
+            false,
+        ) => rgb(21, 128, 61),
+        (
+            LifecycleKind::Connected | LifecycleKind::HumanConnected | LifecycleKind::Succeeded,
+            true,
+        ) => rgb(74, 222, 128),
+        (
+            LifecycleKind::Disconnected | LifecycleKind::HumanDisconnected | LifecycleKind::Failed,
+            false,
+        ) => rgb(200, 30, 58),
+        (
+            LifecycleKind::Disconnected | LifecycleKind::HumanDisconnected | LifecycleKind::Failed,
+            true,
+        ) => rgb(251, 113, 133),
+        (LifecycleKind::Running, false) => rgb(29, 78, 216),
+        (LifecycleKind::Running, true) => rgb(125, 180, 255),
     }
 }
 

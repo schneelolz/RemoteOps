@@ -12,7 +12,6 @@
 
 [![CI](https://github.com/schneelolz/RemoteOps/actions/workflows/ci.yml/badge.svg)](https://github.com/schneelolz/RemoteOps/actions/workflows/ci.yml)
 [![Security](https://github.com/schneelolz/RemoteOps/actions/workflows/security.yml/badge.svg)](https://github.com/schneelolz/RemoteOps/actions/workflows/security.yml)
-[![Agent candidate](https://img.shields.io/badge/Agent_candidate-0.2.0--preview.7-2563eb)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-f97316)](LICENSE)
 
 </div>
@@ -55,7 +54,7 @@ RemoteOps 的价值不只是远程执行命令，而是把连接、分析、传�
 - 通过本地 STDIO MCP 接入 Codex 等 AI 客户端，也可使用 CLI 或 GUI。
 - 通过会话绑定（Session）、所有者隔离（Owner）、权限模式、人工审批、TLS 信任验证和脱敏审计约束远程操作。
 
-当前不包含屏幕采集、鼠标键盘控制、RDP/VNC、任意端口转发、SOCKS、网段扫描、共享公共 Relay 或 macOS 被控端、Linux 桌面控制。
+Windows 人工运维端配对后默认以观察模式打开实时桌面，切换到控制模式后可以使用键鼠。画面可走局域网直连或中继，Linux Headless Agent 提供命令行运维。
 
 ## 当前支持范围
 
@@ -67,7 +66,7 @@ RemoteOps 的价值不只是远程执行命令，而是把连接、分析、传�
 | Controller/MCP | Windows x64、Apple Silicon macOS | Mac 本机 MCP 安装及 Linux 连接已验证；Windows 由原生 CI 验证 |
 | 设备能力 | Windows、Linux、SSH、串口 | 本地回归与 Linux PTY 串口测试通过；真实硬件路径仍需复测 |
 
-Agent CLI / Service 为 `0.2.0-preview.7`，Agent GUI 为 `0.2.0-preview.9`，SSH askpass 为 `0.2.0-preview.6`；Relay 与 MCP 仍为 `0.2.0-preview.5`，共用 `v14` 协议。尚未创建公开 GitHub Release。它面向开发者和受控试点，不建议直接用于关键生产环境。发布状态和验收要求见 [项目状态](docs/PROJECT_STATUS.md)。
+各组件独立版本以对应的 Cargo.toml 为准。可在仓库根目录运行 `cargo metadata --no-deps --format-version 1` 查看当前检出的版本。历史验收记录见[项目状态](docs/PROJECT_STATUS.md)。
 
 ## 快速开始
 
@@ -113,7 +112,7 @@ sudo ./status-remoteops-agent.sh --pairing
 
 ### 3. 安装本机 MCP
 
-Windows 和 Apple Silicon macOS 的安装器、Token 保存方式和卸载步骤见：[RemoteOps MCP 使用手册](docs/RemoteOpsMCP使用手册.md)、[macOS MCP 接入说明](docs/macOSMCP接入说明.md)。安装后重新启动 Codex，并确认 `/mcp` 中的 `remoteops` 已连接。
+使用管理员签发的一次性设置码或设置文件登记本机 MCP。安装后重启 Codex，并在 `/mcp` 中确认连接。详见[一次性安装配置](docs/mcp-one-time-setup.md)和[在 Mac 上构建 MCP 与 RemoteOpsBridge](docs/macOSMCP接入说明.md)。
 
 ### 4. 验证连接与只读操作
 

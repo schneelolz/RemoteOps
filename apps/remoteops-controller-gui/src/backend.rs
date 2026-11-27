@@ -58,7 +58,10 @@ const AI_HISTORY_MAX_ASSISTANT_CHARS: usize = 12_000;
 pub enum BackendCommand {
     /// 打开已配对现场 Agent 的独立人工桌面。
     #[cfg(windows)]
-    OpenDesktop { session_id: SessionId, title: String },
+    OpenDesktop {
+        session_id: SessionId,
+        title: String,
+    },
     /// 使用临时配对码绑定一个现场 Agent。
     Pair {
         /// 九位配对码。
@@ -2045,7 +2048,10 @@ async fn handle_live_command(
             let client = client.clone();
             tokio::spawn(async move {
                 let error = crate::desktop::open(client, session_id, title).await.err();
-                let _ = gui.send(BackendEvent::DesktopEnded(session_id, error.map(|e| format!("{e:#}"))));
+                let _ = gui.send(BackendEvent::DesktopEnded(
+                    session_id,
+                    error.map(|e| format!("{e:#}")),
+                ));
             });
         }
         BackendCommand::Takeover { session_id } => {
@@ -2132,7 +2138,10 @@ async fn send_connections(client: &RelayClient, event_tx: &Sender<BackendEvent>)
     let mut targets = client.list_connections().await;
     if !client.supports_desktop() {
         for target in &mut targets {
-            target.environment.tools.retain(|t|t.name!="remoteops-desktop-v1");
+            target
+                .environment
+                .tools
+                .retain(|t| t.name != "remoteops-desktop-v1");
         }
     }
     let _ = event_tx.send(BackendEvent::Connections(targets));

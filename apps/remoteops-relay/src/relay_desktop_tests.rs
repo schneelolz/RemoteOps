@@ -9,6 +9,7 @@ async fn crossdesk_native_media_and_handoff() {
     verify_paired_desktop(true).await;
 }
 
+#[allow(clippy::too_many_lines, reason = "按顺序验证同一会话的完整生命周期")]
 async fn verify_paired_desktop(native: bool) {
     use remoteops_protocol::desktop::{Action, DesktopEvent, Input, read_video, write_video};
     let turn_config = std::env::temp_dir().join(format!("remoteops-turn-test-{}.json", uuid::Uuid::new_v4()));

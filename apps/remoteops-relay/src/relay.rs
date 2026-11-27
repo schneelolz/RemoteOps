@@ -1,15 +1,15 @@
 #[path = "relay_control.rs"]
 mod control;
-#[path = "relay_portal.rs"]
-mod portal_access;
 #[path = "relay_desktop.rs"]
 mod desktop;
-#[path = "relay_visual_context.rs"]
-mod visual_context;
+#[path = "relay_portal.rs"]
+mod portal_access;
 #[path = "relay_tcp_forward.rs"]
 mod tcp;
 #[path = "relay_tools.rs"]
 mod tools;
+#[path = "relay_visual_context.rs"]
+mod visual_context;
 use control::{broadcast_control_state, refresh_control_state};
 use remoteops_protocol::{
     ControlBasis, ControlSource, ControlStateRequest, ControlStateResult, SessionControlState,
@@ -222,7 +222,9 @@ enum VisualHandoff {
 }
 
 impl SessionBindings {
-    fn taken_over(&self) -> bool { self.human_takeover || self.desktop_takeover }
+    fn taken_over(&self) -> bool {
+        self.human_takeover || self.desktop_takeover
+    }
 
     fn permission_mode(&self) -> PermissionMode {
         self.active_controller_kind()
@@ -488,7 +490,10 @@ impl Relay {
         self
     }
 
-    pub(crate) fn with_release_catalog(mut self, catalog: Option<remoteops_protocol::release::ReleaseCatalog>) -> Self {
+    pub(crate) fn with_release_catalog(
+        mut self,
+        catalog: Option<remoteops_protocol::release::ReleaseCatalog>,
+    ) -> Self {
         self.release_catalog = catalog;
         self
     }
@@ -1618,7 +1623,8 @@ impl Relay {
                     );
                 }
                 Ok(WireMessage::Desktop(event)) => {
-                    self.desktop_agent(agent_id, connection_generation, event).await;
+                    self.desktop_agent(agent_id, connection_generation, event)
+                        .await;
                 }
                 Ok(WireMessage::TcpForwardV2(frame)) => {
                     self.tcp_from_agent(agent_id, connection_generation, frame)
@@ -1782,7 +1788,8 @@ impl Relay {
                     .await;
                 }
                 Ok(WireMessage::Desktop(event)) => {
-                    self.desktop_controller(controller_id, connection_generation, event, &sender).await;
+                    self.desktop_controller(controller_id, connection_generation, event, &sender)
+                        .await;
                 }
                 Ok(WireMessage::TcpForwardV2(frame)) => {
                     self.tcp_from_controller(controller_id, connection_generation, frame)
@@ -2433,7 +2440,7 @@ impl Relay {
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("Agent 连接代次已经耗尽"))?;
             replacement.sender = Some(sender);
-            replacement.visual_context = Default::default();
+            replacement.visual_context = visual_context::VisualContext::default();
             replacement.hello = hello;
             replacement.managed_target_id = managed_target_id;
             replacement.legacy_boot = false;
@@ -2446,7 +2453,7 @@ impl Relay {
                 authenticated_token: replacement.hello.resume_token.clone(),
             });
             let welcome = AgentWelcome {
-            release_catalog: self.release_catalog.clone(),
+                release_catalog: self.release_catalog.clone(),
                 allow_agent_ai_disconnect: replacement.managed_target_id.is_none(),
                 allow_agent_human_disconnect: replacement.managed_target_id.is_none(),
                 test_key_accepted: replacement.hello.test_key_fingerprint.is_some(),
@@ -2524,7 +2531,7 @@ impl Relay {
         state.agents.insert(
             agent_id,
             AgentRecord {
-                visual_context: Default::default(),
+                visual_context: visual_context::VisualContext::default(),
                 hello,
                 managed_target_id,
                 lease: lease.clone(),
@@ -2568,10 +2575,7 @@ impl Relay {
     ) -> anyhow::Result<(PairingLease, Option<TestPairingLease>)> {
         let agent_id = hello.agent_instance_id;
         let Some(fingerprint) = hello.test_key_fingerprint.as_ref() else {
-            return Ok((
-                self.lease_for_agent(state, hello, now)?,
-                reserved,
-            ));
+            return Ok((self.lease_for_agent(state, hello, now)?, reserved));
         };
         let mixed = hello.supports_mixed_pairing_code;
         let code = match reserved.filter(|lease| {
@@ -2930,10 +2934,18 @@ impl Relay {
                 })
             })
         });
-        let installation_grant = (controller_kind == ControllerKind::Ai && supports_installation_grants(&agent.hello))
-            .then(|| request.pairing_code.is_some() && request.expected_session_id.is_none()
-                && managed_connection_id.is_none() && controller.installation_id.is_some_and(|id|
-                    self.enrollment_store().and_then(|store| store.has_device_grant(id, agent_id.as_uuid())).unwrap_or(false)));
+        let installation_grant = (controller_kind == ControllerKind::Ai
+            && supports_installation_grants(&agent.hello))
+        .then(|| {
+            request.pairing_code.is_some()
+                && request.expected_session_id.is_none()
+                && managed_connection_id.is_none()
+                && controller.installation_id.is_some_and(|id| {
+                    self.enrollment_store()
+                        .and_then(|store| store.has_device_grant(id, agent_id.as_uuid()))
+                        .unwrap_or(false)
+                })
+        });
         let (binding_messages, replaced_binding) = {
             let bindings = state.session_bindings.entry(session_id).or_default();
             if managed_connection_id.is_some() {
@@ -3112,26 +3124,57 @@ impl Relay {
         token: &str,
     ) {
         let mut state = self.state.lock().await;
-        let Some(agent_sender) = state.agents.get(&agent_id)
-            .filter(|agent| agent.ready && agent.connection_generation == generation
-                && agent.session_id == session && agent.managed_target_id.is_none())
-            .and_then(|agent| agent.sender.clone()) else { return; };
-        let Some(bindings) = state.session_bindings.get_mut(&session) else { return; };
-        if bindings.managed_connection_id.is_some() { return; }
-        let binding = if bindings.ai.as_ref().is_some_and(|b| b.binding_token == token) {
+        let Some(agent_sender) = state
+            .agents
+            .get(&agent_id)
+            .filter(|agent| {
+                agent.ready
+                    && agent.connection_generation == generation
+                    && agent.session_id == session
+                    && agent.managed_target_id.is_none()
+            })
+            .and_then(|agent| agent.sender.clone())
+        else {
+            return;
+        };
+        let Some(bindings) = state.session_bindings.get_mut(&session) else {
+            return;
+        };
+        if bindings.managed_connection_id.is_some() {
+            return;
+        }
+        let binding = if bindings
+            .ai
+            .as_ref()
+            .is_some_and(|b| b.binding_token == token)
+        {
             bindings.ai.take()
-        } else if bindings.human.as_ref().is_some_and(|b| b.binding_token == token) {
+        } else if bindings
+            .human
+            .as_ref()
+            .is_some_and(|b| b.binding_token == token)
+        {
             bindings.human_takeover = false;
             bindings.human.take()
-        } else { return; }.expect("已核对本代绑定");
+        } else {
+            return;
+        }
+        .expect("已核对本代绑定");
         let human = binding.controller_kind == ControllerKind::Human;
-        if bindings.is_empty() { state.session_bindings.remove(&session); }
+        if bindings.is_empty() {
+            state.session_bindings.remove(&session);
+        }
         if human {
             desktop::close(&mut state, session);
             refresh_control_state(&mut state, session);
             if let Some(bindings) = state.session_bindings.get(&session)
-                && let Some(ai) = bindings.ai.as_ref() {
-                let update = controller_binding(session, ai, bindings.permission_mode_for(ControllerKind::Ai));
+                && let Some(ai) = bindings.ai.as_ref()
+            {
+                let update = controller_binding(
+                    session,
+                    ai,
+                    bindings.permission_mode_for(ControllerKind::Ai),
+                );
                 let _ = agent_sender.send(WireMessage::ControllerBinding(update));
             }
         }
@@ -3139,14 +3182,27 @@ impl Relay {
             && controller.connection_generation == binding.controller_generation
         {
             controller.sessions.remove(&session);
-            let reason = if human {"现场人员已断开人工运维"} else {"现场人员已断开 AI 工程师连接"};
-            let _ = controller.sender.send(WireMessage::ConnectionRemoved { session_id: session, reason: reason.into() });
+            let reason = if human {
+                "现场人员已断开人工运维"
+            } else {
+                "现场人员已断开 AI 工程师连接"
+            };
+            let _ = controller.sender.send(WireMessage::ConnectionRemoved {
+                session_id: session,
+                reason: reason.into(),
+            });
         }
-        state.approvals.retain(|_, approval| approval.session_id != session
-            || approval.controller_id != binding.controller_id || approval.controller_generation != binding.controller_generation);
-        state.in_flight.retain(|_, request| request.session_id != session || request.binding_token != token);
+        state.approvals.retain(|_, approval| {
+            approval.session_id != session
+                || approval.controller_id != binding.controller_id
+                || approval.controller_generation != binding.controller_generation
+        });
+        state
+            .in_flight
+            .retain(|_, request| request.session_id != session || request.binding_token != token);
         let _ = agent_sender.send(WireMessage::ControllerBindingRevoked {
-            session_id: session, binding_token: binding.binding_token,
+            session_id: session,
+            binding_token: binding.binding_token,
         });
         send_session_connection_update(&state, session, None);
     }
@@ -3484,7 +3540,11 @@ impl Relay {
                 .agents
                 .values()
                 .find(|agent| agent.session_id == request.session_id)
-                .and_then(|agent| agent.visual_context.disabled_reason(agent.hello.target_context.as_ref()))
+                .and_then(|agent| {
+                    agent
+                        .visual_context
+                        .disabled_reason(agent.hello.target_context.as_ref())
+                })
         {
             send_request_error(
                 controller_sender,
@@ -3543,11 +3603,19 @@ impl Relay {
         if controller_kind == ControllerKind::Ai
             && !session_bindings.taken_over()
             && !matches!(session_bindings.visual_handoff, VisualHandoff::Ready)
-            && matches!(request.operation, RemoteOperation::VisualInvoke { .. }
-                | RemoteOperation::VisualTypeText { .. } | RemoteOperation::VisualSendInput { .. })
+            && matches!(
+                request.operation,
+                RemoteOperation::VisualInvoke { .. }
+                    | RemoteOperation::VisualTypeText { .. }
+                    | RemoteOperation::VisualSendInput { .. }
+            )
         {
-            send_request_error(controller_sender, &request, "fresh_visual_observation_required",
-                "人工已交还控制。请重新观察截图或控件树，再操作当前画面。");
+            send_request_error(
+                controller_sender,
+                &request,
+                "fresh_visual_observation_required",
+                "人工已交还控制。请重新观察截图或控件树，再操作当前画面。",
+            );
             return;
         }
         let mut permission_mode = session_bindings.permission_mode_for(controller_kind);
@@ -3780,8 +3848,8 @@ impl Relay {
         if matches!(request.operation, RemoteOperation::CloseConnection) {
             desktop::close(&mut state, request.session_id);
         }
-        if matches!(request.operation,RemoteOperation::ReleaseHumanTakeover) {
-            desktop::release_input(&mut state,request.session_id);
+        if matches!(request.operation, RemoteOperation::ReleaseHumanTakeover) {
+            desktop::release_input(&mut state, request.session_id);
         }
         let takeover_state = match &request.operation {
             RemoteOperation::HumanTakeover => Some(true),
@@ -3797,7 +3865,9 @@ impl Relay {
                 .expect("Controller 角色绑定已在同一锁内验证");
             let previous = bindings.human_takeover;
             bindings.human_takeover = next_state;
-            if previous != next_state { bindings.visual_handoff = VisualHandoff::ObserveAgain; }
+            if previous != next_state {
+                bindings.visual_handoff = VisualHandoff::ObserveAgain;
+            }
             if let Some(binding) = bindings.ai.as_mut() {
                 binding.control_state = None;
             }
@@ -3807,17 +3877,28 @@ impl Relay {
         };
         refresh_control_state(&mut state, request.session_id);
         if controller_kind == ControllerKind::Ai
-            && matches!(request.operation, RemoteOperation::VisualObserve { include_screenshot: true, .. }
-                | RemoteOperation::VisualObserve { include_ui_tree: true, .. })
+            && matches!(
+                request.operation,
+                RemoteOperation::VisualObserve {
+                    include_screenshot: true,
+                    ..
+                } | RemoteOperation::VisualObserve {
+                    include_ui_tree: true,
+                    ..
+                }
+            )
             && let Some(bindings) = state.session_bindings.get_mut(&request.session_id)
-            && !bindings.taken_over() && !matches!(bindings.visual_handoff, VisualHandoff::Ready)
+            && !bindings.taken_over()
+            && !matches!(bindings.visual_handoff, VisualHandoff::Ready)
         {
             bindings.visual_handoff = VisualHandoff::Waiting(request.request_id);
         }
         let context_query = if matches!(request.operation, RemoteOperation::GetTargetContext)
             && let Some(agent) = state.agents.get_mut(&agent_id)
         {
-            agent.visual_context.begin(agent.hello.target_context.as_ref())
+            agent
+                .visual_context
+                .begin(agent.hello.target_context.as_ref())
                 .map(|sequence| (agent.connection_generation, sequence))
         } else {
             None
@@ -3996,12 +4077,17 @@ impl Relay {
                 tcp::close(&mut state, request_id, "Agent 未成功建立转发授权");
             }
             let original_binding_active = in_flight_binding_is_active(&state, &in_flight);
-            if original_binding_active && terminal
+            if original_binding_active
+                && terminal
                 && let Some((generation, sequence)) = in_flight.context_query
                 && generation == connection_generation
                 && let Some(agent) = state.agents.get_mut(&agent_id)
             {
-                agent.visual_context.finish(sequence, agent.hello.target_context.as_ref(), &message);
+                agent.visual_context.finish(
+                    sequence,
+                    agent.hello.target_context.as_ref(),
+                    &message,
+                );
             }
             let mut senders = Vec::new();
             if original_binding_active
@@ -4038,12 +4124,22 @@ impl Relay {
                         && !bindings.taken_over()
                         && matches!(bindings.visual_handoff, VisualHandoff::Waiting(id) if id == request_id)
                     {
-                        let observed = response.error_code.is_none() && response.details.as_ref().is_some_and(|v| {
-                            v.get("state").and_then(|s| s.as_str()) == Some("ready")
-                                && (v.get("screenshot_base64").and_then(|s| s.as_str()).is_some_and(|s| !s.is_empty())
-                                    || v.pointer("/ui_tree/available").and_then(|s| s.as_bool()) == Some(true))
-                        });
-                        bindings.visual_handoff = if observed { VisualHandoff::Ready } else { VisualHandoff::ObserveAgain };
+                        let observed = response.error_code.is_none()
+                            && response.details.as_ref().is_some_and(|v| {
+                                v.get("state").and_then(|s| s.as_str()) == Some("ready")
+                                    && (v
+                                        .get("screenshot_base64")
+                                        .and_then(|s| s.as_str())
+                                        .is_some_and(|s| !s.is_empty())
+                                        || v.pointer("/ui_tree/available")
+                                            .and_then(serde_json::Value::as_bool)
+                                            == Some(true))
+                            });
+                        bindings.visual_handoff = if observed {
+                            VisualHandoff::Ready
+                        } else {
+                            VisualHandoff::ObserveAgain
+                        };
                     }
                     control::renew_after_success(&mut state, &completed, &message);
                 }
@@ -4616,7 +4712,7 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
         state.agents.insert(
             agent_id,
             AgentRecord {
-                visual_context: Default::default(),
+                visual_context: visual_context::VisualContext::default(),
                 hello,
                 lease: persisted_agent.lease,
                 test_pairing: persisted_agent.test_pairing,
@@ -4883,8 +4979,12 @@ fn resume_token_matches(agent: &AgentRecord, supplied: Option<&String>) -> bool 
 }
 
 fn supports_installation_grants(hello: &AgentHello) -> bool {
-    hello.target_context.as_ref().is_some_and(|context| context.capabilities.iter().any(|cap|
-        cap.capability == "managed_install_grant_v1" && cap.status == remoteops_domain::CapabilityAvailability::Available))
+    hello.target_context.as_ref().is_some_and(|context| {
+        context.capabilities.iter().any(|cap| {
+            cap.capability == "managed_install_grant_v1"
+                && cap.status == remoteops_domain::CapabilityAvailability::Available
+        })
+    })
 }
 
 fn controller_binding(
@@ -6493,7 +6593,10 @@ mod tests {
         let (at, ht) = {
             let state = relay.state.lock().await;
             let bindings = &state.session_bindings[&session];
-            (bindings.ai.as_ref().unwrap().binding_token.clone(), bindings.human.as_ref().unwrap().binding_token.clone())
+            (
+                bindings.ai.as_ref().unwrap().binding_token.clone(),
+                bindings.human.as_ref().unwrap().binding_token.clone(),
+            )
         };
         for (agent_id, g, s, token) in [
             (id, generation + 1, session, &at),
@@ -6501,7 +6604,9 @@ mod tests {
             (id, generation, SessionId::new(), &at),
             (id, generation + 1, session, &ht),
         ] {
-            relay.disconnect_binding_from_agent(agent_id, g, s, token).await;
+            relay
+                .disconnect_binding_from_agent(agent_id, g, s, token)
+                .await;
         }
         assert!(
             relay.state.lock().await.session_bindings[&session]
@@ -6545,7 +6650,9 @@ mod tests {
                 .ai
                 .is_some()
         );
-        relay.disconnect_binding_from_agent(id, generation, session, &ht).await;
+        relay
+            .disconnect_binding_from_agent(id, generation, session, &ht)
+            .await;
         let state = relay.state.lock().await;
         assert!(state.session_bindings[&session].human.is_none());
         assert!(state.session_bindings[&session].ai.is_some());
@@ -6808,6 +6915,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "验证同一会话中急停前后的状态")]
     async fn human_emergency_stop_aborts_owner_requests_and_downgrades_session() {
         let relay = relay(Duration::minutes(10));
         let agent_id = AgentInstanceId::new();

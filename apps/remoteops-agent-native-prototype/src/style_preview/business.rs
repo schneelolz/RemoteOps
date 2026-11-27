@@ -16,7 +16,7 @@ pub(super) struct Business {
     // 唯一业务宿主；配置、TLS 和权限都由它处理。
     host: ProductHost,
     legal_notices: Option<&'static str>,
-    demo: bool,
+    pub(super) demo: bool,
     // 复用已有工作线程，UI 不直接打开系统剪贴板。
     clipboard: super::clipboard::Clipboard,
     started: Instant,
@@ -205,7 +205,7 @@ fn refresh_values(app: &App) {
         }
         let ids: &[i32] = match panel.kind {
             Kind::Main if app.state.borrow().logs => &[312],
-            Kind::Main => &[300, 303, 304, 305, 306, 312, 341, 343, 344, 345],
+            Kind::Main => &[300, 303, 304, 305, 306, 312, 346, 347],
             Kind::Details => &[402, 404, 406, 408, 410],
             Kind::Permissions => &[421, 426],
             Kind::Grant => &[441],
@@ -218,7 +218,7 @@ fn refresh_values(app: &App) {
             Kind::TestKey => &[],
         };
         for id in ids {
-            if *id == 305
+            if *id == 300
                 && app.state.borrow().product.as_ref().is_some_and(|snapshot| {
                     matches!(
                         snapshot.phase,
@@ -350,8 +350,10 @@ pub(super) fn poll(app: &App) -> bool {
     let (output, snapshot, copied, copy_message, clear_copy) = batch;
     let (appearance_changed, observation_changed, connection_changed) = {
         let mut state = app.state.borrow_mut();
-        let connection_changed = state.connected
-            != (snapshot.controllers > 0 || snapshot.phase == ProductPhase::Controlled);
+        let connection_changed = state.product.as_ref().is_none_or(|old| {
+            (old.ai_connected, old.human_connected)
+                != (snapshot.ai_connected, snapshot.human_connected)
+        });
         let appearance_changed = state.english != (snapshot.language == NativeLanguage::English)
             || state.theme != appearance(snapshot.appearance);
         let changed_output = state
@@ -448,7 +450,9 @@ pub(super) fn command(panel: &Panel, id: i32) -> bool {
         return false;
     }
     match id {
-        345 => { perform(app, ProductAction::DisconnectHuman); }
+        345 => {
+            perform(app, ProductAction::DisconnectHuman);
+        }
         341 => {
             perform(app, ProductAction::DisconnectAi);
         }
@@ -702,6 +706,13 @@ pub(super) fn menu(panel: &Panel, id: i32) -> bool {
                 app.open(Kind::Setup, panel.hwnd.get());
             }
         }
+        5035 => {
+            if let Some(business) = app.business.borrow_mut().as_mut().filter(|b| b.demo) {
+                business.host.preview_connected_session();
+            }
+            snapshot_after_action(app);
+            app.refresh();
+        }
         5043 => app.observer(),
         5030..=5046 => {}
         _ => return false,
@@ -776,8 +787,8 @@ pub(super) fn text_for(panel: &Panel, id: i32, original: &str) -> String {
         540 => snapshot.product_name.clone(),
         300 => if snapshot.tls.is_some() || !matches!(snapshot.phase, crate::product::ProductPhase::Waiting | crate::product::ProductPhase::Controlled) { snapshot.status.clone() } else { String::new() },
         341 | 345 => t("断开", "End").into(),
-        343 => if snapshot.ai_connected { t("AI 工程师\r\n已连接", "AI engineer\r\nConnected") } else { t("AI 工程师\r\n未连接", "AI engineer\r\nOffline") }.into(),
-        344 => if snapshot.human_connected { t("人工运维\r\n已连接", "Operator\r\nConnected") } else { t("人工运维\r\n未连接", "Operator\r\nOffline") }.into(),
+        346 => if snapshot.ai_connected { t("已连接", "Connected") } else { t("未连接", "Offline") }.into(),
+        347 => if snapshot.human_connected { t("已连接", "Connected") } else { t("未连接", "Offline") }.into(),
         303 => snapshot.code.clone().unwrap_or_else(|| "--- --- ---".into()),
         304 => if state.copied.is_some() { "✓".into() } else { t("复制控制码", "Copy code").into() },
         305 => snapshot.countdown.clone(),
@@ -852,11 +863,23 @@ pub(super) fn decorate(panel: &Panel) {
     };
     unsafe {
         if let Some(snapshot) = app.state.borrow().product.as_ref() {
-            for (id, connected) in [(341, snapshot.ai_connected), (345, snapshot.human_connected)] {
+            for (id, connected) in [
+                (341, snapshot.ai_connected),
+                (345, snapshot.human_connected),
+            ] {
                 let button = panel.control(id);
-                if button.is_null() { continue; }
+                if button.is_null() {
+                    continue;
+                }
                 if (IsWindowVisible(button) != 0) != connected {
-                    ShowWindow(button, if connected { SW_SHOWNOACTIVATE } else { SW_HIDE });
+                    ShowWindow(
+                        button,
+                        if connected {
+                            SW_SHOWNOACTIVATE
+                        } else {
+                            SW_HIDE
+                        },
+                    );
                 }
                 if (IsWindowEnabled(button) != 0) == snapshot.disconnect_pending {
                     EnableWindow(button, i32::from(!snapshot.disconnect_pending));

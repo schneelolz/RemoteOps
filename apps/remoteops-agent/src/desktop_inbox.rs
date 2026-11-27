@@ -16,7 +16,10 @@ pub(super) struct Inbox(Mutex<Pending>);
 
 impl Inbox {
     pub(super) fn new() -> Self {
-        Self(Mutex::new(Pending { commands: VecDeque::new(), heartbeat: Instant::now() }))
+        Self(Mutex::new(Pending {
+            commands: VecDeque::new(),
+            heartbeat: Instant::now(),
+        }))
     }
     pub(super) fn push(&self, action: Action) {
         let mut pending = self.0.lock().unwrap();
@@ -25,12 +28,15 @@ impl Inbox {
             return;
         }
         let queue = &mut pending.commands;
-        if let Action::Input {epoch, event: Input::Move {..}} = &action
+        if let Action::Input {
+            epoch,
+            event: Input::Move { .. },
+        } = &action
             && matches!(queue.back(), Some(Command::Wire(Action::Input {epoch: prior, event:Input::Move{..}})) if prior == epoch)
         {
             queue.pop_back();
         }
-        if matches!(action, Action::Control {enabled:false,..}) {
+        if matches!(action, Action::Control { enabled: false, .. }) {
             queue.clear();
         }
         if queue.len() >= 64 {
@@ -57,28 +63,57 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn movement(x:u16)->Action {Action::Input{epoch:3,event:Input::Move{x,y:1}}}
+    fn movement(x: u16) -> Action {
+        Action::Input {
+            epoch: 3,
+            event: Input::Move { x, y: 1 },
+        }
+    }
     #[test]
     fn mouse_bursts_keep_last_position_on_each_side_of_click() {
-        let inbox=Inbox::new();
-        for x in 0..4096 {inbox.push(movement(x));}
-        let click=Action::Input{epoch:3,event:Input::Button{button:0,down:true}};
+        let inbox = Inbox::new();
+        for x in 0..4096 {
+            inbox.push(movement(x));
+        }
+        let click = Action::Input {
+            epoch: 3,
+            event: Input::Button {
+                button: 0,
+                down: true,
+            },
+        };
         inbox.push(click.clone());
-        for x in 5000..6000 {inbox.push(movement(x));}
-        for expected in [movement(4095),click,movement(5999)] {
+        for x in 5000..6000 {
+            inbox.push(movement(x));
+        }
+        for expected in [movement(4095), click, movement(5999)] {
             assert!(matches!(inbox.next(),Some(Command::Wire(actual)) if actual==expected));
         }
         assert!(inbox.is_empty());
     }
     #[test]
     fn saturated_input_releases_and_can_receive_heartbeats_and_new_grants() {
-        let inbox=Inbox::new();
-        for _ in 0..65 {inbox.push(Action::Input{epoch:3,event:Input::Wheel{delta:120}});}
+        let inbox = Inbox::new();
+        for _ in 0..65 {
+            inbox.push(Action::Input {
+                epoch: 3,
+                event: Input::Wheel { delta: 120 },
+            });
+        }
         inbox.push(Action::Heartbeat);
         assert!(inbox.live());
-        assert!(matches!(inbox.next(),Some(Command::ReleaseOverload)));
+        assert!(matches!(inbox.next(), Some(Command::ReleaseOverload)));
         assert!(inbox.is_empty());
-        inbox.push(Action::Control{enabled:true,epoch:4});
-        assert!(matches!(inbox.next(),Some(Command::Wire(Action::Control{enabled:true,epoch:4}))));
+        inbox.push(Action::Control {
+            enabled: true,
+            epoch: 4,
+        });
+        assert!(matches!(
+            inbox.next(),
+            Some(Command::Wire(Action::Control {
+                enabled: true,
+                epoch: 4
+            }))
+        ));
     }
 }

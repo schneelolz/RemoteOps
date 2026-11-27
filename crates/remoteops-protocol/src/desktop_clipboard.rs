@@ -14,24 +14,39 @@ pub struct Packet {
 }
 impl fmt::Debug for Packet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClipboardPacket").field("encoded_len",&self.bytes.len()).finish()
+        f.debug_struct("ClipboardPacket")
+            .field("encoded_len", &self.bytes.len())
+            .finish_non_exhaustive()
     }
 }
 impl Packet {
     /// 校验消息大小，并编码当前包的 SHA-256。
+    #[must_use]
     pub fn encode(data: &[u8]) -> Option<Self> {
-        if data.is_empty() || data.len() > MAX_PACKET {return None;}
-        Some(Self {bytes:STANDARD.encode(data),digest:STANDARD.encode(Sha256::digest(data))})
+        if data.is_empty() || data.len() > MAX_PACKET {
+            return None;
+        }
+        Some(Self {
+            bytes: STANDARD.encode(data),
+            digest: STANDARD.encode(Sha256::digest(data)),
+        })
     }
     /// 中继只验证边界，避免解码并接触用户剪贴板。
+    #[must_use]
     pub fn bounded(&self) -> bool {
-        !self.bytes.is_empty() && self.bytes.len() <= MAX_PACKET.div_ceil(3)*4 && self.digest.len()==44
+        !self.bytes.is_empty()
+            && self.bytes.len() <= MAX_PACKET.div_ceil(3) * 4
+            && self.digest.len() == 44
     }
     /// 端点校验完整性后才交给系统剪贴板。
+    #[must_use]
     pub fn decode(&self) -> Option<Vec<u8>> {
-        if !self.bounded() {return None;}
-        let data=STANDARD.decode(&self.bytes).ok()?;
-        (data.len() <= MAX_PACKET && STANDARD.encode(Sha256::digest(&data))==self.digest).then_some(data)
+        if !self.bounded() {
+            return None;
+        }
+        let data = STANDARD.decode(&self.bytes).ok()?;
+        (data.len() <= MAX_PACKET && STANDARD.encode(Sha256::digest(&data)) == self.digest)
+            .then_some(data)
     }
 }
 #[cfg(test)]
@@ -39,11 +54,11 @@ mod tests {
     use super::*;
     #[test]
     fn contents_are_bounded_verified_and_redacted() {
-        let mut p=Packet::encode(b"private clipboard").unwrap();
-        assert_eq!(p.decode().unwrap(),b"private clipboard");
+        let mut p = Packet::encode(b"private clipboard").unwrap();
+        assert_eq!(p.decode().unwrap(), b"private clipboard");
         assert!(!format!("{p:?}").contains(&p.bytes));
-        p.bytes=STANDARD.encode("altered bytes");
+        p.bytes = STANDARD.encode("altered bytes");
         assert!(p.decode().is_none());
-        assert!(Packet::encode(&vec![0;MAX_PACKET+1]).is_none());
+        assert!(Packet::encode(&vec![0; MAX_PACKET + 1]).is_none());
     }
 }
