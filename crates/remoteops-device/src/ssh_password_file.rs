@@ -28,7 +28,7 @@ pub(super) struct PasswordFile {
     path: PathBuf,
 }
 impl PasswordFile {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(super) fn new(password: &str) -> Result<Self, DeviceError> {
         Self::new_in(password, &std::env::temp_dir())
     }
