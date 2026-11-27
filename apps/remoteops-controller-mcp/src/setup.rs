@@ -595,8 +595,6 @@ mod tests {
         }
     }
 
-    /// Opt-in native coverage; never contacts a Relay or enumerates credentials.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
     fn onboarding_checks_welcome_and_protocol_independently_of_pairing_capability() {
         for supported in [false, true] {
@@ -619,6 +617,8 @@ mod tests {
         assert!(verify_controller_welcome(&other).is_err());
     }
 
+    /// Opt-in native coverage; never contacts a Relay or enumerates credentials.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
     #[ignore = "writes and deletes one isolated dummy entry in the native OS credential store"]
     fn native_os_credential_store_round_trip() -> anyhow::Result<()> {
