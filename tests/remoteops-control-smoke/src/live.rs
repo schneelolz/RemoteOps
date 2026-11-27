@@ -124,7 +124,56 @@ async fn raw_call(client: &Mcp, name: &str, args: Value) -> Result<CallToolResul
 
 async fn call(client: &Mcp, name: &str, args: Value) -> Result<Value> {
     let result = raw_call(client, name, args).await?;
-    ensure!(result.is_error != Some(true), "MCP 工具 {name} 返回失败");
+    if result.is_error == Some(true) {
+        // 只记录固定的诊断片段；MCP 返回正文可能包含配对码或实例路径。
+        let known = [
+            "配对失败次数过多",
+            "控制端已经断开",
+            "控制码租约已经过期",
+            "控制码无效",
+            "无效或已过期",
+            "控制码不存在",
+            "已绑定其他",
+            "Agent 当前离线",
+            "Agent 不存在",
+            "只允许已认证",
+            "控制码当前属于其他会话",
+            "短配对码须为",
+            "未找到连接",
+            "响应通道已关闭",
+            "配对请求超时",
+            "配对失败",
+            "pairing_failed",
+            "远程传输失败",
+            "操作被策略拒绝",
+            "权限不足",
+            "invalid type",
+            "invalid params",
+            "missing field",
+            "invalid argument",
+            "schema",
+            "not ready",
+            "timeout",
+            "disconnect",
+            "permission denied",
+        ];
+        let messages: Vec<_> = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .map(|t| t.text.to_ascii_lowercase())
+            .collect();
+        let categories: Vec<_> = known
+            .iter()
+            .copied()
+            .filter(|marker| {
+                messages
+                    .iter()
+                    .any(|text| text.contains(&marker.to_ascii_lowercase()))
+            })
+            .collect();
+        bail!("MCP 工具 {name} 返回失败，诊断分类 {categories:?}");
+    }
     result.structured_content.context("MCP 工具缺少结构化结果")
 }
 
