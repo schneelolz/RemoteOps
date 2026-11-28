@@ -12,7 +12,6 @@
 
 [![CI](https://github.com/schneelolz/RemoteOps/actions/workflows/ci.yml/badge.svg)](https://github.com/schneelolz/RemoteOps/actions/workflows/ci.yml)
 [![Security](https://github.com/schneelolz/RemoteOps/actions/workflows/security.yml/badge.svg)](https://github.com/schneelolz/RemoteOps/actions/workflows/security.yml)
-[![Agent candidate](https://img.shields.io/badge/Agent_candidate-0.2.0--preview.7-2563eb)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-f97316)](LICENSE)
 
 </div>
@@ -55,7 +54,7 @@ For a server migration, provide two pairing codes: one for the pre-migration env
 - Expose local STDIO MCP tools to Codex and other AI clients, with CLI and GUI controllers also available.
 - Constrain remote operations through session binding (Session), owner isolation (Owner), permission modes, human approval, TLS trust validation, and redacted audit logs.
 
-It does not currently provide screen capture, mouse or keyboard control, RDP/VNC, arbitrary port forwarding, SOCKS, network scanning, a shared public Relay, macOS field agents, or Linux desktop control.
+On Windows, the human controller opens the remote desktop in view-only mode after pairing. Operators can switch to keyboard and mouse control. The desktop supports direct LAN and relayed connections. The headless Linux Agent provides command-line operations.
 
 ## Current support
 
@@ -67,7 +66,7 @@ It does not currently provide screen capture, mouse or keyboard control, RDP/VNC
 | Controller/MCP | Windows x64 and Apple Silicon macOS | Mac MCP installation and Linux connection verified; native Windows CI remains |
 | Device access | Windows, Linux, SSH, and serial | Local regression and Linux PTY serial tests pass; real hardware validation remains |
 
-The Agent CLI / Service candidate is `0.2.0-preview.7`, the Agent GUI is `0.2.0-preview.9`, and SSH askpass is `0.2.0-preview.6`; Relay and MCP remain at `0.2.0-preview.5`. They share protocol `v14`. No public GitHub Release exists yet. It is intended for developers and controlled pilots, not critical production use. See [project status](docs/PROJECT_STATUS.md).
+Components are versioned independently. Run `cargo metadata --no-deps --format-version 1` at the repository root to list the versions in your checkout. See the [project status](docs/PROJECT_STATUS.md) for historical validation records.
 
 ## Quick start
 
@@ -79,6 +78,8 @@ The Relay requires Linux x64, Docker, and an address reachable by both the Agent
 
 ```bash
 cp deploy/relay/.env.example deploy/relay/.env
+npm --prefix relay-admin ci --ignore-scripts
+npm --prefix relay-admin run build
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml config --quiet
 docker compose --env-file deploy/relay/.env -f deploy/relay/docker-compose.yml up -d --build
 curl --fail http://127.0.0.1:18080/health
@@ -111,7 +112,7 @@ The initial Linux baseline is Ubuntu 24.04 x86_64, glibc, and systemd. Other dis
 
 ### 3. Install local MCP
 
-For installers, token storage, and uninstall steps, see [RemoteOps MCP guide](docs/RemoteOpsMCP使用手册.md) and [macOS MCP setup](docs/macOSMCP接入说明.md). Restart Codex and confirm that `remoteops` is connected in `/mcp`.
+Enroll the local MCP using a one-time setup code or file issued by the administrator. Restart Codex and check `/mcp` for the connection. See [one-time setup](docs/mcp-one-time-setup.md) and [building MCP and RemoteOpsBridge on macOS](docs/macOSMCP接入说明.md).
 
 ### 4. Verify the connection and read-only operations
 
@@ -183,3 +184,5 @@ Recorded validation: 262 macOS workspace tests, Linux workspace checks, and 50 i
 ## License
 
 RemoteOps is licensed under [AGPL-3.0-only](LICENSE). It remains self-hosted and vendor-neutral; check the license and commercial terms of any third-party AI or Visual Provider integration separately.
+
+The management console is now a separately built Vue frontend. See [deployment instructions](deploy/relay-admin/README.md) and [preview.17 delivery](docs/relay-admin-split-preview17.md).

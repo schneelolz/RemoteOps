@@ -127,9 +127,12 @@ try {
     }
     $releaseVersion = $packageVersionMatch.Groups['version'].Value
 
-    $source = Join-Path `
-        $workspaceRoot `
-        "target\$rustTarget\release\remoteops-relay"
+    # 从 Cargo 获取实际缓存目录，避免显式 CARGO_TARGET_DIR 时交付旧产物。
+    $metadataText = & cargo.exe metadata --locked --no-deps --format-version 1
+    if ($LASTEXITCODE -ne 0) { throw '读取 Linux Relay 实际构建目录失败。' }
+    $cargoTargetDirectory = [string](($metadataText -join "`n") | ConvertFrom-Json).target_directory
+    if ([string]::IsNullOrWhiteSpace($cargoTargetDirectory)) { throw 'Cargo metadata 缺少构建目录。' }
+    $source = Join-Path $cargoTargetDirectory "$rustTarget\release\remoteops-relay"
     if (-not (Test-Path -LiteralPath $source)) {
         throw "Linux Relay 构建产物不存在：$source"
     }

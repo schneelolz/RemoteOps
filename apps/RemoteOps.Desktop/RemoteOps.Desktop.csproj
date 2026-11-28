@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Version>0.1.0-preview.19</Version>
+    <AssemblyVersion>0.1.0.19</AssemblyVersion>
+    <FileVersion>0.1.0.19</FileVersion>
+    <ApplicationIcon>Assets/remoteops.ico</ApplicationIcon>
+    <Product>RemoteOps 人工控制端</Product>
+    <Description>人工远程桌面与运维工作台</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Condition="'$(DesktopProductProfile)' != ''" Include="$(DesktopProductProfile)" LogicalName="RemoteOps.Desktop.ProductProfile.json"/>
+    <AvaloniaResource Include="Assets/*"/>
+    <PackageReference Include="Tmds.DBus.Protocol" Version="0.21.3" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.12" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.12" />
+  </ItemGroup>
+</Project>

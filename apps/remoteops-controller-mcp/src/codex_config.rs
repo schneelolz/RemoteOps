@@ -37,6 +37,40 @@ pub(super) fn configure(
     })
 }
 
+/// 仅替换现有 `RemoteOps` command 值，保留其余配置的原始字节。
+pub(super) fn update_command(path: &Path, command: &str) -> anyhow::Result<()> {
+    update(path, |input| render_command_update(input, command))
+}
+
+fn render_command_update(input: &str, command: &str) -> anyhow::Result<String> {
+    if command.is_empty() {
+        bail!("MCP 命令路径不能为空");
+    }
+    let document = parse(input)?;
+    let existing = document
+        .get("mcp_servers")
+        .and_then(Item::as_table_like)
+        .and_then(|servers| servers.get("remoteops"))
+        .and_then(Item::as_table_like)
+        .and_then(|remoteops| remoteops.get("command"))
+        .and_then(Item::as_value)
+        .filter(|value| value.as_str().is_some())
+        .context("升级需要现有的 RemoteOps command 字符串；原文件未修改")?;
+    if existing.as_str() == Some(command) {
+        return Ok(input.to_owned());
+    }
+    let span = existing
+        .span()
+        .context("现有 RemoteOps command 缺少源位置信息；原文件未修改")?;
+    let replacement = toml_edit::Value::from(command).to_string();
+    let mut output = String::with_capacity(input.len() + replacement.len());
+    output.push_str(&input[..span.start]);
+    output.push_str(&replacement);
+    output.push_str(&input[span.end..]);
+    parse(&output).context("生成的 Codex 配置未通过校验；原文件未修改")?;
+    Ok(output)
+}
+
 /// Remove only the parsed `mcp_servers.remoteops` subtree, if present.
 pub(super) fn unconfigure(path: &Path) -> anyhow::Result<()> {
     update(path, remove_remoteops)
@@ -420,6 +454,39 @@ mod tests {
         let path = std::env::temp_dir().join(format!("remoteops-codex-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn command_upgrade_preserves_modes_permissions_comments_and_line_endings() {
+        for original in [
+            "# keep\r\n[mcp_servers.\"remoteops\"]\r\ncommand = 'old' # keep\r\nargs = ['--config', 'private.json', '--command-mode', 'readonly']\nstartup_timeout_sec = 27\r\ntool_timeout_sec = 999\n[mcp_servers.remoteops.tools.set_control_mode]\napproval_mode = 'prompt'\n[mcp_servers.other]\ncommand = 'keep'",
+            "mcp_servers.remoteops = { command = 'old', args = ['preserve'], enabled = false }\r\n",
+            "mcp_servers.remoteops.command = 'old'\nmodel = 'keep'\n",
+        ] {
+            let command = "C:\\Program Files\\RemoteOps\\mcp.exe";
+            let rendered = render_command_update(original, command).unwrap();
+            let expected =
+                original.replacen("'old'", &toml_edit::Value::from(command).to_string(), 1);
+            assert_eq!(rendered, expected);
+            assert_eq!(render_command_update(&rendered, command).unwrap(), rendered);
+        }
+    }
+
+    #[test]
+    fn command_upgrade_rejects_missing_or_invalid_target_without_filesystem_changes() {
+        for original in [
+            "",
+            "[mcp_servers.other]\ncommand = 'keep'\n",
+            "[mcp_servers.remoteops]\ncommand = 12\n",
+        ] {
+            let directory = temp_directory();
+            let path = directory.join("config.toml");
+            fs::write(&path, original).unwrap();
+            assert!(update_command(&path, "new.exe").is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

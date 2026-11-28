@@ -13,7 +13,7 @@
 | 通用 MCP 与恢复 | `crates/remoteops-application`、`apps/remoteops-controller-mcp/src/main.rs`：按 session 返回上下文、未知能力不放权、配对响应丢失重试、断线不重放执行请求、主动关闭持久授权 |
 | 示例与测试 | `examples/example-service-agent`、Relay 门户测试、`tests/remoteops-control-smoke/src/managed_portal_live.rs`、`pair_result_proxy.rs`、`target_context_live.rs`、两个控制权限测试脚本 |
 
-保留客户 GUI 的 `AutoPerBoot`：新启动换码，同一次启动断线保码。受管产品显式使用 `ManagedOnDemand`，上线默认无码。没有修改 OpsCenter 或 RemoteOps-JLAI；薄服务示例与公共接口见[接入说明](custom-service-agent.md)、[门户接口](portal-api-v1.md)。
+保留客户 GUI 的 `AutoPerBoot`：新启动换码，同一次启动断线保码。受管产品显式使用 `ManagedOnDemand`，上线默认无码。没有修改使用方的定制产品；薄服务示例与公共接口见[接入说明](custom-service-agent.md)、[门户接口](portal-api-v1.md)。
 
 ## 已执行验证
 
@@ -54,8 +54,8 @@ Python 脚本语法、示例及公共部署 PowerShell 脚本语法/定制参数
 
 ## 发布与现场边界
 
-当前协议为 18，Relay 只为自动签码模式兼容 17，拒绝 16。现有 JLAI 固定旧 rev 属于协议 16，正式升级前必须同步更新其公共依赖和伴随程序，不能直接替换生产 Relay 后继续期待旧二进制兼容。
+当前协议为 18，Relay 只为自动签码模式兼容 17，拒绝 16。仍固定协议 16 旧 rev 的定制产品，正式升级前必须同步更新其公共依赖和伴随程序，不能直接替换生产 Relay 后继续期待旧二进制兼容。
 
-本地验收完成后，变更在独立分支 `codex/custom-service-agent-integration` 通过草稿 PR 进入集成验证。GitHub CI 的实际状态以该 PR 对应提交的检查结果为准，不将已配置工作流写成远端检查通过。JLAI 等使用方先固定该分支的完整提交 SHA，完成适配、产物编译和实际环境测试；CI 与定制产物验收均通过后，再由维护者确认合并 `main`。
+本地验收完成后，变更在独立分支 `codex/custom-service-agent-integration` 通过草稿 PR 进入集成验证。GitHub CI 的实际状态以该 PR 对应提交的检查结果为准，不将已配置工作流写成远端检查通过。定制产品使用方先固定该分支的完整提交 SHA，完成适配、产物编译和实际环境测试；CI 与定制产物验收均通过后，再由维护者确认合并 `main`。
 
 尚未合并 `main`，未替换任何生产 Relay/MCP/Agent。真实 SCM、无登录、RDP、长时间运行、生产 HTTPS/备份恢复和实际门户使用方适配仍需现场验收。可执行入口见[服务示例](../../examples/example-service-agent/README.md)，不能用前台或模拟上下文替代真实服务验收。

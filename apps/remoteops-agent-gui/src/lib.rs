@@ -35,9 +35,10 @@ use eframe::egui::{
 };
 use egui_phosphor::regular as icons;
 use remoteops_agent::{
-    AgentConfig, AgentControllerBinding, AgentEvent, AgentEventSender, AgentLogLevel,
-    AgentOperationLog, AgentOperationState, AgentPermissionControl, AgentRuntimeOptions,
-    active_agent_config_path, initialize_tracing, run_agent_with_scoped_options,
+    AgentConfig, AgentControllerBinding, AgentEvent, AgentLogLevel, AgentOperationLog,
+    AgentOperationState, AgentPermissionControl, AgentRuntimeOptions, BoundedAgentEventReceiver,
+    BoundedAgentEventSender as AgentEventSender, active_agent_config_path, bounded_agent_events,
+    initialize_tracing, run_agent_with_bounded_scoped_options,
 };
 use remoteops_domain::{AgentInstanceId, Capability, CapabilitySet, RequestId};
 use remoteops_i18n::{Language, Translator};
@@ -147,6 +148,15 @@ fn store_operation_log(
     drawer_open: bool,
     unread: &mut usize,
 ) {
+    if let Some(repetition) = log.repetition
+        && let Some(existing) = logs.iter_mut().find(|item| {
+            item.repetition
+                .is_some_and(|value| value.record_id == repetition.record_id)
+        })
+    {
+        *existing = log;
+        return;
+    }
     if logs.len() >= MAX_OPERATION_LOGS {
         logs.pop_front();
     }
@@ -207,6 +217,8 @@ struct Args {
     /// 仅默认选择允许自动回退，显式命令行或产品环境变量保持原意。
     #[arg(skip)]
     automatic_renderer: bool,
+    #[arg(skip)]
+    test_key_fingerprint: Option<String>,
 }
 
 #[derive(Default)]
@@ -243,7 +255,8 @@ impl Args {
     {
         let mut command = Self::command()
             .name(profile.id.clone())
-            .about(profile.name.clone());
+            .about(profile.name.clone())
+            .after_help("--gen-key 生成 GUID；--key GUID / --key-file PATH 启动测试模式");
         if !profile.version.is_empty() {
             command = command.version(profile.version.clone());
         }
@@ -507,6 +520,7 @@ fn short_request_id(request_id: &RequestId) -> String {
 #[allow(dead_code)]
 struct RemoteOpsAgentApp {
     profile: ProductProfile,
+    test_key_fingerprint: Option<String>,
     options: GuiOptions,
     activity: activity::ActivityModel,
     event_epoch: Option<u64>,
@@ -516,7 +530,9 @@ struct RemoteOpsAgentApp {
     /// 向后台 Agent 发送生命周期事件的通道。
     event_sender: AgentEventSender,
     /// 后台 Agent 发来的生命周期事件。
-    events: Receiver<AgentEvent>,
+    events: BoundedAgentEventReceiver,
+    /// 已报告的界面省略记录数，与重复累计次数分开统计。
+    reported_dropped: u64,
     /// TLS 预检线程发送状态的通道。
     trust_sender: Sender<TrustBootstrapEvent>,
     /// TLS 预检线程返回的状态。
@@ -565,6 +581,8 @@ struct RemoteOpsAgentApp {
     log_unread: usize,
     /// 与后台运行时共享的 Agent 本地权限控制器。
     permission_control: AgentPermissionControl,
+    // 语言选择与真实 Agent 后台共享。
+    ui_language: remoteops_agent::AgentUiLanguage,
     control_ui: ControlUi,
     /// 当前进程是否已提升权限。
     elevated: Option<bool>,
@@ -578,6 +596,8 @@ struct RemoteOpsAgentApp {
     show_stop_confirmation: bool,
     /// 是否展示高级设置框。
     show_advanced_settings: bool,
+    // 资源来源与白名单的编辑状态。
+    resource_settings: ResourceSettings,
     /// 最近一次打开传输目录时的错误。
     transfer_root_open_error: Option<String>,
     /// 是否允许本次窗口关闭请求直接执行。
@@ -588,6 +608,19 @@ struct RemoteOpsAgentApp {
     layout_is_setup: Option<bool>,
     /// 启动窗口等待稳定外框并完成居中的状态。
     window_centering: WindowCenteringState,
+}
+
+/// 资源来源编辑草稿；保存后在下一次连接生效。
+#[derive(Default)]
+struct ResourceSettings {
+    // 设置窗口是否打开。
+    open: bool,
+    // 清单完整地址，空白表示关闭。
+    index_url: String,
+    // 每行一个明确的 HTTPS 来源。
+    allowed_origins: String,
+    // 最近一次校验或保存错误。
+    error: Option<String>,
 }
 
 /// 启动窗口的居中校准状态。
@@ -625,6 +658,7 @@ impl RemoteOpsAgentApp {
         diagnostics: StartupDiagnostics,
         profile: ProductProfile,
         options: GuiOptions,
+        test_key_fingerprint: Option<String>,
     ) -> Self {
         configure_fonts(&cc.egui_ctx);
         install_style(&cc.egui_ctx);
@@ -654,20 +688,10 @@ impl RemoteOpsAgentApp {
             .appearance
             .unwrap_or(options.appearance)
             .apply(&cc.egui_ctx);
-        let (runtime_event_sender, runtime_events) = mpsc::channel();
-        let (event_sender, events) = mpsc::channel();
+        let (runtime_event_sender, events) = bounded_agent_events(1024);
         let repaint_context = cc.egui_ctx.clone();
-        std::thread::Builder::new()
-            .name("remoteops-agent-event-forwarder".to_owned())
-            .spawn(move || {
-                while let Ok(event) = runtime_events.recv() {
-                    if event_sender.send(event).is_err() {
-                        break;
-                    }
-                    repaint_context.request_repaint();
-                }
-            })
-            .expect("应能启动 Agent 事件转发线程");
+        let runtime_event_sender =
+            runtime_event_sender.with_wakeup(move || repaint_context.request_repaint());
         let (trust_sender, trust_events) = mpsc::channel();
         let (shutdown, _) = watch::channel(false);
         let appearance = saved_settings.appearance.unwrap_or(options.appearance);
@@ -684,8 +708,11 @@ impl RemoteOpsAgentApp {
                     egui::TextureOptions::LINEAR,
                 )
             });
+        let ui_language = remoteops_agent::AgentUiLanguage::default();
+        ui_language.set(target_ui_language(language));
         let mut app = Self {
             profile,
+            test_key_fingerprint,
             options,
             activity: activity::ActivityModel::default(),
             event_epoch: None,
@@ -693,6 +720,7 @@ impl RemoteOpsAgentApp {
             diagnostics,
             event_sender: runtime_event_sender,
             events,
+            reported_dropped: 0,
             trust_sender,
             trust_events,
             shutdown,
@@ -718,12 +746,14 @@ impl RemoteOpsAgentApp {
             log_unread: 0,
             permission_control: AgentPermissionControl::default(),
             control_ui: ControlUi::default(),
+            ui_language,
             elevated: detect_elevated(),
             translator,
             appearance,
             language_file,
             show_stop_confirmation: false,
             show_advanced_settings: false,
+            resource_settings: ResourceSettings::default(),
             transfer_root_open_error: None,
             allow_close: false,
             copied_until: None,
@@ -782,11 +812,16 @@ impl RemoteOpsAgentApp {
             self.shutdown.subscribe(),
             self.permission_control.clone(),
             self.profile.clone(),
+            self.ui_language.clone(),
+            self.test_key_fingerprint.clone(),
         ));
     }
 
     /// 处理 TLS 预检线程返回的状态。
     fn receive_trust_events(&mut self) {
+        if *self.shutdown.borrow() {
+            return;
+        }
         while let Ok(event) = self.trust_events.try_recv() {
             match event {
                 TrustBootstrapEvent::Ready(config) => self.start_live(config),
@@ -824,6 +859,23 @@ impl RemoteOpsAgentApp {
             };
             self.apply_event(event);
             processed += 1;
+        }
+        let dropped = self.events.dropped_log_lines();
+        if dropped > self.reported_dropped {
+            let count = dropped - self.reported_dropped;
+            self.reported_dropped = dropped;
+            let message = if self.translator.language() == Language::ZhCn {
+                format!("[中间显示记录已省略 {count} 条；任务状态继续保留]")
+            } else {
+                format!("[{count} intermediate display records omitted; task state retained]")
+            };
+            self.apply_event(AgentEvent::OperationLog(AgentOperationLog {
+                repetition: None,
+                request_id: None,
+                occurred_at: Utc::now(),
+                level: AgentLogLevel::Info,
+                message,
+            }));
         }
         processed == MAX_EVENTS_PER_FRAME
     }
@@ -864,6 +916,7 @@ impl RemoteOpsAgentApp {
             AgentEvent::Connected {
                 pairing_code,
                 lease_expires_at,
+                ..
             } => {
                 self.pairing_code = Some(pairing_code);
                 self.pairing_code_expires_at = Some(lease_expires_at);
@@ -926,6 +979,10 @@ impl RemoteOpsAgentApp {
                     }
                 }
             }
+            // 新原生观察宿主使用结构化上下文；旧版日志保持既有呈现。
+            AgentEvent::OperationContext { .. }
+            | AgentEvent::OperationPresentation { .. }
+            | AgentEvent::OperationOutputUpdate { .. } => {}
             AgentEvent::OperationLog(log) => {
                 if let Some(diagnostic) = log.message.strip_prefix("图形探测：") {
                     self.diagnostics.record_detail("visual_probe", diagnostic);
@@ -1011,19 +1068,49 @@ impl RemoteOpsAgentApp {
         Some(label)
     }
 
-    /// 请求后台停止，并允许随后关闭窗口。
+    /// 请求后台清理资源，实际线程结束后再关闭进程。
     fn stop_and_close(&mut self, ctx: &egui::Context) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
         self.clear_controller_state();
         self.status = UiStatus::Stopped;
-        self.allow_close = true;
         self.show_stop_confirmation = false;
+        self.finish_shutdown_if_ready(ctx);
+    }
+
+    /// 停止通知可能被订阅丢弃，因此以后台线程实际退出为准。
+    fn finish_shutdown_if_ready(&mut self, ctx: &egui::Context) -> bool {
+        if !*self.shutdown.borrow() {
+            return false;
+        }
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return false;
+        }
+        self.allow_close = true;
+        self.status = UiStatus::Stopped;
         ctx.send_viewport_cmd(ViewportCommand::Close);
+        true
+    }
+
+    /// 资源清理期间保持明确的双语退出状态。
+    fn shutdown_label(&self) -> Option<&'static str> {
+        (*self.shutdown.borrow() && !self.allow_close).then(|| {
+            localized_label(
+                self.translator.language(),
+                "正在停止并清理临时资源…",
+                "Stopping and cleaning temporary resources…",
+            )
+        })
     }
 
     /// 切换界面语言，并重新应用可选外部语言包。
     fn set_language(&mut self, language: Language, ctx: &egui::Context) {
         self.translator.set_language(language);
+        self.ui_language.set(target_ui_language(language));
         if let Some(path) = &self.language_file {
             let _ = self.translator.overlay_file(path);
         }
@@ -1426,6 +1513,9 @@ impl RemoteOpsAgentApp {
     }
 
     fn connection_heading(&self) -> String {
+        if let Some(label) = self.shutdown_label() {
+            return label.to_owned();
+        }
         let key = match self.status {
             UiStatus::Starting => "status.starting",
             UiStatus::Connecting => "status.connecting",
@@ -1439,6 +1529,9 @@ impl RemoteOpsAgentApp {
 
     /// 返回当前操作状态摘要；连接不可用时优先显示生命周期状态。
     fn operation_status_label(&self) -> String {
+        if let Some(label) = self.shutdown_label() {
+            return label.to_owned();
+        }
         let key = match self.status {
             UiStatus::Starting => "status.starting",
             UiStatus::Connecting => "status.connecting",
@@ -1758,6 +1851,97 @@ impl RemoteOpsAgentApp {
                         }
                     });
             });
+    }
+
+    /// 保存本地资源信任来源，不影响正在运行的连接。
+    fn save_resource_settings(&mut self) -> anyhow::Result<()> {
+        let mut config = self
+            .control_ui
+            .config
+            .clone()
+            .unwrap_or_else(|| AgentConfig::for_product(&self.profile));
+        config.resource_tools.index_url = (!self.resource_settings.index_url.trim().is_empty())
+            .then(|| self.resource_settings.index_url.trim().to_owned());
+        config.resource_tools.allowed_origins = self
+            .resource_settings
+            .allowed_origins
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        config.resource_tools.validate()?;
+        self.config_path = config.save_for_product(&self.profile, &self.config_path, false)?;
+        if let Some(setup) = &mut self.setup {
+            setup.base_config.resource_tools = config.resource_tools.clone();
+        }
+        self.control_ui.config = Some(config);
+        Ok(())
+    }
+
+    /// 在现有设置入口编辑HTTPS来源；运行连接保持其启动时的信任快照。
+    fn render_resource_settings(&mut self, ctx: &egui::Context) {
+        if !self.resource_settings.open {
+            return;
+        }
+        let zh = self.translator.language() == Language::ZhCn;
+        let label = |cn, en| if zh { cn } else { en };
+        let mut save = false;
+        let mut open = self.resource_settings.open;
+        egui::Window::new(label("资源工具来源", "Resource tool sources"))
+            .id(egui::Id::new("resource-tool-settings"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                ui.label(label(
+                    "清单地址（留空关闭）",
+                    "Index URL (empty disables tools)",
+                ));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.resource_settings.index_url)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.weak("https://example.com/remoteops/v1/index.json");
+                ui.add_space(8.0);
+                ui.label(label(
+                    "允许下载的 HTTPS 来源（每行一个）",
+                    "Allowed HTTPS origins (one per line)",
+                ));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.resource_settings.allowed_origins)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.weak(label(
+                    "例如 https://example.com，不含路径；每次跳转都会检查。",
+                    "Example: https://example.com, without a path; every redirect is checked.",
+                ));
+                ui.label(label(
+                    "仅信任你认可的资源发布者。保存后重启 Agent 生效。",
+                    "Trust only publishers you recognize. Restart Agent after saving.",
+                ));
+                if let Some(error) = &self.resource_settings.error {
+                    ui.colored_label(Palette::current(ctx).danger, error);
+                }
+                ui.horizontal(|ui| {
+                    save = ui.button(label("保存", "Save")).clicked();
+                    if ui.button(label("取消", "Cancel")).clicked() {
+                        self.resource_settings.open = false;
+                    }
+                });
+            });
+        self.resource_settings.open &= open;
+        if save {
+            match self.save_resource_settings() {
+                Ok(()) => self.resource_settings.open = false,
+                Err(error) => {
+                    self.resource_settings.error =
+                        Some(remoteops_agent::redact_diagnostic(&error.to_string()));
+                }
+            }
+        }
     }
 
     /// 渲染只读运行信息；SSH 密码只在控制端 MCP 的本机安全窗口录入。
@@ -2138,6 +2322,28 @@ impl RemoteOpsAgentApp {
                 self.control_ui.open = true;
             }
             ui.separator();
+            if ui
+                .button(if self.translator.language() == Language::ZhCn {
+                    "资源工具来源"
+                } else {
+                    "Resource tool sources"
+                })
+                .clicked()
+            {
+                let resource = self
+                    .control_ui
+                    .config
+                    .as_ref()
+                    .map(|config| &config.resource_tools);
+                self.resource_settings.index_url = resource
+                    .and_then(|config| config.index_url.clone())
+                    .unwrap_or_default();
+                self.resource_settings.allowed_origins =
+                    resource.map_or_else(String::new, |config| config.allowed_origins.join("\n"));
+                self.resource_settings.error = None;
+                self.resource_settings.open = true;
+                ui.close();
+            }
             ui.weak(format!("{} v{}", self.profile.name, self.profile.version));
             ui.weak(format!("RemoteOps {}", env!("CARGO_PKG_VERSION")));
         })
@@ -2414,11 +2620,8 @@ fn setup_error_message(error: &str) -> String {
 
 /// 将控制码统一显示为连字符分隔的三位一组，和复制值保持一致。
 fn display_pairing_code(code: &str) -> String {
-    let digits: String = code.chars().filter(char::is_ascii_digit).collect();
-    if digits.len() == 9 {
-        return format!("{}-{}-{}", &digits[..3], &digits[3..6], &digits[6..]);
-    }
-    code.to_owned()
+    remoteops_domain::PairingCode::parse(code)
+        .map_or_else(|_| code.to_owned(), |value| value.display_grouped())
 }
 
 /// 返回控制码距离租约到期的剩余秒数；已过期时返回 None。
@@ -2440,6 +2643,13 @@ fn format_countdown(seconds: i64) -> String {
 }
 
 /// 返回适合当前界面语言的短标签。
+fn target_ui_language(language: Language) -> remoteops_domain::TargetUiLanguage {
+    match language {
+        Language::ZhCn => remoteops_domain::TargetUiLanguage::ZhCn,
+        Language::EnUs => remoteops_domain::TargetUiLanguage::EnUs,
+    }
+}
+
 fn localized_label(language: Language, zh_cn: &'static str, en_us: &'static str) -> &'static str {
     match language {
         Language::ZhCn => zh_cn,
@@ -2594,17 +2804,23 @@ impl eframe::App for RemoteOpsAgentApp {
         }
         // 加载动画仅在控制码区域可见时请求重绘；其余状态按秒刷新。
         ctx.request_repaint_after(Duration::from_secs(1));
-        if matches!(self.status, UiStatus::Stopped) && !self.allow_close {
+        let shutdown_requested = *self.shutdown.borrow();
+        if shutdown_requested {
+            self.finish_shutdown_if_ready(&ctx);
+        }
+        if matches!(self.status, UiStatus::Stopped) && !self.allow_close && !shutdown_requested {
             self.allow_close = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
         if ctx.input(|input| input.viewport().close_requested()) && !self.allow_close {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            if matches!(self.status, UiStatus::Stopped | UiStatus::Failed(_)) {
-                self.allow_close = true;
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            } else {
-                self.show_stop_confirmation = true;
+            if !shutdown_requested {
+                if matches!(self.status, UiStatus::Stopped | UiStatus::Failed(_)) {
+                    self.allow_close = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                } else {
+                    self.show_stop_confirmation = true;
+                }
             }
         }
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -2618,6 +2834,7 @@ impl eframe::App for RemoteOpsAgentApp {
         self.render_control_permissions(&ctx);
         self.render_stop_confirmation(&ctx);
         self.render_advanced_settings(&ctx);
+        self.render_resource_settings(&ctx);
         self.render_certificate_confirmation(&ctx);
         ctx.request_repaint_after(Duration::from_secs(1));
     }
@@ -2636,6 +2853,7 @@ impl eframe::App for RemoteOpsAgentApp {
 
 impl Drop for RemoteOpsAgentApp {
     fn drop(&mut self) {
+        self.events.close();
         let _ = self.shutdown.send(true);
     }
 }
@@ -2718,6 +2936,8 @@ fn spawn_live(
     shutdown_receiver: watch::Receiver<bool>,
     permission_control: AgentPermissionControl,
     profile: ProductProfile,
+    ui_language: remoteops_agent::AgentUiLanguage,
+    test_key_fingerprint: Option<String>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("remoteops-agent-runtime".to_owned())
@@ -2728,18 +2948,21 @@ fn spawn_live(
                 .worker_threads(2)
                 .thread_name("remoteops-agent-worker")
                 .build();
+            let mut options =
+                AgentRuntimeOptions::interactive(profile).with_ui_language(ui_language);
+            options.test_key_fingerprint = test_key_fingerprint;
             let result = match runtime {
-                Ok(runtime) => runtime.block_on(run_agent_with_scoped_options(
+                Ok(runtime) => runtime.block_on(run_agent_with_bounded_scoped_options(
                     config,
-                    Some(event_sender.clone()),
+                    event_sender.clone(),
                     shutdown_receiver,
                     permission_control,
-                    AgentRuntimeOptions::interactive(profile),
+                    options,
                 )),
                 Err(error) => Err(anyhow::Error::new(error).context("无法创建 Agent 异步运行时")),
             };
             if let Err(error) = result {
-                let _ = event_sender.send(AgentEvent::Failed {
+                event_sender.send(AgentEvent::Failed {
                     message: error.to_string(),
                 });
             }
@@ -2750,11 +2973,14 @@ fn spawn_live(
 /// 演示使用与真实连接相同的绑定状态驱动权限展示。
 fn demo_controller_binding() -> AgentControllerBinding {
     AgentControllerBinding {
+        installation_authorized: false,
+        disconnect_target: None,
         owner_id: remoteops_domain::ControllerOwnerId::new(),
         controller_kind: ControllerKind::Ai,
         permission_mode: remoteops_domain::PermissionMode::ApprovalRequired,
         controller_control_mode: Some(ControllerControlMode::FullAccess),
         control_state: Some(SessionControlState {
+            initialization_pending: false,
             session_id: remoteops_domain::SessionId::new(),
             controller_id: remoteops_domain::ControllerInstanceId::new(),
             agent_generation: 1,
@@ -2777,7 +3003,7 @@ fn spawn_demo(
     std::thread::Builder::new()
         .name("remoteops-agent-demo".to_owned())
         .spawn(move || {
-            let _ = event_sender.send(AgentEvent::Started {
+            event_sender.send(AgentEvent::Started {
                 agent_instance_id: AgentInstanceId::new(),
                 relay: config.relay,
                 transfer_root: config.transfer_root,
@@ -2795,14 +3021,15 @@ fn spawn_demo(
                 .unwrap_or(2)
                 .min(120);
             std::thread::sleep(Duration::from_secs(loading_seconds));
-            let _ = event_sender.send(AgentEvent::Connected {
+            event_sender.send(AgentEvent::Connected {
+                latest_update: None,
                 pairing_code: "482-915-307".to_owned(),
                 lease_expires_at: Utc::now() + chrono::Duration::minutes(10),
             });
-            let _ = event_sender.send(AgentEvent::ControllerCountChanged {
+            event_sender.send(AgentEvent::ControllerCountChanged {
                 active_connections: 1,
             });
-            let _ = event_sender.send(AgentEvent::ControllerBindingsChanged {
+            event_sender.send(AgentEvent::ControllerBindingsChanged {
                 bindings: vec![demo_controller_binding()],
             });
             // 保留空闲时间，并循环演示执行、成功与失败，便于观察固定布局。
@@ -2812,11 +3039,12 @@ fn spawn_demo(
                     break;
                 }
                 let request_id = RequestId::new();
-                let _ = event_sender.send(AgentEvent::OperationStateChanged {
+                event_sender.send(AgentEvent::OperationStateChanged {
                     request_id,
                     state: AgentOperationState::Running,
                 });
-                let _ = event_sender.send(AgentEvent::OperationLog(AgentOperationLog {
+                event_sender.send(AgentEvent::OperationLog(AgentOperationLog {
+                    repetition: None,
                     request_id: Some(request_id),
                     occurred_at: Utc::now(),
                     level: AgentLogLevel::Running,
@@ -2827,7 +3055,8 @@ fn spawn_demo(
                     break;
                 }
                 let failed = index % 3 == 2;
-                let _ = event_sender.send(AgentEvent::OperationLog(AgentOperationLog {
+                event_sender.send(AgentEvent::OperationLog(AgentOperationLog {
+                    repetition: None,
                     request_id: Some(request_id),
                     occurred_at: Utc::now(),
                     level: if failed {
@@ -2841,7 +3070,7 @@ fn spawn_demo(
                         "模拟操作完成：设备环境检查通过".to_owned()
                     },
                 }));
-                let _ = event_sender.send(AgentEvent::OperationStateChanged {
+                event_sender.send(AgentEvent::OperationStateChanged {
                     request_id,
                     state: if failed {
                         AgentOperationState::Failed
@@ -3220,6 +3449,7 @@ fn run_gui(
                 .map(|path| path.with_file_name("demo-gui.ron"))
         })
         .flatten();
+    let test_key_fingerprint = args.test_key_fingerprint.clone();
     let startup = args.into_product_startup(&profile);
     let initial_setup = matches!(&startup, StartupState::Setup(_));
     diagnostics.record_detail("renderer", renderer);
@@ -3279,6 +3509,7 @@ fn run_gui(
                 app_diagnostics.clone(),
                 profile,
                 options,
+                test_key_fingerprint,
             );
             app_diagnostics.record("app_created");
             Ok(Box::new(app))
@@ -3379,7 +3610,7 @@ fn launch_gui(
 }
 
 /// Launch the default product through the same public host.
-#[must_use]
+#[must_use = "将启动结果作为进程退出码返回"]
 pub fn run_default() -> std::process::ExitCode {
     let profile = ProductProfile {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -3388,11 +3619,11 @@ pub fn run_default() -> std::process::ExitCode {
     run(profile, GuiOptions::remoteops())
 }
 /// 按启动参数运行同一产品的 GUI 或无图形控制台。
-#[must_use]
+#[must_use = "将启动结果作为进程退出码返回"]
 pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCode {
-    if console_startup::console_requested(std::env::args_os())
-        && let Err(error) = remoteops_native_host::ensure_console()
-    {
+    let command_line: Vec<_> = std::env::args_os().collect();
+    let cli_requested = console_startup::console_requested(command_line.iter().cloned());
+    if cli_requested && let Err(error) = remoteops_native_host::ensure_console() {
         eprintln!("无法初始化控制台：{error}");
         return std::process::ExitCode::FAILURE;
     }
@@ -3400,23 +3631,49 @@ pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCo
         eprintln!("{error}");
         return std::process::ExitCode::FAILURE;
     }
-    let _ = DIAGNOSTIC_PRODUCT.set(profile.clone());
-    install_panic_reporter();
-    let diagnostics = StartupDiagnostics::start();
-    diagnostics.record("panic_reporter_installed");
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    diagnostics.record("rustls_provider_installed");
-    let args = match Args::parse_for(&profile, std::env::args_os()) {
+    let (command_line, action) = match remoteops_agent::split_test_key_args(command_line) {
+        Ok(parsed) => parsed,
+        Err(error) => return test_key_startup_error(cli_requested, &error.to_string()),
+    };
+    let mut args = match Args::parse_for(&profile, command_line) {
         Ok(args) => args,
         Err(error) => {
             if let Some(error) = error.downcast_ref::<clap::Error>() {
                 let _ = error.print();
                 return std::process::ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(1));
             }
-            eprintln!("{error}");
-            return std::process::ExitCode::FAILURE;
+            return test_key_startup_error(cli_requested, &error.to_string());
         }
     };
+    match action {
+        remoteops_agent::TestKeyAction::Normal => {}
+        remoteops_agent::TestKeyAction::Use(fingerprint) => {
+            if args.demo {
+                return test_key_startup_error(cli_requested, "演示模式不接受测试密钥");
+            }
+            args.test_key_fingerprint = Some(fingerprint);
+        }
+        remoteops_agent::TestKeyAction::Generate => {
+            let guid = remoteops_agent::generate_test_key();
+            if args.cli {
+                println!("{guid}");
+                return std::process::ExitCode::SUCCESS;
+            }
+            #[cfg(windows)]
+            return match remoteops_native_host::show_test_key_dialog(&guid) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => test_key_startup_error(false, &error.to_string()),
+            };
+            #[cfg(not(windows))]
+            return test_key_startup_error(false, "此平台请使用 --cli 生成 GUID");
+        }
+    }
+    let _ = DIAGNOSTIC_PRODUCT.set(profile.clone());
+    install_panic_reporter();
+    let diagnostics = StartupDiagnostics::start();
+    diagnostics.record("panic_reporter_installed");
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    diagnostics.record("rustls_provider_installed");
     diagnostics.record("arguments_parsed");
     if args.cli {
         diagnostics.record("console_mode_selected");
@@ -3429,6 +3686,17 @@ pub fn run(profile: ProductProfile, options: GuiOptions) -> std::process::ExitCo
         return std::process::ExitCode::FAILURE;
     }
     launch_gui(args, &diagnostics, profile, options)
+}
+
+fn test_key_startup_error(cli: bool, message: &str) -> std::process::ExitCode {
+    #[cfg(windows)]
+    if !cli {
+        remoteops_native_host::show_startup_error(message);
+        return std::process::ExitCode::FAILURE;
+    }
+    let _ = cli;
+    eprintln!("{message}");
+    std::process::ExitCode::FAILURE
 }
 
 #[cfg(test)]
@@ -3472,9 +3740,9 @@ mod tests {
                 )
             );
             let title = if language == Language::ZhCn {
-                "精灵 AI 远程协助"
+                "示例远程协助"
             } else {
-                "JLAI Remote Assistance"
+                "Example Remote Assistance"
             };
             translator
                 .overlay_entries(std::collections::BTreeMap::from([(
@@ -3506,8 +3774,8 @@ mod tests {
         let mut app = test_app();
         app.profile.version = "9.8.7-preview.6".into();
         app.options.texts = [
-            (Language::ZhCn, "精灵 AI 远程协助"),
-            (Language::EnUs, "JLAI Remote Assistance"),
+            (Language::ZhCn, "示例远程协助"),
+            (Language::EnUs, "Example Remote Assistance"),
         ]
         .into_iter()
         .map(|(language, title)| {
@@ -3518,13 +3786,14 @@ mod tests {
         })
         .collect();
         for (language, title) in [
-            (Language::ZhCn, "精灵 AI 远程协助"),
-            (Language::EnUs, "JLAI Remote Assistance"),
-            (Language::ZhCn, "精灵 AI 远程协助"),
+            (Language::ZhCn, "示例远程协助"),
+            (Language::EnUs, "Example Remote Assistance"),
+            (Language::ZhCn, "示例远程协助"),
         ] {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 app.set_language(language, ui.ctx());
             });
+            assert_eq!(app.ui_language.get(), Some(target_ui_language(language)));
             let expected = format!("{title} v9.8.7-preview.6");
             assert!(output.viewport_output[&egui::ViewportId::ROOT].commands.iter().any(|command| matches!(command, ViewportCommand::Title(value) if value == &expected)));
         }
@@ -3560,6 +3829,7 @@ mod tests {
     fn pairing_code_display_and_countdown_are_stable() {
         assert_eq!(display_pairing_code("482-915-307"), "482-915-307");
         assert_eq!(display_pairing_code("pending"), "pending");
+        assert_eq!(display_pairing_code("a2cd3ef4g"), "A2C-D3E-F4G");
         assert_eq!(format_countdown(599), "09:59");
         assert_eq!(format_countdown(3_661), "1:01:01");
 
@@ -3572,6 +3842,105 @@ mod tests {
     }
 
     #[test]
+    fn requested_close_waits_for_runtime_cleanup_even_without_stopped_event() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        let (release, wait) = mpsc::channel();
+        app.worker = Some(std::thread::spawn(move || {
+            wait.recv().unwrap();
+        }));
+        app.stop_and_close(&ctx);
+        assert!(*app.shutdown.borrow());
+        assert!(!app.allow_close);
+        assert_eq!(app.shutdown_label(), Some("正在停止并清理临时资源…"));
+        app.set_language(Language::EnUs, &ctx);
+        assert_eq!(
+            app.shutdown_label(),
+            Some("Stopping and cleaning temporary resources…")
+        );
+        app.apply_event(AgentEvent::Stopped);
+        assert!(!app.finish_shutdown_if_ready(&ctx));
+        app.trust_sender
+            .send(TrustBootstrapEvent::Failed("late event".into()))
+            .unwrap();
+        app.receive_trust_events();
+        assert!(matches!(app.status, UiStatus::Stopped));
+        release.send(()).unwrap();
+        app.worker.take().unwrap().join().unwrap();
+        assert!(app.finish_shutdown_if_ready(&ctx));
+        assert!(app.allow_close);
+        assert!(app.shutdown_label().is_none());
+    }
+
+    #[test]
+    fn bounded_gui_subscription_coalesces_slow_consumer_cumulative_updates() {
+        let mut app = test_app();
+        app.apply_event(AgentEvent::ConnectionEpoch(7));
+        let request_id = RequestId::new();
+        for total in 1..=10_000 {
+            let repetition = remoteops_agent::AgentOutputRepetition {
+                record_id: 91,
+                total,
+            };
+            for event in [
+                AgentEvent::OperationLog(AgentOperationLog {
+                    repetition: Some(repetition),
+                    request_id: Some(request_id),
+                    occurred_at: Utc::now(),
+                    level: AgentLogLevel::Info,
+                    message: if total == 1 {
+                        "same".into()
+                    } else {
+                        format!("same × {total}")
+                    },
+                }),
+                AgentEvent::OperationOutputUpdate {
+                    request_id,
+                    text: "same".into(),
+                    repetition,
+                },
+            ] {
+                app.event_sender.send(AgentEvent::ScopedOperation {
+                    epoch: 7,
+                    event: Box::new(event),
+                });
+            }
+        }
+        assert_eq!(app.events.dropped_log_lines(), 0);
+        assert!(!app.receive_events());
+        assert_eq!(app.operation_logs.len(), 1);
+        assert_eq!(app.operation_logs[0].message, "same × 10000");
+        assert_eq!(app.operation_logs[0].repetition.unwrap().total, 10_000);
+        assert!(app.events.try_recv().is_err());
+    }
+
+    #[test]
+    fn cumulative_serial_log_updates_keep_one_unread_record() {
+        let mut logs = VecDeque::new();
+        let mut unread = 0;
+        for total in [1, 128, 10_000] {
+            store_operation_log(
+                &mut logs,
+                AgentOperationLog {
+                    repetition: Some(remoteops_agent::AgentOutputRepetition {
+                        record_id: 9,
+                        total,
+                    }),
+                    request_id: None,
+                    occurred_at: Utc::now(),
+                    level: AgentLogLevel::Info,
+                    message: format!("same × {total}"),
+                },
+                false,
+                &mut unread,
+            );
+        }
+        assert_eq!(logs.len(), 1);
+        assert_eq!(unread, 1);
+        assert_eq!(logs[0].message, "same × 10000");
+    }
+
+    #[test]
     fn operation_log_view_is_bounded_and_tracks_unread() {
         let mut logs = VecDeque::new();
         let mut unread = 0;
@@ -3579,6 +3948,7 @@ mod tests {
             store_operation_log(
                 &mut logs,
                 AgentOperationLog {
+                    repetition: None,
                     request_id: None,
                     occurred_at: Utc::now(),
                     level: AgentLogLevel::Info,
@@ -3594,6 +3964,7 @@ mod tests {
         store_operation_log(
             &mut logs,
             AgentOperationLog {
+                repetition: None,
                 request_id: None,
                 occurred_at: Utc::now(),
                 level: AgentLogLevel::Success,
@@ -4087,18 +4458,20 @@ mod tests {
     }
 
     fn test_app() -> RemoteOpsAgentApp {
-        let (event_sender, events) = mpsc::channel();
+        let (event_sender, events) = bounded_agent_events(1024);
         let (trust_sender, trust_events) = mpsc::channel();
         let (shutdown, _receiver) = watch::channel(false);
         RemoteOpsAgentApp {
             profile: ProductProfile::default(),
             options: GuiOptions::remoteops(),
+            test_key_fingerprint: None,
             activity: activity::ActivityModel::default(),
             event_epoch: None,
             logo: None,
             diagnostics: StartupDiagnostics { path: None },
             event_sender,
             events,
+            reported_dropped: 0,
             trust_sender,
             trust_events,
             shutdown,
@@ -4124,12 +4497,14 @@ mod tests {
             log_unread: 0,
             permission_control: AgentPermissionControl::default(),
             control_ui: ControlUi::default(),
+            ui_language: remoteops_agent::AgentUiLanguage::default(),
             elevated: Some(true),
             translator: Translator::new(remoteops_i18n::Language::ZhCn),
             appearance: Appearance::default(),
             language_file: None,
             show_stop_confirmation: false,
             show_advanced_settings: false,
+            resource_settings: ResourceSettings::default(),
             transfer_root_open_error: None,
             allow_close: false,
             copied_until: None,
@@ -4150,6 +4525,7 @@ mod tests {
             path: Some(path.clone()),
         };
         app.apply_event(AgentEvent::OperationLog(AgentOperationLog {
+            repetition: None,
             request_id: None,
             occurred_at: Utc::now(),
             level: AgentLogLevel::Info,
@@ -4175,6 +4551,7 @@ mod tests {
         }
         assert_eq!(app.running_operations.len(), 2);
         app.apply_event(AgentEvent::OperationLog(AgentOperationLog {
+            repetition: None,
             request_id: Some(first),
             occurred_at: Utc::now(),
             level: AgentLogLevel::Error,
@@ -4434,6 +4811,7 @@ mod tests {
                     });
                     for index in 0..8 {
                         app.apply_event(AgentEvent::OperationLog(AgentOperationLog {
+                            repetition: None,
                             request_id: None,
                             occurred_at: Utc::now(),
                             level: AgentLogLevel::Info,
@@ -4770,6 +5148,7 @@ mod tests {
             assert!(app.controller_bindings.is_empty());
             assert_eq!(app.controller_control_mode_label(), None);
             app.apply_event(AgentEvent::Connected {
+                latest_update: None,
                 pairing_code: "test".into(),
                 lease_expires_at: Utc::now(),
             });

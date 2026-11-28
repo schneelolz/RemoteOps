@@ -1,2 +1,4 @@
 *.sh text eol=lf
 
+# 固定摘要校验要求保留上游许可证原始字节。
+third-party/putty/LICENCE.txt -text whitespace=cr-at-eol

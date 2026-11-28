@@ -3,10 +3,20 @@
 > 文档状态：当前现场客户机手册，适用于 Agent GUI `0.2.0-preview.23`。
 
 - 适用版本：`0.2.0-preview.23`
-- 本地验收程序：`target/release/remoteops-agent-gui.exe`（尚未发布）
+- 本地验收程序：`target/release-small/remoteops-agent-gui.exe`（尚未发布）
 - Relay：由部署者配置，不内置公共默认值
 - 使用方式：管理员完成一次配置后，现场人员双击启动
 - 运行依赖：正式发布 EXE 静态链接 MSVC CRT，不需要另装 VC++ 运行库
+
+## 跨重启测试控制码
+
+平时双击 Agent，仍使用当次启动的随机九位码。要跨重启做测试，在同一台设备上先生成一次 GUID，再让每次测试启动都使用同一个 GUID。
+
+- GUI 用 `--gen-key` 打开复制窗口。控制台用 `--cli --gen-key`，独立 CLI 程序用 `--gen-key`。
+- GUI 用 `--key <GUID>` 或 `--key-file <路径>` 启动测试。需要控制台运行时再加 `--cli`。开机启动项可用 `--key-file`，文本文件只放一个 GUID。
+- Relay 仍发送九位控制码。测试 Agent 离线后，号码最多保留两小时，期间不能配对。按原 GUID 重启后可重新用原码配对。普通启动会暂停该测试码。
+- 自动化首次配对后保存响应中的 `agent_instance_id`，后续重新配对传入 `expected_agent_id`。每次 Agent 重启都建立新会话，已有会话授权随旧会话结束。
+- 测试模式和设备核对需要支持该功能的 Relay。命令行参数可能被同机进程查看，开机任务可把 GUID 放入仅允许当前运行账号读取的文件。
 
 ## 一、现场使用
 
@@ -35,7 +45,7 @@ start "" /wait "remoteops-agent-gui.exe" --cli
 定制版使用自己的 EXE 名称，例如：
 
 ```cmd
-start "" /wait "精灵AI-Agent-Release.exe" --cli
+start "" /wait "remoteops-agent-gui.exe" --cli
 ```
 
 PowerShell 中可使用：
@@ -191,10 +201,12 @@ Windows 默认使用 WGPU 的 DirectX 12 后端和低延迟单帧交换链，避
 cargo test -p remoteops-agent -p remoteops-agent-gui --locked
 cargo clippy -p remoteops-agent -p remoteops-agent-gui --all-targets --locked -- -D warnings
 .\scripts\Build-Windows.ps1
-.\scripts\Test-AgentGuiConsole.ps1 -Executable .\target\release\remoteops-agent-gui.exe
+.\scripts\Test-AgentGuiConsole.ps1 -Executable .\target\release-small\remoteops-agent-gui.exe
 .\scripts\Test-AgentGuiCodexMcp.ps1
 ```
 
 `Test-AgentGuiCodexMcp.ps1` 默认从剪贴板读取 GUI 复制的控制码，也可以通过 `-PairingCode` 显式提供。脚本仅在子进程内传递控制码，最终结果不会输出控制码、Token、`session_id` 或审批标识。
+
+`Build-Windows.ps1` 仅对现场 Agent GUI 使用 `release-small` 体积优化配置，本地缓存位于 `target/release-small`；最终交付目录仍由发布脚本的输出目录决定。DX12 默认启动、Glow 兼容回退和 `--cli` 入口保持原有行为。
 
 无图形启动检查 `Test-AgentGuiConsole.ps1` 在独立目录复制指定 EXE，以帮助、版本和无效临时配置验证控制台输出、快速失败及诊断阶段没有进入窗口初始化。脚本不连接 Relay，不代替配对、Shell 执行或 Server 2016 现场验收。

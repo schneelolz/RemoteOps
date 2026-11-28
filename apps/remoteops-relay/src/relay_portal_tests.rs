@@ -10,6 +10,7 @@ mod managed_portal_tests {
     struct ManagedFixture {
         relay: Relay,
         principal_id: Uuid,
+        asset_id: String,
         token: String,
         hello: AgentHello,
         registration: AgentRegistration,
@@ -18,6 +19,10 @@ mod managed_portal_tests {
 
     impl ManagedFixture {
         async fn new() -> Self {
+            Self::with_asset("asset-a".into(), false).await
+        }
+
+        async fn with_asset(asset_id: String, delegated: bool) -> Self {
             let mut relay = relay(Duration::minutes(10));
             relay.portal_store = Some(Arc::new(PortalStore::in_memory(test_owner_id()).unwrap()));
             let principal = relay
@@ -28,13 +33,24 @@ mod managed_portal_tests {
                 })
                 .await
                 .unwrap();
-            let asset = relay
-                .portal_create_asset(CreateAssetRequest {
-                    asset_id: "asset-a".into(),
-                    principal_id: principal.principal.principal_id,
-                })
-                .await
-                .unwrap();
+            let asset = if delegated {
+                relay
+                    .portal_prepare_managed_enrollment(
+                        &principal.token,
+                        principal.principal.principal_id,
+                        &asset_id,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                relay
+                    .portal_create_asset(CreateAssetRequest {
+                        asset_id: asset_id.clone(),
+                        principal_id: principal.principal.principal_id,
+                    })
+                    .await
+                    .unwrap()
+            };
             let mut hello = hello(AgentInstanceId::new(), None);
             hello.pairing_mode = PairingMode::ManagedOnDemand;
             hello.target_context = Some(remoteops_domain::TargetContext {
@@ -69,6 +85,7 @@ mod managed_portal_tests {
             Self {
                 relay,
                 principal_id: principal.principal.principal_id,
+                asset_id,
                 token: principal.token,
                 hello,
                 registration,
@@ -78,7 +95,7 @@ mod managed_portal_tests {
 
         async fn issue(&self) -> IssuedInvitation {
             self.relay
-                .portal_issue(&self.token, "asset-a", issue_request())
+                .portal_issue(&self.token, &self.asset_id, issue_request())
                 .await
                 .unwrap()
         }
@@ -131,12 +148,55 @@ mod managed_portal_tests {
 
     fn first_pair(code: &str) -> PairRequest {
         PairRequest {
+            expected_agent_id: None,
             request_id: RequestId::new(),
-            pairing_code: Some(PairingCode::parse(code).unwrap()),
+            pairing_code: Some(AccessCode::parse(code).unwrap()),
             expected_session_id: None,
             permission_mode: PermissionMode::ApprovalRequired,
             connection_resume_token: None,
         }
+    }
+
+    #[tokio::test]
+    async fn delegated_asset_registers_redeems_and_closes() {
+        let fixture =
+            ManagedFixture::with_asset(format!("opscenter-managed-{}", "a".repeat(64)), true).await;
+        let relay = &fixture.relay;
+        let status = relay
+            .portal_status(&fixture.token, &fixture.asset_id)
+            .await
+            .unwrap();
+        assert_eq!(status["online"], true);
+        let issued = fixture.issue().await;
+        let (controller, generation, _receiver) =
+            register_controller(relay, ControllerKind::Ai).await;
+        let paired = relay
+            .pair_controller(controller, generation, first_pair(&issued.code))
+            .await;
+        assert!(paired.error.is_none());
+        let status = relay
+            .portal_store
+            .as_ref()
+            .unwrap()
+            .status(fixture.principal_id, &fixture.asset_id, Utc::now())
+            .unwrap();
+        let connection = status.connection.unwrap();
+        let closed = relay
+            .portal_close(
+                &fixture.token,
+                connection.connection_id,
+                Some(connection.revision),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.state, "closed");
+        assert!(
+            relay
+                .pair_controller(controller, generation, first_pair(&issued.code))
+                .await
+                .error
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -251,6 +311,7 @@ mod managed_portal_tests {
 
     fn resume_pair(session: SessionId, token: &str) -> PairRequest {
         PairRequest {
+            expected_agent_id: None,
             request_id: RequestId::new(),
             pairing_code: None,
             expected_session_id: Some(session),
@@ -1166,5 +1227,896 @@ mod managed_portal_tests {
                 "每一个受管目标都必须收到旧绑定撤销，不能被首个落盘错误中断"
             );
         }
+    }
+    struct AdminManagedTarget {
+        hello: AgentHello,
+        target_id: String,
+        agent_resume_token: String,
+        session: SessionId,
+        request: RequestId,
+        code: String,
+        connection_resume_token: String,
+        receiver: mpsc::Receiver<WireMessage>,
+    }
+
+    async fn prepare_admin_managed_target(
+        relay: &Relay,
+        principal_id: Uuid,
+        token: &str,
+        asset_id: &str,
+        controller: ControllerInstanceId,
+        generation: u64,
+    ) -> AdminManagedTarget {
+        let asset = relay
+            .portal_create_asset(CreateAssetRequest {
+                principal_id,
+                asset_id: asset_id.into(),
+            })
+            .await
+            .unwrap();
+        let target_id = asset.asset.target_id;
+        let mut hello = hello(AgentInstanceId::new(), None);
+        hello.pairing_mode = PairingMode::ManagedOnDemand;
+        hello.target_context = Some(remoteops_domain::TargetContext::default());
+        hello.managed_enrollment = Some(ManagedAgentEnrollment {
+            target_id: target_id.clone(),
+            token: asset.enrollment_token,
+        });
+        let (sender, mut receiver) = test_channel();
+        let registration = relay.register_agent(hello.clone(), sender).await.unwrap();
+        assert!(
+            relay
+                .commit_agent_resume(hello.agent_instance_id, registration.connection_generation)
+                .await
+        );
+        assert!(
+            relay
+                .finalize_agent_resume(hello.agent_instance_id, registration.connection_generation)
+                .await
+                .is_some()
+        );
+        let issued = relay
+            .portal_issue(token, asset_id, issue_request())
+            .await
+            .unwrap();
+        let session = issued.invitation.target.session_id;
+        let paired = relay
+            .pair_controller(controller, generation, first_pair(&issued.code))
+            .await;
+        assert!(paired.error.is_none());
+        let request = RequestId::new();
+        let sender = controller_sender(relay, controller).await;
+        relay
+            .forward_controller_request(
+                controller,
+                generation,
+                RemoteRequest {
+                    request_id: request,
+                    session_id: session,
+                    source: EventSource::Ai,
+                    operation: RemoteOperation::GetTargetContext,
+                    approval_id: None,
+                    payload_base64: None,
+                    control_proof: None,
+                },
+                &sender,
+            )
+            .await;
+        assert!(relay.state.lock().await.in_flight.contains_key(&request));
+        while receiver.try_recv().is_ok() {}
+        AdminManagedTarget {
+            hello,
+            target_id,
+            agent_resume_token: registration.welcome.resume_token,
+            session,
+            request,
+            code: issued.code,
+            connection_resume_token: paired.connection_resume_token.unwrap(),
+            receiver,
+        }
+    }
+
+    async fn admin_test_principal(
+        relay: &Relay,
+        name: &str,
+        assets: &[&str],
+    ) -> remoteops_portal::CreatedPrincipal {
+        relay
+            .portal_create_principal(CreatePrincipalRequest {
+                name: name.into(),
+                owner_id: test_owner_id(),
+                allowed_assets: assets.iter().map(|asset| (*asset).into()).collect(),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn managed_admin_transfer_preserves_other_target_and_agent_identity() {
+        use remoteops_portal::{TransferAssetRequest, UpdatePrincipalAssetsRequest};
+        let mut relay = relay(Duration::minutes(10));
+        relay.portal_store = Some(Arc::new(PortalStore::in_memory(test_owner_id()).unwrap()));
+        let destination = admin_test_principal(&relay, "center", &["windows"]).await;
+        let source = admin_test_principal(&relay, "linux-test", &["linux"]).await;
+        let (controller, generation, _receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        let mut windows = prepare_admin_managed_target(
+            &relay,
+            destination.principal.principal_id,
+            &destination.token,
+            "windows",
+            controller,
+            generation,
+        )
+        .await;
+        let mut linux = prepare_admin_managed_target(
+            &relay,
+            source.principal.principal_id,
+            &source.token,
+            "linux",
+            controller,
+            generation,
+        )
+        .await;
+        let updated = relay
+            .portal_update_principal_assets(
+                destination.principal.principal_id,
+                UpdatePrincipalAssetsRequest {
+                    expected_revision: destination.principal.revision,
+                    idempotency_key: Uuid::new_v4(),
+                    add: vec!["linux".into()],
+                    remove: vec![],
+                },
+                "runtime-test",
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.state, "completed");
+        {
+            let state = relay.state.lock().await;
+            assert!(state.session_bindings.contains_key(&windows.session));
+            assert!(state.session_bindings.contains_key(&linux.session));
+        }
+        let before = relay.portal_get_asset(&linux.target_id).await.unwrap();
+        let request = TransferAssetRequest {
+            expected_principal_id: source.principal.principal_id,
+            destination_principal_id: destination.principal.principal_id,
+            expected_revision: before.revision,
+            idempotency_key: Uuid::new_v4(),
+        };
+        let operation = relay
+            .portal_transfer_asset(&linux.target_id, request.clone(), "runtime-test")
+            .await
+            .unwrap();
+        assert_eq!(operation.state, "completed");
+        let after = relay.portal_get_asset(&linux.target_id).await.unwrap();
+        assert_eq!(after.target_id, before.target_id);
+        assert_eq!(after.asset_id, before.asset_id);
+        assert_eq!(after.agent_id, before.agent_id);
+        assert_eq!(after.principal_id, destination.principal.principal_id);
+        {
+            let state = relay.state.lock().await;
+            let agent = &state.agents[&linux.hello.agent_instance_id];
+            assert_eq!(
+                agent.managed_target_id.as_deref(),
+                Some(linux.target_id.as_str())
+            );
+            assert_eq!(
+                agent.resume_token.as_deref(),
+                Some(linux.agent_resume_token.as_str())
+            );
+            assert_eq!(agent.hello.boot_id, linux.hello.boot_id);
+            assert!(agent.ready && agent.sender.is_some());
+            assert!(!state.session_bindings.contains_key(&linux.session));
+            assert!(!state.in_flight.contains_key(&linux.request));
+            assert!(state.session_bindings.contains_key(&windows.session));
+            assert!(state.in_flight.contains_key(&windows.request));
+            assert!(
+                state.controllers[&controller]
+                    .sessions
+                    .contains(&windows.session)
+            );
+        }
+        assert!(matches!(
+            windows.receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let mut revoked = false;
+        while let Ok(message) = linux.receiver.try_recv() {
+            revoked |= matches!(message, WireMessage::ControllerBindingRevoked { session_id, .. }
+                if session_id == linux.session);
+        }
+        assert!(revoked);
+        assert!(relay.portal_status(&source.token, "linux").await.is_err());
+        assert!(
+            relay
+                .portal_issue(&source.token, "linux", issue_request())
+                .await
+                .is_err()
+        );
+        assert!(
+            relay
+                .portal_status(&destination.token, "windows")
+                .await
+                .is_ok()
+        );
+        assert!(
+            relay
+                .portal_status(&destination.token, "linux")
+                .await
+                .is_ok()
+        );
+        assert!(
+            relay
+                .pair_controller(controller, generation, first_pair(&linux.code))
+                .await
+                .error
+                .is_some()
+        );
+        assert!(
+            relay
+                .pair_controller(
+                    controller,
+                    generation,
+                    resume_pair(linux.session, &linux.connection_resume_token)
+                )
+                .await
+                .error
+                .is_some()
+        );
+
+        // 原登记证明与恢复令牌继续恢复同一 Agent，迁移不要求重新部署。
+        linux.hello.resume_token = Some(linux.agent_resume_token.clone());
+        let (sender, receiver) = test_channel();
+        let resumed = relay
+            .register_agent(linux.hello.clone(), sender)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.welcome.managed_target_id.as_deref(),
+            Some(linux.target_id.as_str())
+        );
+        assert!(
+            relay
+                .commit_agent_resume(linux.hello.agent_instance_id, resumed.connection_generation)
+                .await
+        );
+        assert!(
+            relay
+                .finalize_agent_resume(linux.hello.agent_instance_id, resumed.connection_generation)
+                .await
+                .is_some()
+        );
+        linux.receiver = receiver;
+        let issued = relay
+            .portal_issue(&destination.token, "linux", issue_request())
+            .await
+            .unwrap();
+        let paired = relay
+            .pair_controller(controller, generation, first_pair(&issued.code))
+            .await;
+        assert!(paired.error.is_none());
+        let new_session = issued.invitation.target.session_id;
+        let replayed = relay
+            .portal_transfer_asset(&linux.target_id, request, "runtime-test")
+            .await
+            .unwrap();
+        assert_eq!(replayed.operation_id, operation.operation_id);
+        let state = relay.state.lock().await;
+        assert!(state.session_bindings.contains_key(&new_session));
+        assert!(state.session_bindings.contains_key(&windows.session));
+    }
+
+    #[tokio::test]
+    async fn managed_admin_acl_changes_only_end_removed_targets() {
+        use remoteops_portal::UpdatePrincipalAssetsRequest;
+        let mut relay = relay(Duration::minutes(10));
+        relay.portal_store = Some(Arc::new(PortalStore::in_memory(test_owner_id()).unwrap()));
+        let principal = admin_test_principal(&relay, "center", &["windows", "linux"]).await;
+        let id = principal.principal.principal_id;
+        let (controller, generation, _receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        let windows = prepare_admin_managed_target(
+            &relay,
+            id,
+            &principal.token,
+            "windows",
+            controller,
+            generation,
+        )
+        .await;
+        let linux = prepare_admin_managed_target(
+            &relay,
+            id,
+            &principal.token,
+            "linux",
+            controller,
+            generation,
+        )
+        .await;
+        let operation = relay
+            .portal_update_principal_assets(
+                id,
+                UpdatePrincipalAssetsRequest {
+                    expected_revision: principal.principal.revision,
+                    idempotency_key: Uuid::new_v4(),
+                    add: vec!["future".into()],
+                    remove: vec!["linux".into()],
+                },
+                "runtime-test",
+            )
+            .await
+            .unwrap();
+        assert_eq!(operation.state, "completed");
+        {
+            let state = relay.state.lock().await;
+            assert!(state.session_bindings.contains_key(&windows.session));
+            assert!(state.in_flight.contains_key(&windows.request));
+            assert!(!state.session_bindings.contains_key(&linux.session));
+            assert!(!state.in_flight.contains_key(&linux.request));
+            assert_eq!(
+                state.agents[&linux.hello.agent_instance_id]
+                    .resume_token
+                    .as_deref(),
+                Some(linux.agent_resume_token.as_str())
+            );
+        }
+        assert!(
+            relay
+                .portal_status(&principal.token, "windows")
+                .await
+                .is_ok()
+        );
+        assert!(
+            relay
+                .portal_issue(&principal.token, "linux", issue_request())
+                .await
+                .is_err()
+        );
+        assert!(
+            relay
+                .pair_controller(controller, generation, first_pair(&linux.code))
+                .await
+                .error
+                .is_some()
+        );
+        assert!(
+            relay
+                .pair_controller(
+                    controller,
+                    generation,
+                    resume_pair(linux.session, &linux.connection_resume_token)
+                )
+                .await
+                .error
+                .is_some()
+        );
+        let latest = relay.portal_get_principal(id).await.unwrap();
+        assert!(latest.allowed_assets.contains(&"future".to_owned()));
+        assert!(!latest.allowed_assets.contains(&"linux".to_owned()));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn managed_admin_removed_acl_preserves_agent_reconnect() {
+        use remoteops_portal::UpdatePrincipalAssetsRequest;
+        let mut fixture = ManagedFixture::new().await;
+        let enrollment = fixture.hello.managed_enrollment.as_ref().unwrap().clone();
+        let before = fixture
+            .relay
+            .portal_get_asset(&enrollment.target_id)
+            .await
+            .unwrap();
+        let issued = fixture.issue().await;
+        let old_session = issued.invitation.target.session_id;
+        let (controller, generation, _receiver) =
+            register_controller(&fixture.relay, ControllerKind::Ai).await;
+        let paired = fixture
+            .relay
+            .pair_controller(controller, generation, first_pair(&issued.code))
+            .await;
+        assert!(paired.error.is_none());
+        let old_resume = paired.connection_resume_token.unwrap();
+        let principal = fixture
+            .relay
+            .portal_get_principal(fixture.principal_id)
+            .await
+            .unwrap();
+        fixture
+            .relay
+            .portal_update_principal_assets(
+                fixture.principal_id,
+                UpdatePrincipalAssetsRequest {
+                    expected_revision: principal.revision,
+                    idempotency_key: Uuid::new_v4(),
+                    add: vec![],
+                    remove: vec!["asset-a".into()],
+                },
+                "runtime-test",
+            )
+            .await
+            .unwrap();
+
+        // 门户授权撤销不删除受管部署身份，也不阻止同次启动和新启动恢复。
+        for new_boot in [false, true] {
+            fixture.reconnect_agent(new_boot).await;
+            assert_eq!(
+                fixture.registration.welcome.managed_target_id.as_deref(),
+                Some(enrollment.target_id.as_str())
+            );
+            assert!(fixture.registration.welcome.pairing_code.is_none());
+            let current = fixture
+                .relay
+                .portal_get_asset(&enrollment.target_id)
+                .await
+                .unwrap();
+            assert_eq!(current.agent_id, before.agent_id);
+            assert_eq!(current.target_id, before.target_id);
+            let proof = fixture.hello.managed_enrollment.as_ref().unwrap();
+            assert_eq!(proof.target_id, enrollment.target_id);
+            assert_eq!(proof.token, enrollment.token);
+            assert!(
+                fixture.relay.state.lock().await.agents[&fixture.hello.agent_instance_id].ready
+            );
+            assert!(
+                fixture
+                    .relay
+                    .portal_status(&fixture.token, "asset-a")
+                    .await
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .relay
+                    .portal_issue(&fixture.token, "asset-a", issue_request())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .relay
+                    .pair_controller(
+                        controller,
+                        generation,
+                        resume_pair(old_session, &old_resume)
+                    )
+                    .await
+                    .error
+                    .is_some()
+            );
+        }
+        let mut downgraded = fixture.hello.clone();
+        downgraded.pairing_mode = PairingMode::AutoPerBoot;
+        downgraded.managed_enrollment = None;
+        let (sender, _receiver) = test_channel();
+        assert!(
+            fixture
+                .relay
+                .register_agent(downgraded, sender)
+                .await
+                .is_err()
+        );
+        let principal = fixture
+            .relay
+            .portal_get_principal(fixture.principal_id)
+            .await
+            .unwrap();
+        fixture
+            .relay
+            .portal_update_principal_assets(
+                fixture.principal_id,
+                UpdatePrincipalAssetsRequest {
+                    expected_revision: principal.revision,
+                    idempotency_key: Uuid::new_v4(),
+                    add: vec!["asset-a".into()],
+                    remove: vec![],
+                },
+                "runtime-test",
+            )
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .relay
+                .portal_status(&fixture.token, "asset-a")
+                .await
+                .is_ok()
+        );
+        assert!(
+            fixture
+                .relay
+                .pair_controller(controller, generation, first_pair(&issued.code))
+                .await
+                .error
+                .is_some()
+        );
+        assert!(
+            fixture
+                .relay
+                .pair_controller(
+                    controller,
+                    generation,
+                    resume_pair(old_session, &old_resume)
+                )
+                .await
+                .error
+                .is_some()
+        );
+        let fresh = fixture.issue().await;
+        assert!(
+            fixture
+                .relay
+                .pair_controller(controller, generation, first_pair(&fresh.code))
+                .await
+                .error
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_admin_transfer_revokes_unredeemed_invitation() {
+        use remoteops_portal::TransferAssetRequest;
+        let fixture = ManagedFixture::new().await;
+        let destination = admin_test_principal(&fixture.relay, "destination", &["asset-a"]).await;
+        let issued = fixture.issue().await;
+        let target_id = &fixture.hello.managed_enrollment.as_ref().unwrap().target_id;
+        let asset = fixture.relay.portal_get_asset(target_id).await.unwrap();
+        let (controller, generation, _receiver) =
+            register_controller(&fixture.relay, ControllerKind::Ai).await;
+        let operation = fixture
+            .relay
+            .portal_transfer_asset(
+                target_id,
+                TransferAssetRequest {
+                    expected_principal_id: fixture.principal_id,
+                    destination_principal_id: destination.principal.principal_id,
+                    expected_revision: asset.revision,
+                    idempotency_key: Uuid::new_v4(),
+                },
+                "runtime-test",
+            )
+            .await
+            .unwrap();
+        assert_eq!(operation.state, "completed");
+        assert!(
+            fixture
+                .relay
+                .pair_controller(controller, generation, first_pair(&issued.code))
+                .await
+                .error
+                .is_some()
+        );
+        assert!(
+            fixture
+                .relay
+                .portal_store
+                .as_ref()
+                .unwrap()
+                .invitation_target(&issued.code, Utc::now())
+                .is_err()
+        );
+        let fresh = fixture
+            .relay
+            .portal_issue(&destination.token, "asset-a", issue_request())
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .relay
+                .pair_controller(controller, generation, first_pair(&fresh.code))
+                .await
+                .error
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn managed_admin_pending_transfer_reconciles_after_restart() {
+        use remoteops_portal::TransferAssetRequest;
+        let state_file = TestStateFile::new("managed-transfer-restart");
+        let relay = persisted_relay(&state_file.path, Duration::minutes(10)).unwrap();
+        let source = admin_test_principal(&relay, "source", &["linux"]).await;
+        let destination = admin_test_principal(&relay, "destination", &["linux"]).await;
+        let (controller, generation, _controller_receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        let mut linux = prepare_admin_managed_target(
+            &relay,
+            source.principal.principal_id,
+            &source.token,
+            "linux",
+            controller,
+            generation,
+        )
+        .await;
+        let before = relay.portal_get_asset(&linux.target_id).await.unwrap();
+        let request = TransferAssetRequest {
+            expected_principal_id: source.principal.principal_id,
+            destination_principal_id: destination.principal.principal_id,
+            expected_revision: before.revision,
+            idempotency_key: Uuid::new_v4(),
+        };
+        // 模拟 SQLite 已提交、Relay 尚未清理旧会话即退出的进程边界。
+        let pending = relay
+            .portal_store
+            .as_ref()
+            .unwrap()
+            .transfer_asset(&linux.target_id, request.clone(), "runtime-test")
+            .unwrap();
+        assert_eq!(pending.state, "pending");
+        assert!(
+            relay
+                .state
+                .lock()
+                .await
+                .session_bindings
+                .contains_key(&linux.session)
+        );
+        drop(relay);
+
+        let restored = persisted_relay(&state_file.path, Duration::minutes(10)).unwrap();
+        let completed = restored
+            .portal_admin_operation(pending.operation_id)
+            .await
+            .unwrap();
+        assert_eq!(completed.state, "completed");
+        assert!(
+            restored
+                .portal_store
+                .as_ref()
+                .unwrap()
+                .pending_admin_operations()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            restored
+                .portal_get_asset(&linux.target_id)
+                .await
+                .unwrap()
+                .principal_id,
+            destination.principal.principal_id
+        );
+        {
+            let state = restored.state.lock().await;
+            assert!(state.controllers.is_empty());
+            assert!(state.session_bindings.is_empty());
+            assert!(state.in_flight.is_empty());
+            let agent = &state.agents[&linux.hello.agent_instance_id];
+            assert_ne!(agent.session_id, linux.session);
+            assert_eq!(
+                agent.resume_token.as_deref(),
+                Some(linux.agent_resume_token.as_str())
+            );
+            assert_eq!(
+                agent.managed_target_id.as_deref(),
+                Some(linux.target_id.as_str())
+            );
+        }
+        linux.hello.resume_token = Some(linux.agent_resume_token.clone());
+        let (sender, _agent_receiver) = test_channel();
+        let resumed = restored.register_agent(linux.hello, sender).await.unwrap();
+        assert!(
+            restored
+                .commit_agent_resume(before.agent_id.unwrap(), resumed.connection_generation)
+                .await
+        );
+        assert!(
+            restored
+                .finalize_agent_resume(before.agent_id.unwrap(), resumed.connection_generation)
+                .await
+                .is_some()
+        );
+        let (sender, _controller_receiver) = test_channel();
+        let generation = restored
+            .register_controller(
+                controller,
+                test_owner_id(),
+                ControllerKind::Ai,
+                None,
+                None,
+                sender,
+            )
+            .await
+            .unwrap();
+        assert!(
+            restored
+                .pair_controller(controller, generation, first_pair(&linux.code))
+                .await
+                .error
+                .is_some()
+        );
+        assert!(
+            restored
+                .pair_controller(
+                    controller,
+                    generation,
+                    resume_pair(linux.session, &linux.connection_resume_token)
+                )
+                .await
+                .error
+                .is_some()
+        );
+        let issued = restored
+            .portal_issue(&destination.token, "linux", issue_request())
+            .await
+            .unwrap();
+        assert!(
+            restored
+                .pair_controller(controller, generation, first_pair(&issued.code))
+                .await
+                .error
+                .is_none()
+        );
+        let replayed = restored
+            .portal_transfer_asset(&linux.target_id, request, "runtime-test")
+            .await
+            .unwrap();
+        assert_eq!(replayed.operation_id, pending.operation_id);
+        assert!(
+            restored
+                .state
+                .lock()
+                .await
+                .session_bindings
+                .contains_key(&issued.invitation.target.session_id)
+        );
+
+        // 再次读取真实 JSON，确认启动收敛后的会话边界已经持久化。
+        drop(restored);
+        let persisted = persisted_relay(&state_file.path, Duration::minutes(10)).unwrap();
+        assert_ne!(
+            persisted.state.lock().await.agents[&before.agent_id.unwrap()].session_id,
+            linux.session
+        );
+        assert_eq!(
+            persisted
+                .portal_admin_operation(pending.operation_id)
+                .await
+                .unwrap()
+                .state,
+            "completed"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn managed_admin_transfer_json_failure_blocks_until_idempotent_retry() {
+        use remoteops_portal::TransferAssetRequest;
+        let mut relay = relay(Duration::minutes(10));
+        relay.portal_store = Some(Arc::new(PortalStore::in_memory(test_owner_id()).unwrap()));
+        let source = admin_test_principal(&relay, "source", &["linux"]).await;
+        let destination = admin_test_principal(&relay, "destination", &["linux"]).await;
+        let (controller, generation, _receiver) =
+            register_controller(&relay, ControllerKind::Ai).await;
+        let linux = prepare_admin_managed_target(
+            &relay,
+            source.principal.principal_id,
+            &source.token,
+            "linux",
+            controller,
+            generation,
+        )
+        .await;
+        let before = relay.portal_get_asset(&linux.target_id).await.unwrap();
+        let request = TransferAssetRequest {
+            expected_principal_id: source.principal.principal_id,
+            destination_principal_id: destination.principal.principal_id,
+            expected_revision: before.revision,
+            idempotency_key: Uuid::new_v4(),
+        };
+        let state_file = TestStateFile::new("managed-transfer-recovery");
+        std::fs::create_dir_all(&state_file.root).unwrap();
+        let blocker = state_file.root.join("not-a-directory");
+        std::fs::write(&blocker, b"block parent creation").unwrap();
+        relay.state_path = Some(blocker.join("relay-state.json"));
+        assert!(matches!(
+            relay
+                .portal_transfer_asset(&linux.target_id, request.clone(), "runtime-test")
+                .await,
+            Err(PortalError::Storage)
+        ));
+        let pending = relay
+            .portal_store
+            .as_ref()
+            .unwrap()
+            .pending_admin_operations()
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].state, "pending");
+        let operation_id = pending[0].operation_id;
+        assert_eq!(
+            relay
+                .portal_admin_operation(operation_id)
+                .await
+                .unwrap()
+                .state,
+            "pending"
+        );
+        assert_eq!(
+            relay
+                .portal_get_asset(&linux.target_id)
+                .await
+                .unwrap()
+                .principal_id,
+            destination.principal.principal_id
+        );
+        assert!(
+            relay
+                .portal_issue(&destination.token, "linux", issue_request())
+                .await
+                .is_err()
+        );
+        assert!(
+            relay
+                .pair_controller(controller, generation, first_pair(&linux.code))
+                .await
+                .error
+                .is_some()
+        );
+        assert!(
+            relay
+                .pair_controller(
+                    controller,
+                    generation,
+                    resume_pair(linux.session, &linux.connection_resume_token)
+                )
+                .await
+                .error
+                .is_some()
+        );
+        {
+            let state = relay.state.lock().await;
+            assert!(!state.session_bindings.contains_key(&linux.session));
+            assert!(!state.in_flight.contains_key(&linux.request));
+        }
+        relay.state_path = Some(state_file.path.clone());
+        let completed = relay
+            .portal_transfer_asset(&linux.target_id, request.clone(), "runtime-test")
+            .await
+            .unwrap();
+        assert_eq!(completed.operation_id, operation_id);
+        assert_eq!(completed.state, "completed");
+        assert!(state_file.path.exists());
+        assert!(
+            relay
+                .portal_store
+                .as_ref()
+                .unwrap()
+                .pending_admin_operations()
+                .unwrap()
+                .is_empty()
+        );
+        let issued = relay
+            .portal_issue(&destination.token, "linux", issue_request())
+            .await
+            .unwrap();
+        let paired = relay
+            .pair_controller(controller, generation, first_pair(&issued.code))
+            .await;
+        assert!(paired.error.is_none());
+        let new_session = issued.invitation.target.session_id;
+        let token = paired.connection_resume_token.unwrap();
+        let replayed = relay
+            .portal_transfer_asset(&linux.target_id, request, "runtime-test")
+            .await
+            .unwrap();
+        assert_eq!(replayed.operation_id, operation_id);
+        assert!(
+            relay
+                .state
+                .lock()
+                .await
+                .session_bindings
+                .contains_key(&new_session)
+        );
+        assert!(
+            relay
+                .pair_controller(controller, generation, resume_pair(new_session, &token))
+                .await
+                .error
+                .is_none()
+        );
     }
 }

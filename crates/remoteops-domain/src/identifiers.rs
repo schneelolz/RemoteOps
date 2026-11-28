@@ -99,7 +99,7 @@ uuid_identifier!(
 
 /// 人工输入的临时配对码。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct PairingCode(String);
 
 impl PairingCode {
@@ -107,13 +107,17 @@ impl PairingCode {
     ///
     /// # Errors
     ///
-    /// 当控制码不是九位数字或分组格式不正确时返回错误。
+    /// 控制码应含九个 ASCII 字母或数字，其中至少一位为数字。
     pub fn parse(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
-        let compact = value.replace([' ', '-'], "");
-        if compact.len() != 9 || !compact.bytes().all(|byte| byte.is_ascii_digit()) {
+        let mut compact = value.replace([' ', '-'], "");
+        if compact.len() != 9
+            || !compact.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !compact.bytes().any(|byte| byte.is_ascii_digit())
+        {
             return Err(DomainError::InvalidPairingCode);
         }
+        compact.make_ascii_uppercase();
         Ok(Self(compact))
     }
 
@@ -127,6 +131,20 @@ impl PairingCode {
     #[must_use]
     pub fn display_grouped(&self) -> String {
         format!("{}-{}-{}", &self.0[0..3], &self.0[3..6], &self.0[6..9])
+    }
+}
+
+impl TryFrom<String> for PairingCode {
+    type Error = DomainError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl From<PairingCode> for String {
+    fn from(code: PairingCode) -> Self {
+        code.0
     }
 }
 
@@ -161,6 +179,21 @@ mod tests {
     #[test]
     fn pairing_code_rejects_invalid_values() {
         assert!(PairingCode::parse("123").is_err());
-        assert!(PairingCode::parse("12345678x").is_err());
+        for invalid in ["12345678!", "ABCDEFGHI", "A1B2C3D4５", "A1Б2C3D4E"] {
+            assert!(PairingCode::parse(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn mixed_pairing_codes_are_case_insensitive_and_canonical_on_the_wire() {
+        let mixed = PairingCode::parse("a2c d3e-f4g").unwrap();
+        assert_eq!(mixed.as_str(), "A2CD3EF4G");
+        assert_eq!(mixed.display_grouped(), "A2C-D3E-F4G");
+        assert_eq!(serde_json::to_string(&mixed).unwrap(), r#""A2CD3EF4G""#);
+        assert_eq!(
+            serde_json::from_str::<PairingCode>(r#""a2cd3ef4g""#).unwrap(),
+            mixed
+        );
+        assert!(serde_json::from_str::<PairingCode>(r#""短码""#).is_err());
     }
 }

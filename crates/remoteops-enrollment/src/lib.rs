@@ -255,6 +255,9 @@ pub struct ClientSummary {
     pub created_at: DateTime<Utc>,
     pub last_seen: Option<DateTime<Utc>>,
     pub revoked: bool,
+    /// 与远程控制独立的工具管理权限，旧记录默认关闭。
+    #[serde(default)]
+    pub tool_management: bool,
 }
 
 #[cfg(test)]

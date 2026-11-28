@@ -8,7 +8,7 @@ $workspaceRoot = Split-Path -Parent $PSScriptRoot
 $markdownFiles = @(
     Get-ChildItem -LiteralPath $workspaceRoot -Recurse -Filter '*.md' -File |
         Where-Object {
-            $_.FullName -notmatch '[\\/](?:target|artifacts)[\\/]'
+            $_.FullName -notmatch '[\\/](?:target|artifacts|node_modules|\.git)[\\/]'
         }
 )
 $brokenLinks = [System.Collections.Generic.List[string]]::new()

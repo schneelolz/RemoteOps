@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../apps/RemoteOps.Desktop/RemoteOps.Desktop.csproj" />
+  </ItemGroup>
+  <Target Name="BuildWindowFixture" AfterTargets="Build" Inputs="$(MSBuildProjectDirectory)/window_fixture.rs" Outputs="$(TargetDir)window_fixture.dll">
+    <Exec Command="rustc --crate-type cdylib &quot;$(MSBuildProjectDirectory)/window_fixture.rs&quot; -o &quot;$(TargetDir)window_fixture.dll&quot;" />
+  </Target>
+</Project>

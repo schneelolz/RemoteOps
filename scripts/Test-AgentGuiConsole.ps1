@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Executable,
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot '../artifacts/gui-console-check')
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot '../artifacts/gui-console-check'),
+    [switch]$NativeWin32
 )
 
 Set-StrictMode -Version Latest
@@ -25,6 +26,7 @@ $cases = @(
     @{ Name = 'version'; Arguments = '--cli --version'; Success = $true; Pattern = '\d+\.\d+\.\d+' },
     @{ Name = 'invalid-config'; Arguments = ('--cli --config "{0}"' -f $invalidConfig); Success = $false; Pattern = '启动失败|Error|error' }
 )
+$nativeWindowObserved = $false
 $results = foreach ($case in $cases) {
     $stdout = Join-Path $runDirectory ($case.Name + '.stdout.txt')
     $stderr = Join-Path $runDirectory ($case.Name + '.stderr.txt')
@@ -49,7 +51,12 @@ $results = foreach ($case in $cases) {
         $null = $process.Start()
         $readOutput = $process.StandardOutput.ReadToEndAsync()
         $readError = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(15000)) {
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        while (-not $process.WaitForExit(25) -and [DateTime]::UtcNow -lt $deadline) {
+            $process.Refresh()
+            if ($process.MainWindowHandle -ne [IntPtr]::Zero) { $nativeWindowObserved = $true }
+        }
+        if (-not $process.HasExited) {
             $process.Kill()
             $process.WaitForExit()
             throw ('控制台启动超时，可能打开了图形错误对话框：' + $case.Name)
@@ -71,7 +78,7 @@ $consoleSelected = $diagnostics -match 'stage: console_mode_selected(?:\r?\n|$)'
 $windowStarted = $diagnostics -match 'stage: (starting_native_window|ui_thread_started)(?:\r?\n|$)'
 $results += [PSCustomObject]@{
     Case = 'no-graphics-startup'
-    Passed = $consoleSelected -and -not $windowStarted
+    Passed = if ($NativeWin32) { -not $nativeWindowObserved } else { $consoleSelected -and -not $windowStarted }
     ExitCode = $null
 }
 $results | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $runDirectory 'results.json')

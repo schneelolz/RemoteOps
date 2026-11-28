@@ -1,6 +1,11 @@
 //! 最小宿主事实与控制台封装；不加载图形 Provider、不枚举窗口、不截图、不注入输入。
 
 mod console;
+#[cfg(windows)]
+mod test_key_dialog;
+
+#[cfg(windows)]
+pub use test_key_dialog::{show_startup_error, show_test_key_dialog};
 
 pub use console::ensure_console;
 

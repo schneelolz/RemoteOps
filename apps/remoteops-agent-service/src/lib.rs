@@ -208,6 +208,7 @@ fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: Agen
         AgentEvent::Connected {
             pairing_code,
             lease_expires_at,
+            ..
         } => {
             "waiting".clone_into(&mut status.status);
             status.pairing_code = Some(pairing_code);
@@ -238,6 +239,9 @@ fn update_status_from_event(path: &Path, status: &mut RuntimeStatus, event: Agen
         AgentEvent::ControllerBindingsChanged { .. } => {}
         // 操作日志不改变服务状态，避免按输出行重复写入状态文件。
         AgentEvent::OperationLog(_)
+        | AgentEvent::OperationPresentation { .. }
+        | AgentEvent::OperationOutputUpdate { .. }
+        | AgentEvent::OperationContext { .. }
         | AgentEvent::OperationStateChanged { .. }
         | AgentEvent::ConnectionEpoch(_)
         | AgentEvent::ScopedOperation { .. }
@@ -579,6 +583,7 @@ mod tests {
             &path,
             &mut status,
             AgentEvent::Connected {
+                latest_update: None,
                 pairing_code: "123-456-789".into(),
                 lease_expires_at: Utc::now(),
             },
@@ -622,11 +627,25 @@ mod operation_log_tests {
             &path,
             &mut status,
             AgentEvent::OperationLog(AgentOperationLog {
+                repetition: None,
                 request_id: None,
                 occurred_at: Utc::now(),
                 level: AgentLogLevel::Info,
                 message: "example command output".to_owned(),
             }),
+        );
+        assert_eq!(status.status, "controlled");
+        assert!(!path.exists());
+        update_status_from_event(
+            &path,
+            &mut status,
+            AgentEvent::OperationContext {
+                request_id: remoteops_domain::RequestId::new(),
+                kind: remoteops_agent::AgentOperationKind::Ssh,
+                shell: None,
+                source: remoteops_domain::EventSource::Ai,
+                resource_id: None,
+            },
         );
         assert_eq!(status.status, "controlled");
         assert!(!path.exists());

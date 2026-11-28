@@ -30,6 +30,12 @@
 
 另附 [暗色日志](logs-dark.png)、[暗色停止确认](stop-confirmation-dark.png)。日志正文是原始模拟事件文本，因此不随界面语言翻译。
 
+## 设计对照记录
+
+macOS 上以 2× 像素密度捕获的英文暗色演示图与设计稿按内容区比例比较。复制按钮和控制码整体居中，标题和倒计时分别居中。中英文、亮暗四种组合中主要文字均可读，底栏没有截断。对照时排除了系统标题栏和指针。
+
+亮色菜单用蓝底白字标出选中项，危险操作确认使用较深的红底。图标沿用 Phosphor 和原窗口图标。设置按钮边框、系统字体和图标轮廓与设计稿略有差别。演示截图使用模拟会话，倒计时持续变化。后续缩小窗口和调整日志页后的布局由边界测试覆盖。
+
 ## 已完成检查
 
 最终提交前在 macOS 完成全工作区 `cargo check --workspace --locked`、`cargo clippy --workspace --all-targets --locked -- -D warnings` 和 `cargo test --workspace --locked`，均通过。

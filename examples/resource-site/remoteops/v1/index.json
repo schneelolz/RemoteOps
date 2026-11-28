@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "tools": [
+    {
+      "id": "playwright-mcp",
+      "version": "0.0.84",
+      "description": "独立浏览器自动化；不接管客户现有登录状态",
+      "capabilities": [
+        "browser.navigation",
+        "browser.snapshot",
+        "browser.interaction"
+      ],
+      "documentation_url": "https://github.com/microsoft/playwright-mcp",
+      "publisher": "本地发布者（部署前替换）",
+      "license": "Apache-2.0 AND MIT AND LicenseRef-Chrome-for-Testing",
+      "limitations": [
+        "实验候选；平台组合必须实测后才能标记 passed",
+        "仅 Windows x86_64，Server 2016 的 Chromium 兼容性不受支持"
+      ],
+      "release_notes": "固定上游版本，包内附依赖锁文件和上游许可证；不在现场执行 npm install",
+      "permissions": [
+        "execute_external_code",
+        "browser_read_write",
+        "network"
+      ],
+      "requires_desktop": true,
+      "platforms": [
+        {
+          "os": "windows",
+          "arch": "x86_64",
+          "os_versions": "Windows 10",
+          "status": "pending",
+          "min_windows_build": 17763,
+          "max_windows_build": 19045
+        },
+        {
+          "os": "windows",
+          "arch": "x86_64",
+          "os_versions": "Windows 11",
+          "status": "pending",
+          "min_windows_build": 22000,
+          "max_windows_build": 26200
+        },
+        {
+          "os": "windows",
+          "arch": "x86_64",
+          "os_versions": "Windows Server 2016",
+          "status": "unsupported",
+          "min_windows_build": 14393,
+          "max_windows_build": 14393
+        },
+        {
+          "os": "windows",
+          "arch": "x86_64",
+          "os_versions": "Windows Server 2019/2022/2025",
+          "status": "pending",
+          "min_windows_build": 17763,
+          "max_windows_build": 26100
+        }
+      ],
+      "package": {
+        "url": "packages/playwright-mcp-0.0.84-win-x64-6367bf1b69220db4.zip",
+        "format": "zip",
+        "size": 258689061,
+        "sha256": "6367bf1b69220db4663a11595dc4c710af7af9c80b72ddb1bfcd7558ea9946da"
+      },
+      "startup": {
+        "interface": "stdio_mcp",
+        "executable": "node/node.exe",
+        "args": [
+          "${package}/tools/node_modules/@playwright/mcp/cli.js"
+        ],
+        "browser_adapter": "playwright",
+        "browser_executable": "browser/chrome-win64/chrome.exe"
+      },
+      "health_check": {
+        "method": "tools/list",
+        "timeout_secs": 60
+      },
+      "timeout_secs": 60
+    },
+    {
+      "id": "agent-browser",
+      "version": "0.41.2",
+      "description": "独立浏览器自动化；不接管客户现有登录状态",
+      "capabilities": [
+        "browser.navigation",
+        "browser.snapshot",
+        "browser.interaction"
+      ],
+      "documentation_url": "https://agent-browser.dev",
+      "publisher": "本地发布者（部署前替换）",
+      "license": "Apache-2.0 AND MIT AND LicenseRef-Chrome-for-Testing",
+      "limitations": [
+        "实验候选；平台组合必须实测后才能标记 passed",
+        "仅 Windows x86_64，Server 2016 的 Chromium 兼容性不受支持"
+      ],
+      "release_notes": "固定上游版本，包内附依赖锁文件和上游许可证；不在现场执行 npm install",
+      "permissions": [
+        "execute_external_code",
+        "browser_read_write",
+        "network"
+      ],
+      "requires_desktop": true,
+      "platforms": [
+        {
+          "os": "windows",
+          "arch": "x86_64",
+          "os_versions": "Windows 10",
+          "status": "pending",
+          "min_windows_build": 17763,
+          "max_windows_build": 19045
+        },
+        {
+          "os": "windows",
+          "arch": "x86_64",
+          "os_versions": "Windows 11",
+          "status": "pending",
+          "min_windows_build": 22000,
+          "max_windows_build": 26200
+        },
+        {
+          "os": "windows",
+          "arch": "x86_64",
+          "os_versions": "Windows Server 2016",
+          "status": "unsupported",
+          "min_windows_build": 14393,
+          "max_windows_build": 14393
+        },
+        {
+          "os": "windows",
+          "arch": "x86_64",
+          "os_versions": "Windows Server 2019/2022/2025",
+          "status": "pending",
+          "min_windows_build": 17763,
+          "max_windows_build": 26100
+        }
+      ],
+      "package": {
+        "url": "packages/agent-browser-0.41.2-win-x64-499683b78ec6dc3b.zip",
+        "format": "zip",
+        "size": 225329722,
+        "sha256": "499683b78ec6dc3b57e0ba096eed4e26924f67400399585da65378fb36ba7b0a"
+      },
+      "startup": {
+        "interface": "agent_browser_cli",
+        "executable": "bin/agent-browser-win32-x64.exe",
+        "args": [],
+        "browser_executable": "browser/chrome-win64/chrome.exe"
+      },
+      "health_check": {
+        "method": "version",
+        "timeout_secs": 60
+      },
+      "timeout_secs": 60
+    }
+  ]
+}

@@ -22,10 +22,10 @@ use remoteops_ai::{
 use remoteops_application::{ApplicationError, ControllerKind, RelayClient, RelayClientConfig};
 use remoteops_audit::sha256_bytes;
 use remoteops_domain::{
-    AgentInstanceId, ApprovalId, ApprovalState, CapabilitySet, ConnectionDescriptor,
+    AccessCode, AgentInstanceId, ApprovalId, ApprovalState, CapabilitySet, ConnectionDescriptor,
     ConnectionState, ControllerInstanceId, ControllerOwnerId, EventPayload, EventSource,
-    PairingCode, PermissionMode, RemoteEvent, RemoteOperation, RequestId, SerialSettings,
-    SessionId, SessionRole, ShellKind,
+    PermissionMode, RemoteEvent, RemoteOperation, RequestId, SerialSettings, SessionId,
+    SessionRole, ShellKind,
 };
 use remoteops_protocol::PROTOCOL_VERSION;
 use remoteops_serial::{
@@ -56,6 +56,12 @@ const AI_HISTORY_MAX_ASSISTANT_CHARS: usize = 12_000;
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum BackendCommand {
+    /// 打开已配对现场 Agent 的独立人工桌面。
+    #[cfg(windows)]
+    OpenDesktop {
+        session_id: SessionId,
+        title: String,
+    },
     /// 使用临时配对码绑定一个现场 Agent。
     Pair {
         /// 九位配对码。
@@ -169,6 +175,9 @@ pub enum BackendCommand {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum BackendEvent {
+    /// 本次观看已经结束，可以重试。
+    #[cfg(windows)]
+    DesktopEnded(SessionId, Option<String>),
     /// 后端已经启动。
     Ready {
         /// 是否为本地演示模式。
@@ -2033,6 +2042,18 @@ async fn handle_live_command(
                 }
             }
         }
+        #[cfg(windows)]
+        BackendCommand::OpenDesktop { session_id, title } => {
+            let gui = event_tx.clone();
+            let client = client.clone();
+            tokio::spawn(async move {
+                let error = crate::desktop::open(client, session_id, title).await.err();
+                let _ = gui.send(BackendEvent::DesktopEnded(
+                    session_id,
+                    error.map(|e| format!("{e:#}")),
+                ));
+            });
+        }
         BackendCommand::Takeover { session_id } => {
             let result = client.human_takeover(&session_id.to_string()).await?;
             let _ = event_tx.send(BackendEvent::Message(result.response.summary));
@@ -2059,7 +2080,7 @@ async fn pair_connection(
     pairing_code: &str,
     alias: Option<String>,
 ) -> Result<ConnectionDescriptor, String> {
-    let code = PairingCode::parse(pairing_code).map_err(|error| error.to_string())?;
+    let code = AccessCode::parse(pairing_code).map_err(|error| error.to_string())?;
     let connection = client.pair(code).await.map_err(|error| error.to_string())?;
     if let Some(alias) = alias {
         client
@@ -2114,7 +2135,16 @@ fn send_serial_opened(
 }
 
 async fn send_connections(client: &RelayClient, event_tx: &Sender<BackendEvent>) {
-    let _ = event_tx.send(BackendEvent::Connections(client.list_connections().await));
+    let mut targets = client.list_connections().await;
+    if !client.supports_desktop() {
+        for target in &mut targets {
+            target
+                .environment
+                .tools
+                .retain(|t| t.name != "remoteops-desktop-v1");
+        }
+    }
+    let _ = event_tx.send(BackendEvent::Connections(targets));
 }
 
 fn demo_connections() -> Vec<ConnectionDescriptor> {
@@ -2495,6 +2525,8 @@ async fn handle_demo_command(
                 }
             }
         }
+        #[cfg(windows)]
+        BackendCommand::OpenDesktop { .. } => {}
         BackendCommand::Takeover { .. } => {
             let _ = event_tx.send(BackendEvent::Message(
                 "演示模式已暂停 AI；真实模式会通过 Relay 发送人工接管请求".to_owned(),

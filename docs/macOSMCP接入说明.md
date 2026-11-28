@@ -1,96 +1,27 @@
-# macOS MCP 接入说明
+# 在 Mac 上构建 RemoteOpsBridge 和 MCP
 
-> 当前安装规则：新版安装器只支持设置码/设置文件，不再支持 Token 安装。Relay 后台「允许旧 Token 客户端接入」默认开启，已安装的旧 MCP 可继续使用原 Token；关闭时断开旧连接并拒绝重连，独立凭据及 Human 不受影响。旧 Token 配置说明仅供已有安装排查，不能用于新版安装；新安装见[一次性安装配置](mcp-one-time-setup.md)。
+以下命令在仓库根目录执行。先用 `git branch --show-current` 和 `git rev-parse --short HEAD` 核对当前检出的分支和提交。两个组件都通过仓库的 Cargo.lock 固定依赖。
 
-RemoteOps 首个公开预览支持在 Apple Silicon Mac 上运行 Codex STDIO MCP，并通过自托管 Relay 控制现有 Windows Agent。这里的 macOS 支持是控制端 MCP，不是 macOS 被控端 Agent。
+## 编译 RemoteOpsBridge
 
-## 支持范围
-
-- 系统：macOS 13 或更高版本；
-- 架构：Apple Silicon（arm64）；
-- AI 客户端：使用 `~/.codex/config.toml` 的 Codex；
-- 现场端：当前仍为 Windows x64 Agent；
-- Relay：当前首发部署仍为 Linux x64 + Docker。
-
-Intel Mac、Universal Binary、Developer ID 签名和 Apple Notarization 尚未包含在首个预览。发布包未签名时，macOS 可能要求用户在“系统设置 → 隐私与安全性”中确认来源；不要通过长期关闭 Gatekeeper 绕过保护。
-
-## 安装前准备
-
-你需要：
-
-1. `RemoteOps-MCP-macOS-arm64-0.2.0-preview.5.tar.gz`；
-2. 管理员签发的设置文件或设置码；
-3. 通过可信渠道核对设置中的 Relay、HTTPS 登记地址和公开信任证书。
-
-## 安装
+安装 Xcode Command Line Tools 和符合根目录 [Cargo.toml](../Cargo.toml) 要求的 Rust 工具链，执行：
 
 ```bash
-tar -xzf RemoteOps-MCP-macOS-arm64-0.2.0-preview.5.tar.gz
-cd RemoteOps-MCP-macOS-arm64-0.2.0-preview.5
-chmod +x install-remoteops-mcp.sh test-remoteops-mcp.sh uninstall-remoteops-mcp.sh
-./install-remoteops-mcp.sh --setup-file "$HOME/Downloads/client.remoteops-setup"
+cargo build --release --locked -p remoteops-bridge
 ```
 
-只有设置码时，使用隐藏输入提示：
+默认输出为 `target/release/RemoteOpsBridge`。宿主通过标准输入和标准输出与它交换 JSON-RPC 消息。在 macOS 上，宿主初始化时应显式传入当前用户可写的绝对目录 `dataRoot`，例如用户主目录下的 `Library/Application Support/RemoteOpsBridge`（由宿主展开成绝对路径）。省略该字段会查找 Windows 的数据目录环境变量。构建与宿主联调是两项验收，联调参数见 [RemoteOpsBridge 接入说明](integrations/remoteops-bridge.md)。
+
+## 生成 Apple Silicon MCP 安装包
+
+构建机使用 macOS 13 或更高版本的 Apple Silicon Mac，准备 Rust、rustup、Python 3、PowerShell 7（`pwsh`）和 Xcode Command Line Tools。选择一个新的输出目录：
 
 ```bash
-./install-remoteops-mcp.sh --setup-code
+bash scripts/Build-MacosMcp.sh "$PWD/artifacts/mac-build"
 ```
 
-安装器预览设置中的非秘密地址及信任配置，确认后兑换独立凭据，保存到当前用户的 macOS Keychain。Codex 配置直接启动 MCP，JSON 仅保存凭据引用，不包含秘密。公网 CA 使用系统可信根；私有 CA 由管理员放入设置文件，不再接收手工 Token、Relay、Owner 或证书参数。
+脚本读取 MCP 和凭据辅助程序各自的 Cargo 版本，编译 arm64 程序并检查架构和版本。安装包位于 `artifacts/mac-build/RemoteOps-MCP-macOS-arm64-<版本>.tar.gz`。解压后进入包目录可用 `shasum -a 256 -c SHA256SUMS.txt` 校验文件。
 
-默认安装位置：
+## 登记和验证
 
-```text
-~/.codex/remoteops/remoteops-controller-mcp-0.2.0-preview.12
-~/.codex/remoteops/controller-config.json
-~/.codex/remoteops/setup-state.json
-~/.codex/config.toml
-~/.agents/skills/remoteops/SKILL.md
-~/.codex/skills/remoteops/SKILL.md
-```
-
-审计日志和文件交换目录位于：
-
-```text
-~/Library/Application Support/RemoteOps/audit.jsonl
-~/Library/Application Support/RemoteOps/transfers
-```
-
-## 验证
-
-```bash
-./test-remoteops-mcp.sh
-```
-
-没有网络条件时先运行：
-
-```bash
-./test-remoteops-mcp.sh --skip-network
-```
-
-随后完全退出 Codex，再重新打开并输入 `/mcp`。应看到已启用的 `remoteops`。新建任务后直接使用自然语言：
-
-```text
-这是 RemoteOps 控制码 123-456-789。请检查现场电脑的网络和指定进程，只进行只读诊断。
-```
-
-## 更新和卸载
-
-同一个公开版本的首发候选反复安装时，安装器会覆盖当前二进制并保留审计和文件交换目录。公开版本号只在实际 GitHub Release 时递增，内部修复不制造新的公开版本序列。
-
-卸载：
-
-```bash
-./uninstall-remoteops-mcp.sh
-```
-
-卸载器会备份并删除 Codex 中的 RemoteOps MCP 配置段，删除 MCP、skill 和 Keychain Token，但保留审计日志与文件交换目录。
-
-## 故障排查
-
-- `/mcp` 看不到 `remoteops`：完全退出 Codex，包括仍在运行的后台进程，再重新打开并新建任务。
-- 提示无法读取 Token：重新运行安装器，不使用 `--skip-token-prompt`；不要把 Token 写到 shell 历史或 `config.toml`。
-- Relay 不可达：使用 `nc -G 5 -vz relay.example.com 7443` 检查网络、防火墙和端口。
-- 证书不受信任：公网证书检查域名与系统时间；私有证书使用 CA PEM 或独立核对后的固定指纹。
-- macOS 阻止未签名二进制：在确认下载来源和 SHA-256 后，通过系统设置对该文件进行一次性允许；不要全局关闭 Gatekeeper。
+管理员签发一次性设置码或设置文件，安装器将此 MCP 安装登记到指定 Relay。安装后的自检、重载宿主、升级和卸载步骤见 [macOS 安装包说明](../deploy/controller-mcp/macos/README.md)。登记流程和设置码的用途见 [MCP 一次性安装配置](mcp-one-time-setup.md)。

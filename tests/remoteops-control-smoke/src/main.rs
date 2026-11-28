@@ -35,6 +35,7 @@ async fn agent_connect(
     write_frame(
         &mut stream,
         &WireMessage::Hello(ClientHello::Agent(AgentHello {
+            test_key_fingerprint: None,
             boot_id,
             target_context: None,
             pairing_mode: remoteops_protocol::PairingMode::AutoPerBoot,
@@ -49,6 +50,7 @@ async fn agent_connect(
             credential_encryption_public_key: String::new(),
             credential_encryption_key_id: String::new(),
             mac_address: None,
+            supports_mixed_pairing_code: false,
             supports_agent_shutdown: false,
         })),
     )

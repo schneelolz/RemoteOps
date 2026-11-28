@@ -1,4 +1,5 @@
 //! 门户单目标授权存储；SQLite 事务是邀请消费和撤销的持久边界。
+mod admin;
 mod types;
 pub use types::*;
 
@@ -23,7 +24,7 @@ use zeroize::Zeroizing;
 /// 门户持久授权操作的返回结果。
 pub type PortalResult<T> = Result<T, PortalError>;
 const APPLICATION_ID: i64 = 0x524f_5054;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const INVITATION_SECONDS: i64 = 600;
 
 /// 门户存储拥有独立数据库；运行态修改由 Relay 在同一目标状态锁内协调。
@@ -109,6 +110,7 @@ impl PortalStore {
                 return Err(PortalError::Storage);
             }
             tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(admin::SCHEMA)?;
             let mut key = Zeroizing::new(vec![0_u8; 32]);
             OsRng.fill_bytes(&mut key);
             tx.execute(
@@ -116,6 +118,9 @@ impl PortalStore {
                 params![owner_id.to_string(), key.as_slice()],
             )?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if application == APPLICATION_ID && version == 1 {
+            tx.execute_batch(admin::SCHEMA)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if application != APPLICATION_ID || version != SCHEMA_VERSION {
             return Err(PortalError::Storage);
@@ -196,6 +201,7 @@ impl PortalStore {
             name: request.name,
             owner_id: self.owner_id,
             allowed_assets: assets,
+            revision: 1,
             revoked: false,
         };
         let token = format!("ropp1.{}.{}", principal.principal_id, random_secret());
@@ -240,6 +246,7 @@ impl PortalStore {
         }
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        admin::require_principal_ready(&tx, request.principal_id)?;
         let owner = principal(&tx, request.principal_id)?;
         check_acl(&owner, &request.asset_id)?;
         let exists: bool = tx.query_row(
@@ -266,6 +273,87 @@ impl PortalStore {
         })
     }
 
+    /// 为已委托的集成主体准备专用命名空间内的未登记资产，重复请求返回相同登记材料。
+    ///
+    /// # Errors
+    /// 主体未获委托、资产已绑定、名称冲突或持久化失败时返回错误。
+    pub fn prepare_managed_enrollment(
+        &self,
+        credential: &str,
+        delegated_principal: Uuid,
+        asset_id: &str,
+    ) -> PortalResult<CreatedAsset> {
+        let authenticated = self.authenticate_principal(credential)?;
+        if authenticated.principal_id != delegated_principal {
+            return Err(PortalError::Forbidden);
+        }
+        if !asset_id
+            .strip_prefix("opscenter-managed-")
+            .is_some_and(|id| {
+                id.len() == 64
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        {
+            return Err(PortalError::InvalidInput);
+        }
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        admin::require_principal_ready(&tx, delegated_principal)?;
+        let mut owner = principal(&tx, delegated_principal)?;
+        let existing: Option<(String, Vec<u8>)> = tx.query_row(
+            "SELECT target_id,enrollment_hash FROM portal_assets WHERE principal_id=?1 AND asset_id=?2",
+            params![delegated_principal.to_string(), asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let enrollment = |target_id: &str| {
+            format!(
+                "rope1.{target_id}.{}",
+                URL_SAFE_NO_PAD.encode(self.mac(
+                    b"remoteops-opscenter-managed-enrollment-v1\0",
+                    format!("{delegated_principal}:{target_id}").as_bytes()
+                ))
+            )
+        };
+        if let Some((target_id, expected)) = existing {
+            check_acl(&owner, asset_id)?;
+            let asset = read_asset(&tx, &target_id)?;
+            let token = enrollment(&target_id);
+            if asset.agent_id.is_some()
+                || !bool::from(expected.ct_eq(hash(token.as_bytes()).as_slice()))
+            {
+                return Err(PortalError::Conflict);
+            }
+            return Ok(CreatedAsset {
+                asset,
+                enrollment_token: token,
+            });
+        }
+        if check_acl(&owner, asset_id).is_err() {
+            if owner.allowed_assets.len() >= 1024 {
+                return Err(PortalError::Conflict);
+            }
+            owner.allowed_assets.push(asset_id.to_owned());
+            owner.allowed_assets.sort();
+            owner.revision = owner.revision.checked_add(1).ok_or(PortalError::Storage)?;
+            tx.execute(
+                "UPDATE portal_principals SET data=?1 WHERE id=?2",
+                params![encode(&owner)?, delegated_principal.to_string()],
+            )?;
+        }
+        let target_id = Uuid::new_v4().to_string();
+        let token = enrollment(&target_id);
+        tx.execute("INSERT INTO portal_assets(target_id,principal_id,asset_id,enrollment_hash,agent_id,revision) VALUES(?1,?2,?3,?4,NULL,1)",
+            params![target_id, delegated_principal.to_string(), asset_id, hash(token.as_bytes()).as_slice()])?;
+        let asset = read_asset(&tx, &target_id)?;
+        tx.commit()?;
+        Ok(CreatedAsset {
+            asset,
+            enrollment_token: token,
+        })
+    }
+
     /// 一次登记锁定准确 Agent 身份；同身份重试允许，其他身份不能抢占。
     ///
     /// # Errors
@@ -282,8 +370,6 @@ impl PortalStore {
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut asset = read_asset(&tx, target_id)?;
-        let owner = principal(&tx, asset.principal_id)?;
-        check_acl(&owner, &asset.asset_id)?;
         let expected: Vec<u8> = tx.query_row(
             "SELECT enrollment_hash FROM portal_assets WHERE target_id=?1",
             [target_id],
@@ -295,6 +381,8 @@ impl PortalStore {
         match asset.agent_id {
             Some(existing) if existing != agent_id => return Err(PortalError::Conflict),
             None => {
+                let owner = principal(&tx, asset.principal_id)?;
+                check_acl(&owner, &asset.asset_id)?;
                 if find_agent(&tx, agent_id)?.is_some() {
                     return Err(PortalError::Conflict);
                 }
@@ -350,6 +438,7 @@ impl PortalStore {
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let asset = authorized_asset(&tx, principal_id, asset_id)?;
+        admin::require_target_ready(&tx, &asset.target_id)?;
         check_target(&asset, target)?;
         let fingerprint = encode(&(asset_id, target.agent_id, target.boot_id, &request))?;
         let prior:Option<(String,String,i64)>=tx.query_row("SELECT id,request_data,nonce FROM portal_invitations WHERE principal_id=?1 AND idempotency_key=?2",params![principal_id.to_string(),request.idempotency_key.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
@@ -449,6 +538,7 @@ impl PortalStore {
         let id = self.lookup_code(&db, code)?;
         let invitation = read_invitation(&db, &id, now)?;
         let asset = read_asset(&db, &invitation.target_id)?;
+        admin::require_target_ready(&db, &asset.target_id)?;
         let owner = principal(&db, asset.principal_id)?;
         check_acl(&owner, &asset.asset_id)?;
         if invitation.state == "revoked" {
@@ -512,6 +602,7 @@ impl PortalStore {
         let id = self.lookup_code(&tx, code)?;
         let invitation = read_invitation(&tx, &id, now)?;
         let asset = read_asset(&tx, &invitation.target_id)?;
+        admin::require_target_ready(&tx, &asset.target_id)?;
         let owner = principal(&tx, asset.principal_id)?;
         check_acl(&owner, &asset.asset_id)?;
         check_target(&asset, target)?;
@@ -721,6 +812,7 @@ impl PortalStore {
     pub fn revoke_principal(&self, id: Uuid) -> PortalResult<Vec<ConnectionSummary>> {
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        admin::require_principal_ready(&tx, id)?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM portal_principals WHERE id=?1)",
             [id.to_string()],
@@ -764,20 +856,17 @@ impl PortalStore {
     ) -> PortalResult<AssetStatus> {
         let db = self.db()?;
         let asset = authorized_asset(&db, principal_id, asset_id)?;
-        let id: Option<String> = db
-            .query_row(
-                "SELECT id FROM portal_invitations WHERE target_id=?1 ORDER BY rowid DESC LIMIT 1",
-                [&asset.target_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let invitation = id.map(|id| read_invitation(&db, &id, now)).transpose()?;
-        let connection = active_connection(&db, &asset.target_id)?;
-        Ok(AssetStatus {
-            asset,
-            invitation,
-            connection,
-        })
+        asset_status(&db, asset, now)
+    }
+
+    /// Relay 按准确登记目标读取状态；仅供内部运行态协调，不校验门户白名单。
+    ///
+    /// # Errors
+    /// 目标不存在或存储不可用时返回错误。
+    pub fn target_status(&self, target_id: &str, now: DateTime<Utc>) -> PortalResult<AssetStatus> {
+        let db = self.db()?;
+        let asset = read_asset(&db, target_id)?;
+        asset_status(&db, asset, now)
     }
 
     /// 返回调用方资产范围内的单目标连接状态。
@@ -790,6 +879,23 @@ impl PortalStore {
         authorize_target(&db, principal_id, &connection.target_id)?;
         Ok(connection)
     }
+}
+
+fn asset_status(db: &Connection, asset: Asset, now: DateTime<Utc>) -> PortalResult<AssetStatus> {
+    let id: Option<String> = db
+        .query_row(
+            "SELECT id FROM portal_invitations WHERE target_id=?1 ORDER BY rowid DESC LIMIT 1",
+            [&asset.target_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let invitation = id.map(|id| read_invitation(db, &id, now)).transpose()?;
+    let connection = active_connection(db, &asset.target_id)?;
+    Ok(AssetStatus {
+        asset,
+        invitation,
+        connection,
+    })
 }
 
 fn sql_revision(value: u64) -> PortalResult<i64> {
@@ -1006,6 +1112,7 @@ fn authorize_connection(db: &Connection, c: &ConnectionSummary) -> PortalResult<
     if c.state != "active" {
         return Err(PortalError::Revoked);
     }
+    admin::require_target_ready(db, &c.target_id)?;
     let asset = authorize_target(db, c.principal_id, &c.target_id)?;
     check_target(&asset, c.target)
 }
@@ -1027,3 +1134,6 @@ CREATE UNIQUE INDEX one_active_per_target ON portal_connections(target_id) WHERE
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod admin_tests;

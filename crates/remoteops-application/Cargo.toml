@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-application"
-version.workspace = true
+version = "0.2.0-preview.6"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+remoteops-tool-center = { path = "../remoteops-tool-center" }
 anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true

@@ -1028,3 +1028,133 @@ fn failed_policy_writes_preserve_the_previous_value() {
     assert!(store.set_allow_legacy_token(true).is_err());
     assert!(!store.allow_legacy_token().unwrap());
 }
+
+#[test]
+fn tool_management_is_independent_revocable_and_durable() {
+    let database = TestDatabase::new();
+    let owner = ControllerOwnerId::new();
+    let store = EnrollmentStore::open(database.path(), owner).unwrap();
+    store.set_settings(endpoints()).unwrap();
+    let now = Utc::now();
+    let request = request(&create(&store, now));
+    store.redeem(request.clone(), now).unwrap();
+    let id = request.installation_id;
+    assert!(!store.has_tool_management(id).unwrap());
+    assert!(
+        !store
+            .authenticate_token(&token(&request), now)
+            .unwrap()
+            .tool_management
+    );
+    assert!(store.set_tool_management(id, true).unwrap());
+    assert!(!store.set_tool_management(id, true).unwrap());
+    assert!(
+        store
+            .authenticate_token(&token(&request), now)
+            .unwrap()
+            .tool_management
+    );
+    drop(store);
+    let store = EnrollmentStore::open(database.path(), owner).unwrap();
+    assert!(store.has_tool_management(id).unwrap());
+    assert!(store.list_clients().unwrap()[0].tool_management);
+    assert!(store.set_tool_management(id, false).unwrap());
+    assert!(!store.has_tool_management(id).unwrap());
+    store.set_tool_management(id, true).unwrap();
+    store.revoke_client(id).unwrap();
+    assert!(!store.has_tool_management(id).unwrap());
+    assert!(matches!(
+        store.set_tool_management(id, true),
+        Err(StoreError::Revoked)
+    ));
+    assert!(!store.has_tool_management(Uuid::new_v4()).unwrap());
+}
+
+#[test]
+fn version_one_database_migrates_with_tool_management_disabled() {
+    let database = TestDatabase::new();
+    let owner = ControllerOwnerId::new();
+    let store = EnrollmentStore::open(database.path(), owner).unwrap();
+    store.set_settings(endpoints()).unwrap();
+    let now = Utc::now();
+    let request = request(&create(&store, now));
+    store.redeem(request.clone(), now).unwrap();
+    drop(store);
+    let connection = Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE enrollment_device_grants; ALTER TABLE enrollment_clients DROP COLUMN tool_management; PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(connection);
+    let store = EnrollmentStore::open(database.path(), owner).unwrap();
+    assert!(!store.has_tool_management(request.installation_id).unwrap());
+    assert!(!store.list_clients().unwrap()[0].tool_management);
+    assert!(store.authenticate_token(&token(&request), now).is_ok());
+}
+
+#[test]
+fn device_grants_migrate_persist_and_match_only_the_enrolled_pair() {
+    let db = TestDatabase::new();
+    let owner = ControllerOwnerId::new();
+    let first = EnrollmentStore::open(db.path(), owner).unwrap();
+    first.set_settings(endpoints()).unwrap();
+    let now = Utc::now();
+    let installs = [0, 1].map(|_| {
+        let r = request(&create(&first, now));
+        first.redeem(r.clone(), now).unwrap();
+        r.installation_id
+    });
+    drop(first);
+    Connection::open(db.path())
+        .unwrap()
+        .execute_batch("DROP TABLE enrollment_device_grants; PRAGMA user_version = 2;")
+        .unwrap();
+    let store = EnrollmentStore::open(db.path(), owner).unwrap();
+    let devices = [Uuid::new_v4(), Uuid::new_v4()];
+    assert_eq!(
+        store.list_device_grants(installs[0]).unwrap(),
+        [] as [uuid::Uuid; 0]
+    );
+    assert!(
+        store
+            .set_device_grant(installs[0], devices[0], true)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .set_device_grant(installs[0], devices[0], true)
+            .unwrap()
+    );
+    drop(store);
+    let store = EnrollmentStore::open(db.path(), owner).unwrap();
+    for (i, installation) in installs.into_iter().enumerate() {
+        for (j, device) in devices.into_iter().enumerate() {
+            assert_eq!(
+                store.has_device_grant(installation, device).unwrap(),
+                (i, j) == (0, 0)
+            );
+        }
+    }
+    assert_eq!(
+        store.list_device_grants(installs[0]).unwrap(),
+        vec![devices[0]]
+    );
+    assert!(
+        store
+            .set_device_grant(installs[0], devices[0], false)
+            .unwrap()
+    );
+    assert!(!store.has_device_grant(installs[0], devices[0]).unwrap());
+    store
+        .set_device_grant(installs[0], devices[0], true)
+        .unwrap();
+    store.forget_device_grants(devices[0]).unwrap();
+    assert!(!store.has_device_grant(installs[0], devices[0]).unwrap());
+    store.revoke_client(installs[1]).unwrap();
+    assert!(
+        store
+            .set_device_grant(installs[1], devices[0], true)
+            .is_err()
+    );
+}

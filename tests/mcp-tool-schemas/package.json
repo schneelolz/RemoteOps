@@ -1,0 +1,12 @@
+{
+  "name": "remoteops-mcp-tool-schema-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test contract.test.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ajv": "8.17.1"
+  }
+}

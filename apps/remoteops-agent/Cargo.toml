@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-agent"
-version = "0.2.0-preview.28"
+version = "0.2.0-preview.43"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -15,7 +15,18 @@ ProductName = "RemoteOps"
 OriginalFilename = "remoteops-agent.exe"
 LegalCopyright = "Copyright (c) RemoteOps contributors"
 
+[features]
+controller-approved-default = []
+managed-install-grant = ["controller-approved-default"]
+desktop-pilot = ["dep:remoteops-desktop-media"]
+paired-human-desktop = ["desktop-pilot", "remoteops-protocol/desktop-lan"]
+
+[target.'cfg(windows)'.dependencies]
+remoteops-desktop-media = { path = "../../crates/remoteops-desktop-media", optional = true }
+rustls.workspace = true
+
 [dependencies]
+remoteops-resources = { path = "../../crates/remoteops-resources" }
 remoteops-product = { path = "../../crates/remoteops-product" }
 remoteops-native-host = { path = "../../crates/remoteops-native-host" }
 tempfile = "3"
@@ -34,6 +45,7 @@ remoteops-serial = { path = "../../crates/remoteops-serial" }
 remoteops-visual = { path = "../../crates/remoteops-visual" }
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

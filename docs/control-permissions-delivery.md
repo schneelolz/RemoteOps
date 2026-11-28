@@ -9,7 +9,7 @@
 - Relay `0.2.0-preview.6`，包含 Windows x64 和 Linux x64 / glibc 2.36 产物。
 - 协议版本 16，三端必须配套；旧组件不能因缺少授权字段获得权限。
 - 批次目录：`artifacts/release/control-permissions-20260929`，内含各平台 `manifest.json`、总 `SHA256SUMS.txt`、`build-info.json` 及依赖许可证清单。
-- 新 GUI 已覆盖 `C:\Users\ywb\Desktop\RemoteOps\remoteops-agent-gui.exe`，复制后 SHA-256 与发布包一致；目录内其余 4 个文件哈希未变。旧 GUI 已另存批次目录 `rollback-local/remoteops-agent-gui.previous.exe`。
+- 新 GUI 已覆盖用户指定交付目录中的 `remoteops-agent-gui.exe`，复制后 SHA-256 与发布包一致；目录内其余 4 个文件哈希未变。旧 GUI 已另存批次目录 `rollback-local/remoteops-agent-gui.previous.exe`。
 
 ## 修改范围
 
@@ -33,7 +33,7 @@ Agent GUI 增加现场控制权限、默认偏好、确认与失败提示，状�
 
 真实 MCP/Agent 专项执行了临时目录写操作，并核验磁盘结果：默认逐项确认拒写、MCP 完全控制同步且允许写、现场撤销后拒写、现场临时授权恢复写；默认完全控制首次和解绑重配自动授权，现场撤销后的解绑重配仍逐项确认。协议专项另验证旧修订请求拒绝及 TLS 断线重连清除临时授权。
 
-原生 GUI 使用隔离 demo 配置验证中文浅色及英文深色主界面、权限窗口、默认授权确认、长文案滚动及连接不可用提示。实际点击保存后检查隔离配置，默认值已写入，当前来源未改变。四种语言/主题组合另有布局测试。截图与详细边界见 `outputs/control-permissions-qa/验收说明.md`。所有自有测试进程已结束；demo 未连接生产。
+原生 GUI 使用隔离 demo 配置验证中文浅色及英文深色主界面、权限窗口、默认授权确认、长文案滚动及连接不可用提示。实际点击保存后检查隔离配置，默认值已写入，当前来源未改变。四种语言/主题组合另有布局测试。截图与验收说明保存在本机验收归档中，按原目录 `outputs/control-permissions-qa` 可从归档索引定位。所有自有测试进程已结束；demo 未连接生产。
 
 ## 生产部署与现场验收边界
 

@@ -1,7 +1,12 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod browser_tools;
 mod codex_config;
 mod setup;
+mod tcp_forward;
+mod tool_center_input;
+mod tool_center_output;
+mod tool_schemas;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,8 +26,8 @@ use remoteops_application::{
 };
 use remoteops_audit::sha256_bytes;
 use remoteops_domain::{
-    ApprovalId, Capability, ControllerInstanceId, ControllerOwnerId, EventSource, FileTransferId,
-    PairingCode, PermissionMode, PowerAction, RemoteOperation, RequestId, SerialDataBits,
+    AccessCode, ApprovalId, Capability, ControllerInstanceId, ControllerOwnerId, EventSource,
+    FileTransferId, PermissionMode, PowerAction, RemoteOperation, RequestId, SerialDataBits,
     SerialFlowControl, SerialLineEnding, SerialParity, SerialSettings, SerialStopBits,
     SerialTerminalProfile, ServiceAction, SessionId, ShellId, ShellKind, VisualTarget,
 };
@@ -48,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
     process::Command,
     sync::Mutex,
     time::timeout,
@@ -55,12 +61,17 @@ use tokio::{
 use tracing_subscriber::EnvFilter;
 use zeroize::{Zeroize as _, Zeroizing};
 
+use tool_center_output::ToolCenterOutput;
+
 /// `RemoteOps` 本地 STDIO MCP Server。
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
     #[command(flatten)]
     setup: setup::SetupArgs,
+    /// 离线检查实际工具目录及其输入、输出 Schema，不读取配置、凭据或连接 Relay。
+    #[arg(long)]
+    check_tool_schemas: bool,
     /// MCP JSON 配置文件；默认读取 `Codex` 用户目录下的 `RemoteOps` 配置。
     #[arg(long, env = "REMOTEOPS_MCP_CONFIG")]
     config: Option<PathBuf>,
@@ -156,6 +167,18 @@ struct ResolvedArgs {
     reconnect_seconds: u64,
 }
 
+// 私有发行版在构建时固定业务地址；公版继续使用现有设置文件。
+fn check_product_endpoint(relay: &str, server: &str) -> anyhow::Result<()> {
+    if let Some(expected) = option_env!("REMOTEOPS_PRODUCT_RELAY")
+        && (!relay.eq_ignore_ascii_case(expected)
+            || option_env!("REMOTEOPS_PRODUCT_TLS_NAME")
+                .is_none_or(|expected_name| !server.eq_ignore_ascii_case(expected_name)))
+    {
+        bail!("连接配置与定制版的 Relay 或 TLS 服务名不匹配");
+    }
+    Ok(())
+}
+
 impl Args {
     fn resolve(self) -> anyhow::Result<ResolvedArgs> {
         self.resolve_with_credential_loader(setup::credential_token)
@@ -227,6 +250,7 @@ impl Args {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .map_or_else(|| infer_server_name(&relay), Ok)?;
+        check_product_endpoint(&relay, &server_name)?;
         let ca_cert = self.ca_cert.or(file_config.ca_cert.map(|path| {
             if path.is_absolute() {
                 path
@@ -336,7 +360,7 @@ impl From<CommandMode> for PermissionMode {
 
 #[derive(Clone, Debug)]
 struct PairSpec {
-    code: PairingCode,
+    code: AccessCode,
     alias: Option<String>,
 }
 
@@ -352,6 +376,8 @@ struct RemoteOpsMcp {
     ssh_credential_cache: Arc<Mutex<BTreeMap<SshCredentialCacheKey, CachedSshCredential>>>,
     credential_prompt_lock: Arc<Mutex<()>>,
     credential_prompt: Arc<dyn CredentialPrompt>,
+    resource_tasks: Arc<Mutex<BTreeMap<RequestId, browser_tools::ResourceTask>>>,
+    tcp_forwards: Arc<tcp_forward::Manager>,
 }
 
 const SSH_CREDENTIAL_CACHE_TIMEOUT: Duration = Duration::from_mins(10);
@@ -373,6 +399,9 @@ fn authorization_without_prompt(
     state: &SessionControlState,
     approval_id: Option<ApprovalId>,
 ) -> Result<Option<WriteAuthorization>, String> {
+    if state.initialization_pending {
+        return Err("现场默认权限正在核对，尚未允许提交修改操作".into());
+    }
     if command_mode == CommandMode::Readonly || state.mode == ControllerControlMode::ReadOnly {
         return Err("当前连接仅允许只读操作".into());
     }
@@ -402,6 +431,85 @@ fn authorization_without_prompt(
 enum McpControlMode {
     StepByStep,
     FullAccess,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+struct ToolCenterManageInput {
+    /// 稳定请求标识；断线后先读取状态，不能自动换标识重放。
+    request_id: String,
+    /// 上一次读取到的目录修订号。
+    #[schemars(extend("maximum" = 18_446_744_073_709_551_615_u64))]
+    expected_revision: u64,
+    /// 工具管理命令，action 为 `snapshot/set_policy/set_guide/put_tool/set_tool_enabled/record_test/import_external`。
+    #[schemars(with = "remoteops_tool_center::ToolCenterCommand")]
+    command: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RefreshGlobalGuideInput {}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct GlobalGuideOutput {
+    revision: u64,
+    markdown: String,
+    source: String,
+    status: String,
+    updated_at: Option<String>,
+    message: String,
+    error_code: Option<String>,
+    stale: bool,
+}
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+struct UploadToolPackageInput {
+    /// MCP 本机 transfer-root 内的 ZIP 相对路径。
+    local_path: String,
+    /// 当前工具目录修订号。
+    expected_revision: u64,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct StartResourceToolInput {
+    /// `list_connections` 返回的精确目标会话。
+    session_id: String,
+    /// `list_resource_tools` 返回的工具 ID。
+    tool_id: String,
+    /// 精确候选版本。
+    version: String,
+    /// 所选包的完整SHA-256。
+    sha256: String,
+    /// 显式受控平台测试，默认false，不自动登记passed。
+    #[serde(default)]
+    validation_mode: bool,
+    /// 是否等待最终结果；false短等待后通过`get_resource_tool_status`查询。
+    wait_for_completion: Option<bool>,
+    /// 独立人工控制器审批标识（仅外部审批模式）。
+    approval_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CallResourceToolInput {
+    /// 当前目标会话。
+    session_id: String,
+    /// `start_resource_tool` 返回的实例标识。
+    instance_id: String,
+    /// 实例公开的工具名称。
+    tool_name: String,
+    /// 严格按实例返回的 Schema 构造 JSON 参数。
+    #[schemars(schema_with = "tool_center_output::any_json_schema")]
+    arguments: serde_json::Value,
+    /// 独立人工控制器审批标识（仅外部审批模式）。
+    approval_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct StopResourceToolInput {
+    /// 当前目标会话。
+    session_id: String,
+    /// 当前会话拥有的实例标识。
+    instance_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -446,23 +554,32 @@ fn control_output(state: &SessionControlState) -> ControlModeOutput {
         idle_timeout_seconds: (state.mode == ControllerControlMode::FullAccess
             && state.source == Some(ControlSource::Mcp))
         .then_some(3600),
-        message: match state.mode {
-            ControllerControlMode::FullAccess => match state.source {
-                Some(ControlSource::Mcp) => "完全控制已确认；成功操作续期，空闲一小时失效",
-                Some(ControlSource::LocalDefault) => {
-                    "现场默认完全控制已确认；本连接无需 RemoteOps 逐项审批"
-                }
-                _ => "现场完全控制已确认；本连接无需 RemoteOps 逐项审批",
-            },
-            ControllerControlMode::ReadOnly => "当前连接仅允许只读操作",
-            ControllerControlMode::ExternalApproval => "当前连接强制要求独立人工审批",
-            ControllerControlMode::Expired => "完全控制已过期，当前逐项确认",
-            ControllerControlMode::StepByStep => "当前逐项确认；修改操作需确认",
+        message: if state.initialization_pending {
+            "现场正在核对默认权限，当前状态尚未完成初始化"
+        } else {
+            match state.mode {
+                ControllerControlMode::FullAccess => match state.source {
+                    Some(ControlSource::Mcp) => "完全控制已确认；成功操作续期，空闲一小时失效",
+                    Some(ControlSource::LocalDefault) => {
+                        "现场默认完全控制已确认；本连接无需 RemoteOps 逐项审批"
+                    }
+                    _ => "现场完全控制已确认；本连接无需 RemoteOps 逐项审批",
+                },
+                ControllerControlMode::ReadOnly => "当前连接仅允许只读操作",
+                ControllerControlMode::ExternalApproval => "当前连接强制要求独立人工审批",
+                ControllerControlMode::Expired => "完全控制已过期，当前逐项确认",
+                ControllerControlMode::StepByStep => "当前逐项确认；修改操作需确认",
+            }
         }
         .into(),
         source,
         revision: Some(state.revision),
-        sync_status: "synced".into(),
+        sync_status: if state.initialization_pending {
+            "initializing"
+        } else {
+            "synced"
+        }
+        .into(),
         expires_at: state.expires_at.map(|at| at.to_rfc3339()),
     }
 }
@@ -508,6 +625,17 @@ struct TargetInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct HostQueryInput {
+    session_id: String,
+    instance_id: String,
+    capability_id: String,
+    version: String,
+    #[schemars(schema_with = "tool_center_output::any_json_schema")]
+    arguments: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct VisualObserveInput {
     session_id: String,
     include_screenshot: Option<bool>,
@@ -533,8 +661,10 @@ struct VisualActionInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PairConnectionInput {
-    /// Agent 窗口显示的九位临时配对码。
+    /// Agent 九位临时码（字母不分大小写，兼容纯数字）或 Bridge UUID v4 长授权码。
     pairing_code: String,
+    /// 重启后重新配对时，填入首次配对返回的 `agent_instance_id`。
+    expected_agent_id: Option<String>,
     /// 可选展示别名，例如“客户 A”。
     alias: Option<String>,
 }
@@ -544,7 +674,7 @@ struct RunReadonlyCommandInput {
     /// `list_connections` 返回的不可变 `session_id`。
     session_id: String,
     /// 用于本次命令的一次性 Shell。
-    shell: Option<McpShell>,
+    shell: McpShell,
     /// 白名单中的单条只读查询，最长 4096 字节。不得包含换行、分号、管道、
     /// 重定向或命令连接符。PowerShell 参数只接受字面量，不支持变量展开、
     /// 子表达式或脚本块；环境变量可单独查询，例如 `$env:LOCALAPPDATA`。
@@ -648,6 +778,56 @@ struct TcpExchangeInput {
     max_response_bytes: Option<usize>,
     timeout_millis: Option<u64>,
     approval_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TcpForwardInput {
+    session_id: String,
+    /// Agent 所在网络中的固定目标主机。
+    host: String,
+    /// Agent 所在网络中的固定目标端口。
+    port: u16,
+    /// 本机回环监听端口。省略时由系统分配临时端口。
+    local_port: Option<u16>,
+    /// 回环 IP，默认 `127.0.0.1`，也可显式选择 `::1`。
+    listen_host: Option<String>,
+    approval_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CloseTcpForwardInput {
+    /// `create_tcp_forward` 返回的监听标识。
+    forward_id: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct TcpPolicyOutput {
+    /// 当前会话可见的策略、修订和申请字段。
+    #[schemars(schema_with = "tool_center_output::any_json_schema")]
+    policy: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct TcpForwardListOutput {
+    forwards: Vec<tcp_forward::ForwardStatus>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct TcpForwardCloseOutput {
+    closed: bool,
+    changed: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct RemoteOpsInfoOutput {
+    latest_mcp_version: Option<String>,
+    mcp_release_status: String,
+    mcp_version: String,
+    protocol: u16,
+    relay_connected: bool,
+    tcp_forward_version: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -843,10 +1023,12 @@ struct CachedSshCredential {
 }
 
 struct CredentialPromptRequest<'a> {
+    browser_target: Option<&'a str>,
     host: &'a str,
     port: u16,
     username: &'a str,
     command_sha256: &'a str,
+    language: &'a str,
 }
 
 struct PromptedCredential {
@@ -911,6 +1093,19 @@ struct ApprovalRequestInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ApprovalActionInput {
+    /// 为固定版本的外部资源启动申请独立人工审批。
+    StartResourceTool {
+        tool_id: String,
+        version: String,
+        sha256: String,
+    },
+    /// 为一次精确的外部资源调用申请独立人工审批。
+    CallResourceTool {
+        instance_id: String,
+        tool_name: String,
+        #[schemars(schema_with = "tool_center_output::any_json_schema")]
+        arguments: serde_json::Value,
+    },
     /// 申请执行一条非只读命令。
     RunCommand {
         /// `open_shell` 返回的 `shell_id`；与 `shell` 二选一。
@@ -1093,6 +1288,7 @@ struct ConnectionOutput {
     hostname: String,
     mac_address: Option<String>,
     operating_system: String,
+    #[schemars(schema_with = "tool_center_output::any_json_schema")]
     environment: serde_json::Value,
     state: String,
     role: String,
@@ -1101,10 +1297,21 @@ struct ConnectionOutput {
     control_source: Option<String>,
     control_revision: Option<u64>,
     control_sync_status: String,
+    /// 最近一次核对后的权限状态说明，含现场默认授权来源。
+    control_message: Option<String>,
     /// MCP 本地（控制端）的实际文件交换目录，供 `local_path` 使用；不是 Agent 远端目录。
     transfer_root: String,
+    /// MCP 本机交换根目录，与旧 `transfer_root` 等值。
+    local_transfer_root: String,
+    /// 由当前 Agent 实时确认的绝对交换目录；旧组件缺失时为空。
+    agent_transfer_root: Option<String>,
+    /// Agent 目录事实状态：reported、stale 或 unknown。
+    agent_transfer_root_status: String,
+    /// 确实支持 SSH 主机密钥管理命令的远端 Agent 程序；不猜测旧组件入口。
+    ssh_trust_cli: Option<String>,
     capabilities: Vec<String>,
     /// 当前目标专用上下文；旧组件缺少字段时明确显示未知。
+    #[schemars(schema_with = "tool_center_output::any_json_schema")]
     target_context: serde_json::Value,
     /// 上下文是否已报告或实时刷新失败。
     target_context_status: String,
@@ -1125,7 +1332,7 @@ struct ShellOutput {
     message: String,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 struct ActionOutput {
     status: String,
     session_id: String,
@@ -1134,6 +1341,7 @@ struct ActionOutput {
     summary: String,
     approval_id: Option<String>,
     sha256: Option<String>,
+    #[schemars(schema_with = "tool_center_output::any_json_schema")]
     details: Option<serde_json::Value>,
 }
 
@@ -1153,6 +1361,14 @@ impl CredentialPrompt for ProcessCredentialPrompt {
         let mut output = timeout(
             CREDENTIAL_PROMPT_TIMEOUT,
             Command::new(executable)
+                .arg("--purpose")
+                .arg(if request.browser_target.is_some() {
+                    "browser"
+                } else {
+                    "ssh"
+                })
+                .arg("--browser-target")
+                .arg(request.browser_target.unwrap_or_default())
                 .arg("--host")
                 .arg(request.host)
                 .arg("--port")
@@ -1161,6 +1377,8 @@ impl CredentialPrompt for ProcessCredentialPrompt {
                 .arg(request.username)
                 .arg("--command-sha256")
                 .arg(request.command_sha256)
+                .arg("--language")
+                .arg(request.language)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1208,6 +1426,13 @@ impl CredentialPrompt for ProcessCredentialPrompt {
             _ => Err("SSH 密码安全输入窗口返回了未知操作".to_owned()),
         }
     }
+}
+
+fn credential_prompt_language(context: Option<&remoteops_domain::TargetContext>) -> &'static str {
+    context.and_then(|context| context.ui_language).map_or_else(
+        || remoteops_i18n::Language::detect().code(),
+        remoteops_domain::TargetUiLanguage::code,
+    )
 }
 
 fn credential_prompt_executable() -> Result<PathBuf, String> {
@@ -1308,6 +1533,7 @@ impl RemoteOpsMcp {
                 "full-access 参数只声明权限上限；使用 set_control_mode 或现场授权确认本次连接"
             );
         }
+        let tcp_forwards = tcp_forward::Manager::new(client.clone());
         let mcp = Self {
             client,
             shells: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1319,6 +1545,8 @@ impl RemoteOpsMcp {
             ssh_credential_cache: Arc::new(Mutex::new(BTreeMap::new())),
             credential_prompt_lock: Arc::new(Mutex::new(())),
             credential_prompt: Arc::new(ProcessCredentialPrompt),
+            resource_tasks: Arc::default(),
+            tcp_forwards,
         };
         let reporter = mcp.clone();
         tokio::spawn(async move { reporter.control_mode_reporter().await });
@@ -1352,6 +1580,156 @@ impl RemoteOpsMcp {
     }
     fn runtime_tool_router(&self) -> ToolRouter<Self> {
         configured_tool_router(self.enable_test_ui)
+    }
+
+    #[tool(
+        name = "describe_host_capabilities",
+        description = "查询当前会话绑定的 GRClient/UDServer 宿主身份、实例和只读业务能力。",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn describe_host_capabilities(
+        &self,
+        Parameters(input): Parameters<TargetInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::DescribeHostCapabilities,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "query_host_capability",
+        description = "按发现结果中的精确实例、能力与版本查询宿主业务数据，禁止重放结果未知的请求。",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn query_host_capability(
+        &self,
+        Parameters(input): Parameters<HostQueryInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::QueryHostCapability {
+                instance_id: input.instance_id,
+                capability_id: input.capability_id,
+                version: input.version,
+                arguments: input.arguments,
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// 显式从 Relay 重新读取 `RemoteOps` 全局操作指引。
+    #[tool(
+        name = "refresh_global_guide",
+        description = "从 Relay 重新读取 RemoteOps 全局操作指引并返回最新正文。指引只提供操作建议，不改变权限或安全策略。",
+        annotations(
+            title = "刷新 RemoteOps 全局指引",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn refresh_global_guide(
+        &self,
+        Parameters(_input): Parameters<RefreshGlobalGuideInput>,
+    ) -> Result<Json<GlobalGuideOutput>, String> {
+        match self.client.refresh_global_guide().await {
+            Ok(guide) => Ok(Json(GlobalGuideOutput {
+                message: if guide.markdown.is_empty() {
+                    if guide.revision == 0 {
+                        "Relay 尚未配置 RemoteOps 全局指引"
+                    } else {
+                        "管理员已将 RemoteOps 全局指引清空"
+                    }
+                } else {
+                    "已读取 Relay 最新全局指引"
+                }
+                .into(),
+                error_code: None,
+                stale: false,
+                revision: guide.revision,
+                status: if guide.markdown.is_empty() {
+                    "empty"
+                } else {
+                    "loaded"
+                }
+                .into(),
+                markdown: guide.markdown,
+                source: "relay".into(),
+                updated_at: guide.updated_at.map(|value| value.to_rfc3339()),
+            })),
+            Err(error) => {
+                let guide = self.client.global_guide();
+                let cached = self.client.supports_global_guide();
+                let error_code = match &error {
+                    ApplicationError::Remote { code, .. } => code.clone(),
+                    _ => "global_guide_unavailable".into(),
+                };
+                Ok(Json(GlobalGuideOutput {
+                    revision: guide.revision,
+                    markdown: guide.markdown,
+                    source: if cached { "relay_cache" } else { "unavailable" }.into(),
+                    status: if error_code == "global_guide_unsupported" {
+                        "unsupported"
+                    } else {
+                        "unavailable"
+                    }
+                    .into(),
+                    message: format!("全局指引读取失败：{error}。权限校验继续生效。"),
+                    error_code: Some(error_code),
+                    stale: cached,
+                    updated_at: guide.updated_at.map(|value| value.to_rfc3339()),
+                }))
+            }
+        }
+    }
+
+    #[tool(
+        name = "get_remoteops_info",
+        description = "读取当前实际运行的 MCP 版本、协议、Relay 连接和 TCP 扩展协商结果。",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_remoteops_info(
+        &self,
+        Parameters(_input): Parameters<RefreshGlobalGuideInput>,
+    ) -> Json<RemoteOpsInfoOutput> {
+        let product = if option_env!("REMOTEOPS_PRODUCT_RELAY").is_some() {
+            "jlai-mcp"
+        } else {
+            "remoteops-mcp"
+        };
+        let release = self
+            .client
+            .published_version(product, env!("CARGO_PKG_VERSION"));
+        Json(RemoteOpsInfoOutput {
+            mcp_release_status: release.as_ref().map_or("unknown", |(_, s)| *s).into(),
+            latest_mcp_version: release.map(|(v, _)| v),
+            mcp_version: env!("CARGO_PKG_VERSION").into(),
+            protocol: PROTOCOL_VERSION,
+            relay_connected: self.client.is_connected(),
+            tcp_forward_version: self.client.supports_tcp_forward().then_some(2),
+        })
     }
 
     async fn run_test_prompt(
@@ -1480,6 +1858,25 @@ impl RemoteOpsMcp {
                 return Ok(password);
             }
         }
+        // 每次显示本机窗口前查询目标当前语言；旧 Agent 使用控制端语言。
+        let connection = self
+            .client
+            .list_connections()
+            .await
+            .into_iter()
+            .find(|connection| connection.session_id == key.session_id)
+            .ok_or_else(|| "未找到 session_id".to_owned())?;
+        let context = if supports_target_context(&connection) {
+            Some(
+                self.client
+                    .refresh_target_context(key.session_id)
+                    .await
+                    .map_err(|error| format!("刷新目标界面语言失败：{error}"))?,
+            )
+        } else {
+            None
+        };
+        let language = credential_prompt_language(context.as_ref());
         let prompted = self
             .credential_prompt
             .prompt(CredentialPromptRequest {
@@ -1487,6 +1884,8 @@ impl RemoteOpsMcp {
                 port: key.port,
                 username: &key.username,
                 command_sha256,
+                language,
+                browser_target: None,
             })
             .await?
             .ok_or_else(|| "用户取消了 SSH 密码输入".to_owned())?;
@@ -1548,7 +1947,7 @@ impl RemoteOpsMcp {
         let command_sha256 = sha256_bytes(command.as_bytes());
         let mut password = self.ssh_password(&cache_key, &command_sha256).await?;
         let context = CredentialEncryptionContext {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: connection.environment.protocol_version,
             agent_instance_id: connection.agent_instance_id,
             session_id,
             envelope_id: remoteops_domain::RequestId::new(),
@@ -1581,18 +1980,28 @@ impl RemoteOpsMcp {
     }
 
     async fn control_mode_output(&self, session_id: SessionId) -> ControlModeOutput {
-        match self.client.query_control_state(session_id).await {
-            Ok(state) => control_output(&state),
-            Err(error) => ControlModeOutput {
-                session_id: session_id.to_string(),
-                mode: "unsynced".into(),
-                idle_timeout_seconds: None,
-                message: format!("控制模式未同步：{error}"),
-                source: None,
-                revision: None,
-                sync_status: "failed".into(),
-                expires_at: None,
-            },
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match self.client.query_control_state(session_id).await {
+                Ok(state)
+                    if state.initialization_pending && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok(state) => return control_output(&state),
+                Err(error) => {
+                    return ControlModeOutput {
+                        session_id: session_id.to_string(),
+                        mode: "unsynced".into(),
+                        idle_timeout_seconds: None,
+                        message: format!("控制模式未同步：{error}"),
+                        source: None,
+                        revision: None,
+                        sync_status: "failed".into(),
+                        expires_at: None,
+                    };
+                }
+            }
         }
     }
     async fn elicit_confirmation(
@@ -1601,16 +2010,29 @@ impl RemoteOpsMcp {
         message: &str,
         title: &'static str,
     ) -> Result<bool, String> {
+        self.confirm_permission(context, message, title, false)
+            .await
+    }
+
+    async fn confirm_permission(
+        &self,
+        context: &RequestContext<RoleServer>,
+        message: &str,
+        title: &'static str,
+        full_session: bool,
+    ) -> Result<bool, String> {
         let schema = ElicitationSchema::builder()
             .required_property(
                 "confirmed",
                 PrimitiveSchemaDefinition::Boolean(
                     BooleanSchema::new()
                         .title(title)
-                        .description(
-                            "在当前 MCP 确认界面点击允许即表示仅确认本次操作；这不是完全控制授权。配套 Agent 可由现场人员授权完全控制",
-                        )
-                        .with_default(true),
+                        .description(if full_session {
+                            "允许此 AI 会话执行命令和文件操作，直至断开、撤销或授权到期。"
+                        } else {
+                            "仅确认本次操作。"
+                        })
+                        .with_default(!full_session),
                 ),
             )
             .build()
@@ -1627,7 +2049,14 @@ impl RemoteOpsMcp {
             )
             .await
             .map_err(|error| elicitation_unavailable_error(&error.to_string()))?;
-        Ok(elicitation_accepted(&response.action))
+        Ok(elicitation_accepted(&response.action)
+            && (!full_session
+                || response
+                    .content
+                    .as_ref()
+                    .and_then(|v| v.get("confirmed"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)))
     }
 
     async fn confirm_large_transfer(
@@ -1789,7 +2218,7 @@ impl RemoteOpsMcp {
     /// 列出所有已配对连接及其不可变 `session_id`。
     #[tool(
         name = "list_connections",
-        description = "列出 RemoteOps 当前连接。后续每个工具必须使用这里返回的不可变 session_id；不要根据别名猜测。transfer_root 是 MCP 本地（控制端）交换目录，供 local_path 使用，不是 Agent 远端目录。",
+        description = "列出 RemoteOps 当前连接。后续每个工具必须使用这里返回的不可变 session_id；不要根据别名猜测。transfer_root/local_transfer_root 是 MCP 本机目录；agent_transfer_root 是 Agent 已确认的目录，状态 unknown/stale 时不能猜路径。",
         annotations(
             title = "列出远程连接",
             read_only_hint = true,
@@ -1803,6 +2232,7 @@ impl RemoteOpsMcp {
         for connection in self.client.list_connections().await {
             let mut output = connection_output(connection);
             output.transfer_root = self.transfer_root.display().to_string();
+            output.local_transfer_root.clone_from(&output.transfer_root);
             let session_id =
                 parse_session_id(&output.session_id).expect("Relay 返回的 session_id 必须有效");
             let state = self.control_mode_output(session_id).await;
@@ -1810,6 +2240,7 @@ impl RemoteOpsMcp {
             output.control_source = state.source;
             output.control_revision = state.revision;
             output.control_sync_status = state.sync_status;
+            output.control_message = Some(state.message);
             connections.push(output);
         }
         self.report_current_control_modes().await;
@@ -1819,7 +2250,7 @@ impl RemoteOpsMcp {
     /// 在 MCP 运行期间配对一个新 Agent。
     #[tool(
         name = "pair_connection",
-        description = "当用户提供 RemoteOps 控制码、RemoteOps 配对码或 Agent 窗口显示的九位码（例如 123-456-789）时，必须先调用此工具建立远程连接。可同时设置别名；无需修改 MCP 启动参数或重启 Codex。不要改用远程桌面、Computer Use、本机 Shell 或 SSH 直连。",
+        description = "当用户提供 RemoteOps 控制码、RemoteOps 配对码或 Agent 窗口显示的九位码（例如 A2C-D3E-F4G 或 123-456-789，字母不分大小写）时，必须先调用此工具建立远程连接。可同时设置别名；无需修改 MCP 启动参数或重启 Codex。不要改用远程桌面、Computer Use、本机 Shell 或 SSH 直连。",
         annotations(
             title = "配对远程连接",
             read_only_hint = false,
@@ -1831,12 +2262,22 @@ impl RemoteOpsMcp {
     async fn pair_connection(
         &self,
         Parameters(input): Parameters<PairConnectionInput>,
+        context: RequestContext<RoleServer>,
     ) -> Result<Json<ConnectionOutput>, String> {
         let pairing_code =
-            PairingCode::parse(input.pairing_code).map_err(|error| error.to_string())?;
+            AccessCode::parse(input.pairing_code).map_err(|error| error.to_string())?;
+        let expected_agent_id = input
+            .expected_agent_id
+            .as_deref()
+            .map(|value| {
+                value
+                    .parse::<remoteops_domain::AgentInstanceId>()
+                    .map_err(|_| "预期 Agent ID 必须是有效的 GUID".to_owned())
+            })
+            .transpose()?;
         let connection = self
             .client
-            .pair(pairing_code)
+            .pair_for_agent(pairing_code, expected_agent_id)
             .await
             .map_err(application_error)?;
         if let Some(alias) = input.alias {
@@ -1853,13 +2294,57 @@ impl RemoteOpsMcp {
             .find(|item| item.session_id == connection.session_id)
             .ok_or_else(|| "配对成功后未找到连接".to_owned())?;
         let session_id = connection.session_id;
+        // 现场偏好只触发询问；实际授权仍绑定当前会话、当前版本和操作者确认。
+        let can_offer = option_env!("REMOTEOPS_PRODUCT_RELAY").is_some()
+            && !matches!(
+                self.command_mode,
+                CommandMode::Readonly | CommandMode::Approval
+            )
+            && connection.target_context.as_ref().is_some_and(|ctx| {
+                ctx.capabilities
+                    .iter()
+                    .any(|v| v.capability == "session_approval_offer_v1")
+            });
         let mut output = connection_output(connection);
         output.transfer_root = self.transfer_root.display().to_string();
-        let state = self.control_mode_output(session_id).await;
+        output.local_transfer_root.clone_from(&output.transfer_root);
+        let mut state = self.control_mode_output(session_id).await;
+        if can_offer
+            && state.mode == "step_by_step"
+            && self
+                .client
+                .refresh_target_context(session_id)
+                .await
+                .is_ok_and(|ctx| {
+                    ctx.capabilities.iter().any(|v| {
+                        v.capability == "session_approval_offer_v1"
+                            && v.status == remoteops_domain::CapabilityAvailability::Available
+                    })
+                })
+        {
+            match self
+                .set_control_mode(
+                    Parameters(SetControlModeInput {
+                        session_id: session_id.to_string(),
+                        mode: McpControlMode::FullAccess,
+                    }),
+                    context,
+                )
+                .await
+            {
+                Ok(Json(granted)) => state = granted,
+                Err(reason) => {
+                    state = self.control_mode_output(session_id).await;
+                    state.message =
+                        format!("{}。本次配对保留，授权未完成：{reason}", state.message);
+                }
+            }
+        }
         output.control_mode = state.mode;
         output.control_source = state.source;
         output.control_revision = state.revision;
         output.control_sync_status = state.sync_status;
+        output.control_message = Some(state.message);
         Ok(Json(output))
     }
 
@@ -1887,7 +2372,7 @@ impl RemoteOpsMcp {
     /// 更改指定 Agent 在本 MCP 进程中的控制模式。
     #[tool(
         name = "set_control_mode",
-        description = "按精确 session_id 切换控制模式。默认保持 step_by_step；不得因为逐项确认界面不可用、超时或写操作被拒绝而调用 full_access。只有用户明确要求完全控制时才调用。调用 full_access 时只使用 Codex 对本工具的授权，不再嵌套弹出第二次确认；配套 Agent 支持现场授权；已生效时不要重复授权。切回逐项确认立即生效。",
+        description = "按精确 session_id 切换控制模式。默认保持 step_by_step；不得因为逐项确认界面不可用、超时或写操作被拒绝而调用 full_access。只有用户明确要求完全控制时才调用。调用 full_access 时需要操作者授权；定制端会确认本次连接的设备；配套 Agent 支持现场授权；已生效时不要重复授权。切回逐项确认立即生效。",
         annotations(
             title = "切换控制模式",
             read_only_hint = false,
@@ -1899,6 +2384,7 @@ impl RemoteOpsMcp {
     async fn set_control_mode(
         &self,
         Parameters(input): Parameters<SetControlModeInput>,
+        context: RequestContext<RoleServer>,
     ) -> Result<Json<ControlModeOutput>, String> {
         let session_id = parse_session_id(&input.session_id)?;
         self.ensure_connection_exists(session_id).await?;
@@ -1925,6 +2411,24 @@ impl RemoteOpsMcp {
         {
             return Ok(Json(control_output(&expected)));
         }
+        if mode == ControllerControlMode::FullAccess
+            && option_env!("REMOTEOPS_PRODUCT_RELAY").is_some()
+        {
+            let connection = self
+                .client
+                .list_connections()
+                .await
+                .into_iter()
+                .find(|entry| entry.session_id == session_id)
+                .ok_or("配对已结束")?;
+            let message = format!("是否允许本次连接对 {} 完全控制？", connection.hostname);
+            if !self
+                .confirm_permission(&context, &message, "授权本次连接", true)
+                .await?
+            {
+                return Err("未授权本次连接完全控制".into());
+            }
+        }
         let state = self
             .client
             .request_control_state(ControlStateRequest {
@@ -1941,7 +2445,7 @@ impl RemoteOpsMcp {
     /// 读取单个连接的主机、系统、能力和状态。
     #[tool(
         name = "get_target_info",
-        description = "按精确 session_id 获取目标详情。别名只用于展示，不能代替 session_id。transfer_root 是 MCP 本地（控制端）交换目录，供 local_path 使用，不是 Agent 远端目录。",
+        description = "按精确 session_id 获取目标详情。别名只用于展示，不能代替 session_id。transfer_root/local_transfer_root 是 MCP 本机目录；agent_transfer_root 来自当前 Agent 实时事实，旧组件缺失时明确 unknown。",
         annotations(
             title = "读取目标信息",
             read_only_hint = true,
@@ -1974,14 +2478,20 @@ impl RemoteOpsMcp {
                 if let Some(context) = connection.target_context.as_mut() {
                     context.facts.interactive_desktop =
                         remoteops_domain::CapabilityAvailability::Unknown;
+                    context.transfer_root = None;
+                    context.ssh_trust_cli = None;
                 }
             }
         }
         let mut output = connection_output(connection);
         if stale {
             "stale".clone_into(&mut output.target_context_status);
+            output.agent_transfer_root = None;
+            output.ssh_trust_cli = None;
+            "stale".clone_into(&mut output.agent_transfer_root_status);
         }
         output.transfer_root = self.transfer_root.display().to_string();
+        output.local_transfer_root.clone_from(&output.transfer_root);
         let state = self.control_mode_output(session_id).await;
         output.control_mode = state.mode;
         output.control_source = state.source;
@@ -2091,7 +2601,7 @@ impl RemoteOpsMcp {
     /// 执行只读诊断命令。
     #[tool(
         name = "run_readonly_command",
-        description = "在精确 session_id 上通过一次性 Shell 执行白名单中的单条只读查询，最长 4096 字节；并非任意只读脚本都可执行。命令文本不得包含换行、分号、管道、重定向、命令连接符或反引号；PowerShell 参数只接受字面量，不支持变量展开、子表达式、脚本块或会写入变量的参数。可单独查询 $env:LOCALAPPDATA，再将返回的实际路径作为字面量传给 Get-ChildItem -LiteralPath '实际路径' -Recurse -Depth 2；多个目录分别调用，筛选和格式化在控制端完成，不使用 Where-Object、Select-Object、Format-Table 或 Out-String 管道。被拒绝时按限制改写或拆分查询，不要仅因此自动改走审批命令或切换完全控制；完全控制也不会放宽本工具的白名单。",
+        description = "在精确 session_id 上通过指定的一次性 Shell 执行白名单中的单条只读查询，shell 必填，最长 4096 字节；并非任意只读脚本都可执行。命令文本不得包含换行、分号、管道、重定向、命令连接符或反引号；PowerShell 参数只接受字面量，不支持变量展开、子表达式、脚本块或会写入变量的参数。可单独查询 $env:LOCALAPPDATA，再将返回的实际路径作为字面量传给 Get-ChildItem -LiteralPath '实际路径' -Recurse -Depth 2；多个目录分别调用，筛选和格式化在控制端完成，不使用 Where-Object、Select-Object、Format-Table 或 Out-String 管道。被拒绝时按限制改写或拆分查询，不要仅因此自动改走审批命令或切换完全控制；完全控制也不会放宽本工具的白名单。",
         annotations(
             title = "执行只读命令",
             read_only_hint = true,
@@ -2105,7 +2615,9 @@ impl RemoteOpsMcp {
         Parameters(input): Parameters<RunReadonlyCommandInput>,
     ) -> Result<Json<ActionOutput>, String> {
         let session_id = parse_session_id(&input.session_id)?;
-        let shell = self.resolve_shell(session_id, None, input.shell).await?;
+        let shell = self
+            .resolve_shell(session_id, None, Some(input.shell))
+            .await?;
         let operation = command_operation(shell, input.command, true);
         let result = self
             .client
@@ -2485,6 +2997,122 @@ impl RemoteOpsMcp {
             .await
             .map_err(application_error)?;
         Ok(Json(action_output(session_id, result)))
+    }
+
+    /// 创建绑定当前 MCP 生命周期的本地回环 TCP 转发。
+    #[tool(
+        name = "create_tcp_forward",
+        description = "创建从本机回环端口到 Agent 所在网络固定目标的一条持续 TCP 转发。仅支持管理员允许的单目标，不提供 SOCKS、扫描或反向隧道。",
+        annotations(
+            title = "创建本地 TCP 转发",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn create_tcp_forward(
+        &self,
+        Parameters(input): Parameters<TcpForwardInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<tcp_forward::ForwardStatus>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        remoteops_protocol::tcp_forward::validate_target(&input.host, input.port)?;
+        let address = input
+            .listen_host
+            .as_deref()
+            .unwrap_or("127.0.0.1")
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| "监听地址必须是回环 IP")?;
+        if !address.is_loopback() {
+            return Err("TCP 本地监听仅允许回环地址".into());
+        }
+        if !self.client.supports_tcp_forward() {
+            return Err("Relay 不支持 TCP 转发 v2，请升级 Relay".into());
+        }
+        let listener = TcpListener::bind((address, input.local_port.unwrap_or(0)))
+            .await
+            .map_err(|error| format!("本机回环端口监听失败：{error}"))?;
+        let local_address = listener.local_addr().map_err(|_| "读取本机监听地址失败")?;
+        let action = format!(
+            "创建 TCP 转发，本机 {local_address} 到现场固定目标 {}:{}，最多两个连接，累计 512 MiB，空闲十分钟，随当前会话及授权结束",
+            input.host, input.port
+        );
+        let authorization = self
+            .authorize_mutation(&context, session_id, &action, input.approval_id)
+            .await?;
+        self.tcp_forwards
+            .create(session_id, input.host, input.port, listener, authorization)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
+        name = "get_tcp_forward_policy",
+        description = "只读查询当前绑定可见的 TCP 目标规则、修订号和管理员申请步骤。空规则拒绝创建，策略在线更新无需重启 Relay。",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_tcp_forward_policy(
+        &self,
+        Parameters(input): Parameters<TargetInput>,
+    ) -> Result<Json<TcpPolicyOutput>, String> {
+        let snapshot = self
+            .client
+            .tcp_forward_policy(parse_session_id(&input.session_id)?)
+            .await
+            .map_err(application_error)?;
+        Ok(Json(TcpPolicyOutput {
+            policy: serde_json::to_value(snapshot).map_err(|error| error.to_string())?,
+        }))
+    }
+
+    #[tool(
+        name = "list_tcp_forwards",
+        description = "读取本 MCP 的活动 TCP 监听、目标、连接数、流量及近期关闭原因。",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_tcp_forwards(
+        &self,
+        Parameters(_input): Parameters<RefreshGlobalGuideInput>,
+    ) -> Json<TcpForwardListOutput> {
+        Json(TcpForwardListOutput {
+            forwards: self.tcp_forwards.statuses(),
+        })
+    }
+
+    #[tool(
+        name = "close_tcp_forward",
+        description = "关闭本 MCP 创建的指定 TCP 监听和全部连接，释放本地端口。",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn close_tcp_forward(
+        &self,
+        Parameters(input): Parameters<CloseTcpForwardInput>,
+    ) -> Result<Json<TcpForwardCloseOutput>, String> {
+        let id = input
+            .forward_id
+            .parse::<RequestId>()
+            .map_err(|_| "TCP 转发标识无效")?;
+        let changed = self.tcp_forwards.close(id, "操作者显式关闭 TCP 转发");
+        Ok(Json(TcpForwardCloseOutput {
+            closed: true,
+            changed,
+        }))
     }
 
     #[tool(
@@ -3010,13 +3638,35 @@ impl RemoteOpsMcp {
         } else {
             None
         };
-        if let Some(authorization) = authorization {
+        let guidance_host = match &operation {
+            RemoteOperation::RunSsh { host, .. } => host.clone(),
+            _ => unreachable!(),
+        };
+        let Json(mut output) = if let Some(authorization) = authorization {
             self.execute_authorized(session_id, operation, authorization, payload)
-                .await
+                .await?
         } else {
             self.execute_simple(session_id.to_string(), operation, None, payload)
-                .await
-        }
+                .await?
+        };
+        let cli = self
+            .client
+            .list_connections()
+            .await
+            .into_iter()
+            .find(|connection| connection.session_id == session_id)
+            .and_then(|connection| connection_output(connection).ssh_trust_cli);
+        let mut details = output
+            .details
+            .take()
+            .map(details_object)
+            .unwrap_or_default();
+        details.insert(
+            "ssh_host_key_management".into(),
+            ssh_trust_guidance(cli.as_deref(), &guidance_host, port),
+        );
+        output.details = Some(details.into());
+        Ok(Json(output))
     }
 
     #[tool(
@@ -3068,7 +3718,7 @@ impl RemoteOpsMcp {
     /// 上传控制端本机文件到 Agent。
     #[tool(
         name = "upload_file",
-        description = "从 MCP 本地 transfer-root 以 1 MiB 分块上传文件到精确 session_id。local_path 必须是本地交换目录内已存在文件的相对路径，remote_path 必须是 Agent 自己交换目录内的相对目标路径；双方根目录可不同，拒绝绝对路径、.. 和链接逃逸。校验分块及完整 SHA-256；超过 1 GiB 时在读取文件前单独确认。",
+        description = "从 MCP 本地 transfer-root 以 1 MiB 分块上传文件到精确 session_id。成功后直接返回 Agent 报告的实际绝对路径；旧 Agent 未提供时明确标为未知，不使用 MCP 本机目录推算。local_path 必须是本地交换目录内已存在文件的相对路径，remote_path 必须是 Agent 自己交换目录内的相对目标路径；双方根目录可不同，拒绝绝对路径、.. 和链接逃逸。校验分块及完整 SHA-256；超过 1 GiB 时在读取文件前单独确认。",
         annotations(
             title = "上传诊断文件",
             read_only_hint = false,
@@ -3173,12 +3823,7 @@ impl RemoteOpsMcp {
             }
         };
         let mut output = action_output(session_id, result);
-        output.summary = format!("已分块上传 {size} 字节");
-        output.sha256 = Some(hash);
-        output.details = Some(serde_json::json!({
-            "size": size,
-            "chunk_size_bytes": FILE_CHUNK_BYTES,
-        }));
+        output = upload_receipt_output(output, size, hash, &self.transfer_root);
         Ok(Json(output))
     }
 
@@ -3483,6 +4128,344 @@ impl RemoteOpsMcp {
         Ok(output)
     }
 
+    /// 使用刷新后的目标能力和当前Relay声明验证扩展协议。
+    #[tool(
+        name = "manage_relay_tools",
+        description = "维护中继工具库，无需目标 Agent 会话；需此安装客户端单独获授工具管理权限。command.action支持snapshot、set_policy{enabled}、set_guide{guide_markdown}、put_tool{tool}、set_tool_enabled{tool_id,enabled}、record_test{tool_id,version,sha256,record}、import_external{url,expected_sha256}。请先实际测试、整理说明与执行定义，再登记；仅按用户指令启用。完整工具资料含versions[].packages[].tool（固定资源执行契约）、source{kind:hosted|external,url}，新增工具默认关闭。上传成功仅代表文件校验通过。",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn manage_relay_tools(
+        &self,
+        Parameters(input): Parameters<ToolCenterManageInput>,
+    ) -> Result<Json<ToolCenterOutput>, String> {
+        let request = remoteops_tool_center::ToolCenterRequest {
+            request_id: input.request_id,
+            expected_revision: input.expected_revision,
+            command: tool_center_input::parse_command(input.command)?,
+        };
+        let response = self
+            .client
+            .tool_center_request(request)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Json(response.into()))
+    }
+
+    #[tool(
+        name = "upload_relay_tool_package",
+        description = "从本机transfer-root内相对路径向中继工具仓库上传ZIP，256KiB逐块确认，最大1GiB。需独立工具管理权限，与远程完全控制无关。文件校验成功不会声明平台测试通过或自动启用。",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn upload_relay_tool_package(
+        &self,
+        Parameters(input): Parameters<UploadToolPackageInput>,
+    ) -> Result<Json<ToolCenterOutput>, String> {
+        use remoteops_tool_center::{ToolCenterCommand as Command, ToolCenterRequest};
+        use tokio::io::AsyncSeekExt as _;
+        let path = resolve_existing_transfer_file(&self.transfer_root, &input.local_path).await?;
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(|_| "无法读取本机工具包".to_owned())?;
+        let size = file
+            .metadata()
+            .await
+            .map_err(|_| "无法读取包长度".to_owned())?
+            .len();
+        if size == 0 || size > 1024 * 1024 * 1024 {
+            return Err("工具包大小必须为1字节至1GiB".into());
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0; 256 * 1024];
+        let mut hashed = 0;
+        loop {
+            let n = file
+                .read(&mut buffer)
+                .await
+                .map_err(|_| "读取包失败".to_owned())?;
+            if n == 0 {
+                break;
+            }
+            hashed += n as u64;
+            if hashed > size {
+                return Err("本机工具包在读取时发生变化".into());
+            }
+            digest.update(&buffer[..n]);
+        }
+        if hashed != size {
+            return Err("本机工具包在读取时发生变化".into());
+        }
+        let sha256 = format!("{:x}", digest.finalize());
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|_| "无法重读工具包".to_owned())?;
+        let request = |command| ToolCenterRequest {
+            request_id: RequestId::new().to_string(),
+            expected_revision: input.expected_revision,
+            command,
+        };
+        let begin = self
+            .client
+            .tool_center_request(request(Command::BeginUpload { size, sha256 }))
+            .await
+            .map_err(|e| e.to_string())?;
+        if begin.error.is_some() {
+            return Ok(Json(begin.into()));
+        }
+        let upload_id = begin
+            .data
+            .get("upload_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("中继未返回上传标识")?
+            .to_owned();
+        let mut offset = 0;
+        loop {
+            let n = file
+                .read(&mut buffer)
+                .await
+                .map_err(|_| "读取包失败".to_owned())?;
+            if n == 0 {
+                break;
+            }
+            let response = self
+                .client
+                .tool_center_request(request(Command::UploadChunk {
+                    upload_id: upload_id.clone(),
+                    offset,
+                    data_base64: BASE64.encode(&buffer[..n]),
+                }))
+                .await
+                .map_err(|e| e.to_string())?;
+            if response.error.is_some() {
+                return Ok(Json(response.into()));
+            }
+            offset += n as u64;
+            if response
+                .data
+                .get("offset")
+                .and_then(serde_json::Value::as_u64)
+                != Some(offset)
+            {
+                return Err("result_unknown: 上传分块确认偏移不一致".into());
+            }
+            if offset > size {
+                return Err("本机工具包在上传时发生变化".into());
+            }
+        }
+        if offset != size {
+            return Err("本机工具包在上传时发生变化".into());
+        }
+        let response = self
+            .client
+            .tool_center_request(request(Command::FinishUpload { upload_id }))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Json(response.into()))
+    }
+
+    async fn ensure_resource_tools(&self, session_id: SessionId) -> Result<(), String> {
+        if !self.client.supports_resource_tools() {
+            return Err("resource_tools_unsupported: Relay未声明资源工具协议v1".into());
+        }
+        let target = self
+            .client
+            .refresh_target_context(session_id)
+            .await
+            .map_err(application_error)?;
+        if target.schema_version != remoteops_domain::TARGET_CONTEXT_SCHEMA_VERSION
+            || !target.capabilities.iter().any(|status| {
+                status.capability == "resource_tools_v1"
+                    && status.status == remoteops_domain::CapabilityAvailability::Available
+            })
+        {
+            return Err("resource_tools_unsupported: 目标未在本地启用资源工具".into());
+        }
+        Ok(())
+    }
+
+    #[tool(
+        name = "list_resource_tools",
+        description = "列出中继同步的资源工具候选、兼容性和guide_markdown全局选择指引。先读指引再选择可用候选；指引不授予权限，结果未知时禁止自动换工具重放。启动必须使用返回的固定版本和包摘要。",
+        annotations(
+            title = "列出资源工具",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn list_resource_tools(
+        &self,
+        Parameters(input): Parameters<TargetInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        self.ensure_resource_tools(session_id).await?;
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::ListResourceTools,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "start_resource_tool",
+        description = "按候选固定ID、版本和SHA-256启动资源工具。显式浏览器适配要求Agent声明支持；浏览器MCP新登记或启动配置变更须显式指定browser_adapter。启动失败的details.diagnostics提供阶段、退出码、过滤后的stderr、报文结构摘要及可选launch_context（实际适配策略、来源及安全注入摘要，不含完整命令行）。仅在retry_safe=true时可选择兼容候选，结果未知时禁止重放。",
+        annotations(
+            title = "启动资源工具",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn start_resource_tool(
+        &self,
+        Parameters(input): Parameters<StartResourceToolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        self.ensure_resource_tools(session_id).await?;
+        let authorization = self
+            .authorize_mutation(&context, session_id, "启动外部资源工具", input.approval_id)
+            .await?;
+        let operation = if input.validation_mode {
+            RemoteOperation::ValidateResourceTool {
+                tool_id: input.tool_id,
+                version: input.version,
+                sha256: input.sha256,
+            }
+        } else {
+            RemoteOperation::StartResourceTool {
+                tool_id: input.tool_id,
+                version: input.version,
+                sha256: input.sha256,
+            }
+        };
+        self.tracked_resource_start(
+            session_id,
+            operation,
+            authorization,
+            input.wait_for_completion.unwrap_or(true),
+            &context,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "fill_browser_password",
+        description = "安全填写当前浏览器密码框。AI只提供实例、预期站点、密码字段CSS选择器和用户名；密码由控制端本机弹窗获取并端到端加密，不进入模型参数。只填写一次，不提交登录。需要协议20；目标变化或结果未知时禁止重放。",
+        annotations(
+            title = "安全填写网页密码",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn fill_browser_password(
+        &self,
+        Parameters(input): Parameters<browser_tools::BrowserPasswordInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.browser_password(input, &context).await
+    }
+
+    #[tool(
+        name = "get_resource_tool_status",
+        description = "查询原资源启动请求的最新进度和最终结果，不会重新下载或启动。传入start_resource_tool返回的同一request_id。",
+        annotations(
+            title = "查询工具准备进度",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_resource_tool_status(
+        &self,
+        Parameters(input): Parameters<browser_tools::ResourceStatusInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        self.resource_status(input).await
+    }
+
+    #[tool(
+        name = "call_resource_tool",
+        description = "调用会话绑定的外部浏览器工具，所有调用按高风险审批。不得信任上游只读声明；操作已提交后结果未知时禁止重试或切换后端重放，应先核实目标状态。",
+        annotations(
+            title = "调用资源工具",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn call_resource_tool(
+        &self,
+        Parameters(input): Parameters<CallResourceToolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        self.ensure_resource_tools(session_id).await?;
+        let authorization = self
+            .authorize_mutation(
+                &context,
+                session_id,
+                "调用外部资源工具（可能修改网页状态）",
+                input.approval_id,
+            )
+            .await?;
+        self.execute_authorized(
+            session_id,
+            RemoteOperation::CallResourceTool {
+                instance_id: input.instance_id,
+                tool_name: input.tool_name,
+                arguments: input.arguments,
+            },
+            authorization,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "stop_resource_tool",
+        description = "停止当前会话拥有的外部工具并清理独立浏览器临时状态；保留可复用包缓存。",
+        annotations(
+            title = "停止资源工具",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn stop_resource_tool(
+        &self,
+        Parameters(input): Parameters<StopResourceToolInput>,
+    ) -> Result<Json<ActionOutput>, String> {
+        let session_id = parse_session_id(&input.session_id)?;
+        self.ensure_resource_tools(session_id).await?;
+        self.execute_simple(
+            input.session_id,
+            RemoteOperation::StopResourceTool {
+                instance_id: input.instance_id,
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
     async fn execute_simple(
         &self,
         session_id: String,
@@ -3508,6 +4491,60 @@ impl RemoteOpsMcp {
         }
     }
 
+    /// 排队后保留请求标识；丢失响应不能变成可自动回退的启动失败。
+    async fn execute_resource_authorized(
+        &self,
+        session_id: SessionId,
+        operation: RemoteOperation,
+        authorization: WriteAuthorization,
+    ) -> Result<Json<ActionOutput>, String> {
+        let record = match &operation {
+            RemoteOperation::StartResourceTool {
+                tool_id,
+                version,
+                sha256,
+            } => serde_json::json!({ "tool_id":tool_id, "version":version, "sha256":sha256 }),
+            RemoteOperation::CallResourceTool {
+                instance_id,
+                tool_name,
+                arguments,
+            } => {
+                serde_json::json!({ "instance_id":instance_id, "tool_name":tool_name, "arguments_sha256":sha256_bytes(arguments.to_string().as_bytes()) })
+            }
+            _ => unreachable!("资源高风险路径仅用于启动与调用"),
+        };
+        let pending = self
+            .client
+            .start_execute_with_control(
+                &session_id.to_string(),
+                EventSource::Ai,
+                operation,
+                authorization.approval_id,
+                None,
+                None,
+                authorization.proof,
+            )
+            .await;
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(error) => {
+                return Ok(Json(resource_transport_output(
+                    session_id, None, error, record,
+                )));
+            }
+        };
+        let request_id = pending.request_id;
+        match pending.wait().await {
+            Ok(result) => Ok(Json(resource_response_output(session_id, result, record))),
+            Err(error) => Ok(Json(resource_transport_output(
+                session_id,
+                Some(request_id),
+                error,
+                record,
+            ))),
+        }
+    }
+
     async fn execute_authorized(
         &self,
         session_id: SessionId,
@@ -3515,6 +4552,14 @@ impl RemoteOpsMcp {
         authorization: WriteAuthorization,
         payload_base64: Option<String>,
     ) -> Result<Json<ActionOutput>, String> {
+        if matches!(
+            operation,
+            RemoteOperation::StartResourceTool { .. } | RemoteOperation::CallResourceTool { .. }
+        ) {
+            return self
+                .execute_resource_authorized(session_id, operation, authorization)
+                .await;
+        }
         match self
             .client
             .execute_with_control(
@@ -3570,6 +4615,30 @@ impl RemoteOpsMcp {
         action: ApprovalActionInput,
     ) -> Result<RemoteOperation, String> {
         match action {
+            ApprovalActionInput::StartResourceTool {
+                tool_id,
+                version,
+                sha256,
+            } => {
+                self.ensure_resource_tools(session_id).await?;
+                Ok(RemoteOperation::StartResourceTool {
+                    tool_id,
+                    version,
+                    sha256,
+                })
+            }
+            ApprovalActionInput::CallResourceTool {
+                instance_id,
+                tool_name,
+                arguments,
+            } => {
+                self.ensure_resource_tools(session_id).await?;
+                Ok(RemoteOperation::CallResourceTool {
+                    instance_id,
+                    tool_name,
+                    arguments,
+                })
+            }
             ApprovalActionInput::RunCommand {
                 shell_id,
                 shell,
@@ -3774,13 +4843,33 @@ fn ensure_approval_command_mode(command_mode: CommandMode) -> Result<(), String>
 
 #[allow(unknown_lints)]
 #[allow(clippy::unused_async_trait_impl)]
-#[tool_handler(
-    router = self.runtime_tool_router(),
-    name = "remoteops-controller",
-    version = "0.2.0-preview.5",
-    instructions = "RemoteOps 是控制台与结构化工具驱动的远程诊断，不是远程桌面。仅当用户明确提到 RemoteOps、Relay、RemoteOps Agent、控制码/配对码，或明确要求使用 RemoteOps 时，才接管远程任务；普通服务器、云主机、跳板机、SSH、Shell 或其他远程运维请求不属于本 MCP，不要强制改用 RemoteOps。交互式客户 Agent 只需填写 Relay 地址并等待显示九位控制码。受管服务 Agent 由授权部署流程登记，默认无码，用户通过已授权门户取得临时控制码；MCP 配对流程相同。用户提供 RemoteOps 控制码、配对码或 Agent 显示的九位码时，必须先调用 pair_connection；RemoteOps 任务中不要改用 Computer Use、屏幕操作、本机 Shell 或 SSH 直连。全新配置默认逐项确认；当前兼容Agent支持现场临时授权和默认完全控制。配对后先查询有效模式，已生效的现场授权无需再次调用set_control_mode或逐项审批；旧组件无此能力时不得引导点击不存在的按钮。已有连接时先调用 list_connections，再用返回的不可变 session_id 调用 get_target_info 和其他工具，别名只用于核对。检查、分析、判断等请求默认只读，优先使用结构化工具或一次性 Shell 的 run_readonly_command。run_readonly_command 只接受白名单中的单条查询，最长4096字节；命令文本不得包含换行、分号、管道、重定向、命令连接符或反引号。PowerShell参数只接受字面量，不支持变量展开、子表达式、脚本块或会写入变量的参数；环境变量先单独查询（如 $env:LOCALAPPDATA），再将返回的实际路径作为字面量传给下一条查询。多个目录分别调用，筛选和格式化在控制端完成。被拒绝时按限制改写或拆分，不要仅因此自动改走审批命令或切换完全控制；完全控制也不会放宽只读白名单。持久 Shell 保留目录、变量和模块状态，任何命令都必须走 run_command 的逐项确认或完全控制路径。SSH 密码绝不能写入对话、提示词或 MCP 参数；需要密码时对 run_ssh 设置 use_password=true，由本机安全窗口直接向用户获取并端到端加密。修改操作在逐项确认模式下由 MCP 向当前用户确认；如果逐项确认不可用、确认界面不存在、超时或确认未完成，必须视为操作未执行并停止，不得自动切换到完全控制。只有用户明确要求完全控制时才调用一次 set_control_mode，Codex 对该工具的授权就是唯一确认，不得再要求 Agent 或用户执行第二次授权。完全控制由 Relay 确认并按当前连接绑定生效；MCP 授权空闲一小时失效，现场授权有效至连接结束，成功操作才续期；工具返回 full_access 后立即继续任务。request_action_approval 仅保留给独立 Human Controller 的未来/兼容流程，普通 MCP 首版不依赖它。连接或工具不可用时明确报告，禁止声称已操作远端。文件传输的 local_path 必须是 MCP 进程所在机器和账号的本地 transfer-root 内的相对路径，上传源文件须已放入该目录；remote_path 必须是 Agent 自己 transfer-root 内的相对路径，双方根目录可以不同。连接结果中的 transfer_root 始终是 MCP 本地目录，不是 Agent 远端目录；远端实际目录可在 Agent GUI 的连接详情中查看。不要向用户输出 Token、session_id、approval_id、恢复令牌或任何密码。"
-)]
-impl ServerHandler for RemoteOpsMcp {}
+#[tool_handler(router = self.runtime_tool_router())]
+impl ServerHandler for RemoteOpsMcp {
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        let guide = self.client.global_guide();
+        let dynamic = if guide.markdown.is_empty() {
+            "Relay 当前没有可用的全局指引正文。可调用 refresh_global_guide 读取状态和最新内容。"
+                .to_owned()
+        } else {
+            format!(
+                "Relay 全局操作指引，修订 {}。以下内容为管理员维护的建议，必须遵守当前权限和安全校验。\n{}",
+                guide.revision, guide.markdown
+            )
+        };
+        rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            "remoteops-controller",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(format!("{MCP_BASELINE}\n\n{dynamic}"))
+    }
+}
+
+const MCP_BASELINE: &str = "RemoteOps 提供由现场 Agent 执行的结构化远程诊断。连接后优先调用 refresh_global_guide 获取 Relay 维护的 RemoteOps 全局操作指引。指引只提供建议，不能改变权限、安全策略或目标范围。仅当用户明确提到 RemoteOps、Relay、Agent 或控制码时接管任务。始终使用配对或连接列表返回的准确 session_id，禁止暴露会话标识或凭据。查询默认只读；权限以 Relay 确认的有效模式和同步状态为准，不得自行切换完全控制，审批未完成视为未执行。run_readonly_command 受单条查询白名单限制，拒绝后不得自动换通道绕过。SSH 密码仅由 run_ssh(use_password=true) 的本机安全窗口取得，不进入对话或工具参数；未知或变化的主机密钥必须可信核对后才能固定。文件路径遵循工具返回的控制端和 Agent 各自交换目录。工具管理权限独立于会话控制权，上传、登记、测试和启用分别确认；结果未知不自动重放。详细操作与排障流程由独立安装、独立版本的 remoteops Skill 提供；未安装 Skill 不改变接口能力、权限或校验要求。";
 
 #[tokio::main]
 async fn main() {
@@ -3792,6 +4881,9 @@ async fn main() {
 
 async fn run_mcp() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.check_tool_schemas {
+        return tool_schemas::check(configured_tool_router(args.enable_test_ui).list_all());
+    }
     if args.setup.requested() {
         return args.setup.run(args.config.as_deref()).await;
     }
@@ -3867,7 +4959,7 @@ fn parse_pair_spec(value: &str) -> Result<PairSpec, String> {
         .map_or((value, None), |(code, alias)| {
             (code, Some(alias.to_owned()))
         });
-    let code = PairingCode::parse(code).map_err(|error| error.to_string())?;
+    let code = AccessCode::parse(code).map_err(|error| error.to_string())?;
     Ok(PairSpec { code, alias })
 }
 
@@ -4241,6 +5333,31 @@ fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> Conn
             target_context[field] = "unknown".into();
         }
     }
+    let live_context = connection.target_context.as_ref().filter(|context| {
+        reported
+            && context.validate().is_ok()
+            && connection.state == remoteops_domain::ConnectionState::Online
+    });
+    let agent_transfer_root = live_context.and_then(|context| context.transfer_root.clone());
+    let ssh_trust_cli = live_context.and_then(|context| context.ssh_trust_cli.clone());
+    if live_context.is_none()
+        && let Some(fields) = target_context.as_object_mut()
+    {
+        fields.remove("transfer_root");
+        fields.remove("ssh_trust_cli");
+    }
+    let root_status = if agent_transfer_root.is_some() {
+        "reported"
+    } else if reported
+        && connection
+            .target_context
+            .as_ref()
+            .is_some_and(|context| context.transfer_root.is_some())
+    {
+        "stale"
+    } else {
+        "unknown"
+    };
     ConnectionOutput {
         display_name: connection.display_name(),
         alias: connection.alias,
@@ -4258,7 +5375,12 @@ fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> Conn
         control_source: None,
         control_revision: None,
         control_sync_status: "pending".into(),
+        control_message: None,
         transfer_root: String::new(),
+        local_transfer_root: String::new(),
+        agent_transfer_root,
+        agent_transfer_root_status: root_status.into(),
+        ssh_trust_cli,
         target_context,
         target_context_status: if reported { "reported" } else { "unknown" }.to_owned(),
         guidance_is_advisory: true,
@@ -4269,6 +5391,135 @@ fn connection_output(connection: remoteops_domain::ConnectionDescriptor) -> Conn
             .map(|capability| format!("{capability:?}").to_lowercase())
             .chain(visual_allowed.then(|| "visual".to_owned()))
             .collect(),
+    }
+}
+
+/// 保留兼容组件的任意详情，不因新增结构化字段而丢弃原始回执。
+fn details_object(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    match value {
+        serde_json::Value::Object(fields) => fields,
+        value => serde_json::Map::from_iter([("agent_details".into(), value)]),
+    }
+}
+
+// 只识别远端明确给出的绝对路径，不按控制端操作系统解析或拼接远端位置。
+fn is_reported_agent_absolute_path(path: &str) -> bool {
+    if path.is_empty() || path.chars().any(char::is_control) {
+        return false;
+    }
+    if path.starts_with('/') {
+        return true;
+    }
+    let drive_absolute = |value: &str| {
+        let bytes = value.as_bytes();
+        bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/')
+    };
+    let unc_tail = |value: &str| {
+        let mut parts = value.split(['\\', '/']);
+        let valid = |part: &str| !part.is_empty() && !matches!(part, "." | ".." | "?");
+        parts.next().is_some_and(valid) && parts.next().is_some_and(valid)
+    };
+    if let Some(extended) = path.strip_prefix(r"\\?\") {
+        return drive_absolute(extended) || extended.strip_prefix(r"UNC\").is_some_and(unc_tail);
+    }
+    drive_absolute(path) || path.strip_prefix(r"\\").is_some_and(unc_tail)
+}
+
+/// 合并远端完成回执，失败和完整性冲突不能写成上传成功。
+fn upload_receipt_output(
+    mut output: ActionOutput,
+    size: u64,
+    hash: String,
+    local_root: &Path,
+) -> ActionOutput {
+    if output.status != "completed" {
+        return output;
+    }
+    if output.exit_code.is_some_and(|code| code != 0) {
+        "failed".clone_into(&mut output.status);
+        return output;
+    }
+    if output
+        .sha256
+        .as_ref()
+        .is_none_or(|reported| reported != &hash)
+    {
+        "failed".clone_into(&mut output.status);
+        "远端未返回匹配的 SHA-256，文件可能已写入，尚不能确认上传完整性；请核对后处理"
+            .clone_into(&mut output.summary);
+        return output;
+    }
+    let mut details = output
+        .details
+        .take()
+        .map(details_object)
+        .unwrap_or_default();
+    if details
+        .get("size")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|reported| reported != size)
+    {
+        "failed".clone_into(&mut output.status);
+        "远端返回的文件大小与上传源不一致，文件可能已写入，请核对后处理"
+            .clone_into(&mut output.summary);
+        output.details = Some(details.into());
+        return output;
+    }
+    if details
+        .get("sha256")
+        .filter(|reported| !reported.is_null())
+        .is_some_and(|reported| reported.as_str() != Some(hash.as_str()))
+    {
+        "failed".clone_into(&mut output.status);
+        "远端回执中的 SHA-256 与上传源不一致，文件可能已写入，请核对后处理"
+            .clone_into(&mut output.summary);
+        output.details = Some(details.into());
+        return output;
+    }
+    let reported_path = details
+        .get("remote_absolute_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| is_reported_agent_absolute_path(path))
+        .map(str::to_owned);
+    output.summary = format!("已分块上传 {size} 字节；Agent 未返回可用的实际绝对路径");
+    output.sha256 = Some(hash);
+    details.insert("size".into(), size.into());
+    details.insert("chunk_size_bytes".into(), FILE_CHUNK_BYTES.into());
+    details.insert(
+        "local_transfer_root".into(),
+        local_root.display().to_string().into(),
+    );
+    details.insert(
+        "agent_path_status".into(),
+        if reported_path.is_some() {
+            "reported"
+        } else {
+            "unknown"
+        }
+        .into(),
+    );
+    if let Some(path) = reported_path {
+        output.summary = format!("已分块上传 {size} 字节，远端文件：{path}");
+    }
+    output.details = Some(details.into());
+    output
+}
+
+/// 返回参数数组指引，不把远端路径插入待执行的 Shell 文本，也不自动信任。
+fn ssh_trust_guidance(executable: Option<&str>, host: &str, port: u16) -> serde_json::Value {
+    if let Some(executable) = executable {
+        serde_json::json!({"status":"available", "executable":executable,
+            "scan_arguments":["--ssh-key-scan",host,&port.to_string()],
+            "trust_arguments_template":["--ssh-key-trust",host,&port.to_string(),"<用户经可信渠道核对的完整指纹，可追加多个独立参数>"],
+            "automatic_trust":false,
+            "powershell_output_pipeline":"Out-String",
+            "instruction":"先核对目标和全部指纹；扫描结果本身不代表可信。用户确认前不得执行信任命令。Agent命令通过现有获授权run_command执行；PowerShell中使用 & 可执行文件 参数... | Out-String，以等待原生GUI宿主退出并捕获JSON。不自动重跑失败SSH命令。"})
+    } else {
+        serde_json::json!({"status":"unavailable", "automatic_trust":false,
+            "instruction":"当前Agent未报告SSH主机密钥管理入口。不能猜程序路径或自动接受密钥；请使用支持该能力的Agent或经核对的预置流程。"})
     }
 }
 
@@ -4292,16 +5543,87 @@ fn visual_unavailable_output(session_id: SessionId, reason: &str) -> ActionOutpu
 }
 
 fn action_output(session_id: SessionId, result: OperationResult) -> ActionOutput {
+    let status = match result.response.error_code.as_deref() {
+        None => "completed",
+        Some("result_unknown") => "unknown",
+        Some(_) => "failed",
+    };
+    let details = result.response.details.or_else(|| {
+        result
+            .response
+            .error_code
+            .as_ref()
+            .map(|code| serde_json::json!({"code":code}))
+    });
     ActionOutput {
-        status: "completed".to_owned(),
+        status: status.to_owned(),
         session_id: session_id.to_string(),
         request_id: Some(result.response.request_id.to_string()),
         exit_code: result.response.exit_code,
         summary: result.response.summary,
         approval_id: None,
         sha256: result.response.sha256,
-        details: result.response.details,
+        details,
     }
+}
+
+/// 保留 Agent 已确认的启动前失败；仅未知结果禁止据此回退。
+fn resource_response_output(
+    session_id: SessionId,
+    result: OperationResult,
+    record: serde_json::Value,
+) -> ActionOutput {
+    let mut output = action_output(session_id, result);
+    let mut details = output
+        .details
+        .take()
+        .map(details_object)
+        .unwrap_or_default();
+    details.insert("operation_record".into(), record);
+    details.insert("operation_replay".into(), "never_automatic".into());
+    if output.status == "unknown" {
+        details.insert("execution_state".into(), "unknown".into());
+        details.insert("retry_safe".into(), false.into());
+    }
+    output.details = Some(details.into());
+    output
+}
+
+/// 资源操作一旦排队或传输状态不明，必须先核实，不能自动换后端重放。
+fn resource_transport_output(
+    session_id: SessionId,
+    request_id: Option<RequestId>,
+    error: ApplicationError,
+    record: serde_json::Value,
+) -> ActionOutput {
+    let certainly_unsent = request_id.is_none()
+        && matches!(
+            &error,
+            ApplicationError::PolicyDenied(_)
+                | ApplicationError::Domain(_)
+                | ApplicationError::ApprovalRequired { .. }
+                | ApplicationError::ApprovalNotGranted
+        );
+    let mut output = error_action_output(session_id, error);
+    if let Some(request_id) = request_id {
+        output.request_id = Some(request_id.to_string());
+    }
+    let mut details = output
+        .details
+        .take()
+        .map(details_object)
+        .unwrap_or_default();
+    details.insert("retry_safe".into(), certainly_unsent.into());
+    details.insert("operation_record".into(), record);
+    details.insert("operation_replay".into(), "never_automatic".into());
+    if !certainly_unsent {
+        details.insert("execution_state".into(), "unknown".into());
+        output
+            .summary
+            .push_str("；资源操作结果未知，请先核实，禁止自动重放或切换后端重试");
+    }
+    output.details = Some(details.into());
+    output
 }
 
 fn error_action_output(session_id: SessionId, error: ApplicationError) -> ActionOutput {
@@ -4350,6 +5672,79 @@ fn error_action_output(session_id: SessionId, error: ApplicationError) -> Action
 #[allow(clippy::needless_pass_by_value)]
 fn application_error(error: ApplicationError) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod resource_transport_tests {
+    use super::*;
+    #[test]
+    fn resource_confirmed_failure_preserves_fallback_and_unknown_evidence() {
+        let session = SessionId::new();
+        for (code, retry_safe, status) in [
+            ("incompatible", true, "failed"),
+            ("result_unknown", false, "unknown"),
+        ] {
+            let request_id = RequestId::new();
+            let response = remoteops_protocol::RemoteResponse {
+                request_id,
+                session_id: session,
+                exit_code: None,
+                summary: "fixture failure".into(),
+                error_code: Some(code.into()),
+                payload_base64: None,
+                sha256: None,
+                details: Some(
+                    serde_json::json!({"code":code,"retry_safe":retry_safe,"diagnostics":{"stage":"initialize","reason":"eof","stderr_tail":"filtered stderr"}}),
+                ),
+            };
+            let output = resource_response_output(
+                session,
+                OperationResult { response },
+                serde_json::json!({"tool_id":"fixture-tool"}),
+            );
+            assert_eq!(output.status, status);
+            assert_eq!(output.request_id, Some(request_id.to_string()));
+            let details = output.details.unwrap();
+            assert_eq!(details["retry_safe"], retry_safe);
+            assert_eq!(details["diagnostics"]["stage"], "initialize");
+            assert_eq!(details["operation_record"]["tool_id"], "fixture-tool");
+            if retry_safe {
+                assert!(details.get("execution_state").is_none());
+            } else {
+                assert_eq!(details["execution_state"], "unknown");
+            }
+        }
+    }
+
+    #[test]
+    fn resource_response_loss_preserves_evidence_and_prevents_replay() {
+        let session = SessionId::new();
+        let request = RequestId::new();
+        let output = resource_transport_output(
+            session,
+            Some(request),
+            ApplicationError::Transport("fixture_disconnect".into()),
+            serde_json::json!({"instance_id":"fixture-instance", "arguments_sha256":"fixture-digest"}),
+        );
+        assert_eq!(
+            output.request_id.as_deref(),
+            Some(request.to_string().as_str())
+        );
+        let details = output.details.unwrap();
+        assert_eq!(details["retry_safe"], false);
+        assert_eq!(details["execution_state"], "unknown");
+        assert_eq!(
+            details["operation_record"]["instance_id"],
+            "fixture-instance"
+        );
+        let unsent = resource_transport_output(
+            session,
+            None,
+            ApplicationError::PolicyDenied("readonly".into()),
+            serde_json::json!({}),
+        );
+        assert_eq!(unsent.details.unwrap()["retry_safe"], true);
+    }
 }
 
 #[cfg(test)]
@@ -4755,6 +6150,27 @@ mod tests {
         assert!(cache.is_empty());
     }
 
+    #[test]
+    fn credential_prompt_uses_target_language_and_legacy_controller_fallback() {
+        let mut context = remoteops_domain::TargetContext::default();
+        for language in [
+            remoteops_domain::TargetUiLanguage::ZhCn,
+            remoteops_domain::TargetUiLanguage::EnUs,
+        ] {
+            context.ui_language = Some(language);
+            assert_eq!(credential_prompt_language(Some(&context)), language.code());
+        }
+        context.ui_language = None;
+        assert_eq!(
+            credential_prompt_language(Some(&context)),
+            remoteops_i18n::Language::detect().code()
+        );
+        assert_eq!(
+            credential_prompt_language(None),
+            remoteops_i18n::Language::detect().code()
+        );
+    }
+
     #[tokio::test]
     async fn credential_prompt_abstraction_supports_cancel_and_memory_choice() {
         let prompt = FakeCredentialPrompt {
@@ -4769,6 +6185,8 @@ mod tests {
                 port: 22,
                 username: "admin",
                 command_sha256: &"a".repeat(64),
+                language: "zh-CN",
+                browser_target: None,
             })
             .await
             .expect("假安全窗口应成功")
@@ -4780,6 +6198,7 @@ mod tests {
     fn test_args(config: PathBuf) -> Args {
         Args {
             setup: setup::SetupArgs::default(),
+            check_tool_schemas: false,
             config: Some(config),
             relay: None,
             server_name: None,
@@ -4940,6 +6359,7 @@ mod tests {
     #[test]
     fn confirmed_local_grants_skip_prompt_and_revocation_requires_confirmation() {
         let mut state = SessionControlState {
+            initialization_pending: false,
             session_id: SessionId::new(),
             agent_generation: 4,
             controller_id: remoteops_domain::ControllerInstanceId::new(),
@@ -5132,6 +6552,272 @@ mod tests {
     }
 
     #[test]
+    fn agent_roots_are_per_target_and_offline_or_legacy_values_are_not_claimed() {
+        let make = |name: &str, root: &str| {
+            let mut connection = graphics_test_connection(name);
+            connection.target_context = Some(remoteops_domain::TargetContext {
+                transfer_root: Some(root.into()),
+                ssh_trust_cli: Some("C:/Agent/native-core.exe".into()),
+                ..remoteops_domain::TargetContext::default()
+            });
+            connection
+        };
+        let first = make("first", "C:/first transfer");
+        let mut second = make("second", "D:/second transfer");
+        assert_eq!(
+            connection_output(first).agent_transfer_root.as_deref(),
+            Some("C:/first transfer")
+        );
+        assert_eq!(
+            connection_output(second.clone())
+                .agent_transfer_root
+                .as_deref(),
+            Some("D:/second transfer")
+        );
+        second.state = remoteops_domain::ConnectionState::Offline;
+        let offline = connection_output(second);
+        assert!(offline.agent_transfer_root.is_none() && offline.ssh_trust_cli.is_none());
+        assert_eq!(offline.agent_transfer_root_status, "stale");
+        assert!(offline.target_context.get("transfer_root").is_none());
+        assert!(offline.target_context.get("ssh_trust_cli").is_none());
+        let old = connection_output(graphics_test_connection("old"));
+        assert!(old.agent_transfer_root.is_none());
+        assert_eq!(old.agent_transfer_root_status, "unknown");
+    }
+
+    #[test]
+    fn upload_preserves_actual_receipt_and_never_relabels_failure_or_conflict() {
+        let result = |status: &str| ActionOutput {
+            status: status.into(),
+            session_id: "fixture".into(),
+            request_id: None,
+            exit_code: None,
+            summary: "fixture".into(),
+            approval_id: None,
+            sha256: Some("hash".into()),
+            details: Some(
+                serde_json::json!({"remote_absolute_path":"C:/Agent transfer/tool.exe", "agent_transfer_root":"C:/Agent transfer", "remote_path":"tool.exe", "size":42, "custom":"preserved"}),
+            ),
+        };
+        let receipt = upload_receipt_output(
+            result("completed"),
+            42,
+            "hash".into(),
+            Path::new("D:/MCP local"),
+        );
+        let detail = receipt.details.unwrap();
+        assert_eq!(detail["remote_absolute_path"], "C:/Agent transfer/tool.exe");
+        assert_eq!(detail["local_transfer_root"], "D:/MCP local");
+        assert_eq!(detail["custom"], "preserved");
+        assert_eq!(receipt.status, "completed");
+        let failed = upload_receipt_output(result("failed"), 42, "hash".into(), Path::new("local"));
+        assert_eq!(failed.summary, "fixture");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            upload_receipt_output(result("completed"), 42, "other".into(), Path::new("local"))
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            upload_receipt_output(result("completed"), 43, "hash".into(), Path::new("local"))
+                .status,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn upload_does_not_claim_success_for_nonzero_exit_or_missing_hash() {
+        let result = || ActionOutput {
+            status: "completed".into(),
+            session_id: "fixture".into(),
+            request_id: None,
+            exit_code: Some(1),
+            summary: "real remote failure".into(),
+            approval_id: None,
+            sha256: Some("hash".into()),
+            details: None,
+        };
+        let failed = upload_receipt_output(result(), 42, "hash".into(), Path::new("local"));
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.summary, "real remote failure");
+        let mut missing = result();
+        missing.exit_code = None;
+        missing.sha256 = None;
+        assert_eq!(
+            upload_receipt_output(missing, 42, "hash".into(), Path::new("local")).status,
+            "failed"
+        );
+    }
+
+    fn upload_test_output(details: Option<serde_json::Value>) -> ActionOutput {
+        ActionOutput {
+            status: "completed".into(),
+            session_id: "fixture".into(),
+            request_id: Some("final-upload-request".into()),
+            exit_code: Some(0),
+            summary: "Agent completed upload".into(),
+            approval_id: None,
+            sha256: Some("hash".into()),
+            details,
+        }
+    }
+
+    #[test]
+    fn upload_final_response_retains_agent_path_through_mcp_json_serialization() {
+        let session_id = SessionId::new();
+        let absolute = r"C:\现场 Agent\transfer\中文 工具.txt";
+        let response = remoteops_protocol::RemoteResponse {
+            request_id: RequestId::new(),
+            session_id,
+            exit_code: Some(0),
+            summary: "已完成上传".into(),
+            error_code: None,
+            payload_base64: None,
+            sha256: Some("hash".into()),
+            details: Some(serde_json::json!({
+                "remote_absolute_path": absolute,
+                "agent_transfer_root": r"C:\现场 Agent\transfer",
+                "remote_path": "中文 工具.txt",
+                "size": 42,
+                "sha256": "hash",
+            })),
+        };
+        let decoded = serde_json::from_slice::<remoteops_protocol::RemoteResponse>(
+            &serde_json::to_vec(&response).unwrap(),
+        )
+        .unwrap();
+        let output = upload_receipt_output(
+            action_output(session_id, OperationResult { response: decoded }),
+            42,
+            "hash".into(),
+            Path::new("D:/MCP 本地 transfer"),
+        );
+        let direct = serde_json::to_value(output).unwrap();
+        assert_eq!(direct["status"], "completed");
+        assert!(direct["summary"].as_str().unwrap().contains(absolute));
+        assert_eq!(direct["details"]["remote_absolute_path"], absolute);
+        assert_eq!(
+            direct["details"]["agent_transfer_root"],
+            r"C:\现场 Agent\transfer"
+        );
+        assert_eq!(direct["details"]["agent_path_status"], "reported");
+        assert_eq!(
+            direct["details"]["local_transfer_root"],
+            "D:/MCP 本地 transfer"
+        );
+        assert_eq!(direct["details"]["sha256"], "hash");
+    }
+
+    #[test]
+    fn agent_absolute_path_recognition_is_independent_of_controller_os() {
+        for path in [
+            "/var/现场 transfer/中文工具.txt",
+            r"C:\现场 transfer\中文工具.txt",
+            "D:/现场 transfer/中文工具.txt",
+            r"\\server\share\中文工具.txt",
+            r"\\?\C:\现场 transfer\中文工具.txt",
+            r"\\?\UNC\server\share\中文工具.txt",
+        ] {
+            assert!(is_reported_agent_absolute_path(path), "{path:?}");
+        }
+        for path in [
+            "",
+            " ",
+            "中文工具.txt",
+            "folder/中文工具.txt",
+            r"C:中文工具.txt",
+            r"\current-drive-relative.txt",
+            r"\\server",
+            r"\\.\PhysicalDrive0",
+            "https://example.test/tool.txt",
+            "C:/transfer/tool.txt\n伪造状态",
+            "C:/transfer/\0tool.txt",
+        ] {
+            assert!(!is_reported_agent_absolute_path(path), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn upload_legacy_or_unusable_paths_are_explicitly_unknown_without_local_guessing() {
+        for details in [
+            None,
+            Some(serde_json::json!({"size": 42})),
+            Some(serde_json::json!({"size": 42, "sha256": null})),
+            Some(serde_json::json!({"remote_absolute_path": ""})),
+            Some(serde_json::json!({"remote_absolute_path": "  "})),
+            Some(serde_json::json!({"remote_absolute_path": "中文工具.txt"})),
+            Some(serde_json::json!({"remote_absolute_path": "C:relative.txt"})),
+            Some(serde_json::json!({"remote_absolute_path": null})),
+            Some(serde_json::json!(["legacy", "details"])),
+        ] {
+            let original = details.clone();
+            let output = upload_receipt_output(
+                upload_test_output(details),
+                42,
+                "hash".into(),
+                Path::new("D:/MCP local only"),
+            );
+            assert_eq!(output.status, "completed");
+            assert!(output.summary.contains("未返回可用的实际绝对路径"));
+            assert!(!output.summary.contains("D:/MCP"));
+            let details = output.details.unwrap();
+            assert_eq!(details["agent_path_status"], "unknown");
+            assert!(details.get("agent_transfer_root").is_none());
+            if let Some(original) = original {
+                if original.is_array() {
+                    assert_eq!(details["agent_details"], original);
+                } else if let Some(path) = original.get("remote_absolute_path") {
+                    // 保留异常回执供诊断，但绝不把它标为已确认绝对路径。
+                    assert_eq!(&details["remote_absolute_path"], path);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upload_pending_or_failed_receipts_are_not_decorated_as_completed_uploads() {
+        for status in ["unknown", "failed", "approval_required"] {
+            let mut output = upload_test_output(Some(serde_json::json!({
+                "offset": 0, "next_offset": 42,
+            })));
+            status.clone_into(&mut output.status);
+            let before = serde_json::to_value(&output).unwrap();
+            let after = upload_receipt_output(output, 42, "hash".into(), Path::new("local"));
+            assert_eq!(serde_json::to_value(after).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn upload_conflicting_agent_detail_hash_is_not_silently_overwritten() {
+        for wrong in [serde_json::json!("other"), serde_json::json!(42)] {
+            let output = upload_receipt_output(
+                upload_test_output(Some(serde_json::json!({
+                    "remote_absolute_path": "C:/Agent transfer/tool.exe",
+                    "size": 42,
+                    "sha256": wrong,
+                }))),
+                42,
+                "hash".into(),
+                Path::new("local"),
+            );
+            assert_eq!(output.status, "failed");
+            assert!(output.summary.contains("回执中的 SHA-256"));
+            assert_eq!(output.details.unwrap()["sha256"], wrong);
+        }
+    }
+
+    #[test]
+    fn ssh_guidance_is_explicit_and_does_not_infer_a_legacy_executable() {
+        let old = ssh_trust_guidance(None, "127.0.0.1", 2222);
+        assert_eq!(old["status"], "unavailable");
+        assert!(old.get("executable").is_none());
+        let current = ssh_trust_guidance(Some("C:/程序 带空格/native-core.exe"), "127.0.0.1", 2222);
+        assert_eq!(current["automatic_trust"], false);
+        assert_eq!(current["scan_arguments"][1], "127.0.0.1");
+        assert_eq!(current["scan_arguments"][2], "2222");
+    }
+
+    #[test]
     fn transfer_schemas_distinguish_controller_and_agent_roots() {
         for schema in [
             serde_json::to_value(schemars::schema_for!(UploadInput)).unwrap(),
@@ -5154,9 +6840,12 @@ mod tests {
             .unwrap();
         assert!(description.contains("MCP 本地"));
         assert!(description.contains("不是 Agent"));
+        assert!(schema["properties"].get("agent_transfer_root").is_some());
+        assert!(schema["properties"].get("local_transfer_root").is_some());
         assert!(
-            schema["properties"].get("remote_transfer_root").is_none(),
-            "本轮不扩展远端协议或修改输出字段"
+            schema["properties"]
+                .get("agent_transfer_root_status")
+                .is_some()
         );
     }
 

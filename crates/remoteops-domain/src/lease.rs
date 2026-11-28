@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentInstanceId, PairingCode};
+use crate::{AccessCode, AgentInstanceId};
 
 /// Relay 为 Agent 颁发的配对码租约。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -9,7 +9,7 @@ pub struct PairingLease {
     /// Agent 实例标识。
     pub agent_instance_id: AgentInstanceId,
     /// 租约有效期内保持不变的配对码。
-    pub pairing_code: Option<PairingCode>,
+    pub pairing_code: Option<AccessCode>,
     /// 租约到期时间。
     pub expires_at: DateTime<Utc>,
 }
@@ -19,13 +19,13 @@ impl PairingLease {
     #[must_use]
     pub fn new(
         agent_instance_id: AgentInstanceId,
-        pairing_code: PairingCode,
+        pairing_code: impl Into<AccessCode>,
         now: DateTime<Utc>,
         lifetime: Duration,
     ) -> Self {
         Self {
             agent_instance_id,
-            pairing_code: Some(pairing_code),
+            pairing_code: Some(pairing_code.into()),
             expires_at: now + lifetime,
         }
     }
@@ -63,7 +63,7 @@ mod tests {
     #[test]
     fn renew_keeps_pairing_code_stable() {
         let now = Utc::now();
-        let code = PairingCode::parse("123456789").expect("测试配对码应有效");
+        let code = AccessCode::parse("123456789").expect("测试配对码应有效");
         let mut lease = PairingLease::new(
             AgentInstanceId::new(),
             code.clone(),

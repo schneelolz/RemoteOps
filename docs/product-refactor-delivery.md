@@ -173,4 +173,4 @@ python3 scripts/Test-ExternalProduct.py
 | 隔离安装测试 `--platform windows --powershell powershell.exe` / `pwsh`，指定已构建 `--helper` | 每组 27 通过、1 项 macOS 专用测试跳过；各自版本检查 2 项通过 |
 | `scripts/Test-Documentation.ps1`、`git diff --check` | 通过 |
 
-本轮没有执行被忽略的原生凭据库/完整注册与交互桌面观察测试。未执行 macOS 原生验收、生产部署或真实 JLAI 迁移；未提交或推送，因此远端 CI 尚未包含这些修复。
+本轮没有执行被忽略的原生凭据库/完整注册与交互桌面观察测试。未执行 macOS 原生验收、生产部署或真实定制产品迁移；未提交或推送，因此远端 CI 尚未包含这些修复。

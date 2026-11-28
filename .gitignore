@@ -1,4 +1,7 @@
 target/
+**/bin/
+!crates/remoteops-resources/src/bin/
+**/obj/
 artifacts/
 outputs/
 work/

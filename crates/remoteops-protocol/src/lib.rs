@@ -7,25 +7,31 @@ pub use control::{
     SessionControlState,
 };
 mod credential;
+pub mod desktop;
 mod message;
+pub mod release;
+pub mod tcp_forward;
 mod tls;
 
 pub use codec::{FrameError, MAX_FRAME_SIZE, read_frame, write_frame};
 pub use credential::{
-    CredentialEncryptionContext, CredentialEncryptionError, CredentialEncryptionKeyPair,
-    EncryptedCredentialPayload, open_credential, seal_credential,
+    BrowserCredentialContext, CredentialEncryptionContext, CredentialEncryptionError,
+    CredentialEncryptionKeyPair, EncryptedCredentialPayload, open_browser_credential,
+    open_credential, seal_browser_credential, seal_credential,
 };
 pub use message::{
     AgentHello, AgentLeaseRenewed, AgentPermissionModeChanged, AgentResumeCommitAck,
     AgentResumeCommitted, AgentShutdownRequest, AgentShutdownResult, AgentWelcome, AgentWelcomeAck,
-    ApprovalDecision, ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest, ClientHello,
-    ControllerBinding, ControllerControlMode, ControllerControlModeUpdate, ControllerHello,
-    ControllerKind, LEGACY_PROTOCOL_VERSION, ManagedAgentEnrollment, PROTOCOL_VERSION, PairRequest,
-    PairResult, PairingErrorCode, PairingMode, RelayAuthorization, ReleaseSessionRequest,
-    ReleaseSessionResult, RemoteRequest, RemoteResponse, WireMessage, supports_protocol_version,
+    ApprovalDecision, ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest,
+    BRIDGE_PROTOCOL_VERSION, ClientHello, ControllerBinding, ControllerControlMode,
+    ControllerControlModeUpdate, ControllerHello, ControllerKind, GlobalGuide,
+    LEGACY_PROTOCOL_VERSION, ManagedAgentEnrollment, PROTOCOL_VERSION, PairRequest, PairResult,
+    PairingErrorCode, PairingMode, RelayAuthorization, ReleaseSessionRequest, ReleaseSessionResult,
+    RemoteRequest, RemoteResponse, TEST_PAIRING_AGENT_PROTOCOL_VERSION, WireMessage,
+    supports_protocol_version,
 };
 pub use tls::{
     TlsCertificateProbe, TlsError, TlsServerConfig, accept_tls, connect_tls, load_client_config,
     load_native_client_config, load_pinned_client_config, load_server_config,
-    normalize_certificate_fingerprint, probe_server_certificate,
+    normalize_certificate_fingerprint, pinned_client_config, probe_server_certificate,
 };

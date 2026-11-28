@@ -178,8 +178,73 @@ pub enum PowerAction {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RemoteOperation {
+    /// 读取宿主服务身份及只读业务能力清单。
+    DescribeHostCapabilities,
+    /// 查询宿主登记的只读业务能力；执行端核验实例和能力元数据。
+    QueryHostCapability {
+        /// 发现时返回的宿主进程实例。
+        instance_id: String,
+        /// 宿主能力标识。
+        capability_id: String,
+        /// 精确能力版本。
+        version: String,
+        /// 结构化业务参数。
+        arguments: serde_json::Value,
+    },
     /// 读取当前目标上下文与宿主事实，不启动图形 Provider。
     GetTargetContext,
+    /// 列出本地显式启用的公开资源工具候选。
+    ListResourceTools,
+    /// 按固定版本和包摘要启动会话隔离的外部工具。
+    StartResourceTool {
+        /// 清单中的稳定工具标识。
+        tool_id: String,
+        /// 精确版本，禁止自动升级。
+        version: String,
+        /// 所选包的 SHA-256。
+        sha256: String,
+    },
+    /// 显式受控平台验证；不会自动登记通过。
+    ValidateResourceTool {
+        /// 固定工具标识。
+        tool_id: String,
+        /// 固定工具版本。
+        version: String,
+        /// 固定包摘要。
+        sha256: String,
+    },
+    /// 核对网页密码字段并生成单次绑定，不填写秘密。
+    PrepareBrowserPassword {
+        /// 当前会话的工具实例。
+        instance_id: String,
+        /// 预期站点来源，含协议和端口。
+        expected_origin: String,
+        /// 主文档中的唯一密码字段 CSS 选择器。
+        selector: String,
+        /// 供用户核对的账号。
+        username: String,
+    },
+    /// 使用请求加密负载向已绑定的密码字段填写一次。
+    FillBrowserPassword {
+        /// 当前会话的工具实例。
+        instance_id: String,
+        /// Agent 签发的单次目标绑定。
+        binding_id: String,
+    },
+    /// 调用已启动实例，所有上游调用均按高风险处理。
+    CallResourceTool {
+        /// 当前会话拥有的实例标识。
+        instance_id: String,
+        /// 上游声明的工具名称。
+        tool_name: String,
+        /// 结构化参数，不通过 Shell 拼接。
+        arguments: serde_json::Value,
+    },
+    /// 停止当前会话拥有的外部工具实例。
+    StopResourceTool {
+        /// 当前会话拥有的实例标识。
+        instance_id: String,
+    },
     /// 打开持久交互式 Shell。
     OpenShell {
         /// Shell 类型。
@@ -305,6 +370,15 @@ pub enum RemoteOperation {
     DeleteFile {
         /// Agent 文件路径。
         remote_path: String,
+    },
+    /// 为一个固定目标创建持续 TCP 监听，生命周期绑定当前控制授权。
+    CreateTcpForward {
+        /// 现场可访问的固定主机。
+        host: String,
+        /// 固定端口。
+        port: u16,
+        /// 操作者本机的实际回环监听地址。
+        local_address: String,
     },
     /// 向用户明确指定的单个 TCP 目标发送并接收有界数据。
     TcpExchange {
@@ -458,6 +532,21 @@ pub enum RemoteOperation {
 }
 
 impl RemoteOperation {
+    /// 判断是否属于需要资源协议门禁的扩展操作。
+    #[must_use]
+    pub const fn is_resource_tool(&self) -> bool {
+        matches!(
+            self,
+            Self::ListResourceTools
+                | Self::StartResourceTool { .. }
+                | Self::ValidateResourceTool { .. }
+                | Self::PrepareBrowserPassword { .. }
+                | Self::FillBrowserPassword { .. }
+                | Self::CallResourceTool { .. }
+                | Self::StopResourceTool { .. }
+        )
+    }
+
     /// 判断操作是否会访问图形 Provider，包括能力探测和会话停止。
     #[must_use]
     pub const fn is_visual(&self) -> bool {
@@ -505,6 +594,19 @@ pub enum EventPayload {
         stderr: bool,
         /// UTF-8 文本；非 UTF-8 数据由设备层编码。
         text: String,
+    },
+    /// 工具准备进度；字节只描述下载，不代表总体完成百分比。
+    ResourceToolProgress {
+        /// 固定工具标识。
+        tool_id: String,
+        /// waiting、download、verify、extract、cached、starting、ready、failed、cancelled。
+        stage: String,
+        /// 实际完成字节数。
+        completed: u64,
+        /// 包声明总字节数，未知时为空。
+        total: Option<u64>,
+        /// 已测下载速度，其他阶段为零。
+        bytes_per_second: u64,
     },
     /// 操作完成。
     OperationCompleted {

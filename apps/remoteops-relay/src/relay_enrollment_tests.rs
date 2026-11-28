@@ -105,6 +105,7 @@ async fn revoking_installation_disconnects_every_connection_and_clears_bindings_
             hello.controller_instance_id,
             generation,
             PairRequest {
+                expected_agent_id: None,
                 connection_resume_token: None,
                 expected_session_id: None,
                 request_id: RequestId::new(),
@@ -405,6 +406,7 @@ async fn disable_legacy_token_cleans_only_legacy_ai_connections_and_their_author
             old.controller_instance_id,
             generation,
             PairRequest {
+                expected_agent_id: None,
                 connection_resume_token: None,
                 expected_session_id: None,
                 request_id: RequestId::new(),

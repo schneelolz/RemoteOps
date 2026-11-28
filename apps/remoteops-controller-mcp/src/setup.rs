@@ -61,6 +61,9 @@ pub(super) struct SetupArgs {
     /// Configure only the `RemoteOps` MCP table.
     #[arg(long, requires_all = ["mcp_command", "mcp_config"])]
     configure_codex: Option<PathBuf>,
+    /// 仅更新现有 `RemoteOps` MCP 程序路径，保留参数、权限与超时。
+    #[arg(long, requires = "mcp_command")]
+    update_codex_command: Option<PathBuf>,
     /// Remove only the `RemoteOps` MCP table.
     #[arg(long)]
     unconfigure_codex: Option<PathBuf>,
@@ -88,12 +91,14 @@ impl SetupArgs {
             || self.inspect_codex.is_some()
             || self.configure_codex.is_some()
             || self.unconfigure_codex.is_some()
+            || self.update_codex_command.is_some()
     }
     fn run_codex_action(&self) -> anyhow::Result<bool> {
         let codex_actions = usize::from(self.validate_codex.is_some())
             + usize::from(self.inspect_codex.is_some())
             + usize::from(self.configure_codex.is_some())
-            + usize::from(self.unconfigure_codex.is_some());
+            + usize::from(self.unconfigure_codex.is_some())
+            + usize::from(self.update_codex_command.is_some());
         if codex_actions > 0 {
             if codex_actions != 1
                 || self.setup_file.is_some()
@@ -114,6 +119,12 @@ impl SetupArgs {
             }
             if let Some(path) = &self.unconfigure_codex {
                 super::codex_config::unconfigure(path)?;
+            }
+            if let Some(path) = &self.update_codex_command {
+                super::codex_config::update_command(
+                    path,
+                    self.mcp_command.as_deref().context("缺少 MCP command")?,
+                )?;
             }
             if let Some(path) = &self.configure_codex {
                 super::codex_config::configure(
@@ -170,6 +181,7 @@ impl SetupArgs {
                 .read_to_string(&mut input)?;
         }
         let setup = SetupDocument::decode(&input)?;
+        crate::check_product_endpoint(&setup.relay, &setup.server_name)?;
         if self.setup_preview {
             println!(
                 "{}",
@@ -481,6 +493,20 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     }
     result
 }
+// 欢迎帧只在 Relay 验证凭据后返回。可选的配对和桌面能力随 Relay 版本变化。
+fn verify_controller_welcome(message: &WireMessage) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(
+            message,
+            WireMessage::ControllerWelcome {
+                protocol_version: PROTOCOL_VERSION,
+                ..
+            }
+        ),
+        "Relay 未确认此安装的 AI Controller 身份"
+    );
+    Ok(())
+}
 async fn check_relay(response: &RedeemResponse, path: &Path, secret: &str) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(15), async {
         let tls = if response.relay_ca_pem.is_some() {
@@ -504,12 +530,7 @@ async fn check_relay(response: &RedeemResponse, path: &Path, secret: &str) -> an
             })),
         )
         .await?;
-        match read_frame::<WireMessage, _>(&mut stream).await? {
-            WireMessage::ControllerWelcome {
-                protocol_version: PROTOCOL_VERSION,
-            } => Ok(()),
-            _ => bail!("Relay 未确认此安装的 AI Controller 身份"),
-        }
+        verify_controller_welcome(&read_frame::<WireMessage, _>(&mut stream).await?)
     })
     .await
     .context("Relay 连接自检超时")?
@@ -572,6 +593,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn onboarding_checks_welcome_and_protocol_independently_of_pairing_capability() {
+        for supported in [false, true] {
+            for version in [PROTOCOL_VERSION, PROTOCOL_VERSION - 1] {
+                let frame = serde_json::from_value(serde_json::json!({
+                    "type": "controller_welcome",
+                    "payload": {"protocol_version": version, "test_pairing_supported": supported}
+                }))
+                .unwrap();
+                assert_eq!(
+                    verify_controller_welcome(&frame).is_ok(),
+                    version == PROTOCOL_VERSION
+                );
+            }
+        }
+        let other = WireMessage::Heartbeat {
+            sent_at: chrono::Utc::now(),
+            controller_modes: vec![],
+        };
+        assert!(verify_controller_welcome(&other).is_err());
     }
 
     /// Opt-in native coverage; never contacts a Relay or enumerates credentials.
@@ -874,7 +917,15 @@ mod tests {
             write_frame(
                 &mut stream,
                 &WireMessage::ControllerWelcome {
+                    test_pairing_supported: false,
+                    bridge_protocol_version: None,
+                    tcp_forward_version: None,
+                    desktop_version: None,
+                    resource_tools_schema_version: None,
+                    tool_center_schema_version: None,
                     protocol_version: PROTOCOL_VERSION,
+                    release_catalog: None,
+                    global_guide: None,
                 },
             )
             .await

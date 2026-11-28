@@ -13,6 +13,32 @@ use remoteops_visual::{VisualProvider, VisualProviderError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// 宿主与后台共享的界面语言状态；连接重试与运行中切换均保留当前选择。
+#[derive(Clone, Default)]
+pub struct AgentUiLanguage {
+    // 语言独立于图形探测缓存，避免后续探测恢复旧值。
+    selected: Arc<Mutex<Option<remoteops_domain::TargetUiLanguage>>>,
+}
+
+impl AgentUiLanguage {
+    /// 设置宿主明确选择的界面语言。
+    pub fn set(&self, language: remoteops_domain::TargetUiLanguage) {
+        *self
+            .selected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(language);
+    }
+
+    /// 读取当前语言；没有界面的宿主允许不报告。
+    #[must_use]
+    pub fn get(&self) -> Option<remoteops_domain::TargetUiLanguage> {
+        *self
+            .selected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 const VISUAL_PROBE_BUDGET: Duration = Duration::from_secs(35);
 const VISUAL_PROBE_COOLDOWN: Duration = Duration::from_secs(3);
 
@@ -34,8 +60,18 @@ pub struct AgentRuntimeOptions {
     pub visual_provider_factory: Option<VisualProviderFactory>,
     /// 普通临时控制码或门户受管按需邀请。
     pub pairing_mode: PairingMode,
+    /// 本次启动指定的测试 GUID 摘要，不写入 Agent 配置。
+    pub test_key_fingerprint: Option<String>,
     /// 产品说明与案例引用，只提供给当前目标，不授予权限。
     pub guidance: Vec<TargetGuidance>,
+    /// 当前真实程序入口是否实现 SSH 主机密钥管理 CLI；仅由宿主声明。
+    pub ssh_trust_cli: bool,
+    /// 产品编译时内置的工具；普通 Agent 配置和远程请求不能替换。
+    pub bundled_tools: Option<remoteops_device::BundledTools>,
+    /// 宿主当前选择的语言；与运行中的目标上下文同步。
+    pub ui_language: AgentUiLanguage,
+    /// 本机宿主提供的业务能力，不从远端配置构造。
+    pub host_business: Option<Arc<dyn super::HostBusinessProvider>>,
 }
 impl AgentRuntimeOptions {
     /// 创建兼容原 GUI 行为的交互宿主配置。
@@ -48,9 +84,35 @@ impl AgentRuntimeOptions {
             visual_enabled: cfg!(windows),
             visual_provider_factory: None,
             pairing_mode: PairingMode::AutoPerBoot,
+            test_key_fingerprint: None,
             guidance: Vec::new(),
+            ssh_trust_cli: false,
+            bundled_tools: None,
+            ui_language: AgentUiLanguage::default(),
+            host_business: None,
         }
     }
+    /// 声明当前程序已接入主机密钥核对 CLI，不从环境或远程配置推断。
+    #[must_use]
+    pub fn with_ssh_trust_cli(mut self) -> Self {
+        self.ssh_trust_cli = true;
+        self
+    }
+
+    /// 绑定本机产品的可信工具资源，不在构造时释放或执行。
+    #[must_use]
+    pub fn with_bundled_tools(mut self, tools: Option<remoteops_device::BundledTools>) -> Self {
+        self.bundled_tools = tools;
+        self
+    }
+
+    /// 绑定与宿主共享的语言状态。
+    #[must_use]
+    pub fn with_ui_language(mut self, language: AgentUiLanguage) -> Self {
+        self.ui_language = language;
+        self
+    }
+
     /// 创建无图形服务产品配置；控制台诊断也保留该产品上限。
     #[must_use]
     pub fn service(product: ProductProfile) -> Self {
@@ -98,8 +160,15 @@ struct VisualState {
 
 #[derive(Clone)]
 pub(crate) struct RuntimeBoundary {
+    // 仅建议控制端询问当前操作者，不能代替会话授权。
+    pub session_approval_offer: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub host_business: Option<Arc<dyn super::HostBusinessProvider>>,
     pub context: Arc<TargetContext>,
     pub policy: AgentCapabilityPolicy,
+    // 本地显式配置后创建，不能由远程上下文构造或扩张。
+    pub resources: Option<Arc<remoteops_resources::ResourceManager>>,
+    // 不与图形缓存共用，以便下一次上下文查询立即反映语言切换。
+    ui_language: AgentUiLanguage,
     // 同步快照不跨异步等待持锁。
     visual_state: Arc<Mutex<Option<VisualState>>>,
     // 同一目标的主动查询合并为串行且有冷却的探测。
@@ -108,8 +177,12 @@ pub(crate) struct RuntimeBoundary {
 impl Default for RuntimeBoundary {
     fn default() -> Self {
         Self {
+            session_approval_offer: None,
             context: Arc::new(TargetContext::default()),
             policy: AgentCapabilityPolicy::default(),
+            resources: None,
+            host_business: None,
+            ui_language: AgentUiLanguage::default(),
             visual_state: Arc::new(Mutex::new(None)),
             visual_probe: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -117,11 +190,14 @@ impl Default for RuntimeBoundary {
 }
 impl RuntimeBoundary {
     fn latest_context(&self) -> TargetContext {
-        self.visual_state
+        let mut context = self
+            .visual_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map_or_else(|| (*self.context).clone(), |state| state.context.clone())
+            .map_or_else(|| (*self.context).clone(), |state| state.context.clone());
+        context.ui_language = self.ui_language.get();
+        context
     }
 
     fn hard_visual_reason(&self) -> Option<&'static str> {
@@ -134,9 +210,127 @@ impl RuntimeBoundary {
         }
     }
 
+    fn update_host_capabilities(&self, context: &mut TargetContext) {
+        context
+            .capabilities
+            .retain(|v| v.capability != "managed_install_grant_v1");
+        #[cfg(feature = "managed-install-grant")]
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "managed_install_grant_v1".into(),
+            status: CapabilityAvailability::Available,
+            reasons: vec![],
+        });
+        context
+            .capabilities
+            .retain(|v| v.capability != "session_approval_offer_v1");
+        if let Some(pref) = &self.session_approval_offer {
+            context.capabilities.push(TargetCapabilityStatus {
+                capability: "session_approval_offer_v1".into(),
+                status: if pref.load(std::sync::atomic::Ordering::SeqCst)
+                    && !self.policy.read_only()
+                {
+                    CapabilityAvailability::Available
+                } else {
+                    CapabilityAvailability::Unavailable
+                },
+                reasons: vec![],
+            });
+        }
+        context
+            .capabilities
+            .retain(|status| status.capability != "host_business_v1");
+        let host_available = self.host_business.is_some() && self.policy.allows("host_business");
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "host_business_v1".into(),
+            status: if host_available {
+                CapabilityAvailability::Available
+            } else {
+                CapabilityAvailability::Unavailable
+            },
+            reasons: if host_available {
+                vec![]
+            } else {
+                vec!["host_business_disabled".into()]
+            },
+        });
+    }
+
     pub fn snapshot(&self) -> TargetContext {
         let mut context = self.latest_context();
+        self.update_host_capabilities(&mut context);
         context.facts = native_facts();
+        context
+            .capabilities
+            .retain(|status| status.capability != "resource_tools_v1");
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "resource_tools_v1".into(),
+            status: if self.resources.is_some() {
+                CapabilityAvailability::Available
+            } else {
+                CapabilityAvailability::Unavailable
+            },
+            reasons: if self.resources.is_some() {
+                Vec::new()
+            } else {
+                vec!["resource_tools_disabled".into()]
+            },
+        });
+        context
+            .capabilities
+            .retain(|status| status.capability != "resource_tools_browser_adapters_v1");
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "resource_tools_browser_adapters_v1".into(),
+            status: if self.resources.is_some() {
+                CapabilityAvailability::Available
+            } else {
+                CapabilityAvailability::Unavailable
+            },
+            reasons: if self.resources.is_some() {
+                Vec::new()
+            } else {
+                vec!["resource_tools_disabled".into()]
+            },
+        });
+        for capability in [
+            "resource_tools_validation_v1",
+            "resource_tools_progress_v1",
+            "browser_password_v1",
+        ] {
+            context
+                .capabilities
+                .retain(|entry| entry.capability != capability);
+            context.capabilities.push(TargetCapabilityStatus {
+                capability: capability.into(),
+                status: if self.resources.is_some() {
+                    CapabilityAvailability::Available
+                } else {
+                    CapabilityAvailability::Unavailable
+                },
+                reasons: if self.resources.is_some() {
+                    vec![]
+                } else {
+                    vec!["resource_tools_disabled".into()]
+                },
+            });
+        }
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "control_initialization_v1".into(),
+            status: CapabilityAvailability::Available,
+            reasons: Vec::new(),
+        });
+        context.capabilities.push(TargetCapabilityStatus {
+            capability: "tcp_forward_v2".into(),
+            status: if self.policy.allows("tcp_forward") {
+                CapabilityAvailability::Available
+            } else {
+                CapabilityAvailability::Unavailable
+            },
+            reasons: if self.policy.allows("tcp_forward") {
+                vec![]
+            } else {
+                vec!["product_policy_disabled".into()]
+            },
+        });
         if let Some(reason) = self.hard_visual_reason() {
             set_visual_status(&mut context, Some(reason));
         } else if context.facts.interactive_desktop != CapabilityAvailability::Available {
@@ -206,6 +400,7 @@ impl RuntimeBoundary {
                 && let Some(state) = state.as_mut()
             {
                 state.context.facts = context.facts;
+                state.context.ui_language = self.ui_language.get();
                 return state.context.clone();
             }
             // 先发布最新宿主事实，延迟 Provider 只在此硬边界允许后创建。
@@ -263,6 +458,7 @@ impl RuntimeBoundary {
                 Ok(Ok(_)) => (None, None),
             }
         };
+        context.ui_language = self.ui_language.get();
         set_visual_status(&mut context, reason);
         let diagnostic = format!(
             "{}; elapsed_ms={}; {}",
@@ -319,6 +515,18 @@ impl RuntimeBoundary {
     }
 
     pub fn check(&self, operation: &RemoteOperation) -> anyhow::Result<()> {
+        if required_capability(operation).is_some_and(|name| !self.policy.allows(name)) {
+            return Err(RuntimeDenied {
+                code: "product_policy_disabled".into(),
+            }
+            .into());
+        }
+        if operation.is_resource_tool() && self.resources.is_none() {
+            return Err(RuntimeDenied {
+                code: "resource_tools_disabled".into(),
+            }
+            .into());
+        }
         if operation.is_visual() {
             if !self.policy.visual_allowed() {
                 return Err(RuntimeDenied {
@@ -372,14 +580,93 @@ pub(crate) fn native_facts() -> TargetRuntimeFacts {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
+fn filter_capabilities(
+    capabilities: CapabilitySet,
+    policy: AgentCapabilityPolicy,
+) -> CapabilitySet {
+    capabilities
+        .iter()
+        .copied()
+        .filter(|capability| {
+            serde_json::to_value(capability)
+                .ok()
+                .and_then(|value| value.as_str().map(|name| policy.allows(name)))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn required_capability(operation: &RemoteOperation) -> Option<&'static str> {
+    use RemoteOperation as Op;
+    match operation {
+        Op::DescribeHostCapabilities | Op::QueryHostCapability { .. } => Some("host_business"),
+        Op::OpenShell { shell }
+        | Op::RunCommand { shell, .. }
+        | Op::RunShellCommand { shell, .. } => Some(match shell {
+            remoteops_domain::ShellKind::Cmd | remoteops_domain::ShellKind::System => "cmd",
+            remoteops_domain::ShellKind::WindowsPowerShell => "windows_power_shell",
+            remoteops_domain::ShellKind::PowerShell => "power_shell",
+        }),
+        Op::RunSsh { .. } => Some("ssh"),
+        Op::ListSerial
+        | Op::OpenSerial { .. }
+        | Op::WriteSerial { .. }
+        | Op::RunSerialQuery { .. } => Some("serial"),
+        Op::TestPort { .. } => Some("port_probe"),
+        Op::TcpExchange { .. } => Some("tcp_exchange"),
+        Op::CreateTcpForward { .. } => Some("tcp_forward"),
+        Op::UploadFile { .. }
+        | Op::BeginUploadFile { .. }
+        | Op::UploadFileChunk { .. }
+        | Op::CompleteUploadFile { .. }
+        | Op::AbortUploadFile { .. }
+        | Op::DownloadFile { .. }
+        | Op::AuthorizeDownloadFile { .. }
+        | Op::DownloadFileChunk { .. }
+        | Op::GetFileMetadata { .. }
+        | Op::MoveFile { .. }
+        | Op::DeleteFile { .. } => Some("file_transfer"),
+        Op::ListProcesses
+        | Op::TerminateProcess { .. }
+        | Op::ListServices
+        | Op::ControlService { .. }
+        | Op::PowerControl { .. } => Some("system_operations"),
+        operation if operation.is_visual() => Some("visual"),
+        operation if operation.is_resource_tool() => Some("resource_tools"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 pub(crate) async fn prepare(
     options: &AgentRuntimeOptions,
     environment: &EnvironmentProfile,
     facts: TargetRuntimeFacts,
 ) -> anyhow::Result<(RuntimeBoundary, Arc<dyn VisualProvider>, CapabilitySet)> {
+    prepare_with_probe(options, environment, facts, true).await
+}
+
+pub(crate) async fn prepare_deferred(
+    options: &AgentRuntimeOptions,
+    environment: &EnvironmentProfile,
+    facts: TargetRuntimeFacts,
+) -> anyhow::Result<(RuntimeBoundary, Arc<dyn VisualProvider>, CapabilitySet)> {
+    prepare_with_probe(options, environment, facts, false).await
+}
+
+async fn prepare_with_probe(
+    options: &AgentRuntimeOptions,
+    environment: &EnvironmentProfile,
+    facts: TargetRuntimeFacts,
+    initial_probe: bool,
+) -> anyhow::Result<(RuntimeBoundary, Arc<dyn VisualProvider>, CapabilitySet)> {
     options.product.validate()?;
     if options.pairing_mode == PairingMode::Unknown {
         anyhow::bail!("未知的控制码签发模式");
+    }
+    if options.pairing_mode == PairingMode::LongPerBoot && options.test_key_fingerprint.is_some() {
+        anyhow::bail!("长授权码不能同时使用测试控制码协议21");
     }
     let reason = if !options.capability_policy.visual_allowed()
         || !options.visual_enabled
@@ -393,7 +680,10 @@ pub(crate) async fn prepare(
     } else {
         Some("visual_probe_pending")
     };
-    let capabilities = capabilities_from_environment(environment, false);
+    let capabilities = filter_capabilities(
+        capabilities_from_environment(environment, false),
+        options.capability_policy,
+    );
     let statuses =
         capability_statuses(&capabilities, reason, options.capability_policy.read_only());
     let context = TargetContext {
@@ -404,6 +694,13 @@ pub(crate) async fn prepare(
         facts,
         capabilities: statuses,
         guidance: options.guidance.clone(),
+        ssh_trust_cli: if ssh_trust_cli_available(options.ssh_trust_cli, environment) {
+            std::env::current_exe()
+                .ok()
+                .map(|path| path.display().to_string())
+        } else {
+            None
+        },
         ..TargetContext::default()
     };
     context
@@ -412,17 +709,15 @@ pub(crate) async fn prepare(
         .context("产品目标上下文无效")?;
     // visual_enabled=false 是旧入口也不可绕过的硬上限。
     let policy = if !options.visual_enabled || options.run_mode == AgentRunMode::WindowsService {
-        if options.capability_policy.read_only() {
-            AgentCapabilityPolicy::headless().with_read_only()
-        } else {
-            AgentCapabilityPolicy::headless()
-        }
+        options.capability_policy.without_visual()
     } else {
         options.capability_policy
     };
     let mut boundary = RuntimeBoundary {
+        host_business: options.host_business.clone(),
         context: Arc::new(context),
         policy,
+        ui_language: options.ui_language.clone(),
         ..RuntimeBoundary::default()
     };
     let provider: Arc<dyn VisualProvider> = Arc::new(DeferredVisualProvider {
@@ -433,17 +728,32 @@ pub(crate) async fn prepare(
             .unwrap_or_else(|| Arc::new(remoteops_visual::default_visual_provider)),
         provider: OnceLock::new(),
     });
-    let context = boundary
-        .refresh_visual_with_facts(
-            provider.as_ref(),
-            boundary.context.facts.clone(),
-            Duration::ZERO,
-            VISUAL_PROBE_BUDGET,
-        )
-        .await;
-    let capabilities = capabilities_from_environment(environment, context.visual_allowed());
+    let context = if initial_probe {
+        boundary
+            .refresh_visual_with_facts(
+                provider.as_ref(),
+                boundary.context.facts.clone(),
+                Duration::ZERO,
+                VISUAL_PROBE_BUDGET,
+            )
+            .await
+    } else {
+        boundary.context.as_ref().clone()
+    };
+    let capabilities = filter_capabilities(
+        capabilities_from_environment(environment, context.visual_allowed()),
+        options.capability_policy,
+    );
     boundary.context = Arc::new(context);
     Ok((boundary, provider, capabilities))
+}
+
+fn ssh_trust_cli_available(host_implemented: bool, environment: &EnvironmentProfile) -> bool {
+    host_implemented
+        && environment
+            .tools
+            .iter()
+            .any(|tool| tool.name == "ssh-keyscan" && tool.available)
 }
 
 fn set_visual_status(context: &mut TargetContext, reason: Option<&str>) {
@@ -654,6 +964,75 @@ pub(crate) fn visual_operations() -> Vec<RemoteOperation> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_approval_offer_reads_the_live_site_preference() {
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let boundary = super::RuntimeBoundary {
+            session_approval_offer: Some(enabled.clone()),
+            ..Default::default()
+        };
+        let offer = || {
+            boundary
+                .snapshot()
+                .capabilities
+                .into_iter()
+                .find(|v| v.capability == "session_approval_offer_v1")
+                .unwrap()
+                .status
+        };
+        assert_eq!(offer(), CapabilityAvailability::Available);
+        enabled.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(offer(), CapabilityAvailability::Unavailable);
+    }
+
+    #[test]
+    fn language_switch_is_live_and_isolated_from_other_targets_and_visual_cache() {
+        let selected = super::AgentUiLanguage::default();
+        let boundary = super::RuntimeBoundary {
+            ui_language: selected.clone(),
+            ..super::RuntimeBoundary::default()
+        };
+        assert_eq!(boundary.snapshot().ui_language, None);
+        selected.set(remoteops_domain::TargetUiLanguage::ZhCn);
+        assert_eq!(
+            boundary.snapshot().ui_language,
+            Some(remoteops_domain::TargetUiLanguage::ZhCn)
+        );
+        let cached = boundary.snapshot();
+        *boundary.visual_state.lock().unwrap() = Some(super::VisualState {
+            context: cached,
+            diagnostic: None,
+            last_probe: Some(std::time::Instant::now()),
+        });
+        selected.set(remoteops_domain::TargetUiLanguage::EnUs);
+        assert_eq!(
+            boundary.latest_context().ui_language,
+            Some(remoteops_domain::TargetUiLanguage::EnUs)
+        );
+        assert_eq!(
+            super::RuntimeBoundary::default().snapshot().ui_language,
+            None
+        );
+    }
+
+    #[test]
+    fn plink_does_not_claim_keyscan_cli_without_the_actual_scanner() {
+        let mut environment = EnvironmentProfile::empty();
+        environment.tools = vec![remoteops_domain::ToolProfile {
+            name: "plink".into(),
+            available: true,
+            version: None,
+        }];
+        assert!(!ssh_trust_cli_available(true, &environment));
+        environment.tools.push(remoteops_domain::ToolProfile {
+            name: "ssh-keyscan".into(),
+            available: true,
+            version: None,
+        });
+        assert!(ssh_trust_cli_available(true, &environment));
+        assert!(!ssh_trust_cli_available(false, &environment));
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

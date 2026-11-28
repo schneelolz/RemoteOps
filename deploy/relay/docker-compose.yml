@@ -3,7 +3,7 @@ services:
     build:
       context: ../..
       dockerfile: "${REMOTEOPS_RELAY_DOCKERFILE:-deploy/relay/Dockerfile}"
-    image: "${REMOTEOPS_RELAY_IMAGE:-remoteops-relay:0.2.0-preview.5}"
+    image: "${REMOTEOPS_RELAY_IMAGE:-remoteops-relay:0.2.0-preview.17}"
     container_name: "${REMOTEOPS_RELAY_CONTAINER_NAME:-remoteops-relay}"
     restart: "${REMOTEOPS_RESTART_POLICY:-unless-stopped}"
     environment:
@@ -25,9 +25,30 @@ services:
     ports:
       - "${REMOTEOPS_RELAY_PORT:-7443}:7443"
       - "127.0.0.1:${REMOTEOPS_HEALTH_PORT:-18080}:8080"
-      - "127.0.0.1:${REMOTEOPS_RELAY_ADMIN_PORT:-18081}:18081"
+      - "127.0.0.1:${REMOTEOPS_RELAY_API_PORT:-18082}:18081"
     volumes:
       - remoteops-relay-data:/data
+
+
+  remoteops-relay-admin:
+    build:
+      context: ../..
+      dockerfile: deploy/relay-admin/Dockerfile
+    image: "${REMOTEOPS_RELAY_ADMIN_IMAGE:-remoteops-relay-admin:0.1.1}"
+    container_name: "${REMOTEOPS_RELAY_ADMIN_CONTAINER_NAME:-remoteops-relay-admin}"
+    restart: "${REMOTEOPS_RESTART_POLICY:-unless-stopped}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "127.0.0.1:${REMOTEOPS_RELAY_ADMIN_PORT:-18081}:8080"
+    depends_on:
+      remoteops-relay:
+        condition: service_healthy
 
 volumes:
   remoteops-relay-data:

@@ -1,5 +1,6 @@
 //! `RemoteOps` 领域对象和值对象。
 
+mod access_code;
 mod capability;
 mod connection;
 mod environment;
@@ -12,6 +13,7 @@ mod target_context;
 mod visual;
 mod visual_wait;
 
+pub use access_code::AccessCode;
 pub use capability::{Capability, CapabilitySet, ShellKind};
 pub use connection::{ConnectionDescriptor, ConnectionState, SessionRole};
 pub use environment::{
@@ -32,7 +34,7 @@ pub use permission::PermissionMode;
 pub use target_context::{
     AgentRunMode, CapabilityAvailability, GuidanceReference, MAX_TARGET_CONTEXT_BYTES,
     TARGET_CONTEXT_SCHEMA_VERSION, TargetCapabilityStatus, TargetContext, TargetGuidance,
-    TargetRuntimeFacts,
+    TargetRuntimeFacts, TargetUiLanguage,
 };
 pub use visual::{
     VisualActionResult, VisualCapability, VisualDisplay, VisualObservation, VisualSessionState,

@@ -1,4 +1,8 @@
+> 历史原型：生产管理页面已迁移到 [独立 Vue 前端](../relay-admin/README.md)，本目录不再嵌入 Relay 或参与生产发布。以下为历史说明。
+
 # RemoteOps Relay Admin - 管理控制台
+
+工具中心支持“全局介绍与选择指南”：管理员编辑 Markdown 源文，按纯文本安全展示，并随候选列表提供给 AI；说明最多 32 KiB UTF-8，不改变执行权限。已注册 MCP 列表区分“普通使用”和“普通使用＋工具管理”，保留原授权开关；该权限绑定安装身份，与现场完全控制独立。手机端客户端资料纵向排列，授权入口无需横向查找。隔离本地验收入口为 `scripts/test-tool-center-guide-browser.cjs`。
 
 本项目是 **RemoteOps Relay** 内置的内部运维管理控制台前端，由 `apps/remoteops-relay/src/admin.rs` 通过 `include_str!` 直接嵌入编译至 Relay 二进制中，负责提供集群状态监控、会话管理、Agent 节点拓扑、凭据状态核验、安全设置与审计日志追踪。
 

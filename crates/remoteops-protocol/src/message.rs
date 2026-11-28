@@ -1,26 +1,36 @@
 use chrono::{DateTime, Utc};
 use remoteops_domain::{
-    AgentBootId, AgentInstanceId, ApprovalId, ApprovalState, CapabilitySet, ConnectionDescriptor,
-    ControllerInstanceId, ControllerOwnerId, EnvironmentProfile, EventSource, PairingCode,
+    AccessCode, AgentBootId, AgentInstanceId, ApprovalId, ApprovalState, CapabilitySet,
+    ConnectionDescriptor, ControllerInstanceId, ControllerOwnerId, EnvironmentProfile, EventSource,
     PermissionMode, RemoteEvent, RemoteOperation, RequestId, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
 /// 当前线协议版本。
-pub const PROTOCOL_VERSION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 20;
+/// 长控制码和宿主业务扩展使用的显式协商版本。
+pub const BRIDGE_PROTOCOL_VERSION: u16 = 22;
+/// 仅用于已显式启用测试控制码的 Agent，旧 Relay 会在登记前拒绝。
+pub const TEST_PAIRING_AGENT_PROTOCOL_VERSION: u16 = 21;
 /// 保留启动边界语义的旧版交互客户协议。
 pub const LEGACY_PROTOCOL_VERSION: u16 = 17;
 
 /// 判断 Relay 是否能够读取该客户端的握手。
 #[must_use]
 pub const fn supports_protocol_version(version: u16) -> bool {
-    version == PROTOCOL_VERSION || version == LEGACY_PROTOCOL_VERSION
+    version == PROTOCOL_VERSION
+        || version == BRIDGE_PROTOCOL_VERSION
+        || version == 19
+        || version == 18
+        || version == LEGACY_PROTOCOL_VERSION
 }
 
 /// Agent 控制码签发模式。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PairingMode {
+    /// 每次启动由 Relay 签发 UUID v4 长控制码。
+    LongPerBoot,
     /// 旧版交互 Agent 每次启动签发控制码。
     #[default]
     AutoPerBoot,
@@ -79,6 +89,9 @@ pub struct AgentHello {
     pub agent_instance_id: AgentInstanceId,
     /// 本次运行标识；同一进程断线重连时保持不变。
     pub boot_id: AgentBootId,
+    /// 可选测试密钥摘要，用于查找已认证设备的测试租约。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_key_fingerprint: Option<String>,
     /// 当前启动的产品上下文；协议17客户可不提供。
     #[serde(default)]
     pub target_context: Option<remoteops_domain::TargetContext>,
@@ -105,6 +118,9 @@ pub struct AgentHello {
     /// Agent 主机的高置信度 MAC 地址；无法可靠判断时为空。
     #[serde(default)]
     pub mac_address: Option<String>,
+    /// 能否接收大小写通用的九位字母数字短码；旧 Agent 缺省使用数字码。
+    #[serde(default)]
+    pub supports_mixed_pairing_code: bool,
     /// 是否支持由 Relay 管理员远程请求 Agent 优雅退出。
     #[serde(default)]
     pub supports_agent_shutdown: bool,
@@ -131,6 +147,20 @@ pub struct ControllerHello {
     pub mac_address: Option<String>,
 }
 
+/// Relay 维护的 `RemoteOps` 全局操作指引。内容仅提供模型上下文，不授予权限。
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalGuide {
+    /// 内容修订号，空内容也有稳定修订号。
+    #[serde(default)]
+    pub revision: u64,
+    /// UTF-8 Markdown 正文，最多由 Relay 侧限制为 32 KiB。
+    #[serde(default)]
+    pub markdown: String,
+    /// 最近一次成功更新的时间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 /// 客户端发出的第一条消息。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
@@ -145,8 +175,20 @@ pub enum ClientHello {
 /// Relay 接受 Agent 后颁发的信息。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentWelcome {
+    /// 已发布组件的版本目录，旧 Relay 可以省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_catalog: Option<crate::release::ReleaseCatalog>,
+    /// 当前 Relay 允许现场撤销本设备的 AI 配对；旧版本缺省关闭。
+    #[serde(default)]
+    pub allow_agent_ai_disconnect: bool,
+    /// Relay 允许现场按绑定独立断开人工运维。
+    #[serde(default)]
+    pub allow_agent_human_disconnect: bool,
+    /// Relay 已为本次启动启用测试控制码。
+    #[serde(default)]
+    pub test_key_accepted: bool,
     /// 租约有效期内不变的配对码。
-    pub pairing_code: Option<PairingCode>,
+    pub pairing_code: Option<AccessCode>,
     /// Relay 确认的控制码签发模式。
     #[serde(default)]
     pub pairing_mode: PairingMode,
@@ -240,9 +282,12 @@ pub struct PairRequest {
     /// 请求标识。
     pub request_id: RequestId,
     /// 人工输入的控制码。
-    pub pairing_code: Option<PairingCode>,
+    pub pairing_code: Option<AccessCode>,
     /// 自动恢复时必须匹配的原会话；人工输入控制码时为空。
     pub expected_session_id: Option<SessionId>,
+    /// 配对前必须匹配的设备身份。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_agent_id: Option<AgentInstanceId>,
     /// 自动恢复受管连接的高熵凭据；此时不再提交一次性控制码。
     #[serde(default)]
     pub connection_resume_token: Option<String>,
@@ -260,6 +305,7 @@ impl std::fmt::Debug for PairRequest {
                 &self.pairing_code.as_ref().map(|_| "[REDACTED]"),
             )
             .field("expected_session_id", &self.expected_session_id)
+            .field("expected_agent_id", &self.expected_agent_id)
             .field(
                 "connection_resume_token",
                 &self.connection_resume_token.as_ref().map(|_| "[REDACTED]"),
@@ -353,6 +399,9 @@ pub struct ReleaseSessionResult {
 /// Relay 向 Agent 声明当前唯一有权发送请求的 Controller 绑定。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ControllerBinding {
+    /// Relay 核实本次配对的 MCP 安装与设备授权；旧 Relay 省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_grant: Option<bool>,
     /// 绑定的逻辑会话。
     pub session_id: SessionId,
     /// Controller 实例标识。
@@ -489,6 +538,102 @@ pub struct RemoteResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum WireMessage {
+    /// 已配对控制链上的桌面生命周期和人工输入。
+    Desktop(crate::desktop::DesktopEvent),
+    /// 独立媒体 TLS 连接的首条消息。
+    DesktopMedia(crate::desktop::Ticket),
+    /// 已协商的 v2 数据和生命周期帧。
+    TcpForwardV2(crate::tcp_forward::TcpForwardFrame),
+    /// 当前绑定的只读 TCP 策略查询。
+    TcpForwardPolicyRequest {
+        request_id: RequestId,
+        session_id: SessionId,
+    },
+    /// 仅返回本绑定可见的策略和申请步骤。
+    TcpForwardPolicyResponse {
+        request_id: RequestId,
+        snapshot: Option<crate::tcp_forward::TcpForwardPolicySnapshot>,
+        error: Option<String>,
+    },
+    /// Relay 向 Agent 传递已校验操作及固定目标规则。
+    TcpForwardAuthorized {
+        authorized: AuthorizedRemoteRequest,
+        rules: Vec<crate::tcp_forward::TcpForwardRule>,
+    },
+    /// Agent 确认已完成本次绑定的本地默认权限核对。
+    ControlInitializationComplete { state: crate::SessionControlState },
+    /// Controller 请求创建一个固定目标的持续 TCP 转发。
+    TcpForwardOpen {
+        request_id: RequestId,
+        session_id: SessionId,
+        target_host: String,
+        target_port: u16,
+        max_connections: u16,
+    },
+    /// Relay/Agent 返回持续转发创建结果。
+    TcpForwardOpened {
+        request_id: RequestId,
+        forward_id: RequestId,
+        connection_id: Option<RequestId>,
+        session_id: SessionId,
+        target_host: String,
+        target_port: u16,
+        error: Option<String>,
+    },
+    /// 持续转发的数据帧。数据大小由各端在解码前限制。
+    TcpForwardData {
+        forward_id: RequestId,
+        connection_id: RequestId,
+        data_base64: String,
+        eof: bool,
+    },
+    /// 关闭转发或其中一个本地连接。
+    TcpForwardClose {
+        forward_id: RequestId,
+        connection_id: Option<RequestId>,
+        reason: String,
+    },
+    /// Controller 请求重新读取 Relay 侧的全局操作指引。
+    GlobalGuideRequest { request_id: RequestId },
+    /// Relay 返回全局操作指引或脱敏错误。
+    GlobalGuideResponse {
+        request_id: RequestId,
+        guide: Option<GlobalGuide>,
+        error: Option<String>,
+    },
+    /// 工具中心能力声明，仅向协议 19 及以上连接发送。
+    ToolCenterCapabilities { schema_version: u16 },
+    /// 与目标会话无关的工具管理请求，外层执行独立安装权限校验。
+    ToolCenterRequest {
+        request_id: String,
+        request: serde_json::Value,
+    },
+    /// 工具管理确认；请求不会在断线后自动重放。
+    ToolCenterResponse {
+        request_id: String,
+        response: serde_json::Value,
+    },
+    /// 中继权威工具目录及开关快照。
+    ToolCatalog { catalog: serde_json::Value },
+    /// Agent 确认实际应用的目录修订号。
+    ToolCatalogApplied {
+        revision: u64,
+        error: Option<String>,
+    },
+    /// 每次请求一块包；下一个 offset 是对上一块的确认。
+    ToolPackageRequest {
+        request_id: String,
+        sha256: String,
+        offset: u64,
+    },
+    /// 有界包数据，最多 256 KiB；错误说明不得包含外链签名。
+    ToolPackageChunk {
+        request_id: String,
+        offset: u64,
+        data_base64: String,
+        eof: bool,
+        error: Option<String>,
+    },
     /// 查询或变更共享授权。
     ControlStateRequest(crate::ControlStateRequest),
     /// 共享授权查询或变更的确认。
@@ -509,8 +654,32 @@ pub enum WireMessage {
     AgentLeaseRenewed(AgentLeaseRenewed),
     /// Controller 连接就绪。
     ControllerWelcome {
+        /// Relay 当前发布的版本目录。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release_catalog: Option<crate::release::ReleaseCatalog>,
+        /// Relay 支持在配对前核对目标设备身份。
+        #[serde(default)]
+        test_pairing_supported: bool,
+        /// 长授权码和宿主业务扩展版本，缺省时禁止发送新增能力。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bridge_protocol_version: Option<u16>,
+        /// 持续转发扩展版本，缺省时禁止发送新转发消息。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tcp_forward_version: Option<u16>,
+        /// 桌面传输扩展，旧 Relay 缺省关闭。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desktop_version: Option<u16>,
         /// Relay 当前协议版本。
         protocol_version: u16,
+        /// 可选资源工具协议版本，缺省表示 Relay 不支持。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource_tools_schema_version: Option<u16>,
+        /// 独立工具中心管理能力；缺省表示需要升级 Relay。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_center_schema_version: Option<u16>,
+        /// Relay 维护的产品级操作指引，旧客户端可忽略。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        global_guide: Option<GlobalGuide>,
     },
     /// Controller 请求配对。
     PairRequest(PairRequest),
@@ -589,8 +758,9 @@ mod tests {
         let code = "738291604";
         let secret = "test-managed-resume-secret-must-not-enter-debug";
         let request = WireMessage::PairRequest(PairRequest {
+            expected_agent_id: None,
             request_id: RequestId::new(),
-            pairing_code: Some(PairingCode::parse(code).unwrap()),
+            pairing_code: Some(AccessCode::parse(code).unwrap()),
             expected_session_id: None,
             connection_resume_token: Some(secret.to_owned()),
             permission_mode: PermissionMode::ReadOnly,
@@ -618,6 +788,78 @@ mod tests {
     }
 
     #[test]
+    fn resource_welcome_is_optional_for_legacy_controllers() {
+        #[derive(serde::Deserialize)]
+        struct OldWelcome {
+            protocol_version: u16,
+        }
+        let legacy =
+            serde_json::json!({"type":"controller_welcome", "payload":{"protocol_version":18}});
+        let decoded: WireMessage = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            WireMessage::ControllerWelcome {
+                resource_tools_schema_version: None,
+                tool_center_schema_version: None,
+                ..
+            }
+        ));
+        let mut current = legacy;
+        current["payload"]["resource_tools_schema_version"] = 1.into();
+        let decoded: WireMessage = serde_json::from_value(current).unwrap();
+        assert!(matches!(
+            decoded,
+            WireMessage::ControllerWelcome {
+                resource_tools_schema_version: Some(1),
+                tool_center_schema_version: None,
+                ..
+            }
+        ));
+        // 老控制器忽略新增字段，既有事件类型不因资源扩展而变化。
+        let old: OldWelcome =
+            serde_json::from_value(serde_json::to_value(decoded).unwrap()["payload"].clone())
+                .unwrap();
+        assert_eq!(old.protocol_version, 18);
+    }
+
+    #[test]
+    fn global_guide_round_trips_and_old_welcome_defaults_to_empty() {
+        let guide = GlobalGuide {
+            revision: 3,
+            markdown: "# RemoteOps\n按 Relay 指引执行".into(),
+            updated_at: Some(chrono::Utc::now()),
+        };
+        let message = WireMessage::ControllerWelcome {
+            test_pairing_supported: false,
+            bridge_protocol_version: None,
+            tcp_forward_version: Some(2),
+            desktop_version: None,
+            protocol_version: PROTOCOL_VERSION,
+            resource_tools_schema_version: Some(1),
+            tool_center_schema_version: Some(1),
+            release_catalog: None,
+            global_guide: Some(guide.clone()),
+        };
+        let decoded: WireMessage =
+            serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, WireMessage::ControllerWelcome { global_guide: Some(value), .. } if value == guide)
+        );
+        let legacy = serde_json::json!({
+            "type": "controller_welcome",
+            "payload": {"protocol_version": PROTOCOL_VERSION}
+        });
+        let decoded: WireMessage = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            WireMessage::ControllerWelcome {
+                global_guide: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn current_and_legacy_protocols_have_explicit_modes_and_optional_codes() {
         assert!(super::supports_protocol_version(18));
         assert!(super::supports_protocol_version(17));
@@ -630,6 +872,10 @@ mod tests {
         };
         assert!(!format!("{enrollment:?}").contains(&enrollment.token));
         let value = serde_json::to_value(super::AgentWelcome {
+            release_catalog: None,
+            allow_agent_ai_disconnect: false,
+            allow_agent_human_disconnect: false,
+            test_key_accepted: false,
             pairing_code: None,
             pairing_mode: super::PairingMode::ManagedOnDemand,
             managed_target_id: Some("service-a".into()),
@@ -650,6 +896,7 @@ mod tests {
     #[test]
     fn controller_binding_modes_round_trip_and_legacy_defaults_to_none() {
         let mut binding = ControllerBinding {
+            installation_grant: None,
             session_id: SessionId::new(),
             controller_instance_id: ControllerInstanceId::new(),
             owner_id: ControllerOwnerId::new(),

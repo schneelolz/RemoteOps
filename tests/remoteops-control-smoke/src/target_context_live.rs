@@ -100,6 +100,12 @@ async fn start_target_variant(
     report_context: bool,
 ) -> Result<SimulatedTarget> {
     let context = target_context(service);
+    // 交互 Agent 先连接、后完成桌面探测；GetTargetContext 才返回当前可用状态。
+    let mut startup_context = context.clone();
+    if !service {
+        startup_context.capabilities[0].status = CapabilityAvailability::Unavailable;
+        startup_context.capabilities[0].reasons = vec!["visual_probe_pending".to_owned()];
+    }
     context.validate().map_err(anyhow::Error::msg)?;
     let mut stream = connect_tls(address, "localhost", load_client_config(cert)?).await?;
     let mut environment = EnvironmentProfile::empty();
@@ -113,10 +119,11 @@ async fn start_target_variant(
     write_frame(
         &mut stream,
         &WireMessage::Hello(ClientHello::Agent(AgentHello {
+            test_key_fingerprint: None,
             protocol_version: version,
             agent_instance_id: AgentInstanceId::new(),
             boot_id: AgentBootId::new(),
-            target_context: report_context.then_some(context.clone()),
+            target_context: report_context.then_some(startup_context),
             pairing_mode: PairingMode::AutoPerBoot,
             managed_enrollment: None,
             resume_token: None,
@@ -127,6 +134,7 @@ async fn start_target_variant(
             credential_encryption_public_key: String::new(),
             credential_encryption_key_id: String::new(),
             mac_address: None,
+            supports_mixed_pairing_code: false,
             supports_agent_shutdown: false,
         })),
     )

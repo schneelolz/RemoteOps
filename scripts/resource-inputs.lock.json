@@ -1,0 +1,37 @@
+{
+  "https://nodejs.org/dist/v22.23.4/node-v22.23.4-win-x64.zip": {
+    "url": "https://nodejs.org/dist/v22.23.4/node-v22.23.4-win-x64.zip",
+    "size": 35604229,
+    "sha256": "cbc74b5e0982c9dbb41525fd8fb5dcd32fbee237863f7829072f4639a1ce5f20"
+  },
+  "https://registry.npmjs.org/@playwright/mcp/-/mcp-0.0.84.tgz": {
+    "url": "https://registry.npmjs.org/@playwright/mcp/-/mcp-0.0.84.tgz",
+    "size": 24899,
+    "sha256": "4e749bdc5a19138fed51cf0f51e43dca265c1bfc0fc388220fc70756aac60c26"
+  },
+  "https://registry.npmjs.org/playwright/-/playwright-1.65.0-alpha-2026-10-30.tgz": {
+    "url": "https://registry.npmjs.org/playwright/-/playwright-1.65.0-alpha-2026-10-30.tgz",
+    "size": 910032,
+    "sha256": "0d140b937c384637321d1c90b63794b1f1739b82966b66038077c1493ab9bc2f"
+  },
+  "https://registry.npmjs.org/playwright-core/-/playwright-core-1.65.0-alpha-2026-10-30.tgz": {
+    "url": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.65.0-alpha-2026-10-30.tgz",
+    "size": 3192941,
+    "sha256": "6f46fa60a6ee52221ebe612a03329f8b233d20158ad37f6b240dd087f4a0f4f9"
+  },
+  "https://cdn.playwright.dev/builds/cft/157.0.8103.15/win64/chrome-win64.zip": {
+    "url": "https://cdn.playwright.dev/builds/cft/157.0.8103.15/win64/chrome-win64.zip",
+    "size": 209292933,
+    "sha256": "9b79d71060f08e8953e396a3f3c705105cca1c5862ec708f89bfa080fee78af6"
+  },
+  "https://registry.npmjs.org/agent-browser/-/agent-browser-0.41.2.tgz": {
+    "url": "https://registry.npmjs.org/agent-browser/-/agent-browser-0.41.2.tgz",
+    "size": 54484329,
+    "sha256": "f0d26595c766e54eedcd44324b67fb93b73fd003bd05237414b2513e75444bb0"
+  },
+  "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.38/win64/chrome-win64.zip": {
+    "url": "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.38/win64/chrome-win64.zip",
+    "size": 210600182,
+    "sha256": "ae0deef27d449e1d7529df7705d609bab102de48464da13567ed3dd2ee1a0586"
+  }
+}

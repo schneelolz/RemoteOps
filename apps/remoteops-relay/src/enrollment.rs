@@ -100,6 +100,18 @@ pub(crate) fn router() -> Router<AdminState> {
         .route("/api/admin/mcp/setups/{grant_id}/name", put(rename_setup))
         .route("/api/admin/mcp/clients", get(clients))
         .route(
+            "/api/admin/mcp/clients/{installation_id}/device-grants",
+            get(device_grants),
+        )
+        .route(
+            "/api/admin/mcp/clients/{installation_id}/device-grants/{device}",
+            put(device_grant).delete(device_grant),
+        )
+        .route(
+            "/api/admin/mcp/clients/{installation_id}/tool-management",
+            put(update_tool_management),
+        )
+        .route(
             "/api/admin/mcp/clients/{installation_id}/name",
             put(rename_client),
         )
@@ -288,6 +300,63 @@ async fn rename_client(
         return Err(error(StatusCode::NOT_FOUND, "MCP client not found"));
     }
     Ok(Json(serde_json::json!({"success": true})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolManagementPermission {
+    enabled: bool,
+}
+
+async fn update_tool_management(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    request: Result<Json<ToolManagementPermission>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    authorize(&state, &headers).await?;
+    let id = parse_id(&id)?;
+    let Json(request) = request.map_err(invalid_json)?;
+    let changed = state
+        .relay
+        .set_mcp_tool_management(id, request.enabled)
+        .await
+        .map_err(store_error)?;
+    Ok(Json(
+        serde_json::json!({"success": true, "changed": changed, "tool_management": request.enabled}),
+    ))
+}
+
+async fn device_grants(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(installation): Path<Uuid>,
+) -> ApiResult<serde_json::Value> {
+    authorize(&state, &headers).await?;
+    let ids = state
+        .relay
+        .enrollment_store()
+        .map_err(store_error)?
+        .list_device_grants(installation)
+        .map_err(store_error)?;
+    Ok(Json(serde_json::json!({"agent_instance_ids": ids})))
+}
+
+async fn device_grant(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((installation, device)): Path<(Uuid, Uuid)>,
+    method: axum::http::Method,
+) -> ApiResult<serde_json::Value> {
+    authorize(&state, &headers).await?;
+    let changed = state
+        .relay
+        .set_device_grant(installation, device, method == axum::http::Method::PUT)
+        .await
+        .map_err(store_error)?;
+    Ok(Json(
+        serde_json::json!({"success": true, "changed": changed}),
+    ))
 }
 
 async fn clients(

@@ -22,6 +22,32 @@ pub async fn run_product_console(
     profile: ProductProfile,
     config: AgentConfig,
 ) -> anyhow::Result<()> {
+    run_product_console_with_tools(profile, config, None).await
+}
+
+/// 使用同一产品的内置工具运行控制台，直到实际 SSH 才释放工具。
+///
+/// # Errors
+/// 产品配置、Agent 生命周期或信号监听失败时返回错误。
+pub async fn run_product_console_with_tools(
+    profile: ProductProfile,
+    config: AgentConfig,
+    tools: Option<super::BundledTools>,
+) -> anyhow::Result<()> {
+    run_product_console_with_test_key(profile, config, tools, None).await
+}
+
+/// 使用产品控制台和本次启动指定的测试密钥摘要运行 Agent。
+///
+/// # Errors
+///
+/// 配置、Agent 生命周期或信号监听失败时返回错误。
+pub async fn run_product_console_with_test_key(
+    profile: ProductProfile,
+    config: AgentConfig,
+    tools: Option<super::BundledTools>,
+    test_key_fingerprint: Option<String>,
+) -> anyhow::Result<()> {
     profile.validate()?;
     initialize_tracing();
     println!("{} {} · CLI 无图形模式", profile.name, profile.version);
@@ -30,7 +56,8 @@ pub async fn run_product_console(
     let permission = AgentPermissionControl::from_config(&config);
     let (events, receiver) = std_mpsc::channel();
     let (shutdown, shutdown_receiver) = watch::channel(false);
-    let options = AgentRuntimeOptions::console(profile.clone());
+    let mut options = AgentRuntimeOptions::console(profile.clone()).with_bundled_tools(tools);
+    options.test_key_fingerprint = test_key_fingerprint;
     let mut task = tokio::spawn(run_agent_with_options(
         config,
         Some(events),
@@ -318,6 +345,7 @@ mod tests {
 
     fn binding() -> SessionControlState {
         SessionControlState {
+            initialization_pending: false,
             session_id: SessionId::new(),
             agent_generation: 2,
             controller_id: ControllerInstanceId::new(),
@@ -402,6 +430,8 @@ mod tests {
         confirmed.source = Some(ControlSource::Local);
         state.observe(&AgentEvent::ControllerBindingsChanged {
             bindings: vec![AgentControllerBinding {
+                installation_authorized: false,
+                disconnect_target: None,
                 control_state: Some(confirmed.clone()),
                 owner_id: ControllerOwnerId::new(),
                 controller_kind: remoteops_protocol::ControllerKind::Ai,
@@ -491,6 +521,8 @@ mod tests {
         };
         state.command("full", &control);
         let replacement = AgentControllerBinding {
+            installation_authorized: false,
+            disconnect_target: None,
             control_state: Some(binding()),
             owner_id: ControllerOwnerId::new(),
             controller_kind: remoteops_protocol::ControllerKind::Ai,

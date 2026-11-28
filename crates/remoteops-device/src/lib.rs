@@ -3,7 +3,22 @@
 //! 本 crate 只负责在已经通过上层策略检查后执行具体能力；它不会根据自然
 //! 语言判断权限，也不会替代 Agent 或 Relay 的 Session/审批校验。
 
+mod bundled_tools;
 mod file_commit;
+pub use bundled_tools::{BundledToolPaths, BundledTools, EmbeddedTool, SSH_SCANNER_VERSION};
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod ssh_atomic_file;
+mod ssh_host_keys;
+pub use ssh_host_keys::{
+    scan_ssh_host_keys, scan_ssh_host_keys_async, scan_ssh_host_keys_with_tools,
+    trust_ssh_host_keys, trust_ssh_host_keys_verified, trust_ssh_host_keys_verified_with_tools,
+};
+#[cfg(any(windows, unix))]
+#[allow(unsafe_code)]
+mod ssh_password_file;
+#[cfg(windows)]
+mod ssh_plink;
 pub use file_commit::FileCommitControl;
 
 use std::{
@@ -67,6 +82,21 @@ pub struct SshHostKeyScan {
     entries: Vec<String>,
     /// 供现场用户核对的 SHA-256 指纹。
     pub fingerprints: Vec<String>,
+    /// 本次扫描的有界脱敏诊断；手工构造的已核验记录不包含进程诊断。
+    pub diagnostics: Option<SshScanDiagnostics>,
+}
+
+/// 主机密钥扫描进程的有界诊断，不含认证信息。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SshScanDiagnostics {
+    /// 实际扫描实现。
+    pub backend: &'static str,
+    /// 组件版本；Unix 系统组件版本未知时为空。
+    pub version: Option<&'static str>,
+    /// 实际进程退出码。
+    pub exit_code: Option<i32>,
+    /// 最多 1024 字符的脱敏 stderr。
+    pub stderr: String,
 }
 
 impl SshHostKeyScan {
@@ -79,8 +109,6 @@ impl SshHostKeyScan {
 
 // 为同一进程内的临时文件名提供无锁递增后缀。
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
-// 防止多个首次 SSH 连接并行更新同一个 known_hosts 文件。
-static SSH_KNOWN_HOSTS_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug)]
 struct ManagedChild {
@@ -323,6 +351,24 @@ pub enum DeviceError {
     /// 系统或设备访问失败。
     #[error("设备访问失败：{0}")]
     Operation(String),
+    /// SSH 后端的安全分类错误；原始返回内容由流式输出提供。
+    #[error("SSH [{backend}/{category}] 失败")]
+    Ssh {
+        /// 实际选择的后端或准备阶段。
+        backend: &'static str,
+        /// 不含凭据或原始输出的固定错误类别。
+        category: &'static str,
+    },
+    /// 主机密钥扫描失败，保留实际退出码与有界脱敏 stderr。
+    #[error("SSH [keyscan/{category}] 失败；exit_code={exit_code:?}；{stderr}")]
+    SshScan {
+        /// 固定失败类别。
+        category: &'static str,
+        /// 实际进程退出码，无法取得时为空。
+        exit_code: Option<i32>,
+        /// 有界脱敏诊断。
+        stderr: String,
+    },
     /// 操作超时。
     #[error("设备操作超时")]
     Timeout,
@@ -343,6 +389,30 @@ pub struct CommandResult {
     pub stderr: String,
     /// 进程退出码。
     pub exit_code: Option<i32>,
+}
+
+/// 一次 SSH 执行的实际后端及可确认的诊断，不依赖终端关键词推断阶段。
+#[derive(Clone, Debug, Serialize)]
+pub struct SshExecutionDetails {
+    /// 已选择的实际客户端；准备失败时尚未启动客户端。
+    pub backend: &'static str,
+    /// 后端选择的固定原因码。
+    pub selection_reason: &'static str,
+    /// 命令执行模式。
+    pub execution_mode: &'static str,
+    /// 可确认的错误类别；未知阶段明确保留 unknown。
+    pub error_category: Option<&'static str>,
+}
+
+impl Default for SshExecutionDetails {
+    fn default() -> Self {
+        Self {
+            backend: "unknown",
+            selection_reason: "provider_did_not_report",
+            execution_mode: "exec_no_pty",
+            error_category: None,
+        }
+    }
 }
 
 /// 命令执行期间产生的一段实时输出。
@@ -538,6 +608,81 @@ pub trait SshProvider: Send + Sync {
         command: &str,
         timeout_seconds: u64,
     ) -> Result<CommandResult, DeviceError>;
+
+    /// 流式执行 SSH；旧适配器默认保持最终结果兼容。
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)] // 保持认证、主机密钥与进程取消路径在同一生命周期内。
+    async fn run_command_streaming(
+        &self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: Option<&str>,
+        identity_file: Option<&str>,
+        known_hosts_file: Option<&str>,
+        command: &str,
+        timeout_seconds: u64,
+        output: mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> Result<CommandResult, DeviceError> {
+        let result = self
+            .run_command(
+                host,
+                port,
+                username,
+                password,
+                identity_file,
+                known_hosts_file,
+                command,
+                timeout_seconds,
+            )
+            .await?;
+        for (stderr, text) in [(false, &result.stdout), (true, &result.stderr)] {
+            if !text.is_empty() {
+                let _ = output.send(CommandOutputChunk {
+                    stderr,
+                    text: text.clone(),
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    /// 返回执行结果及同一次执行的诊断；不支持诊断的旧 Provider 明确返回 unknown。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_command_streaming_diagnosed(
+        &self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: Option<&str>,
+        identity_file: Option<&str>,
+        known_hosts_file: Option<&str>,
+        command: &str,
+        timeout_seconds: u64,
+        output: mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> (Result<CommandResult, DeviceError>, SshExecutionDetails) {
+        let result = self
+            .run_command_streaming(
+                host,
+                port,
+                username,
+                password,
+                identity_file,
+                known_hosts_file,
+                command,
+                timeout_seconds,
+                output,
+            )
+            .await;
+        let mut execution = SshExecutionDetails::default();
+        if !result
+            .as_ref()
+            .is_ok_and(|result| result.exit_code == Some(0))
+        {
+            execution.error_category = Some("unknown");
+        }
+        (result, execution)
+    }
 }
 
 /// 已打开的本机串口会话。
@@ -1243,6 +1388,31 @@ pub struct SystemDevice {
     pub allow_ssh_without_password: bool,
     /// Agent 文件上传、下载和 SSH 凭据允许访问的根目录。
     transfer_root: Arc<PathBuf>,
+    // 显式交换根限定初始 cwd；兼容 new() 的既有继承行为。
+    working_directory: Option<Arc<PathBuf>>,
+    // 只由本机产品宿主提供，不从普通配置或远程请求获得。
+    bundled_tools: Option<BundledTools>,
+}
+
+/// 创建仅当前运行账号、系统和管理员可访问的实例目录。
+/// # Errors
+/// 拒绝经过符号链接或重解析点的路径，权限设置失败时返回错误。
+pub fn protect_instance_directory(path: &Path) -> Result<(), DeviceError> {
+    for ancestor in path.ancestors() {
+        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt as _;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    return Err(DeviceError::InvalidInput("实例路径不允许重解析点".into()));
+                }
+            }
+            if metadata.is_symlink() {
+                return Err(DeviceError::InvalidInput("实例路径不允许符号链接".into()));
+            }
+        }
+    }
+    ssh_password_file::protect_directory(path)
 }
 
 impl SystemDevice {
@@ -1255,6 +1425,8 @@ impl SystemDevice {
         Self {
             allow_ssh_without_password: true,
             transfer_root: Arc::new(root),
+            working_directory: None,
+            bundled_tools: None,
         }
     }
 
@@ -1270,14 +1442,88 @@ impl SystemDevice {
             .map_err(|error| DeviceError::Operation(error.to_string()))?;
         Ok(Self {
             allow_ssh_without_password: true,
-            transfer_root: Arc::new(canonical),
+            transfer_root: Arc::new(canonical.clone()),
+            working_directory: Some(Arc::new(canonical)),
+            bundled_tools: None,
         })
+    }
+
+    /// 为当前设备绑定产品内置的可信 SSH 工具，直到实际 SSH 时才释放。
+    #[must_use]
+    pub fn with_bundled_tools(mut self, tools: Option<BundledTools>) -> Self {
+        self.bundled_tools = tools;
+        self
+    }
+
+    /// 返回产品是否绑定内置 SSH 后端；此查询不释放文件或启动工具。
+    #[must_use]
+    pub fn has_bundled_ssh(&self) -> bool {
+        self.bundled_tools.is_some()
+    }
+
+    /// 返回主机密钥扫描能力；Windows 只承认内嵌组件或摘要核验的固定随包路径。
+    #[must_use]
+    pub fn has_ssh_scanner(&self) -> bool {
+        if self
+            .bundled_tools
+            .as_ref()
+            .is_some_and(BundledTools::has_ssh_scanner)
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            bundled_tools::prepare_sidecar_ssh_scanner().is_ok_and(|scanner| scanner.is_some())
+        }
+        #[cfg(not(windows))]
+        {
+            command_exists("ssh-keyscan")
+        }
     }
 
     /// 返回规范化后的文件交换根目录。
     #[must_use]
     pub fn transfer_root(&self) -> &Path {
         self.transfer_root.as_path()
+    }
+
+    /// 返回交换目录内既有普通文件的真实绝对路径，拒绝链接与越界。
+    ///
+    /// # Errors
+    ///
+    /// 当路径不存在、不是普通文件或经过链接／重解析点时返回错误。
+    pub fn resolved_transfer_file(&self, path: &str) -> Result<PathBuf, DeviceError> {
+        let relative = validate_relative_transfer_path(path)?;
+        let mut current = self.transfer_root().to_path_buf();
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            let metadata = std::fs::symlink_metadata(&current)
+                .map_err(|error| DeviceError::Operation(error.to_string()))?;
+            if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
+                return Err(DeviceError::InvalidInput(
+                    "不允许通过链接或重解析点解析文件".to_owned(),
+                ));
+            }
+        }
+        let resolved = resolve_existing_transfer_path(self.transfer_root(), path)?;
+        let file = open_existing_no_follow(&resolved, false)?;
+        if !file
+            .metadata()
+            .map_err(|error| DeviceError::Operation(error.to_string()))?
+            .is_file()
+        {
+            return Err(DeviceError::InvalidInput("交换路径不是普通文件".to_owned()));
+        }
+        Ok(resolved)
+    }
+
+    fn apply_process_context(&self, command: &mut Command) {
+        if let Some(directory) = &self.working_directory {
+            let directory = path_for_child_process(directory);
+            command
+                .current_dir(&directory)
+                .env("REMOTEOPS_TRANSFER_ROOT", &directory);
+        }
     }
 
     /// 创建一次限定在交换目录内的分块上传会话。
@@ -1528,6 +1774,7 @@ impl SystemDevice {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        self.apply_process_context(&mut command);
         let mut child = spawn_managed_process(command)?;
         let stdin = child
             .stdin()
@@ -1714,6 +1961,21 @@ impl SystemDevice {
         }
     }
 
+    fn process_for_shell(&self, shell: ShellKind, text: &str) -> Result<Command, DeviceError> {
+        let (executable, arguments) = self.command_for_shell(shell, text)?;
+        let mut command = Command::new(executable);
+        #[cfg(windows)]
+        if matches!(shell, ShellKind::Cmd | ShellKind::System) {
+            // CMD不解析CRT的反斜杠引号；/S /C只剥除这对外层引号，保留用户命令语义。
+            command
+                .args(["/D", "/S", "/C"])
+                .raw_arg(format!("\"{text}\""));
+            return Ok(command);
+        }
+        command.args(arguments);
+        Ok(command)
+    }
+
     #[cfg(windows)]
     async fn run_process(
         &self,
@@ -1771,14 +2033,37 @@ impl SystemDevice {
         timeout_seconds: u64,
         output: mpsc::UnboundedSender<CommandOutputChunk>,
         output_encoding: ProcessOutputEncoding,
-        mut environment: Vec<(String, String)>,
+        environment: Vec<(String, String)>,
     ) -> Result<CommandResult, DeviceError> {
         let mut command = Command::new(executable);
+        command.args(arguments);
+        self.run_prepared_process_streaming(
+            command,
+            timeout_seconds,
+            output,
+            output_encoding,
+            environment,
+        )
+        .await
+    }
+
+    async fn run_prepared_process_streaming(
+        &self,
+        mut command: Command,
+        timeout_seconds: u64,
+        output: mpsc::UnboundedSender<CommandOutputChunk>,
+        output_encoding: ProcessOutputEncoding,
+        mut environment: Vec<(String, String)>,
+    ) -> Result<CommandResult, DeviceError> {
         command
-            .args(arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        self.apply_process_context(&mut command);
+        // 内部旧协议的口令环境绝不继承；安全文件路径只由本次调用显式设置。
+        command
+            .env_remove("REMOTEOPS_SSH_PASSWORD")
+            .env_remove("REMOTEOPS_SSH_PASSWORD_FILE");
         command.envs(environment.iter().cloned());
         let child_result = spawn_managed_process(command);
         for (_, value) in &mut environment {
@@ -1898,16 +2183,16 @@ impl ShellProvider for SystemDevice {
         if command.trim().is_empty() {
             return Err(DeviceError::InvalidInput("命令不能为空".to_owned()));
         }
-        let (executable, arguments) = self.command_for_shell(shell, command)?;
+        let process = self.process_for_shell(shell, command)?;
         let output_encoding = ProcessOutputEncoding::for_shell(shell);
         let (output, receiver) = mpsc::unbounded_channel();
         drop(receiver);
-        self.run_process_streaming_with_encoding(
-            executable,
-            arguments,
+        self.run_prepared_process_streaming(
+            process,
             timeout_seconds,
             output,
             output_encoding,
+            Vec::new(),
         )
         .await
     }
@@ -1922,14 +2207,14 @@ impl ShellProvider for SystemDevice {
         if command.trim().is_empty() {
             return Err(DeviceError::InvalidInput("命令不能为空".to_owned()));
         }
-        let (executable, arguments) = self.command_for_shell(shell, command)?;
+        let process = self.process_for_shell(shell, command)?;
         let output_encoding = ProcessOutputEncoding::for_shell(shell);
-        self.run_process_streaming_with_encoding(
-            executable,
-            arguments,
+        self.run_prepared_process_streaming(
+            process,
             timeout_seconds,
             output,
             output_encoding,
+            Vec::new(),
         )
         .await
     }
@@ -2409,203 +2694,569 @@ impl SshProvider for SystemDevice {
         command: &str,
         timeout_seconds: u64,
     ) -> Result<CommandResult, DeviceError> {
+        let (output, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        self.run_command_streaming(
+            host,
+            port,
+            username,
+            password,
+            identity_file,
+            known_hosts_file,
+            command,
+            timeout_seconds,
+            output,
+        )
+        .await
+    }
+
+    async fn run_command_streaming(
+        &self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: Option<&str>,
+        identity_file: Option<&str>,
+        known_hosts_file: Option<&str>,
+        command: &str,
+        timeout_seconds: u64,
+        output: mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> Result<CommandResult, DeviceError> {
+        self.run_command_streaming_diagnosed(
+            host,
+            port,
+            username,
+            password,
+            identity_file,
+            known_hosts_file,
+            command,
+            timeout_seconds,
+            output,
+        )
+        .await
+        .0
+    }
+
+    async fn run_command_streaming_diagnosed(
+        &self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: Option<&str>,
+        identity_file: Option<&str>,
+        known_hosts_file: Option<&str>,
+        command: &str,
+        timeout_seconds: u64,
+        output: mpsc::UnboundedSender<CommandOutputChunk>,
+    ) -> (Result<CommandResult, DeviceError>, SshExecutionDetails) {
+        let mut execution = SshExecutionDetails {
+            backend: "preparation",
+            selection_reason: "client_not_started",
+            ..SshExecutionDetails::default()
+        };
+        let result = self
+            .run_ssh_command_streaming(
+                host,
+                port,
+                username,
+                password,
+                identity_file,
+                known_hosts_file,
+                command,
+                timeout_seconds,
+                output,
+                &mut execution,
+            )
+            .await;
+        execution.error_category = match &result {
+            Ok(result) if result.exit_code == Some(0) => None,
+            Err(DeviceError::Ssh { category, .. }) => Some(category),
+            Err(DeviceError::InvalidInput(_) | DeviceError::Unsupported(_)) => Some("preparation"),
+            Err(DeviceError::OutputLimit { .. }) => Some("output_limit"),
+            Ok(_) | Err(_) => Some("unknown"),
+        };
+        (result, execution)
+    }
+}
+
+impl SystemDevice {
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn run_ssh_command_streaming(
+        &self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: Option<&str>,
+        identity_file: Option<&str>,
+        known_hosts_file: Option<&str>,
+        command: &str,
+        timeout_seconds: u64,
+        output: mpsc::UnboundedSender<CommandOutputChunk>,
+        execution: &mut SshExecutionDetails,
+    ) -> Result<CommandResult, DeviceError> {
         if host.trim().is_empty() || username.trim().is_empty() || command.trim().is_empty() {
             return Err(DeviceError::InvalidInput(
                 "SSH 主机、用户名和命令不能为空".to_owned(),
             ));
         }
         validate_ssh_destination(host, username)?;
-        let password = password.map(|value| Zeroizing::new(value.to_owned()));
-        if password.is_none() && !self.allow_ssh_without_password {
-            return Err(DeviceError::Unsupported(
-                "当前策略禁止无密码 SSH".to_owned(),
+        if port == 0 {
+            return Err(DeviceError::InvalidInput("SSH 端口不能为零".to_owned()));
+        }
+        if password.is_some() && identity_file.is_some() {
+            return Err(DeviceError::InvalidInput(
+                "密码 SSH 不能同时指定 identity_file".to_owned(),
             ));
         }
-        let known_hosts_file = resolve_ssh_known_hosts_file(
-            self.transfer_root(),
-            known_hosts_file,
-            password.is_some(),
-            host,
-            port,
-        )?;
-        let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
-        let mut arguments = vec![
-            "-F".to_owned(),
-            null_config.to_owned(),
-            "-o".to_owned(),
-            format!(
-                "BatchMode={}",
-                if password.is_some() { "no" } else { "yes" }
-            ),
-            "-o".to_owned(),
-            "StrictHostKeyChecking=yes".to_owned(),
-            "-o".to_owned(),
-            format!(
-                "UserKnownHostsFile={}",
-                path_for_child_process(&known_hosts_file)
-            ),
-        ];
-        if let Some(identity_file) = identity_file {
-            let identity_file =
-                resolve_existing_transfer_path(self.transfer_root(), identity_file)?;
-            arguments.extend([
-                "-o".to_owned(),
-                "IdentitiesOnly=yes".to_owned(),
-                "-i".to_owned(),
-                path_for_child_process(&identity_file),
-            ]);
-        }
-        let mut environment = Vec::new();
-        if let Some(password) = password {
-            let askpass = std::env::current_exe()
-                .ok()
-                .and_then(|path| {
-                    path.parent()
-                        .map(|parent| parent.join("remoteops-ssh-askpass.exe"))
-                })
-                .filter(|path| path.is_file())
-                .ok_or_else(|| {
-                    DeviceError::InvalidInput(
-                        "密码 SSH 需要与 Agent 同目录的 remoteops-ssh-askpass.exe".to_owned(),
-                    )
-                })?;
-            arguments.extend([
-                "-o".to_owned(),
-                "NumberOfPasswordPrompts=1".to_owned(),
-                "-o".to_owned(),
-                "PreferredAuthentications=password,keyboard-interactive".to_owned(),
-                "-o".to_owned(),
-                "PubkeyAuthentication=no".to_owned(),
-            ]);
-            environment.extend([
-                ("SSH_ASKPASS".to_owned(), path_for_child_process(&askpass)),
-                ("SSH_ASKPASS_REQUIRE".to_owned(), "force".to_owned()),
-                ("DISPLAY".to_owned(), "remoteops".to_owned()),
-                ("REMOTEOPS_SSH_PASSWORD".to_owned(), password.to_string()),
-            ]);
-        }
-        arguments.extend([
-            "-p".to_owned(),
-            port.to_string(),
-            format!("{username}@{host}"),
-            command.to_owned(),
-        ]);
-        let executable = if cfg!(windows) { "ssh.exe" } else { "ssh" };
-        let (output, receiver) = mpsc::unbounded_channel();
-        drop(receiver);
-        self.run_process_streaming_with_environment(
-            executable.to_owned(),
-            arguments,
-            timeout_seconds,
-            output,
-            ProcessOutputEncoding::Utf8,
-            environment,
-        )
-        .await
-    }
-}
-
-/// 扫描 SSH 主机公钥并计算供本地用户确认的 SHA-256 指纹。
-///
-/// # Errors
-///
-/// 当目标格式无效、`ssh-keyscan` 不可用、扫描失败或没有返回有效密钥时返回错误。
-pub fn scan_ssh_host_keys(
-    host: &str,
-    port: u16,
-    timeout_seconds: u64,
-) -> Result<SshHostKeyScan, DeviceError> {
-    validate_ssh_destination(host, "scan")?;
-    let mut command = std::process::Command::new(if cfg!(windows) {
-        "ssh-keyscan.exe"
-    } else {
-        "ssh-keyscan"
-    });
-    command.args([
-        "-T",
-        &timeout_seconds.clamp(1, 30).to_string(),
-        "-p",
-        &port.to_string(),
-        host,
-    ]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(CREATE_NO_WINDOW.0);
-    }
-    let output = command
-        .output()
-        .map_err(|error| DeviceError::Operation(format!("无法启动 ssh-keyscan：{error}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
-    let mut fingerprints = Vec::new();
-    for line in stdout.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() < 3 {
-            continue;
-        }
-        let key = BASE64
-            .decode(fields[2])
-            .map_err(|_| DeviceError::Operation("ssh-keyscan 返回了无效公钥".to_owned()))?;
-        let digest = Sha256::digest(key);
-        let fingerprint = base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest);
-        entries.push(line.to_owned());
-        fingerprints.push(format!("{} SHA256:{fingerprint}", fields[1]));
-    }
-    if entries.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(DeviceError::Operation(format!(
-            "未扫描到 SSH 主机密钥{}",
-            if stderr.trim().is_empty() {
-                String::new()
-            } else {
-                format!("：{}", stderr.trim())
+        let mut backend = "preparation";
+        let operation = async {
+            let password = password.map(|value| Zeroizing::new(value.to_owned()));
+            if password.is_none() && !self.allow_ssh_without_password {
+                return Err(DeviceError::Unsupported(
+                    "当前策略禁止无密码 SSH".to_owned(),
+                ));
             }
-        )));
+            let known_hosts_file = resolve_ssh_known_hosts_file(
+                self.transfer_root(),
+                known_hosts_file,
+                password.is_some(),
+                host,
+                port,
+            )?;
+            #[cfg(windows)]
+            let prepared_plink = if password.is_some() && identity_file.is_none() {
+                self.bundled_tools
+                    .as_ref()
+                    .map(BundledTools::prepare_plink)
+                    .transpose()?
+            } else {
+                None
+            };
+            #[cfg(windows)]
+            let plink_path = prepared_plink
+                .as_ref()
+                .map_or_else(ssh_plink::bundled_executable, |tool| {
+                    Some(tool.path().to_path_buf())
+                });
+            #[cfg(windows)]
+            if password.is_some()
+                && identity_file.is_none()
+                && let Some(plink) = &plink_path
+                && let Some(mut arguments) =
+                    ssh_plink::arguments(&known_hosts_file, host, port, username, command)?
+            {
+                let credential = password
+                    .as_ref()
+                    .map(|value| {
+                        ssh_password_file::PasswordFile::new_in(
+                            value,
+                            &self.transfer_root.join(".tmp"),
+                        )
+                    })
+                    .transpose()?;
+                if let Some(credential) = &credential {
+                    let index = arguments.len() - 2;
+                    arguments.splice(
+                        index..index,
+                        [
+                            "-pwfile".to_owned(),
+                            path_for_child_process(credential.path()),
+                        ],
+                    );
+                }
+                backend = "plink";
+                execution.backend = backend;
+                execution.selection_reason = "bundled_plink_exact_pinned_keys";
+                ssh_backend_preparing(&output, "Plink", "已找到随包组件与精确固定密钥");
+                let diagnostic_output = output.clone();
+                let result = self
+                    .run_process_streaming_with_environment(
+                        path_for_child_process(plink),
+                        arguments,
+                        timeout_seconds,
+                        output,
+                        ProcessOutputEncoding::Utf8,
+                        Vec::new(),
+                    )
+                    .await;
+                let result = classify_ssh_result("plink", result)?;
+                ssh_diagnostic_hint(&diagnostic_output, "plink", &result);
+                return Ok(result);
+            }
+            backend = "openssh";
+            execution.backend = backend;
+            #[cfg(windows)]
+            {
+                execution.selection_reason = if password.is_none() {
+                    "private_key_or_passwordless"
+                } else if plink_path.is_none() {
+                    "bundled_plink_unavailable"
+                } else {
+                    "trust_rules_require_openssh"
+                };
+            }
+            #[cfg(not(windows))]
+            {
+                execution.selection_reason = "platform_openssh";
+            }
+            #[cfg(windows)]
+            let fallback_reason = if password.is_none() {
+                "当前采用私钥／无密码模式"
+            } else if plink_path.is_none() {
+                "未找到 Agent 同目录 tools/plink.exe"
+            } else {
+                "主机信任规则不能等价映射为 Plink 指纹，保留 OpenSSH 验证"
+            };
+            #[cfg(not(windows))]
+            let fallback_reason = "当前平台使用系统 OpenSSH";
+            ssh_backend_preparing(&output, "OpenSSH", fallback_reason);
+            let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+            let mut arguments = vec![
+                "-T".to_owned(),
+                "-F".to_owned(),
+                null_config.to_owned(),
+                "-o".to_owned(),
+                format!(
+                    "BatchMode={}",
+                    if password.is_some() { "no" } else { "yes" }
+                ),
+                "-o".to_owned(),
+                "StrictHostKeyChecking=yes".to_owned(),
+                "-o".to_owned(),
+                // 独立信任文件不能叠加系统级主机库；显式 pin 不接受其他来源。
+                format!("GlobalKnownHostsFile={null_config}"),
+                "-o".to_owned(),
+                ssh_known_hosts_option(&known_hosts_file)?,
+            ];
+            if let Some(identity_file) = identity_file {
+                let identity_file =
+                    resolve_existing_transfer_path(self.transfer_root(), identity_file)?;
+                arguments.extend([
+                    "-o".to_owned(),
+                    "IdentitiesOnly=yes".to_owned(),
+                    "-i".to_owned(),
+                    path_for_child_process(&identity_file),
+                ]);
+            }
+            let mut environment = Vec::new();
+            let mut credential = None;
+            // 保持已验证工具句柄直到子进程结束，不能在密码参数准备块结束时释放。
+            let mut askpass_guard = None;
+            if let Some(password) = password {
+                if let Some(bundle) = &self.bundled_tools {
+                    askpass_guard = Some(bundle.prepare_askpass()?);
+                }
+                let askpass = askpass_guard
+                    .as_ref()
+                    .map(|tool| tool.path().to_path_buf())
+                    .or_else(|| {
+                        std::env::current_exe()
+                            .ok()
+                            .and_then(|path| {
+                                path.parent()
+                                    .map(|parent| parent.join("remoteops-ssh-askpass.exe"))
+                            })
+                            .filter(|path| path.is_file())
+                    })
+                    .ok_or_else(|| {
+                        DeviceError::InvalidInput(
+                            "密码 SSH 需要与 Agent 同目录的 remoteops-ssh-askpass.exe".to_owned(),
+                        )
+                    })?;
+                let (probe_output, receiver) = mpsc::unbounded_channel();
+                drop(receiver);
+                let compatible = self
+                    .run_process_streaming_with_environment(
+                        path_for_child_process(&askpass),
+                        vec!["--protocol-version".to_owned()],
+                        timeout_seconds,
+                        probe_output,
+                        ProcessOutputEncoding::Utf8,
+                        Vec::new(),
+                    )
+                    .await
+                    .is_ok_and(|result| {
+                        result.exit_code == Some(0) && result.stdout == "remoteops-askpass-file-v1"
+                    });
+                if !compatible {
+                    return Err(DeviceError::InvalidInput(
+                        "SSH fallback 需要支持安全文件协议的新版 askpass helper".to_owned(),
+                    ));
+                }
+                arguments.extend([
+                    "-o".to_owned(),
+                    "NumberOfPasswordPrompts=1".to_owned(),
+                    "-o".to_owned(),
+                    "PreferredAuthentications=password,keyboard-interactive".to_owned(),
+                    "-o".to_owned(),
+                    "PubkeyAuthentication=no".to_owned(),
+                ]);
+                credential = Some(ssh_password_file::PasswordFile::new_in(
+                    &password,
+                    &self.transfer_root.join(".tmp"),
+                )?);
+                environment.extend([
+                    ("SSH_ASKPASS".to_owned(), path_for_child_process(&askpass)),
+                    ("SSH_ASKPASS_REQUIRE".to_owned(), "force".to_owned()),
+                    ("DISPLAY".to_owned(), "remoteops".to_owned()),
+                    (
+                        "REMOTEOPS_SSH_PASSWORD_FILE".to_owned(),
+                        path_for_child_process(credential.as_ref().expect("凭据已创建").path()),
+                    ),
+                ]);
+            }
+            arguments.extend([
+                "-p".to_owned(),
+                port.to_string(),
+                format!("{username}@{host}"),
+                command.to_owned(),
+            ]);
+            let executable = if cfg!(windows) { "ssh.exe" } else { "ssh" };
+            let diagnostic_output = output.clone();
+            let result = self
+                .run_process_streaming_with_environment(
+                    executable.to_owned(),
+                    arguments,
+                    timeout_seconds,
+                    output,
+                    ProcessOutputEncoding::Utf8,
+                    environment,
+                )
+                .await;
+            drop(credential);
+            let result = classify_ssh_result("openssh", result)?;
+            ssh_diagnostic_hint(&diagnostic_output, "openssh", &result);
+            Ok(result)
+        };
+        match timeout(Duration::from_secs(timeout_seconds.max(1)), operation).await {
+            Ok(result) => result,
+            Err(_) => Err(DeviceError::Ssh {
+                backend,
+                category: "timeout",
+            }),
+        }
     }
-    Ok(SshHostKeyScan {
-        host: host.to_owned(),
-        port,
-        entries,
-        fingerprints,
-    })
 }
 
-/// 把现场用户已经确认的 SSH 主机密钥写入 Agent 专用信任文件。
-///
-/// # Errors
-///
-/// 当信任目录或文件无法创建、读取或写入时返回错误。
-pub fn trust_ssh_host_keys(scan: &SshHostKeyScan) -> Result<PathBuf, DeviceError> {
-    let _guard = SSH_KNOWN_HOSTS_LOCK
-        .lock()
-        .map_err(|_| DeviceError::Operation("SSH 主机信任锁已损坏".to_owned()))?;
-    let path = default_ssh_known_hosts_file()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| DeviceError::Operation(error.to_string()))?;
+fn ssh_backend_preparing(
+    output: &mpsc::UnboundedSender<CommandOutputChunk>,
+    backend: &str,
+    reason: &str,
+) {
+    let _ = output.send(CommandOutputChunk {
+        stderr: false,
+        text: format!(
+            "[RemoteOps SSH 准备] 后端={backend}；{reason}；模式=exec/无PTY，尚未确认连接。\n"
+        ),
+    });
+}
+
+fn ssh_failure_category(stderr: &str) -> Option<&'static str> {
+    let text = stderr.to_ascii_lowercase();
+    if [
+        "host key verification failed",
+        "host key is not cached",
+        "host key does not match",
+        "host key did not appear",
+        "host key fingerprint is",
+        "remote host identification has changed",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+    {
+        Some("hostkey")
+    } else if [
+        ": permission denied (",
+        "fatal error: authentication",
+        "no supported authentication methods available",
+        "unable to authenticate",
+        "authentication refused",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+    {
+        Some("authentication")
+    } else if [
+        "exec request failed on channel",
+        "server refused to start a shell/command",
+        "shell request failed on channel",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+    {
+        Some("exec_unsupported")
+    } else if [
+        "ssh: connect to host",
+        "fatal error: network error",
+        "fatal error: unable to open connection",
+        "ssh: could not resolve",
+        "no matching host key type found",
+        "no matching key exchange method found",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+    {
+        Some("connection")
+    } else {
+        None
     }
-    let target = known_hosts_target(&scan.host, scan.port);
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(DeviceError::Operation(error.to_string())),
-    };
-    let mut lines = existing
-        .lines()
-        .filter(|line| line.split_whitespace().next() != Some(target.as_str()))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    lines.extend(scan.entries.iter().cloned());
-    let contents = format!("{}\n", lines.join("\n"));
-    let temporary = path.with_extension(format!("known-hosts.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, contents)
-        .map_err(|error| DeviceError::Operation(error.to_string()))?;
-    commit_temporary_file(&temporary, &path, true)?;
-    Ok(path)
+}
+
+fn ssh_diagnostic_hint(
+    output: &mpsc::UnboundedSender<CommandOutputChunk>,
+    backend: &str,
+    result: &CommandResult,
+) {
+    if result.exit_code.is_some_and(|code| code != 0)
+        && let Some(category) = ssh_failure_category(&result.stderr)
+    {
+        let _ = output.send(CommandOutputChunk { stderr: false, text: format!(
+            "[RemoteOps SSH 诊断线索] 后端={backend}；文本匹配={category}；不能据此确认失败阶段，请以实际输出和退出码为准。\n"
+        ) });
+    }
+}
+
+fn classify_ssh_result(
+    backend: &'static str,
+    result: Result<CommandResult, DeviceError>,
+) -> Result<CommandResult, DeviceError> {
+    match result {
+        // 客户端诊断与远端 stderr 共用管道，关键词不能证明认证或 exec 阶段。
+        Ok(result) => Ok(result),
+        Err(DeviceError::Timeout) => Err(DeviceError::Ssh {
+            backend,
+            category: "timeout",
+        }),
+        Err(DeviceError::OutputLimit { limit }) => Err(DeviceError::OutputLimit { limit }),
+        Err(_) => Err(DeviceError::Ssh {
+            backend,
+            category: "spawn_or_io",
+        }),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ssh_streaming_tests {
+    use super::*;
+
+    #[test]
+    fn openssh_known_hosts_path_is_a_single_literal_config_value() {
+        let option = ssh_known_hosts_option(Path::new(r#"C:\space path\a"b%h"#)).unwrap();
+        assert_eq!(option, r#"UserKnownHostsFile="C:/space path/a\"b%%h""#);
+        assert!(ssh_known_hosts_option(Path::new("C:/a\nHost other")).is_err());
+        assert!(ssh_known_hosts_option(Path::new("C:/${USER}/known_hosts")).is_err());
+    }
+
+    #[test]
+    fn openssh_expands_exactly_one_full_known_hosts_filename() {
+        use std::{net::TcpListener, os::windows::process::CommandExt as _};
+        // 仅保留本机测试监听端口且不接受连接；超时前不进行身份交换。
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let known = std::env::temp_dir().join("RemoteOps-%h known-%p hosts-%r");
+        let option = ssh_known_hosts_option(&known).unwrap();
+        let expected = path_for_child_process(&known).replace('\\', "/");
+        let run = |argument: String| {
+            let result = std::process::Command::new("ssh.exe")
+                .args([
+                    "-vvv",
+                    "-F",
+                    "NUL",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "PubkeyAuthentication=no",
+                    "-o",
+                    "PasswordAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "ConnectTimeout=1",
+                    "-o",
+                    &argument,
+                    "-p",
+                    &port.to_string(),
+                    "fixture@127.0.0.1",
+                ])
+                .creation_flags(CREATE_NO_WINDOW.0)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&result.stderr)
+                .lines()
+                .filter(|line| line.contains("expanded UserKnownHostsFile"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        // %% 强制经过实际百分号展开，并让每个错误拆开的片段都留下诊断。
+        let fixed = run(option);
+        assert_eq!(fixed.len(), 1);
+        assert!(fixed[0].contains(&format!("-> '{expected}'")));
+        let unsafe_unquoted = format!("UserKnownHostsFile={expected}");
+        assert!(run(unsafe_unquoted).len() > 1);
+        drop(socket);
+    }
+
+    #[test]
+    fn unknown_password_target_is_rejected_without_bootstrap_or_file_mutation() {
+        let path = std::env::temp_dir().join(format!(
+            "remoteops-knownhosts-test-{}",
+            remoteops_domain::RequestId::new()
+        ));
+        assert!(require_ssh_host_trusted(&path, "example", 22).is_err());
+        assert!(!path.exists());
+        let content = format!("other ssh-rsa {}\n", BASE64.encode(b"known-test-key"));
+        std::fs::write(&path, &content).unwrap();
+        assert!(require_ssh_host_trusted(&path, "example", 22).is_err());
+        assert!(require_ssh_host_trusted(&path, "other", 22).is_ok());
+        assert!(require_ssh_host_trusted(&path, "other", 2222).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ssh_process_transport_publishes_output_before_completion() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            SystemDevice::new().run_process_streaming_with_environment(
+                "powershell.exe".to_owned(),
+                vec!["-NoProfile".to_owned(), "-NonInteractive".to_owned(), "-Command".to_owned(),
+                    "[Console]::Out.WriteLine('SSH_FIRST'); Start-Sleep -Milliseconds 800; [Console]::Error.WriteLine('SSH_SECOND')".to_owned()],
+                10, sender, ProcessOutputEncoding::Utf8, Vec::new(),
+            ).await
+        });
+        let first = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.text.contains("SSH_FIRST"));
+        assert!(!first.stderr);
+        assert!(!task.is_finished());
+        let result = task.await.unwrap().unwrap();
+        assert!(result.stdout.contains("SSH_FIRST"));
+        assert!(result.stderr.contains("SSH_SECOND"));
+    }
+
+    #[tokio::test]
+    async fn ssh_spawn_failure_releases_credential() {
+        let credential = ssh_password_file::PasswordFile::new("fake-test-secret").unwrap();
+        let path = credential.path().to_owned();
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let result = SystemDevice::new()
+            .run_process_streaming_with_environment(
+                path.with_extension("missing-executable")
+                    .display()
+                    .to_string(),
+                Vec::new(),
+                1,
+                sender,
+                ProcessOutputEncoding::Utf8,
+                Vec::new(),
+            )
+            .await;
+        assert!(result.is_err());
+        drop(credential);
+        assert!(!path.exists());
+    }
 }
 
 fn default_ssh_known_hosts_file() -> Result<PathBuf, DeviceError> {
@@ -2632,43 +3283,57 @@ fn resolve_ssh_known_hosts_file(
                 "密码 SSH 不允许由远端指定 known_hosts 文件".to_owned(),
             ));
         }
-        return ensure_default_ssh_host_trusted(host, port);
+        let path = default_ssh_known_hosts_file()?;
+        require_ssh_host_trusted(&path, host, port)?;
+        return Ok(path);
     }
     requested_path.map_or_else(default_ssh_known_hosts_file, |path| {
         resolve_existing_transfer_path(transfer_root, path)
     })
 }
 
-/// 首次密码 SSH 自动采用 TOFU 固定主机密钥；已有目标记录时仍由 OpenSSH 严格校验。
-fn ensure_default_ssh_host_trusted(host: &str, port: u16) -> Result<PathBuf, DeviceError> {
-    let _guard = SSH_KNOWN_HOSTS_LOCK
-        .lock()
-        .map_err(|_| DeviceError::Operation("SSH 主机信任锁已损坏".to_owned()))?;
-    let path = default_ssh_known_hosts_file()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| DeviceError::Operation("无法确定 SSH 主机信任目录".to_owned()))?;
-    std::fs::create_dir_all(parent).map_err(|error| DeviceError::Operation(error.to_string()))?;
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(DeviceError::Operation(error.to_string())),
-    };
+/// 密码认证只使用预先核对的已有目标记录，绝不扫描并自动接受未知密钥。
+fn require_ssh_host_trusted(path: &Path, host: &str, port: u16) -> Result<(), DeviceError> {
+    let existing = std::fs::read_to_string(path).map_err(|_| {
+        DeviceError::InvalidInput("密码 SSH 需要预先核对并固定目标主机密钥".to_owned())
+    })?;
     let target = known_hosts_target(host, port);
-    if existing
-        .lines()
-        .any(|line| line.split_whitespace().next() == Some(target.as_str()))
-    {
-        return Ok(path);
+    let trusted = existing.lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields.len() >= 3
+            && !fields[0].contains(['*', '?', '!', '|'])
+            && fields[0].split(',').any(|name| name == target)
+            && BASE64.decode(fields[2]).is_ok_and(|key| !key.is_empty())
+    });
+    if !trusted {
+        return Err(DeviceError::InvalidInput(
+            "密码 SSH 目标尚未固定主机密钥；请先核对并信任该目标，再重试".to_owned(),
+        ));
     }
-    let scan = scan_ssh_host_keys(host, port, 8)?;
-    let mut lines = existing.lines().map(str::to_owned).collect::<Vec<_>>();
-    lines.extend(scan.entries);
-    let temporary = path.with_extension(format!("known-hosts.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, format!("{}\n", lines.join("\n")))
-        .map_err(|error| DeviceError::Operation(error.to_string()))?;
-    commit_temporary_file(&temporary, &path, true)?;
-    Ok(path)
+    Ok(())
+}
+
+/// 将信任文件作为一个 OpenSSH 配置值传递，避免空格拆成多个信任来源。
+fn ssh_known_hosts_option(path: &Path) -> Result<String, DeviceError> {
+    if path.to_str().is_none() {
+        return Err(DeviceError::InvalidInput(
+            "SSH 信任文件路径必须是有效 Unicode".to_owned(),
+        ));
+    }
+    let value = path_for_child_process(path);
+    if value.chars().any(char::is_control) || value.contains("${") {
+        return Err(DeviceError::InvalidInput(
+            "SSH 信任文件路径包含不支持的控制或环境展开字符".to_owned(),
+        ));
+    }
+    #[cfg(windows)]
+    let value = value.replace('\\', "/");
+    // argv_split 处理引号与反斜杠，随后 OpenSSH 还会展开百分号 token。
+    let value = value
+        .replace('%', "%%")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    Ok(format!("UserKnownHostsFile=\"{value}\""))
 }
 
 fn known_hosts_target(host: &str, port: u16) -> String {
@@ -2731,7 +3396,11 @@ fn resolve_existing_transfer_path(root: &Path, path: &str) -> Result<PathBuf, De
     Ok(canonical)
 }
 
-fn path_for_child_process(path: &Path) -> String {
+/// 将已校验路径转换为子进程可用的普通路径表示。
+///
+/// Windows 去掉 verbatim 前缀并保留 UNC 语义；本函数不执行路径边界或存在性校验。
+#[must_use]
+pub fn path_for_child_process(path: &Path) -> String {
     let value = path.to_string_lossy();
     #[cfg(windows)]
     {
@@ -3531,6 +4200,62 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn cmd_one_shot_preserves_quoted_batch_paths_and_shell_syntax() {
+        let directory = TestDirectory::new("cmd-quoted-path");
+        let nested = directory.0.join("中文 tool & files");
+        std::fs::create_dir(&nested).unwrap();
+        let script = nested.join("quoted script.cmd");
+        std::fs::write(&script, b"@echo off\r\necho CMD_QUOTED_PATH_OK\r\n").unwrap();
+        let command = format!(
+            r#"call "{}" && echo "CMD_QUOTED & VALUE" && echo CMD_OPERATOR_OK"#,
+            path_for_child_process(&script)
+        );
+        let device = SystemDevice::new();
+        for shell in [ShellKind::Cmd, ShellKind::System] {
+            let result = device.run(shell, &command, 10).await.unwrap();
+            assert_eq!(result.exit_code, Some(0), "应执行带引号的中文空格路径");
+            assert!(result.stdout.contains("CMD_QUOTED_PATH_OK"));
+            assert!(result.stdout.contains(r#""CMD_QUOTED & VALUE""#));
+            assert!(result.stdout.contains("CMD_OPERATOR_OK"));
+            assert!(!result.stdout.contains(r#"\""#));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_one_shot_streaming_preserves_quoted_invocation_and_exit_code() {
+        let directory = TestDirectory::new("cmd-quoted-streaming");
+        let script = directory.0.join("中文 quoted & script.cmd");
+        std::fs::write(
+            &script,
+            b"@echo off\r\necho CMD_QUOTED_STREAM_OK\r\necho %1\r\nexit /b 7\r\n",
+        )
+        .unwrap();
+        let command = format!(
+            r#""{}" "STREAM & LITERAL""#,
+            path_for_child_process(&script)
+        );
+        let device = SystemDevice::new();
+        for shell in [ShellKind::Cmd, ShellKind::System] {
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let result = device
+                .run_streaming(shell, &command, 10, sender)
+                .await
+                .unwrap();
+            let mut streamed = String::new();
+            while let Ok(chunk) = receiver.try_recv() {
+                streamed.push_str(&chunk.text);
+            }
+            assert_eq!(result.exit_code, Some(7));
+            assert!(result.stdout.contains("CMD_QUOTED_STREAM_OK"));
+            assert!(result.stdout.contains(r#""STREAM & LITERAL""#));
+            assert_eq!(streamed, result.stdout);
+            assert_eq!(result.stderr, "");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn cmd_one_shot_preserves_utf8_output() {
         let script =
             "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Write-Output 'CMD中文-RemoteOps'";
@@ -3582,7 +4307,7 @@ mod tests {
             },
             "中文"
         );
-        assert_eq!(pending, [] as [u8; 0]);
+        assert_eq!(pending, Vec::<u8>::new());
     }
 
     #[cfg(windows)]
@@ -3901,6 +4626,211 @@ mod tests {
             DeviceError::OutputLimit {
                 limit: MAX_COMMAND_OUTPUT_BYTES
             }
+        ));
+    }
+
+    #[test]
+    fn resolved_transfer_file_is_absolute_regular_and_rejects_escape_and_links() {
+        let directory = TestDirectory::new("路径 空格");
+        let device = SystemDevice::with_transfer_root(&directory.0).unwrap();
+        std::fs::write(directory.0.join("文件.bin"), b"fixture").unwrap();
+        let file = device.resolved_transfer_file("文件.bin").unwrap();
+        assert!(file.is_absolute() && file.is_file());
+        assert_eq!(std::fs::read(file).unwrap(), b"fixture");
+        assert!(device.resolved_transfer_file("../outside").is_err());
+        assert!(device.resolved_transfer_file("missing").is_err());
+        std::fs::create_dir(directory.0.join("folder")).unwrap();
+        assert!(device.resolved_transfer_file("folder").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(directory.0.join("文件.bin"), directory.0.join("link"))
+                .unwrap();
+            assert!(device.resolved_transfer_file("link").is_err());
+        }
+        #[cfg(windows)]
+        {
+            // 无需开发者模式的 junction 也必须拒绝，即使目标仍在交换根内。
+            use std::os::windows::process::CommandExt as _;
+            let link = directory.0.join("junction");
+            let target = directory.0.join("folder");
+            let result = std::process::Command::new("cmd.exe")
+                .args([
+                    "/D",
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &path_for_child_process(&link),
+                    &path_for_child_process(&target),
+                ])
+                .creation_flags(CREATE_NO_WINDOW.0)
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+            std::fs::write(target.join("file.bin"), b"fixture").unwrap();
+            assert!(device.resolved_transfer_file("junction/file.bin").is_err());
+            std::fs::remove_dir(link).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_transfer_root_sets_one_shot_cwd_and_absolute_environment() {
+        let directory = TestDirectory::new("命令 空格");
+        let device = SystemDevice::with_transfer_root(&directory.0).unwrap();
+        let expected = path_for_child_process(device.transfer_root());
+        #[cfg(windows)]
+        let commands = [
+            // CMD先展开变量，再用UTF-8输出，避免OEM代码页丢失中文路径。
+            (
+                ShellKind::Cmd,
+                concat!(
+                    r#"set "REMOTEOPS_TEST_CMD_CWD=%CD%"&"#,
+                    r#"set "REMOTEOPS_TEST_CMD_ROOT=%REMOTEOPS_TRANSFER_ROOT%"&"#,
+                    r#"powershell.exe -NoLogo -NoProfile -NonInteractive -Command ""#,
+                    "[Console]::OutputEncoding = [Text.Encoding]::UTF8; ",
+                    "[Console]::WriteLine($env:REMOTEOPS_TEST_CMD_CWD); ",
+                    r#"[Console]::WriteLine($env:REMOTEOPS_TEST_CMD_ROOT)""#
+                ),
+            ),
+            (
+                ShellKind::WindowsPowerShell,
+                "[Console]::WriteLine((Get-Location).Path); [Console]::WriteLine($env:REMOTEOPS_TRANSFER_ROOT)",
+            ),
+        ];
+        #[cfg(not(windows))]
+        let commands = [(
+            ShellKind::System,
+            "pwd; printf '%s\n' \"$REMOTEOPS_TRANSFER_ROOT\"",
+        )];
+        for (shell, command) in commands {
+            let result = device.run(shell, command, 10).await.unwrap();
+            assert_eq!(result.exit_code, Some(0));
+            let lines = result
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(lines, [expected.as_str(), expected.as_str()]);
+        }
+        assert!(SystemDevice::new().working_directory.is_none());
+    }
+
+    #[tokio::test]
+    async fn persistent_shell_starts_at_transfer_root_then_retains_cd() {
+        let directory = TestDirectory::new("持久 空格");
+        let device = SystemDevice::with_transfer_root(&directory.0).unwrap();
+        std::fs::create_dir(directory.0.join("child")).unwrap();
+        #[cfg(windows)]
+        let (kind, initial, change, query) = (
+            ShellKind::WindowsPowerShell,
+            "[Console]::WriteLine((Get-Location).Path); [Console]::WriteLine($env:REMOTEOPS_TRANSFER_ROOT)",
+            "Set-Location child",
+            "[Console]::WriteLine((Get-Location).Path)",
+        );
+        #[cfg(not(windows))]
+        let (kind, initial, change, query) = (
+            ShellKind::System,
+            "pwd; printf '%s\n' \"$REMOTEOPS_TRANSFER_ROOT\"",
+            "cd child",
+            "pwd",
+        );
+        let session = device.open_interactive_shell(kind).await.unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let first = session
+            .run(initial, "initial", 10, sender.clone())
+            .await
+            .unwrap();
+        let expected = path_for_child_process(device.transfer_root());
+        assert!(
+            first
+                .stdout
+                .lines()
+                .filter(|v| v.trim() == expected)
+                .count()
+                >= 2
+        );
+        session
+            .run(change, "change", 10, sender.clone())
+            .await
+            .unwrap();
+        let next = session.run(query, "query", 10, sender).await.unwrap();
+        assert!(next.stdout.contains(&path_for_child_process(
+            &device.transfer_root().join("child")
+        )));
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ssh_rejects_password_and_identity_before_touching_credentials() {
+        let result = SystemDevice::new()
+            .run_command(
+                "example",
+                22,
+                "fixture",
+                Some("fake"),
+                Some("missing"),
+                None,
+                "query",
+                1,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(DeviceError::InvalidInput(message)) if message.contains("identity_file"))
+        );
+    }
+
+    #[test]
+    fn ssh_diagnostics_are_classified_without_copying_sensitive_text_or_hiding_remote_exit() {
+        for (text, expected) in [
+            ("Host key verification failed.", "hostkey"),
+            (
+                "fixture@example: Permission denied (password).",
+                "authentication",
+            ),
+            (
+                "FATAL ERROR: No supported authentication methods available",
+                "authentication",
+            ),
+            ("exec request failed on channel 0", "exec_unsupported"),
+            (
+                "FATAL ERROR: Server refused to start a shell/command",
+                "exec_unsupported",
+            ),
+            (
+                "ssh: connect to host fixture port 22: Connection refused",
+                "connection",
+            ),
+        ] {
+            let original = CommandResult {
+                stdout: "remote-output".to_owned(),
+                stderr: format!("{text} synthetic-sensitive"),
+                exit_code: Some(1),
+            };
+            let actual = classify_ssh_result("fixture", Ok(original.clone())).unwrap();
+            assert_eq!(actual, original);
+            assert_eq!(ssh_failure_category(&actual.stderr), Some(expected));
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            ssh_diagnostic_hint(&sender, "fixture", &actual);
+            let hint = receiver.try_recv().unwrap();
+            assert!(hint.text.contains("不能据此确认失败阶段"));
+            assert!(!hint.text.contains("synthetic-sensitive"));
+        }
+        let remote = CommandResult {
+            stdout: String::new(),
+            stderr: "cat: file: Permission denied".to_owned(),
+            exit_code: Some(2),
+        };
+        assert_eq!(
+            classify_ssh_result("fixture", Ok(remote.clone())).unwrap(),
+            remote
+        );
+        assert!(matches!(
+            classify_ssh_result("fixture", Err(DeviceError::Timeout)),
+            Err(DeviceError::Ssh {
+                category: "timeout",
+                ..
+            })
         ));
     }
 
@@ -4466,7 +5396,7 @@ mod tests {
         let task = tokio::spawn(async move {
             worker
                 .run(
-                    "sleep 30 & printf '%s\\n' \"$!\"; wait",
+                    "sleep 30 & printf '%s\n' \"$!\"; wait",
                     "descendant",
                     60,
                     sender,

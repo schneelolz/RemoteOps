@@ -5,6 +5,8 @@
 //! 结果转换成自己的界面事件。
 #![allow(clippy::missing_errors_doc)]
 
+mod tool_center_client;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
@@ -14,22 +16,23 @@ use std::{
     },
 };
 
+use base64::Engine as _;
 use chrono::Utc;
 use remoteops_audit::{JsonlAuditStore, sha256_bytes};
 use remoteops_domain::{
-    ApprovalId, ApprovalState, AuditEvent, ConnectionDescriptor, ConnectionState,
-    ControllerOwnerId, DomainError, EventPayload, EventSource, PairingCode, PermissionMode,
-    RemoteEvent, RemoteOperation, RequestId, SessionId, TargetContext,
+    AccessCode, ApprovalId, ApprovalState, AuditEvent, ConnectionDescriptor, ConnectionState,
+    ControllerOwnerId, DomainError, EventPayload, EventSource, PermissionMode, RemoteEvent,
+    RemoteOperation, RequestId, SessionId, TargetContext,
 };
 use remoteops_policy::{DefaultPolicy, PolicyDecision};
 pub use remoteops_protocol::ControllerKind;
 use remoteops_protocol::{
     ApprovalDecision, ApprovalRequest, ApprovalResult, ClientHello, ControlProof,
     ControlStateRequest, ControlStateResult, ControllerControlModeUpdate, ControllerHello,
-    PROTOCOL_VERSION, PairResult, PairingErrorCode, ReleaseSessionRequest, ReleaseSessionResult,
-    RemoteRequest, RemoteResponse, SessionControlState, WireMessage, connect_tls,
-    load_client_config, load_native_client_config, load_pinned_client_config, read_frame,
-    write_frame,
+    GlobalGuide, PROTOCOL_VERSION, PairResult, PairingErrorCode, ReleaseSessionRequest,
+    ReleaseSessionResult, RemoteRequest, RemoteResponse, SessionControlState, WireMessage,
+    connect_tls, load_client_config, load_native_client_config, load_pinned_client_config,
+    read_frame, write_frame,
 };
 use remoteops_session::ConnectionRegistry;
 use thiserror::Error;
@@ -98,6 +101,13 @@ pub struct ControllerCore {
     policy: DefaultPolicy,
 }
 
+fn clear_runtime_paths(connection: &mut ConnectionDescriptor) {
+    if let Some(context) = connection.target_context.as_mut() {
+        context.transfer_root = None;
+        context.ssh_trust_cli = None;
+    }
+}
+
 impl Default for ControllerCore {
     fn default() -> Self {
         Self {
@@ -109,8 +119,45 @@ impl Default for ControllerCore {
 
 impl ControllerCore {
     /// 新增或更新 Relay 返回的连接。
-    pub fn upsert_connection(&mut self, connection: ConnectionDescriptor) -> ConnectionDescriptor {
+    pub fn upsert_connection(
+        &mut self,
+        mut connection: ConnectionDescriptor,
+    ) -> ConnectionDescriptor {
+        if connection.state != ConnectionState::Online {
+            clear_runtime_paths(&mut connection);
+        }
         self.registry.upsert(connection)
+    }
+
+    fn invalidate_runtime_paths(&mut self, session_id: SessionId) {
+        if let Some(mut connection) = self.registry.get(session_id).cloned() {
+            clear_runtime_paths(&mut connection);
+            self.registry.upsert(connection);
+        }
+    }
+
+    fn cache_refreshed_context(
+        &mut self,
+        expected: &ConnectionDescriptor,
+        context: TargetContext,
+    ) -> Result<TargetContext, ApplicationError> {
+        context.validate().map_err(ApplicationError::Transport)?;
+        let mut current = self
+            .registry
+            .get(expected.session_id)
+            .cloned()
+            .ok_or_else(|| ApplicationError::Transport("目标会话已结束".into()))?;
+        if current.state != ConnectionState::Online
+            || current.agent_instance_id != expected.agent_instance_id
+            || current.credential_encryption_key_id != expected.credential_encryption_key_id
+        {
+            return Err(ApplicationError::Transport(
+                "目标进程或连接已换代，请重新读取运行事实".into(),
+            ));
+        }
+        current.target_context = Some(context.clone());
+        self.registry.upsert(current);
+        Ok(context)
     }
 
     /// 返回全部连接。
@@ -163,6 +210,10 @@ impl ControllerCore {
     /// 将当前所有连接标记为传输重连中。
     pub fn mark_all_reconnecting(&mut self) {
         self.registry.mark_all_reconnecting();
+        for mut connection in self.registry.list() {
+            clear_runtime_paths(&mut connection);
+            self.registry.upsert(connection);
+        }
     }
 
     /// 根据策略创建可发送的远程请求，必要时生成审批。
@@ -177,6 +228,17 @@ impl ControllerCore {
             .registry
             .get(session_id)
             .ok_or(ApplicationError::Domain(DomainError::ConnectionNotFound))?;
+        if operation.is_resource_tool()
+            && (connection.environment.protocol_version < 18
+                || !connection
+                    .target_context
+                    .as_ref()
+                    .is_some_and(resource_tools_supported))
+        {
+            return Err(ApplicationError::PolicyDenied(
+                "resource_tools_unsupported: 目标未启用资源工具协议v1".into(),
+            ));
+        }
         if operation.is_visual() {
             let reason = if connection.environment.protocol_version < 18 {
                 Some("host_context_unknown")
@@ -273,12 +335,22 @@ pub struct PendingOperation {
 impl PendingOperation {
     /// 等待远程操作完成。超时或放弃等待只清理本地注册，不代表远端已取消。
     pub async fn wait(self) -> Result<OperationResult, ApplicationError> {
+        self.wait_for(TokioDuration::from_mins(3)).await
+    }
+
+    /// 以明确预算等待同一远端请求，不创建或重放任务。
+    /// # Errors
+    /// 超时不代表远端取消；调用方必须保留原请求标识。
+    pub async fn wait_for(
+        self,
+        budget: TokioDuration,
+    ) -> Result<OperationResult, ApplicationError> {
         let Self {
             request_id,
             receiver,
             registration,
         } = self;
-        let response = timeout(TokioDuration::from_mins(3), receiver)
+        let response = timeout(budget.min(TokioDuration::from_secs(915)), receiver)
             .await
             .map_err(|_| ApplicationError::OperationTimedOut { request_id })?
             .map_err(|_| ApplicationError::Transport("远程响应通道已关闭".to_owned()))??;
@@ -311,12 +383,28 @@ impl Drop for PendingRegistration {
 }
 
 struct ClientInner {
+    test_pairing_supported: std::sync::atomic::AtomicBool,
+    bridge_protocol_version: AtomicU64,
+    guide_supported: std::sync::atomic::AtomicBool,
+    desktop_version: AtomicU64,
+    desktop_events: broadcast::Sender<remoteops_protocol::desktop::DesktopEvent>,
+    tcp_forward_version: AtomicU64,
     config: RelayClientConfig,
     tls_config: Arc<ClientConfig>,
     controller_instance_id: remoteops_domain::ControllerInstanceId,
     host_identity: remoteops_host_identity::HostIdentity,
     transport: Mutex<Option<ActiveTransport>>,
     transport_generation: AtomicU64,
+    // 每次握手重新采集，不从协议18本身推断资源能力。
+    resource_tools_schema_version: AtomicU64,
+    tool_center: tool_center_client::ToolCenterClientState,
+    release_catalog: std::sync::RwLock<Option<remoteops_protocol::release::ReleaseCatalog>>,
+    global_guide: Arc<std::sync::RwLock<GlobalGuide>>,
+    guide_pending:
+        Mutex<BTreeMap<RequestId, oneshot::Sender<Result<GlobalGuide, ApplicationError>>>>,
+    tcp_open_pending:
+        Mutex<BTreeMap<RequestId, oneshot::Sender<Result<WireMessage, ApplicationError>>>>,
+    tcp_events: broadcast::Sender<WireMessage>,
     connected: watch::Sender<bool>,
     core: Mutex<ControllerCore>,
     pending: Arc<PendingRegistry>,
@@ -326,18 +414,19 @@ struct ClientInner {
     controller_modes: Mutex<Vec<ControllerControlModeUpdate>>,
     control_pending: Mutex<BTreeMap<RequestId, oneshot::Sender<ControlStateResult>>>,
     control_states: Mutex<BTreeMap<SessionId, SessionControlState>>,
-    known_pairings: Mutex<BTreeMap<PairingCode, SessionId>>,
+    known_pairings: Mutex<BTreeMap<AccessCode, SessionId>>,
     // 受管连接不保留已兑换的一次码，凭据仅存在本Controller进程。
     managed_pairings: Mutex<BTreeMap<SessionId, String>>,
-    automatic_pair_pending: Mutex<BTreeMap<RequestId, (Option<PairingCode>, SessionId)>>,
+    automatic_pair_pending: Mutex<BTreeMap<RequestId, (Option<AccessCode>, SessionId)>>,
     events: broadcast::Sender<RemoteEvent>,
     event_history: Mutex<VecDeque<RemoteEvent>>,
     audit: Option<Arc<JsonlAuditStore>>,
 }
 
 struct PendingPairRequest {
+    expected_agent_id: Option<remoteops_domain::AgentInstanceId>,
     // 仅由仍在等待的人工请求建立连接并记录恢复目标。
-    pairing_code: PairingCode,
+    pairing_code: AccessCode,
     // 只记录本请求等待期间已结束的会话，随请求完成或取消一起释放。
     excluded_sessions: BTreeSet<SessionId>,
     // 同一传输只发送一次；重连时复用同一请求标识进行幂等兑换。
@@ -348,6 +437,8 @@ struct PendingPairRequest {
 struct PendingRemoteResponse {
     /// 请求发送时绑定的不可变目标会话。
     session_id: SessionId,
+    // 资源失败响应需要保留回退与未知结果元数据。
+    resource_operation: bool,
     /// 仅向原始等待者交付匹配的响应。
     sender: oneshot::Sender<Result<RemoteResponse, ApplicationError>>,
 }
@@ -362,6 +453,7 @@ enum PendingResponseMatch {
 struct ActiveTransport {
     generation: u64,
     sender: mpsc::UnboundedSender<WireMessage>,
+    tcp_sender: mpsc::Sender<WireMessage>,
 }
 
 /// Controller Core 的真实 Relay 客户端。
@@ -402,12 +494,25 @@ impl RelayClient {
             .map(JsonlAuditStore::new)
             .map(Arc::new);
         let inner = Arc::new(ClientInner {
+            guide_supported: std::sync::atomic::AtomicBool::new(false),
+            test_pairing_supported: std::sync::atomic::AtomicBool::new(false),
+            bridge_protocol_version: AtomicU64::new(0),
+            tcp_forward_version: AtomicU64::new(0),
             config,
             tls_config,
             controller_instance_id,
             host_identity: remoteops_host_identity::collect(),
             transport: Mutex::new(None),
             transport_generation: AtomicU64::new(0),
+            resource_tools_schema_version: AtomicU64::new(0),
+            tool_center: tool_center_client::ToolCenterClientState::default(),
+            release_catalog: std::sync::RwLock::default(),
+            global_guide: Arc::new(std::sync::RwLock::new(GlobalGuide::default())),
+            guide_pending: Mutex::new(BTreeMap::new()),
+            tcp_open_pending: Mutex::new(BTreeMap::new()),
+            tcp_events: broadcast::channel(256).0,
+            desktop_events: broadcast::channel(128).0,
+            desktop_version: AtomicU64::new(0),
             connected,
             core: Mutex::new(ControllerCore::default()),
             pending: Arc::new(PendingRegistry::default()),
@@ -438,6 +543,275 @@ impl RelayClient {
     #[must_use]
     pub fn is_connected(&self) -> bool {
         *self.inner.connected.borrow()
+    }
+
+    /// 查询当前在线 Relay 公告的已发布版本及与本机的关系。
+    #[must_use]
+    pub fn published_version(&self, product: &str, local: &str) -> Option<(String, &'static str)> {
+        if !self.is_connected() {
+            return None;
+        }
+        self.inner
+            .release_catalog
+            .read()
+            .ok()?
+            .as_ref()?
+            .compare(product, std::env::consts::OS, std::env::consts::ARCH, local)
+            .map(|(v, s)| (v.to_owned(), s))
+    }
+
+    /// 返回最近一次由 Relay 确认的全局操作指引。
+    #[must_use]
+    pub fn global_guide(&self) -> GlobalGuide {
+        self.inner
+            .global_guide
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 当前 Relay 欢迎消息是否提供全局指引。
+    #[must_use]
+    pub fn supports_global_guide(&self) -> bool {
+        self.inner.guide_supported.load(Ordering::Acquire)
+    }
+
+    /// 显式从 Relay 重新读取全局操作指引，不重启传输或重放远程请求。
+    pub async fn refresh_global_guide(&self) -> Result<GlobalGuide, ApplicationError> {
+        if self.is_connected() && !self.supports_global_guide() {
+            return Err(ApplicationError::Remote {
+                code: "global_guide_unsupported".into(),
+                message: "当前 Relay 未声明全局指引接口，请更新 Relay".into(),
+            });
+        }
+        let request_id = RequestId::new();
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .guide_pending
+            .lock()
+            .await
+            .insert(request_id, sender);
+        if let Err(error) = self
+            .send_wire(WireMessage::GlobalGuideRequest { request_id })
+            .await
+        {
+            self.inner.guide_pending.lock().await.remove(&request_id);
+            return Err(error);
+        }
+        match timeout(TokioDuration::from_secs(15), receiver).await {
+            Ok(Ok(Ok(guide))) => Ok(guide),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(_)) => Err(ApplicationError::Transport(
+                "Relay 指引响应通道已关闭".into(),
+            )),
+            Err(_) => {
+                self.inner.guide_pending.lock().await.remove(&request_id);
+                Err(ApplicationError::Transport("Relay 全局指引刷新超时".into()))
+            }
+        }
+    }
+
+    /// 检查当前中继的人工桌面能力。
+    #[must_use]
+    pub fn supports_desktop(&self) -> bool {
+        self.is_connected()
+            && self.inner.config.controller_kind == ControllerKind::Human
+            && self.inner.desktop_version.load(Ordering::Acquire) == 1
+    }
+
+    /// 订阅已绑定桌面的生命周期事件。
+    #[must_use]
+    pub fn desktop_events(&self) -> broadcast::Receiver<remoteops_protocol::desktop::DesktopEvent> {
+        self.inner.desktop_events.subscribe()
+    }
+
+    /// 发送人工面板事件。每条事件还须由中继按当前绑定核验。
+    pub async fn desktop_command(
+        &self,
+        event: remoteops_protocol::desktop::DesktopEvent,
+    ) -> Result<(), ApplicationError> {
+        if !self.supports_desktop() {
+            return Err(ApplicationError::Transport(
+                "当前连接无法打开人工桌面".into(),
+            ));
+        }
+        self.send_wire(WireMessage::Desktop(event)).await
+    }
+
+    /// 复用当前控制端的 TLS 信任配置，接入一次性媒体通道。
+    pub async fn desktop_media(
+        &self,
+        ticket: remoteops_protocol::desktop::Ticket,
+    ) -> Result<impl AsyncRead + Unpin + Send + 'static, ApplicationError> {
+        let mut stream = connect_tls(
+            &self.inner.config.relay_address,
+            &self.inner.config.server_name,
+            self.inner.tls_config.clone(),
+        )
+        .await
+        .map_err(|e| ApplicationError::Transport(e.to_string()))?;
+        write_frame(&mut stream, &WireMessage::DesktopMedia(ticket))
+            .await
+            .map_err(|e| ApplicationError::Transport(e.to_string()))?;
+        Ok(stream)
+    }
+
+    /// 订阅持续 TCP 转发的入站数据和关闭事件。
+    #[must_use]
+    pub fn subscribe_tcp_events(&self) -> broadcast::Receiver<WireMessage> {
+        self.inner.tcp_events.subscribe()
+    }
+    /// 当前 Relay 已确认支持授权转发 v2。
+    #[must_use]
+    pub fn supports_tcp_forward(&self) -> bool {
+        self.is_connected() && self.inner.tcp_forward_version.load(Ordering::Acquire) == 2
+    }
+
+    /// 发送有界转发数据或生命周期帧，不建立或重放远端操作。
+    pub async fn send_tcp_frame(
+        &self,
+        frame: remoteops_protocol::tcp_forward::TcpForwardFrame,
+    ) -> Result<(), ApplicationError> {
+        if !self.supports_tcp_forward() {
+            return Err(ApplicationError::Transport(
+                "Relay 未连接或不支持 TCP 转发 v2".into(),
+            ));
+        }
+        let transport = self
+            .inner
+            .transport
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| ApplicationError::Transport("Relay TCP 传输已经断开".into()))?;
+        transport
+            .tcp_sender
+            .send(WireMessage::TcpForwardV2(frame))
+            .await
+            .map_err(|_| ApplicationError::Transport("Relay TCP 发送通道已经关闭".into()))
+    }
+
+    /// 读取当前绑定的目标策略及管理员申请步骤。
+    pub async fn tcp_forward_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<remoteops_protocol::tcp_forward::TcpForwardPolicySnapshot, ApplicationError> {
+        if !self.supports_tcp_forward() {
+            return Err(ApplicationError::Transport(
+                "Relay 不支持在线 TCP 策略查询，请升级 Relay".into(),
+            ));
+        }
+        let request_id = RequestId::new();
+        let mut events = self.subscribe_tcp_events();
+        self.send_wire(WireMessage::TcpForwardPolicyRequest {
+            request_id,
+            session_id,
+        })
+        .await?;
+        timeout(TokioDuration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(WireMessage::TcpForwardPolicyResponse {
+                        request_id: reply,
+                        snapshot,
+                        error,
+                    }) if reply == request_id => {
+                        return snapshot.ok_or_else(|| ApplicationError::Remote {
+                            code: "tcp_policy_denied".into(),
+                            message: error.unwrap_or_else(|| "TCP 策略不可用".into()),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        return Err(ApplicationError::Transport("TCP 策略响应通道中断".into()));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| ApplicationError::Transport("TCP 策略查询超时".into()))?
+    }
+
+    /// 请求 Relay/Agent 创建一条固定目标的持续 TCP 转发。
+    pub async fn open_tcp_forward(
+        &self,
+        session_id: SessionId,
+        target_host: String,
+        target_port: u16,
+        max_connections: u16,
+    ) -> Result<WireMessage, ApplicationError> {
+        let request_id = RequestId::new();
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .tcp_open_pending
+            .lock()
+            .await
+            .insert(request_id, sender);
+        if let Err(error) = self
+            .send_wire(WireMessage::TcpForwardOpen {
+                request_id,
+                session_id,
+                target_host,
+                target_port,
+                max_connections,
+            })
+            .await
+        {
+            self.inner.tcp_open_pending.lock().await.remove(&request_id);
+            return Err(error);
+        }
+        timeout(TokioDuration::from_secs(15), receiver)
+            .await
+            .map_err(|_| ApplicationError::Transport("TCP 转发创建超时".into()))?
+            .map_err(|_| ApplicationError::Transport("TCP 转发响应通道已关闭".into()))?
+    }
+
+    /// 向已创建的持续 TCP 转发写入一个有界数据块。
+    pub async fn send_tcp_forward_data(
+        &self,
+        forward_id: RequestId,
+        connection_id: RequestId,
+        data: &[u8],
+        eof: bool,
+    ) -> Result<(), ApplicationError> {
+        if data.len() > 64 * 1024 {
+            return Err(ApplicationError::Transport(
+                "TCP 转发数据块超过 64 KiB".into(),
+            ));
+        }
+        self.send_wire(WireMessage::TcpForwardData {
+            forward_id,
+            connection_id,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+            eof,
+        })
+        .await
+    }
+
+    /// 关闭持续 TCP 转发或其中一个连接。
+    pub async fn close_tcp_forward(
+        &self,
+        forward_id: RequestId,
+        connection_id: Option<RequestId>,
+        reason: String,
+    ) -> Result<(), ApplicationError> {
+        self.send_wire(WireMessage::TcpForwardClose {
+            forward_id,
+            connection_id,
+            reason,
+        })
+        .await
+    }
+
+    /// 当前传输已通过欢迎消息确认资源工具协议v1。
+    #[must_use]
+    pub fn supports_resource_tools(&self) -> bool {
+        self.is_connected()
+            && self
+                .inner
+                .resource_tools_schema_version
+                .load(Ordering::Acquire)
+                == 1
     }
 
     /// 等待传输在指定时限内恢复。
@@ -477,14 +851,29 @@ impl RelayClient {
     /// 成功后才会把连接加入当前 Controller 的 Session 列表。
     pub async fn pair(
         &self,
-        pairing_code: remoteops_domain::PairingCode,
+        pairing_code: impl Into<remoteops_domain::AccessCode>,
     ) -> Result<ConnectionDescriptor, ApplicationError> {
+        self.pair_for_agent(pairing_code.into(), None).await
+    }
+
+    /// 使用控制码配对，并可在建立会话前核对目标设备身份。
+    ///
+    /// # Errors
+    ///
+    /// Relay 不支持设备核对、设备不匹配或配对失败时返回错误。
+    pub async fn pair_for_agent(
+        &self,
+        pairing_code: impl Into<remoteops_domain::AccessCode>,
+        expected_agent_id: Option<remoteops_domain::AgentInstanceId>,
+    ) -> Result<ConnectionDescriptor, ApplicationError> {
+        let pairing_code = pairing_code.into();
         let deadline = Instant::now() + TokioDuration::from_secs(20);
         let request_id = RequestId::new();
         let (sender, receiver) = oneshot::channel();
         self.inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
+                expected_agent_id,
                 pairing_code: pairing_code.clone(),
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
@@ -783,6 +1172,53 @@ impl RelayClient {
         Ok(result)
     }
 
+    /// 获取精确会话绑定的宿主服务介绍和业务能力。
+    /// # Errors
+    /// 协议、目标或权限不满足时拒绝执行。
+    pub async fn describe_host_capabilities(
+        &self,
+        target: &str,
+        source: EventSource,
+    ) -> Result<OperationResult, ApplicationError> {
+        self.execute(
+            target,
+            source,
+            RemoteOperation::DescribeHostCapabilities,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// 查询发现结果中的精确宿主实例和能力版本，不自动重放。
+    /// # Errors
+    /// 协议、目标、参数或权限不满足时拒绝执行。
+    pub async fn query_host_capability(
+        &self,
+        target: &str,
+        source: EventSource,
+        instance_id: String,
+        capability_id: String,
+        version: String,
+        arguments: serde_json::Value,
+    ) -> Result<OperationResult, ApplicationError> {
+        self.execute(
+            target,
+            source,
+            RemoteOperation::QueryHostCapability {
+                instance_id,
+                capability_id,
+                version,
+                arguments,
+            },
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
     /// 根据目标字符串和策略执行远程操作。
     ///
     /// # Errors
@@ -881,9 +1317,30 @@ impl RelayClient {
         secret: Option<String>,
         control_proof: Option<ControlProof>,
     ) -> Result<PendingOperation, ApplicationError> {
+        if matches!(
+            operation,
+            RemoteOperation::DescribeHostCapabilities | RemoteOperation::QueryHostCapability { .. }
+        ) && self.inner.bridge_protocol_version.load(Ordering::Acquire)
+            != u64::from(remoteops_protocol::BRIDGE_PROTOCOL_VERSION)
+        {
+            return Err(ApplicationError::PolicyDenied(
+                "bridge_protocol_unsupported: Relay未声明协议22".into(),
+            ));
+        }
         if secret.is_some() {
             return Err(ApplicationError::PolicyDenied(
                 "RemoteOps 协议不允许传递远端秘密".to_owned(),
+            ));
+        }
+        if operation.is_resource_tool()
+            && self
+                .inner
+                .resource_tools_schema_version
+                .load(Ordering::Acquire)
+                != 1
+        {
+            return Err(ApplicationError::PolicyDenied(
+                "resource_tools_unsupported: Relay未声明资源工具协议v1".into(),
             ));
         }
         let mut core = self.inner.core.lock().await;
@@ -968,7 +1425,7 @@ impl RelayClient {
         };
         let result = self
             .execute(
-                target,
+                &session_id.to_string(),
                 EventSource::Human,
                 RemoteOperation::CloseConnection,
                 None,
@@ -976,6 +1433,27 @@ impl RelayClient {
                 None,
             )
             .await?;
+        self.release_session_request(session_id).await?;
+        Ok(result)
+    }
+
+    /// 仅解除发起方的临时配对，保留其他角色的终端和串口。
+    pub async fn release_binding(&self, session_id: SessionId) -> Result<(), ApplicationError> {
+        if self
+            .inner
+            .managed_pairings
+            .lock()
+            .await
+            .contains_key(&session_id)
+        {
+            return Err(ApplicationError::Transport(
+                "此受管授权需要通过管理端结束".into(),
+            ));
+        }
+        self.release_session_request(session_id).await
+    }
+
+    async fn release_session_request(&self, session_id: SessionId) -> Result<(), ApplicationError> {
         let request_id = RequestId::new();
         let (sender, receiver) = oneshot::channel();
         self.inner
@@ -1017,7 +1495,14 @@ impl RelayClient {
         forget_session_pairing(&self.inner, session_id).await;
         // 受管会话会先收到ConnectionRemoved，成功释放后的本地收尾必须幂等。
         let _ = self.inner.core.lock().await.remove_connection(session_id);
-        Ok(result)
+        self.inner.control_states.lock().await.remove(&session_id);
+        fail_session_pending(
+            &self.inner,
+            session_id,
+            "connection_closed",
+            "会话已关闭，未完成操作不再等待远端结果",
+        );
+        Ok(())
     }
 
     /// 实时读取指定会话的安全上下文；不会调用图形 Provider。
@@ -1025,11 +1510,16 @@ impl RelayClient {
         &self,
         session_id: SessionId,
     ) -> Result<TargetContext, ApplicationError> {
-        {
-            let core = self.inner.core.lock().await;
+        let expected = {
+            let mut core = self.inner.core.lock().await;
             let connection = core
                 .get_connection(session_id)
                 .ok_or_else(|| ApplicationError::Transport("目标会话已结束".to_owned()))?;
+            if connection.state != ConnectionState::Online {
+                return Err(ApplicationError::Transport(
+                    "目标当前未在线，运行路径未知".into(),
+                ));
+            }
             if connection.environment.protocol_version < 18
                 || connection
                     .target_context
@@ -1041,7 +1531,18 @@ impl RelayClient {
                     message: "目标未声明安全上下文查询能力".to_owned(),
                 });
             }
-        }
+            let expected = connection.clone();
+            core.invalidate_runtime_paths(session_id);
+            expected
+        };
+        let transport_generation = self.inner.transport_generation.load(Ordering::Acquire);
+        let agent_generation = self
+            .inner
+            .control_states
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|state| state.agent_generation);
         let result = self
             .execute(
                 &session_id.to_string(),
@@ -1058,15 +1559,21 @@ impl RelayClient {
             .ok_or_else(|| ApplicationError::Transport("Agent 未返回目标上下文".to_owned()))?;
         let context: TargetContext = serde_json::from_value(value)
             .map_err(|_| ApplicationError::Transport("Agent 返回了无效目标上下文".to_owned()))?;
-        context.validate().map_err(ApplicationError::Transport)?;
+        // 锁序固定为 core → transport → control_states；状态更新不持 states 等 core。
+        // 最后核验必须在取得 core 之后，且提交前不再让出临界区。
         let mut core = self.inner.core.lock().await;
-        let mut connection = core
-            .get_connection(session_id)
-            .cloned()
-            .ok_or_else(|| ApplicationError::Transport("目标会话已结束".to_owned()))?;
-        connection.target_context = Some(context.clone());
-        core.upsert_connection(connection);
-        Ok(context)
+        let transport = self.inner.transport.lock().await;
+        let states = self.inner.control_states.lock().await;
+        let current_agent_generation = states.get(&session_id).map(|state| state.agent_generation);
+        if transport_generation != self.inner.transport_generation.load(Ordering::Acquire)
+            || transport.as_ref().map(|active| active.generation) != Some(transport_generation)
+            || agent_generation != current_agent_generation
+        {
+            return Err(ApplicationError::Transport(
+                "运行事实查询期间连接换代，请重新读取".into(),
+            ));
+        }
+        core.cache_refreshed_context(&expected, context)
     }
 
     /// 将指定会话的脱敏审计事件导出为 JSON。
@@ -1108,6 +1615,7 @@ impl RelayClient {
         self.inner.pending.lock().insert(
             request_id,
             PendingRemoteResponse {
+                resource_operation: request.operation.is_resource_tool(),
                 session_id: request.session_id,
                 sender,
             },
@@ -1267,9 +1775,49 @@ where
         .await
         .map_err(|error| ApplicationError::Transport(error.to_string()))?
     {
-        WireMessage::ControllerWelcome { protocol_version }
-            if protocol_version == PROTOCOL_VERSION =>
-        {
+        WireMessage::ControllerWelcome {
+            test_pairing_supported,
+            bridge_protocol_version,
+            tcp_forward_version,
+            desktop_version,
+            protocol_version,
+            resource_tools_schema_version,
+            tool_center_schema_version,
+            global_guide,
+            release_catalog,
+        } if protocol_version == PROTOCOL_VERSION => {
+            *inner
+                .release_catalog
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = release_catalog;
+            inner
+                .desktop_version
+                .store(u64::from(desktop_version.unwrap_or(0)), Ordering::Release);
+            inner.bridge_protocol_version.store(
+                u64::from(bridge_protocol_version.unwrap_or(0)),
+                Ordering::Release,
+            );
+            inner
+                .test_pairing_supported
+                .store(test_pairing_supported, Ordering::Release);
+            inner
+                .guide_supported
+                .store(global_guide.is_some(), Ordering::Release);
+            inner.tcp_forward_version.store(
+                u64::from(tcp_forward_version.unwrap_or(0)),
+                Ordering::Release,
+            );
+            inner.tool_center.set_capability(tool_center_schema_version);
+            inner.resource_tools_schema_version.store(
+                u64::from(resource_tools_schema_version.unwrap_or(0)),
+                Ordering::Release,
+            );
+            if let Some(guide) = global_guide {
+                *inner
+                    .global_guide
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = guide;
+            }
             Ok(())
         }
         WireMessage::Error { code, message, .. } => Err(ApplicationError::Remote { code, message }),
@@ -1284,18 +1832,23 @@ async fn run_transport(
     stream: TlsStream<TcpStream>,
     initial_sender: Option<oneshot::Sender<Result<(), ApplicationError>>>,
 ) -> Result<(), ApplicationError> {
-    let generation = inner
-        .transport_generation
-        .fetch_add(1, Ordering::AcqRel)
-        .saturating_add(1);
     let (sender, receiver) = mpsc::unbounded_channel();
-    {
+    let (tcp_sender, tcp_receiver) = mpsc::channel(32);
+    let generation = {
+        // 与运行事实缓存提交共用 core 边界，跳代不能发生在最后核验和提交之间。
+        let _core = inner.core.lock().await;
         let mut transport = inner.transport.lock().await;
+        let generation = inner
+            .transport_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
         *transport = Some(ActiveTransport {
             generation,
             sender: sender.clone(),
+            tcp_sender,
         });
-    }
+        generation
+    };
     set_connected(&inner.connected, true);
     let initial_controller_modes = inner.controller_modes.lock().await.clone();
     if !initial_controller_modes.is_empty() {
@@ -1354,7 +1907,7 @@ async fn run_transport(
     });
 
     let (reader, writer) = tokio::io::split(stream);
-    let result = run_transport_io(inner, reader, writer, receiver).await;
+    let result = run_transport_io(inner, reader, writer, receiver, tcp_receiver).await;
     heartbeat_task.abort();
     pairing_recovery_task.abort();
     result
@@ -1367,11 +1920,42 @@ async fn send_pending_pairings(
 ) -> bool {
     let mut pending = inner.pair_pending.lock().await;
     pending.retain(|_, request| !request.sender.is_closed());
+    pending.retain(|request_id, request| {
+        if request.pairing_code.is_long()
+            && inner.bridge_protocol_version.load(Ordering::Acquire)
+                != u64::from(remoteops_protocol::BRIDGE_PROTOCOL_VERSION)
+        {
+            let (sender, _) = oneshot::channel();
+            let _ = std::mem::replace(&mut request.sender, sender).send(PairResult {
+                request_id: *request_id,
+                connection: None,
+                connection_resume_token: None,
+                error: Some("Relay未声明长授权码协议22，请升级配套Relay".into()),
+                error_code: Some(PairingErrorCode::UnsupportedMode),
+            });
+            return false;
+        }
+        if request.expected_agent_id.is_some()
+            && !inner.test_pairing_supported.load(Ordering::Acquire)
+        {
+            let (sender, _) = oneshot::channel();
+            let _ = std::mem::replace(&mut request.sender, sender).send(PairResult {
+                request_id: *request_id,
+                connection: None,
+                connection_resume_token: None,
+                error: Some("Relay 不支持核对预期 Agent 身份，请更新 Relay".into()),
+                error_code: Some(PairingErrorCode::UnsupportedMode),
+            });
+            return false;
+        }
+        true
+    });
     for (request_id, request) in pending.iter_mut() {
         if request.last_sent_generation == Some(generation) {
             continue;
         }
         let message = WireMessage::PairRequest(remoteops_protocol::PairRequest {
+            expected_agent_id: request.expected_agent_id,
             request_id: *request_id,
             pairing_code: Some(request.pairing_code.clone()),
             expected_session_id: None,
@@ -1415,6 +1999,7 @@ async fn send_recoverable_pairings(
         pending.insert(request_id, (pairing_code.clone(), session_id));
         if sender
             .send(WireMessage::PairRequest(remoteops_protocol::PairRequest {
+                expected_agent_id: None,
                 request_id,
                 pairing_code,
                 expected_session_id: Some(session_id),
@@ -1449,13 +2034,14 @@ async fn run_transport_io<R, W>(
     reader: R,
     writer: W,
     receiver: mpsc::UnboundedReceiver<WireMessage>,
+    tcp_receiver: mpsc::Receiver<WireMessage>,
 ) -> Result<(), ApplicationError>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut reader_task = tokio::spawn(read_transport_messages(inner, reader));
-    let mut writer_task = tokio::spawn(write_transport_messages(writer, receiver));
+    let mut writer_task = tokio::spawn(write_transport_messages(writer, receiver, tcp_receiver));
 
     tokio::select! {
         result = &mut reader_task => {
@@ -1497,11 +2083,17 @@ where
 async fn write_transport_messages<W>(
     mut writer: W,
     mut receiver: mpsc::UnboundedReceiver<WireMessage>,
+    mut tcp_receiver: mpsc::Receiver<WireMessage>,
 ) -> Result<(), ApplicationError>
 where
     W: AsyncWrite + Unpin,
 {
-    while let Some(message) = receiver.recv().await {
+    loop {
+        let message = tokio::select! {
+            Some(message) = receiver.recv() => message,
+            Some(message) = tcp_receiver.recv() => message,
+            else => break,
+        };
         write_frame(&mut writer, &message)
             .await
             .map_err(|error| ApplicationError::Transport(error.to_string()))?;
@@ -1537,6 +2129,15 @@ async fn set_transport_disconnected(inner: &ClientInner, cause: Option<Applicati
 }
 
 async fn fail_pending_requests(inner: &ClientInner, message: &str) {
+    inner.tool_center.disconnect();
+    let guide_pending = std::mem::take(&mut *inner.guide_pending.lock().await);
+    for (_, sender) in guide_pending {
+        let _ = sender.send(Err(ApplicationError::Transport(message.to_owned())));
+    }
+    let tcp_pending = std::mem::take(&mut *inner.tcp_open_pending.lock().await);
+    for (_, sender) in tcp_pending {
+        let _ = sender.send(Err(ApplicationError::Transport(message.to_owned())));
+    }
     inner.control_states.lock().await.clear();
     inner.control_pending.lock().await.clear();
     let pending = std::mem::take(&mut *inner.pending.lock());
@@ -1566,7 +2167,62 @@ fn set_connected(sender: &watch::Sender<bool>, connected: bool) {
 
 #[allow(clippy::too_many_lines)]
 async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
+    if inner.tool_center.handle(&message) {
+        return;
+    }
     match message {
+        WireMessage::Desktop(event) => {
+            let _ = inner.desktop_events.send(event);
+        }
+        message @ (WireMessage::TcpForwardV2(_)
+        | WireMessage::TcpForwardPolicyResponse { .. }
+        | WireMessage::TcpForwardData { .. }
+        | WireMessage::TcpForwardClose { .. }) => {
+            let _ = inner.tcp_events.send(message);
+        }
+        message @ WireMessage::TcpForwardOpened { request_id, .. } => {
+            let _ = inner.tcp_events.send(message.clone());
+            if let Some(sender) = inner.tcp_open_pending.lock().await.remove(&request_id) {
+                match &message {
+                    WireMessage::TcpForwardOpened {
+                        error: Some(error), ..
+                    } => {
+                        let _ = sender.send(Err(ApplicationError::Remote {
+                            code: "tcp_forward_open_failed".into(),
+                            message: error.clone(),
+                        }));
+                    }
+                    _ => {
+                        let _ = sender.send(Ok(message));
+                    }
+                }
+            }
+        }
+        WireMessage::GlobalGuideResponse {
+            request_id,
+            guide,
+            error,
+        } => {
+            let result = match (guide, error) {
+                (Some(guide), None) => {
+                    *inner
+                        .global_guide
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = guide.clone();
+                    Ok(guide)
+                }
+                (_, Some(error)) => Err(ApplicationError::Remote {
+                    code: "global_guide_unavailable".into(),
+                    message: error,
+                }),
+                _ => Err(ApplicationError::Transport(
+                    "Relay 返回空的全局指引响应".into(),
+                )),
+            };
+            if let Some(sender) = inner.guide_pending.lock().await.remove(&request_id) {
+                let _ = sender.send(result);
+            }
+        }
         WireMessage::ControlStateUpdated(state) => {
             cache_control_state(inner, state).await;
         }
@@ -1595,7 +2251,7 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
             if let Some(pending) = manual {
                 if result.error.is_none()
                     && result.error_code.is_none()
-                    && let Some(connection) = result.connection.clone()
+                    && let Some(mut connection) = result.connection.clone()
                 {
                     if pending.excluded_sessions.contains(&connection.session_id) {
                         result.connection = None;
@@ -1611,6 +2267,9 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
                     }
                     // 先在副本中分配序号和别名；接收端仍在等待时才同步提交连接和恢复目标。
                     let mut registry = core.registry.clone();
+                    if connection.state != ConnectionState::Online {
+                        clear_runtime_paths(&mut connection);
+                    }
                     result.connection = Some(registry.upsert(connection.clone()));
                     let resume_token = result.connection_resume_token.clone();
                     if pending.sender.send(result).is_ok() {
@@ -1689,8 +2348,10 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
                 let mut pending = inner.pending.lock();
                 take_matching_pending(&mut pending, response.request_id, response.session_id)
             };
-            let sender = match pending {
-                PendingResponseMatch::Matched(pending) => pending.sender,
+            let (sender, resource_operation) = match pending {
+                PendingResponseMatch::Matched(pending) => {
+                    (pending.sender, pending.resource_operation)
+                }
                 PendingResponseMatch::SessionMismatch(expected_session_id) => {
                     warn!(
                         request_id = %response.request_id,
@@ -1733,7 +2394,9 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
                     occurred_at: Utc::now(),
                 });
             }
-            let result = if let Some(code) = response.error_code.clone() {
+            let result = if let Some(code) = response.error_code.clone()
+                && !resource_operation
+            {
                 Err(ApplicationError::Remote {
                     code,
                     message: response.summary.clone(),
@@ -1788,25 +2451,7 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
             inner.control_states.lock().await.remove(&session_id);
             forget_session_pairing(inner, session_id).await;
             let _ = inner.core.lock().await.remove_connection(session_id);
-            let pending = {
-                let mut pending = inner.pending.lock();
-                let request_ids = pending
-                    .iter()
-                    .filter_map(|(request_id, entry)| {
-                        (entry.session_id == session_id).then_some(*request_id)
-                    })
-                    .collect::<Vec<_>>();
-                request_ids
-                    .into_iter()
-                    .filter_map(|request_id| pending.remove(&request_id))
-                    .collect::<Vec<_>>()
-            };
-            for pending in pending {
-                let _ = pending.sender.send(Err(ApplicationError::Remote {
-                    code: "connection_removed".to_owned(),
-                    message: reason.clone(),
-                }));
-            }
+            fail_session_pending(inner, session_id, "connection_removed", &reason);
         }
         WireMessage::Error {
             code,
@@ -1825,6 +2470,29 @@ async fn handle_wire_message(inner: &ClientInner, message: WireMessage) {
     }
 }
 
+// 会话关闭只结束该目标的等待者；先移出锁再交付，避免影响其他目标和迟到回执。
+fn fail_session_pending(inner: &ClientInner, session_id: SessionId, code: &str, message: &str) {
+    let pending = {
+        let mut pending = inner.pending.lock();
+        let request_ids = pending
+            .iter()
+            .filter_map(|(request_id, entry)| {
+                (entry.session_id == session_id).then_some(*request_id)
+            })
+            .collect::<Vec<_>>();
+        request_ids
+            .into_iter()
+            .filter_map(|request_id| pending.remove(&request_id))
+            .collect::<Vec<_>>()
+    };
+    for pending in pending {
+        let _ = pending.sender.send(Err(ApplicationError::Remote {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        }));
+    }
+}
+
 /// 同一绑定只接受更新修订；传输重建时缓存由断线清理。
 async fn cache_control_state(inner: &ClientInner, state: SessionControlState) {
     let mut states = inner.control_states.lock().await;
@@ -1837,7 +2505,15 @@ async fn cache_control_state(inner: &ClientInner, state: SessionControlState) {
     }) {
         return;
     }
-    states.insert(state.session_id, state);
+    let changed_generation = states
+        .get(&state.session_id)
+        .is_some_and(|old| old.agent_generation != state.agent_generation);
+    let session_id = state.session_id;
+    states.insert(session_id, state);
+    drop(states);
+    if changed_generation {
+        inner.core.lock().await.invalidate_runtime_paths(session_id);
+    }
 }
 
 fn outgoing_approval_state(request: &RemoteRequest) -> ApprovalState {
@@ -1865,8 +2541,25 @@ fn take_matching_pending(
     }
 }
 
+/// 仅采信已验证版本的结构化能力，不从产品文本推断。
+fn resource_tools_supported(context: &TargetContext) -> bool {
+    context.schema_version == remoteops_domain::TARGET_CONTEXT_SCHEMA_VERSION
+        && context.capabilities.iter().any(|status| {
+            status.capability == "resource_tools_v1"
+                && status.status == remoteops_domain::CapabilityAvailability::Available
+        })
+}
+
 fn audit_operation(operation: &RemoteOperation) -> String {
     match operation {
+        RemoteOperation::CallResourceTool {
+            instance_id,
+            tool_name,
+            arguments,
+        } => format!(
+            "call_resource_tool instance_id={instance_id} tool_name={tool_name} arguments_sha256={}",
+            sha256_bytes(arguments.to_string().as_bytes())
+        ),
         RemoteOperation::GetTargetContext => "get_target_context".to_owned(),
         RemoteOperation::RunCommand {
             shell,
@@ -2052,10 +2745,198 @@ mod tests {
         (core, session_id)
     }
 
+    fn context_with_runtime_paths(root: &str) -> TargetContext {
+        TargetContext {
+            transfer_root: Some(root.to_owned()),
+            ssh_trust_cli: Some(format!("{root}/RemoteOps.exe")),
+            ..TargetContext::default()
+        }
+    }
+
+    #[test]
+    fn runtime_paths_refresh_only_the_requested_online_target() {
+        let mut core = ControllerCore::default();
+        let mut first = test_connection(SessionId::new(), ConnectionState::Online);
+        first.credential_encryption_key_id = "first-key".into();
+        first.target_context = Some(context_with_runtime_paths("/first/old"));
+        let mut second = test_connection(SessionId::new(), ConnectionState::Online);
+        second.target_context = Some(context_with_runtime_paths("/second"));
+        core.upsert_connection(first.clone());
+        core.upsert_connection(second.clone());
+        core.invalidate_runtime_paths(first.session_id);
+        assert!(
+            core.get_connection(first.session_id)
+                .unwrap()
+                .target_context
+                .as_ref()
+                .unwrap()
+                .transfer_root
+                .is_none()
+        );
+        assert_eq!(
+            core.get_connection(second.session_id)
+                .unwrap()
+                .target_context,
+            second.target_context
+        );
+        let fresh = context_with_runtime_paths("/first/new");
+        assert_eq!(
+            core.cache_refreshed_context(&first, fresh.clone()).unwrap(),
+            fresh
+        );
+        assert_eq!(
+            core.get_connection(first.session_id)
+                .unwrap()
+                .target_context
+                .as_ref(),
+            Some(&fresh)
+        );
+        assert_eq!(
+            core.get_connection(second.session_id)
+                .unwrap()
+                .target_context,
+            second.target_context
+        );
+    }
+
+    #[test]
+    fn runtime_paths_are_unknown_after_disconnect_replacement_or_legacy_update() {
+        let mut core = ControllerCore::default();
+        let mut connection = test_connection(SessionId::new(), ConnectionState::Online);
+        connection.target_context = Some(context_with_runtime_paths("/active"));
+        core.upsert_connection(connection.clone());
+        core.mark_all_reconnecting();
+        let stale = core
+            .get_connection(connection.session_id)
+            .unwrap()
+            .target_context
+            .as_ref()
+            .unwrap();
+        assert!(stale.transfer_root.is_none());
+        assert!(stale.ssh_trust_cli.is_none());
+        assert!(
+            core.cache_refreshed_context(&connection, context_with_runtime_paths("/late"))
+                .is_err()
+        );
+        for change_identity in [false, true] {
+            let mut replacement = connection.clone();
+            if change_identity {
+                replacement.agent_instance_id = AgentInstanceId::new();
+            } else {
+                replacement.credential_encryption_key_id = "new-process-key".into();
+            }
+            core.upsert_connection(replacement);
+            assert!(
+                core.cache_refreshed_context(&connection, context_with_runtime_paths("/late"))
+                    .is_err()
+            );
+        }
+        let mut legacy = connection.clone();
+        legacy.target_context = Some(TargetContext::default());
+        core.upsert_connection(legacy);
+        assert!(
+            core.get_connection(connection.session_id)
+                .unwrap()
+                .target_context
+                .as_ref()
+                .unwrap()
+                .transfer_root
+                .is_none()
+        );
+        connection.state = ConnectionState::Offline;
+        let offline = core.upsert_connection(connection);
+        assert!(offline.target_context.unwrap().ssh_trust_cli.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_paths_agent_generation_change_invalidates_only_its_session() {
+        let inner = transport_test_inner();
+        let mut state = control_fixture();
+        let mut first = test_connection(state.session_id, ConnectionState::Online);
+        first.target_context = Some(context_with_runtime_paths("/first"));
+        let mut second = test_connection(SessionId::new(), ConnectionState::Online);
+        second.target_context = Some(context_with_runtime_paths("/second"));
+        inner.core.lock().await.upsert_connection(first.clone());
+        inner.core.lock().await.upsert_connection(second.clone());
+        cache_control_state(&inner, state.clone()).await;
+        state.revision += 1;
+        cache_control_state(&inner, state.clone()).await;
+        assert_eq!(
+            inner
+                .core
+                .lock()
+                .await
+                .get_connection(first.session_id)
+                .unwrap()
+                .target_context,
+            first.target_context
+        );
+        state.agent_generation += 1;
+        cache_control_state(&inner, state).await;
+        let core = inner.core.lock().await;
+        let context = core
+            .get_connection(first.session_id)
+            .unwrap()
+            .target_context
+            .as_ref()
+            .unwrap();
+        assert!(context.transfer_root.is_none());
+        assert!(context.ssh_trust_cli.is_none());
+        assert_eq!(
+            core.get_connection(second.session_id)
+                .unwrap()
+                .target_context,
+            second.target_context
+        );
+    }
+
+    #[tokio::test]
+    async fn pinning_pair_request_requires_relay_support() {
+        let inner = transport_test_inner();
+        let agent = remoteops_domain::AgentInstanceId::new();
+        let request_id = RequestId::new();
+        let (wire, mut output) = mpsc::unbounded_channel();
+        let insert = |sender| PendingPairRequest {
+            expected_agent_id: Some(agent),
+            pairing_code: AccessCode::parse("123456789").unwrap(),
+            excluded_sessions: BTreeSet::new(),
+            last_sent_generation: None,
+            sender,
+        };
+        let (reply, result) = oneshot::channel();
+        inner
+            .pair_pending
+            .lock()
+            .await
+            .insert(request_id, insert(reply));
+        assert!(send_pending_pairings(&inner, &wire, 1).await);
+        assert!(output.try_recv().is_err());
+        assert_eq!(
+            result.await.unwrap().error_code,
+            Some(PairingErrorCode::UnsupportedMode)
+        );
+        inner.test_pairing_supported.store(true, Ordering::Release);
+        let (reply, _result) = oneshot::channel();
+        inner
+            .pair_pending
+            .lock()
+            .await
+            .insert(request_id, insert(reply));
+        assert!(send_pending_pairings(&inner, &wire, 2).await);
+        assert!(matches!(
+            output.try_recv().unwrap(),
+            WireMessage::PairRequest(request) if request.expected_agent_id == Some(agent)
+        ));
+    }
+
     fn transport_test_inner() -> Arc<ClientInner> {
         let (connected, _) = watch::channel(false);
         let (events, _) = broadcast::channel(16);
         Arc::new(ClientInner {
+            guide_supported: std::sync::atomic::AtomicBool::new(false),
+            test_pairing_supported: std::sync::atomic::AtomicBool::new(false),
+            bridge_protocol_version: AtomicU64::new(0),
+            tcp_forward_version: AtomicU64::new(0),
             config: RelayClientConfig {
                 relay_address: "127.0.0.1:7443".to_owned(),
                 server_name: "localhost".to_owned(),
@@ -2073,6 +2954,15 @@ mod tests {
             host_identity: remoteops_host_identity::HostIdentity::default(),
             transport: Mutex::new(None),
             transport_generation: AtomicU64::new(0),
+            resource_tools_schema_version: AtomicU64::new(0),
+            tool_center: tool_center_client::ToolCenterClientState::default(),
+            release_catalog: std::sync::RwLock::default(),
+            global_guide: Arc::new(std::sync::RwLock::new(GlobalGuide::default())),
+            guide_pending: Mutex::new(BTreeMap::new()),
+            tcp_open_pending: Mutex::new(BTreeMap::new()),
+            tcp_events: broadcast::channel(16).0,
+            desktop_events: broadcast::channel(128).0,
+            desktop_version: AtomicU64::new(0),
             connected,
             core: Mutex::new(ControllerCore::default()),
             pending: Arc::new(PendingRegistry::default()),
@@ -2113,6 +3003,7 @@ mod tests {
 
     fn control_fixture() -> SessionControlState {
         SessionControlState {
+            initialization_pending: false,
             session_id: SessionId::new(),
             agent_generation: 2,
             controller_id: remoteops_domain::ControllerInstanceId::new(),
@@ -2211,6 +3102,7 @@ mod tests {
         let mut pending = BTreeMap::from([(
             request_id,
             PendingRemoteResponse {
+                resource_operation: false,
                 session_id: expected_session_id,
                 sender,
             },
@@ -2268,9 +3160,7 @@ mod tests {
             inner: inner.clone(),
         };
         let pairing =
-            tokio::spawn(
-                async move { client.pair(PairingCode::parse("123456789").unwrap()).await },
-            );
+            tokio::spawn(async move { client.pair(AccessCode::parse("123456789").unwrap()).await });
         let WireMessage::PairRequest(first) = first_transport.recv().await.unwrap() else {
             panic!("应为首次配对")
         };
@@ -2294,6 +3184,7 @@ mod tests {
         );
         let (sender, mut second_transport) = mpsc::unbounded_channel();
         *inner.transport.lock().await = Some(ActiveTransport {
+            tcp_sender: mpsc::channel(32).0,
             generation: 2,
             sender: sender.clone(),
         });
@@ -2339,9 +3230,7 @@ mod tests {
             inner: inner.clone(),
         };
         let pairing =
-            tokio::spawn(
-                async move { client.pair(PairingCode::parse("123456789").unwrap()).await },
-            );
+            tokio::spawn(async move { client.pair(AccessCode::parse("123456789").unwrap()).await });
         tokio::task::yield_now().await;
         tokio::time::advance(TokioDuration::from_secs(20)).await;
         assert!(matches!(
@@ -2365,6 +3254,7 @@ mod tests {
             inner.core.lock().await.upsert_connection(connection);
             let (sender, mut receiver) = mpsc::unbounded_channel();
             *inner.transport.lock().await = Some(ActiveTransport {
+                tcp_sender: mpsc::channel(32).0,
                 generation: 1,
                 sender,
             });
@@ -2372,6 +3262,162 @@ mod tests {
             assert!(matches!(client.refresh_target_context(session_id).await,
                 Err(ApplicationError::Remote { code, .. }) if code == "unsupported_mode"));
             assert!(receiver.try_recv().is_err(), "旧Agent不能接收到新操作");
+        }
+    }
+
+    #[tokio::test]
+    async fn context_refresh_caches_live_reply_and_rejects_late_generation_reply() {
+        for change in ["none", "transport", "agent"] {
+            let inner = transport_test_inner();
+            let session_id = SessionId::new();
+            let mut connection = test_connection(session_id, ConnectionState::Online);
+            connection.environment.protocol_version = 18;
+            connection.target_context = Some(context_with_runtime_paths("/old"));
+            inner.core.lock().await.upsert_connection(connection);
+            let (sender, mut outgoing) = mpsc::unbounded_channel();
+            *inner.transport.lock().await = Some(ActiveTransport {
+                tcp_sender: mpsc::channel(32).0,
+                generation: 1,
+                sender,
+            });
+            inner.transport_generation.store(1, Ordering::Release);
+            let client = RelayClient {
+                inner: inner.clone(),
+            };
+            let refresh =
+                tokio::spawn(async move { client.refresh_target_context(session_id).await });
+            let request = match outgoing.recv().await.unwrap() {
+                WireMessage::RemoteRequest(request) => request,
+                other => panic!("意外消息 {other:?}"),
+            };
+            assert!(matches!(
+                request.operation,
+                RemoteOperation::GetTargetContext
+            ));
+            assert!(
+                inner
+                    .core
+                    .lock()
+                    .await
+                    .get_connection(session_id)
+                    .unwrap()
+                    .target_context
+                    .as_ref()
+                    .unwrap()
+                    .transfer_root
+                    .is_none()
+            );
+            if change == "transport" {
+                inner.transport_generation.store(2, Ordering::Release);
+            } else if change == "agent" {
+                let mut state = control_fixture();
+                state.session_id = session_id;
+                cache_control_state(&inner, state).await;
+            }
+            let context = context_with_runtime_paths("/actual/live");
+            let mut response = successful_response(request.request_id, session_id);
+            response.details = Some(serde_json::to_value(&context).unwrap());
+            handle_wire_message(&inner, WireMessage::RemoteResponse(response)).await;
+            let result = refresh.await.unwrap();
+            let core = inner.core.lock().await;
+            let cached = core
+                .get_connection(session_id)
+                .unwrap()
+                .target_context
+                .as_ref()
+                .unwrap();
+            if change == "none" {
+                assert_eq!(result.unwrap(), context);
+                assert_eq!(cached, &context);
+            } else {
+                assert!(matches!(result, Err(ApplicationError::Transport(_))));
+                assert!(cached.transfer_root.is_none());
+                assert!(cached.ssh_trust_cli.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn context_refresh_rechecks_generation_after_waiting_for_core_mutex() {
+        for change in ["agent", "transport", "disconnect"] {
+            let inner = transport_test_inner();
+            let session_id = SessionId::new();
+            let mut connection = test_connection(session_id, ConnectionState::Online);
+            connection.environment.protocol_version = 18;
+            connection.target_context = Some(context_with_runtime_paths("/old"));
+            inner.core.lock().await.upsert_connection(connection);
+            let mut initial_state = control_fixture();
+            initial_state.session_id = session_id;
+            cache_control_state(&inner, initial_state.clone()).await;
+            let (sender, mut outgoing) = mpsc::unbounded_channel();
+            *inner.transport.lock().await = Some(ActiveTransport {
+                tcp_sender: mpsc::channel(32).0,
+                generation: 1,
+                sender,
+            });
+            inner.transport_generation.store(1, Ordering::Release);
+            let client = RelayClient {
+                inner: inner.clone(),
+            };
+            let mut refresh = Box::pin(client.refresh_target_context(session_id));
+            // 直接轮询真实 refresh 到待接收响应，不依赖 sleep 或线程调度猜测。
+            let request = tokio::select! {
+                biased;
+                result = &mut refresh => panic!("尚无回执：{result:?}"),
+                message = outgoing.recv() => match message.unwrap() {
+                    WireMessage::RemoteRequest(request) => request,
+                    other => panic!("意外消息：{other:?}"),
+                },
+            };
+            let core_guard = inner.core.lock().await;
+            let mut response = successful_response(request.request_id, session_id);
+            response.details =
+                Some(serde_json::to_value(context_with_runtime_paths("/late")).unwrap());
+            handle_wire_message(&inner, WireMessage::RemoteResponse(response)).await;
+            // biased 保证先轮询 refresh；它必须在实际 core mutex 上排队。
+            tokio::select! {
+                biased;
+                result = &mut refresh => panic!("core 被持有时不应提交：{result:?}"),
+                () = std::future::ready(()) => {},
+            }
+            initial_state.agent_generation += 1;
+            let mut state_update = Box::pin(cache_control_state(&inner, initial_state));
+            if change == "agent" {
+                // 状态已更新为新代，再在 refresh 之后排队清理同一个 core。
+                tokio::select! {
+                    biased;
+                    () = &mut state_update => panic!("core 被持有时清理不应完成"),
+                    () = std::future::ready(()) => {},
+                }
+                assert_eq!(
+                    inner
+                        .control_states
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .unwrap()
+                        .agent_generation,
+                    3
+                );
+            } else if change == "transport" {
+                inner.transport_generation.store(2, Ordering::Release);
+            } else {
+                *inner.transport.lock().await = None;
+            }
+            drop(core_guard);
+            assert!(matches!(refresh.await, Err(ApplicationError::Transport(_))));
+            if change == "agent" {
+                state_update.await;
+            }
+            let core = inner.core.lock().await;
+            let cached = core
+                .get_connection(session_id)
+                .unwrap()
+                .target_context
+                .as_ref()
+                .unwrap();
+            assert!(cached.transfer_root.is_none());
+            assert!(cached.ssh_trust_cli.is_none());
         }
     }
 
@@ -2384,7 +3430,8 @@ mod tests {
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
-                pairing_code: PairingCode::parse("123456789").unwrap(),
+                expected_agent_id: None,
+                pairing_code: AccessCode::parse("123456789").unwrap(),
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
                 sender,
@@ -2497,6 +3544,135 @@ mod tests {
     }
 
     #[test]
+    fn resource_operations_gate_old_targets_and_do_not_trust_free_text() {
+        let (mut core, session_id) = core_with_connection();
+        let list = RemoteOperation::ListResourceTools;
+        assert!(matches!(
+            core.prepare_request(session_id, EventSource::Ai, list.clone(), None),
+            Err(ApplicationError::PolicyDenied(_))
+        ));
+        let mut connection = core.get_connection(session_id).unwrap().clone();
+        let mut context = TargetContext {
+            guidance: vec![remoteops_domain::TargetGuidance {
+                text: "resource_tools_v1 available".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        connection.target_context = Some(context.clone());
+        core.upsert_connection(connection.clone());
+        assert!(
+            core.prepare_request(session_id, EventSource::Ai, list.clone(), None)
+                .is_err()
+        );
+        context
+            .capabilities
+            .push(remoteops_domain::TargetCapabilityStatus {
+                capability: "resource_tools_v1".into(),
+                status: remoteops_domain::CapabilityAvailability::Available,
+                reasons: vec![],
+            });
+        connection.target_context = Some(context);
+        connection.environment.protocol_version = 17;
+        core.upsert_connection(connection.clone());
+        assert!(
+            core.prepare_request(session_id, EventSource::Ai, list.clone(), None)
+                .is_err()
+        );
+        connection.environment.protocol_version = 18;
+        core.upsert_connection(connection);
+        assert!(
+            core.prepare_request(session_id, EventSource::Ai, list, None)
+                .is_ok()
+        );
+        let call = RemoteOperation::CallResourceTool {
+            instance_id: "fixture".into(),
+            tool_name: "browser_click".into(),
+            arguments: serde_json::json!({"readonly":true}),
+        };
+        assert!(
+            core.prepare_request(session_id, EventSource::Ai, call.clone(), None)
+                .is_ok()
+        );
+        assert!(matches!(
+            DefaultPolicy::default().evaluate(EventSource::Ai, &call),
+            PolicyDecision::RequireApproval { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resource_relay_gate_rejects_missing_or_unknown_extension_before_transport() {
+        let inner = transport_test_inner();
+        let client = RelayClient {
+            inner: inner.clone(),
+        };
+        for version in [0, 2] {
+            inner
+                .resource_tools_schema_version
+                .store(version, Ordering::Release);
+            assert!(!client.supports_resource_tools());
+            let result = client
+                .start_execute_with_control(
+                    "missing",
+                    EventSource::Ai,
+                    RemoteOperation::ListResourceTools,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(ApplicationError::PolicyDenied(reason)) if reason.contains("Relay"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_failure_response_keeps_retry_metadata_without_changing_other_errors() {
+        for resource_operation in [false, true] {
+            let inner = transport_test_inner();
+            let request_id = RequestId::new();
+            let session_id = SessionId::new();
+            let (sender, receiver) = oneshot::channel();
+            inner.pending.lock().insert(
+                request_id,
+                PendingRemoteResponse {
+                    session_id,
+                    resource_operation,
+                    sender,
+                },
+            );
+            let mut response = successful_response(request_id, session_id);
+            response.error_code = Some("incompatible".into());
+            response.details = Some(
+                serde_json::json!({"code":"incompatible","retry_safe":true,"operation_replay":"never_automatic","diagnostics":{"stage":"initialize","reason":"eof"}}),
+            );
+            handle_wire_message(&inner, WireMessage::RemoteResponse(response.clone())).await;
+            let result = receiver.await.unwrap();
+            if resource_operation {
+                assert_eq!(result.unwrap().details, response.details);
+            } else {
+                assert!(
+                    matches!(result, Err(ApplicationError::Remote { code, .. }) if code == "incompatible")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resource_audit_hashes_call_arguments() {
+        let operation = RemoteOperation::CallResourceTool {
+            instance_id: "instance".into(),
+            tool_name: "browser_type".into(),
+            arguments: serde_json::json!({"text":"synthetic-sensitive-value"}),
+        };
+        let audit = audit_operation(&operation);
+        assert!(audit.contains("arguments_sha256="));
+        assert!(!audit.contains("synthetic-sensitive-value"));
+    }
+
+    #[test]
     fn target_context_gates_visual_operations_before_transport() {
         let (mut core, session_id) = core_with_connection();
         assert!(matches!(core.prepare_request(session_id, EventSource::Ai,
@@ -2601,7 +3777,7 @@ mod tests {
     async fn recoverable_pairing_retries_until_target_is_online() {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
-        let pairing_code = PairingCode::parse("123-456-789").expect("测试控制码应有效");
+        let pairing_code = AccessCode::parse("123-456-789").expect("测试控制码应有效");
         inner
             .known_pairings
             .lock()
@@ -2671,7 +3847,7 @@ mod tests {
         ] {
             let inner = transport_test_inner();
             let session_id = SessionId::new();
-            let pairing_code = PairingCode::parse("123456789").unwrap();
+            let pairing_code = AccessCode::parse("123456789").unwrap();
             inner
                 .known_pairings
                 .lock()
@@ -2710,7 +3886,7 @@ mod tests {
         let inner = transport_test_inner();
         let original_session = SessionId::new();
         let other_session = SessionId::new();
-        let pairing_code = PairingCode::parse("123456789").unwrap();
+        let pairing_code = AccessCode::parse("123456789").unwrap();
         inner
             .known_pairings
             .lock()
@@ -2747,7 +3923,7 @@ mod tests {
     async fn removed_automatic_pairing_discards_its_late_success() {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
-        let pairing_code = PairingCode::parse("123456789").unwrap();
+        let pairing_code = AccessCode::parse("123456789").unwrap();
         inner
             .known_pairings
             .lock()
@@ -2786,11 +3962,12 @@ mod tests {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
         let request_id = RequestId::new();
-        let pairing_code = PairingCode::parse("123456789").unwrap();
+        let pairing_code = AccessCode::parse("123456789").unwrap();
         let (sender, receiver) = oneshot::channel();
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
+                expected_agent_id: None,
                 pairing_code,
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
@@ -2827,11 +4004,12 @@ mod tests {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
         let request_id = RequestId::new();
-        let pairing_code = PairingCode::parse("123456789").unwrap();
+        let pairing_code = AccessCode::parse("123456789").unwrap();
         let (sender, receiver) = oneshot::channel();
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
+                expected_agent_id: None,
                 pairing_code,
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
@@ -2863,7 +4041,8 @@ mod tests {
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
-                pairing_code: PairingCode::parse("123456789").unwrap(),
+                expected_agent_id: None,
+                pairing_code: AccessCode::parse("123456789").unwrap(),
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
                 sender,
@@ -2905,7 +4084,8 @@ mod tests {
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
-                pairing_code: PairingCode::parse("123456789").unwrap(),
+                expected_agent_id: None,
+                pairing_code: AccessCode::parse("123456789").unwrap(),
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
                 sender,
@@ -2985,6 +4165,7 @@ mod tests {
             .insert(session_id, "test-managed-resume".to_owned());
         let (sender, mut receiver) = mpsc::unbounded_channel();
         *inner.transport.lock().await = Some(ActiveTransport {
+            tcp_sender: mpsc::channel(32).0,
             generation: 1,
             sender,
         });
@@ -3033,10 +4214,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_keeps_first_resolved_session_when_alias_changes_between_core_locks() {
+        let inner = transport_test_inner();
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let mut core = inner.core.lock().await;
+        for session in [first, second] {
+            core.upsert_connection(test_connection(session, ConnectionState::Online));
+        }
+        core.set_alias(first, "chosen").unwrap();
+        drop(core);
+        let (sender, mut outgoing) = mpsc::unbounded_channel();
+        *inner.transport.lock().await = Some(ActiveTransport {
+            tcp_sender: mpsc::channel(32).0,
+            generation: 1,
+            sender,
+        });
+        let client = RelayClient {
+            inner: inner.clone(),
+        };
+        let core_guard = inner.core.lock().await;
+        let mut closing = Box::pin(client.close_connection("chosen"));
+        // 第一轮解析先排队，别名变更排在其后；第二次取得 core 时必须固定 UUID。
+        tokio::select! {
+            biased;
+            result = &mut closing => panic!("首次解析必须等待 core：{result:?}"),
+            () = std::future::ready(()) => {},
+        }
+        let mut rename = Box::pin(async {
+            let mut core = inner.core.lock().await;
+            core.set_alias(first, "original-first").unwrap();
+            core.set_alias(second, "chosen").unwrap();
+        });
+        tokio::select! {
+            biased;
+            () = &mut rename => panic!("别名变更必须等待 core"),
+            () = std::future::ready(()) => {},
+        }
+        drop(core_guard);
+        tokio::select! {
+            biased;
+            result = &mut closing => panic!("执行应排在别名变更后：{result:?}"),
+            () = std::future::ready(()) => {},
+        }
+        rename.await;
+        let request = tokio::select! {
+            biased;
+            result = &mut closing => panic!("尚未响应关闭：{result:?}"),
+            message = outgoing.recv() => match message.unwrap() {
+                WireMessage::RemoteRequest(request) => request,
+                other => panic!("意外消息：{other:?}"),
+            },
+        };
+        assert_eq!(
+            inner.core.lock().await.resolve_target("chosen").unwrap(),
+            second
+        );
+        assert_eq!(request.session_id, first);
+        assert_eq!(request.operation, RemoteOperation::CloseConnection);
+        handle_wire_message(
+            &inner,
+            WireMessage::RemoteResponse(successful_response(request.request_id, first)),
+        )
+        .await;
+        let release = tokio::select! {
+            biased;
+            result = &mut closing => panic!("尚未响应释放：{result:?}"),
+            message = outgoing.recv() => match message.unwrap() {
+                WireMessage::ReleaseSessionRequest(request) => request,
+                other => panic!("意外消息：{other:?}"),
+            },
+        };
+        assert_eq!(release.session_id, first);
+        handle_wire_message(
+            &inner,
+            WireMessage::ReleaseSessionResult(ReleaseSessionResult {
+                request_id: release.request_id,
+                session_id: first,
+                released: true,
+                error: None,
+            }),
+        )
+        .await;
+        assert!(closing.await.is_ok());
+        let core = inner.core.lock().await;
+        assert!(core.get_connection(first).is_none());
+        assert!(core.get_connection(second).is_some());
+        assert_eq!(core.resolve_target("chosen").unwrap(), second);
+    }
+
+    #[tokio::test]
+    async fn ordinary_close_finishes_only_its_pending_operations_after_release() {
+        let inner = transport_test_inner();
+        let session_id = SessionId::new();
+        let other_session = SessionId::new();
+        for target in [session_id, other_session] {
+            inner
+                .core
+                .lock()
+                .await
+                .upsert_connection(test_connection(target, ConnectionState::Online));
+        }
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        *inner.transport.lock().await = Some(ActiveTransport {
+            tcp_sender: mpsc::channel(32).0,
+            generation: 1,
+            sender,
+        });
+        let client = RelayClient {
+            inner: inner.clone(),
+        };
+        let mut operations = Vec::new();
+        for target in [session_id, session_id, other_session] {
+            operations.push(
+                client
+                    .start_execute(
+                        &target.to_string(),
+                        EventSource::Ai,
+                        RemoteOperation::GetTargetContext,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert!(matches!(
+                receiver.recv().await,
+                Some(WireMessage::RemoteRequest(_))
+            ));
+        }
+        let other = operations.pop().unwrap();
+        let other_id = other.request_id;
+        let closing =
+            tokio::spawn(async move { client.close_connection(&session_id.to_string()).await });
+        let WireMessage::RemoteRequest(request) = receiver.recv().await.unwrap() else {
+            panic!("应请求关闭 Agent 资源")
+        };
+        assert_eq!(request.operation, RemoteOperation::CloseConnection);
+        handle_wire_message(
+            &inner,
+            WireMessage::RemoteResponse(successful_response(request.request_id, session_id)),
+        )
+        .await;
+        let WireMessage::ReleaseSessionRequest(release) = receiver.recv().await.unwrap() else {
+            panic!("应请求释放普通会话")
+        };
+        assert_eq!(inner.pending.lock().len(), 3, "释放确认之前保留原操作等待");
+        // 普通会话没有 ConnectionRemoved 通知，仅返回实际 release 回执。
+        handle_wire_message(
+            &inner,
+            WireMessage::ReleaseSessionResult(ReleaseSessionResult {
+                request_id: release.request_id,
+                session_id,
+                released: true,
+                error: None,
+            }),
+        )
+        .await;
+        assert!(closing.await.unwrap().is_ok());
+        assert_eq!(inner.pending.lock().len(), 1);
+        for operation in operations {
+            let result = tokio::time::timeout(TokioDuration::from_secs(1), operation.wait())
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, Err(ApplicationError::Remote { code, message })
+                if code == "connection_closed" && message.contains("会话已关闭"))
+            );
+        }
+        assert!(inner.core.lock().await.get_connection(session_id).is_none());
+        assert!(
+            inner
+                .core
+                .lock()
+                .await
+                .get_connection(other_session)
+                .is_some()
+        );
+        assert!(inner.pending.lock().contains_key(&other_id));
+        handle_wire_message(
+            &inner,
+            WireMessage::RemoteResponse(successful_response(other_id, other_session)),
+        )
+        .await;
+        assert!(other.wait().await.is_ok(), "其他会话仍能正常完成");
+        assert!(inner.pending.lock().is_empty());
+    }
+
+    #[tokio::test]
     async fn explicit_close_forgets_automatic_recovery_pairing() {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
-        let pairing_code = PairingCode::parse("987-654-321").expect("测试控制码应有效");
+        let pairing_code = AccessCode::parse("987-654-321").expect("测试控制码应有效");
         inner
             .known_pairings
             .lock()
@@ -3059,7 +4429,7 @@ mod tests {
     async fn relay_takeover_notification_removes_connection_and_recovery_state() {
         let inner = transport_test_inner();
         let session_id = SessionId::new();
-        let pairing_code = PairingCode::parse("456-789-123").expect("测试控制码应有效");
+        let pairing_code = AccessCode::parse("456-789-123").expect("测试控制码应有效");
         inner
             .core
             .lock()
@@ -3080,6 +4450,7 @@ mod tests {
         inner.pending.lock().insert(
             request_id,
             PendingRemoteResponse {
+                resource_operation: false,
                 session_id,
                 sender: response_sender,
             },
@@ -3136,7 +4507,8 @@ mod tests {
         inner.pair_pending.lock().await.insert(
             request_id,
             PendingPairRequest {
-                pairing_code: PairingCode::parse("123456789").unwrap(),
+                expected_agent_id: None,
+                pairing_code: AccessCode::parse("123456789").unwrap(),
                 excluded_sessions: BTreeSet::new(),
                 last_sent_generation: None,
                 sender: pair_sender,
@@ -3158,8 +4530,13 @@ mod tests {
         let (controller_stream, mut relay_stream) = duplex(4096);
         let (reader, writer) = tokio::io::split(controller_stream);
         let (outgoing_sender, outgoing_receiver) = mpsc::unbounded_channel();
-        let transport_task =
-            tokio::spawn(run_transport_io(inner, reader, writer, outgoing_receiver));
+        let transport_task = tokio::spawn(run_transport_io(
+            inner,
+            reader,
+            writer,
+            outgoing_receiver,
+            mpsc::channel(32).1,
+        ));
 
         relay_stream
             .write_all(&frame[..2])
@@ -3196,6 +4573,27 @@ mod tests {
         transport_task.abort();
     }
 
+    #[tokio::test]
+    async fn tcp_writer_keeps_backpressure_when_transport_stops_reading() {
+        let (writer, _peer) = duplex(1);
+        let (_sender, receiver) = mpsc::unbounded_channel();
+        let (tcp_sender, tcp_receiver) = mpsc::channel(1);
+        let task = tokio::spawn(write_transport_messages(writer, receiver, tcp_receiver));
+        let message = WireMessage::Heartbeat {
+            sent_at: Utc::now(),
+            controller_modes: Vec::new(),
+        };
+        tcp_sender.send(message.clone()).await.unwrap();
+        tcp_sender.send(message.clone()).await.unwrap();
+        assert!(
+            timeout(TokioDuration::from_millis(50), tcp_sender.send(message))
+                .await
+                .is_err()
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
     async fn queue_test_operation(
         inner: &Arc<ClientInner>,
     ) -> (
@@ -3205,6 +4603,7 @@ mod tests {
     ) {
         let (sender, receiver) = mpsc::unbounded_channel();
         *inner.transport.lock().await = Some(ActiveTransport {
+            tcp_sender: mpsc::channel(32).0,
             generation: 1,
             sender,
         });
@@ -3391,7 +4790,7 @@ mod tests {
         peer.write_all(&[0, 0]).await.unwrap();
         let (reader, writer) = tokio::io::split(stream);
         let (_sender, receiver) = mpsc::unbounded_channel();
-        let cause = run_transport_io(inner.clone(), reader, writer, receiver)
+        let cause = run_transport_io(inner.clone(), reader, writer, receiver, mpsc::channel(32).1)
             .await
             .err();
         assert!(
@@ -3487,5 +4886,41 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ApplicationError::PolicyDenied(_))));
+    }
+}
+
+#[cfg(test)]
+mod resource_wait_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn resource_budget_survives_old_three_minute_deadline_without_replay() {
+        let id = RequestId::new();
+        let session = SessionId::new();
+        let (sender, receiver) = oneshot::channel();
+        let pending = PendingOperation {
+            request_id: id,
+            receiver,
+            registration: PendingRegistration {
+                request_id: id,
+                pending: Arc::new(PendingRegistry::default()),
+            },
+        };
+        let waiter = tokio::spawn(pending.wait_for(TokioDuration::from_secs(915)));
+        tokio::task::yield_now().await;
+        tokio::time::advance(TokioDuration::from_secs(181)).await;
+        assert!(!waiter.is_finished());
+        sender
+            .send(Ok(RemoteResponse {
+                request_id: id,
+                session_id: session,
+                exit_code: Some(0),
+                summary: "ready".into(),
+                error_code: None,
+                payload_base64: None,
+                sha256: None,
+                details: None,
+            }))
+            .unwrap();
+        assert_eq!(waiter.await.unwrap().unwrap().response.request_id, id);
     }
 }

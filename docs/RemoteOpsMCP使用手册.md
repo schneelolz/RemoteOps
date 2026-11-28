@@ -4,25 +4,28 @@
 
 > 文档状态：当前 Codex 操作手册。底层配置原理见[Codex MCP 接入说明](CodexMCP接入说明.md)，不要从历史验收报告复制安装参数。
 
-- 更新日期：2026-10-18
-- 发布状态：`0.2.0-preview.5` Technical Preview
-- MCP 版本：`0.2.0-preview.5`
-- 现场 Agent 版本：`0.2.0-preview.5`
+- 更新日期：2026-11-05
+- 发布状态：本地独立组件发布候选，实际构建与安装结果以交付记录为准
+- MCP 版本：`0.2.0-preview.20`；密码安全输入程序：`0.2.0-preview.6`；协议：19
+- Skill 版本：`0.1.0`，最低 MCP `0.2.0-preview.19`，独立安装、更新和卸载
+- 现场 Agent：按目标实际版本核对；本次拆分不要求更新现有 Agent
 - Relay：由部署者配置
 - 控制码生命周期说明适用于协议 17 配套构建；下列历史发布包示例不能证明已包含本次变更，实际可用版本、测试和部署状态以交付清单为准。
 
 ## 一、推荐安装方式
 
-Windows x64 安装包：
+Windows x64 的 MCP 与 Skill 分别安装；首次部署可使用组合包。版本、Y 盘目录、只更新 Skill 的方式及生效要求见 [MCP 与 Skill 独立发布规范](mcp-skill-release.md)。MCP 安装器不再代为安装或覆盖 Skill。
+
+Windows x64 MCP 安装包：
 
 ```text
-artifacts\release\0.2.0-preview.5\mcp\RemoteOps-MCP-Windows-x64-0.2.0-preview.5.zip
+RemoteOps-MCP-Windows-x64-0.2.0-preview.20.zip
 ```
 
 请先从管理员取得设置文件，解压后运行 `Install-RemoteOpsMcp.ps1 -SetupFile <设置文件路径>`；只有设置码时使用 `-SetupCode` 隐藏输入。安装后的默认程序和配置位置为：
 
 ```text
-%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.12.exe
+%USERPROFILE%\.codex\remoteops\remoteops-controller-mcp-0.2.0-preview.20.exe
 %USERPROFILE%\.codex\remoteops\controller-config.json
 %USERPROFILE%\.codex\config.toml
 ```

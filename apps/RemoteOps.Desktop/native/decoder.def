@@ -1,0 +1,5 @@
+LIBRARY remoteops_view_decoder
+EXPORTS
+    ro_codec_new
+    ro_codec_free
+    ro_decode

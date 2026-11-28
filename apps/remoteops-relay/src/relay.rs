@@ -1,7 +1,15 @@
 #[path = "relay_control.rs"]
 mod control;
+#[path = "relay_desktop.rs"]
+mod desktop;
 #[path = "relay_portal.rs"]
 mod portal_access;
+#[path = "relay_tcp_forward.rs"]
+mod tcp;
+#[path = "relay_tools.rs"]
+mod tools;
+#[path = "relay_visual_context.rs"]
+mod visual_context;
 use control::{broadcast_control_state, refresh_control_state};
 use remoteops_protocol::{
     ControlBasis, ControlSource, ControlStateRequest, ControlStateResult, SessionControlState,
@@ -20,8 +28,8 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_ha
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
 use remoteops_domain::{
-    AgentBootId, AgentInstanceId, ApprovalId, ApprovalState, ConnectionDescriptor, ConnectionState,
-    ControllerInstanceId, ControllerOwnerId, EventSource, PairingCode, PairingLease,
+    AccessCode, AgentBootId, AgentInstanceId, ApprovalId, ApprovalState, ConnectionDescriptor,
+    ConnectionState, ControllerInstanceId, ControllerOwnerId, EventSource, PairingLease,
     PermissionMode, RemoteOperation, RequestId, SessionId, SessionRole,
 };
 use remoteops_enrollment_store::{EnrollmentStore, StoreError};
@@ -31,9 +39,9 @@ use remoteops_protocol::{
     AgentHello, AgentLeaseRenewed, AgentResumeCommitted, AgentWelcome, ApprovalDecision,
     ApprovalRequest, ApprovalResult, AuthorizedRemoteRequest, ClientHello, ControllerBinding,
     ControllerControlMode, ControllerControlModeUpdate, ControllerHello, ControllerKind,
-    PROTOCOL_VERSION, PairRequest, PairResult, PairingErrorCode, PairingMode, RelayAuthorization,
-    ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest, WireMessage, read_frame,
-    write_frame,
+    GlobalGuide, PROTOCOL_VERSION, PairRequest, PairResult, PairingErrorCode, PairingMode,
+    RelayAuthorization, ReleaseSessionRequest, ReleaseSessionResult, RemoteRequest, WireMessage,
+    read_frame, write_frame,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,6 +62,7 @@ const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const CLIENT_HELLO_TIMEOUT: time::Duration = time::Duration::from_secs(10);
 const CONTROLLER_IDLE_TIMEOUT: time::Duration = time::Duration::from_secs(45);
 const MAX_REGISTERED_AGENTS: usize = 1024;
+const TEST_PAIRING_RETENTION: Duration = Duration::hours(2);
 const UNPAIRED_AGENT_RETENTION: Duration = Duration::hours(24);
 const MAX_AUDIT_EVENTS: usize = 1_000;
 // 未完成令牌交接时限制连续启动次数，防止退役标识无限积累。
@@ -110,8 +119,11 @@ where
 // 握手确认、在线及历史启动状态是互相独立的持久事实。
 #[allow(clippy::struct_excessive_bools)]
 struct AgentRecord {
+    // 单条 Agent 连接的实时报备，不写入握手或持久化状态。
+    visual_context: visual_context::VisualContext,
     hello: AgentHello,
     lease: PairingLease,
+    test_pairing: Option<TestPairingLease>,
     resume_token: Option<String>,
     previous_resume_token: Option<PreviousResumeToken>,
     pending_resume: Option<PendingResume>,
@@ -133,6 +145,13 @@ struct AgentRecord {
     lease_expired: bool,
     /// Agent 本地用户选择的会话级权限，不持久化。
     permission_mode: PermissionMode,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TestPairingLease {
+    fingerprint: String,
+    code: AccessCode,
+    expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -164,6 +183,8 @@ struct ControllerRecord {
 
 #[derive(Clone)]
 struct SessionBinding {
+    // 本次配对时核验的安装授权，不跨配对缓存。
+    installation_grant: Option<bool>,
     controller_id: ControllerInstanceId,
     owner_id: ControllerOwnerId,
     controller_kind: ControllerKind,
@@ -185,10 +206,26 @@ struct SessionBindings {
     human: Option<SessionBinding>,
     ai: Option<SessionBinding>,
     human_takeover: bool,
+    // 桌面输入授权由当前媒体流持有，流关闭时独立释放。
+    desktop_takeover: bool,
+    // 人工交还后，AI 必须在本次绑定中取得一份新的现场观察。
+    visual_handoff: VisualHandoff,
     managed_connection_id: Option<Uuid>,
 }
 
+#[derive(Default)]
+enum VisualHandoff {
+    #[default]
+    Ready,
+    ObserveAgain,
+    Waiting(RequestId),
+}
+
 impl SessionBindings {
+    fn taken_over(&self) -> bool {
+        self.human_takeover || self.desktop_takeover
+    }
+
     fn permission_mode(&self) -> PermissionMode {
         self.active_controller_kind()
             .map_or(self.agent_permission_mode, |kind| {
@@ -202,7 +239,7 @@ impl SessionBindings {
             .map_or(PermissionMode::ApprovalRequired, |binding| {
                 minimum_permission_mode(binding.permission_mode, self.agent_permission_mode)
             });
-        if kind == ControllerKind::Ai && self.human_takeover {
+        if kind == ControllerKind::Ai && self.taken_over() {
             PermissionMode::ReadOnly
         } else {
             permission_mode
@@ -210,7 +247,7 @@ impl SessionBindings {
     }
 
     fn active_controller_kind(&self) -> Option<ControllerKind> {
-        if self.human_takeover && self.human.is_some() {
+        if self.taken_over() && self.human.is_some() {
             Some(ControllerKind::Human)
         } else if self.ai.is_some() {
             Some(ControllerKind::Ai)
@@ -310,6 +347,8 @@ struct RelayApprovalRecord {
 
 #[derive(Clone)]
 struct InFlightRequest {
+    // GetTargetContext 的现场连接代次与查询序号。
+    context_query: Option<(u64, u64)>,
     binding_token: String,
     agent_id: AgentInstanceId,
     session_id: SessionId,
@@ -331,8 +370,12 @@ struct AgentRegistration {
 
 #[derive(Default)]
 struct RelayState {
+    tcp: tcp::TcpState,
+    desktops: BTreeMap<SessionId, desktop::Stream>,
+    global_guide: GlobalGuide,
+    tool_state: tools::ToolRelayState,
     agents: BTreeMap<AgentInstanceId, AgentRecord>,
-    pairing_index: BTreeMap<PairingCode, AgentInstanceId>,
+    pairing_index: BTreeMap<AccessCode, AgentInstanceId>,
     controllers: BTreeMap<ControllerInstanceId, ControllerRecord>,
     session_bindings: BTreeMap<SessionId, SessionBindings>,
     approvals: BTreeMap<ApprovalId, RelayApprovalRecord>,
@@ -373,6 +416,8 @@ struct PersistedAgent {
     managed_target_id: Option<String>,
     /// 控制码和逻辑会话的租约。
     lease: PairingLease,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    test_pairing: Option<TestPairingLease>,
     /// 最近一次已经确认的 Agent 恢复令牌。
     resume_token: Option<String>,
     /// 恢复令牌两阶段确认期间仍可接受的上一个令牌。
@@ -394,6 +439,8 @@ struct PersistedAgent {
 /// Relay 状态文件格式。
 #[derive(Debug, Deserialize, Serialize)]
 struct PersistedRelayState {
+    #[serde(default)]
+    tcp_forward_policy: remoteops_protocol::tcp_forward::TcpForwardPolicy,
     /// 当前状态文件格式版本。
     version: u16,
     /// 已登记的 Agent。
@@ -402,6 +449,8 @@ struct PersistedRelayState {
     audit_log: Vec<AdminAuditEvent>,
     #[serde(default)]
     admin_password_hash: Option<AdminPasswordHash>,
+    #[serde(default)]
+    global_guide: GlobalGuide,
 }
 
 /// Relay 的并发安全业务入口。
@@ -413,8 +462,13 @@ type ShutdownWaiter = (
 type ShutdownWaiters = Arc<Mutex<BTreeMap<RequestId, ShutdownWaiter>>>;
 
 pub struct Relay {
+    rtc_turn: Option<crate::turn::Issuer>,
+    release_catalog: Option<remoteops_protocol::release::ReleaseCatalog>,
     state: Arc<Mutex<RelayState>>,
     state_path: Option<PathBuf>,
+    tool_center: Option<Arc<remoteops_tool_center::ToolCenter>>,
+    tool_catalog_started: std::sync::atomic::AtomicBool,
+    tool_management_leases: tools::ManagementLeases,
     enrollment_store: Option<Arc<EnrollmentStore>>,
     portal_store: Option<Arc<PortalStore>>,
     /// Serializes credential validation + registration against durable revoke + disconnect.
@@ -431,6 +485,68 @@ pub struct Relay {
 }
 
 impl Relay {
+    pub(crate) fn with_turn(mut self, issuer: Option<crate::turn::Issuer>) -> Self {
+        self.rtc_turn = issuer;
+        self
+    }
+
+    pub(crate) fn with_release_catalog(
+        mut self,
+        catalog: Option<remoteops_protocol::release::ReleaseCatalog>,
+    ) -> Self {
+        self.release_catalog = catalog;
+        self
+    }
+
+    /// 返回当前 `RemoteOps` 全局操作指引的只读快照。
+    pub async fn global_guide(&self) -> GlobalGuide {
+        self.state.lock().await.global_guide.clone()
+    }
+
+    /// 管理员更新 `RemoteOps` 全局操作指引，并以独立修订号发布。
+    pub async fn admin_set_global_guide(
+        &self,
+        actor: &str,
+        markdown: String,
+        expected_revision: u64,
+    ) -> anyhow::Result<GlobalGuide> {
+        let mut state = self.state.lock().await;
+        let mut guide = state.global_guide.clone();
+        if expected_revision != guide.revision {
+            bail!("global_guide_conflict：指引已更新，请重新读取并合并");
+        }
+        if markdown == guide.markdown {
+            return Ok(guide);
+        }
+        guide.revision = guide
+            .revision
+            .checked_add(1)
+            .context("全局指引修订号耗尽")?;
+        guide.markdown = markdown;
+        guide.updated_at = Some(Utc::now());
+        validate_global_guide(&guide)?;
+        let previous = std::mem::replace(&mut state.global_guide, guide.clone());
+        let previous_audit = state.audit_log.clone();
+        append_audit(
+            &mut state,
+            "global_guide_update",
+            None,
+            true,
+            actor,
+            if guide.markdown.is_empty() {
+                "已清空 RemoteOps 全局操作指引"
+            } else {
+                "已更新 RemoteOps 全局操作指引"
+            },
+        );
+        if let Err(error) = self.persist_state_locked(&state) {
+            state.global_guide = previous;
+            state.audit_log = previous_audit;
+            return Err(error);
+        }
+        Ok(guide)
+    }
+
     /// 创建 Relay。
     #[must_use]
     pub fn new(
@@ -443,6 +559,9 @@ impl Relay {
         Self {
             state: Arc::new(Mutex::new(RelayState::default())),
             state_path: None,
+            tool_center: None,
+            tool_catalog_started: std::sync::atomic::AtomicBool::new(false),
+            tool_management_leases: Arc::default(),
             enrollment_store: None,
             portal_store: None,
             enrollment_gate: Mutex::new(()),
@@ -458,6 +577,8 @@ impl Relay {
             ai_controller_token,
             policy: DefaultPolicy::default(),
             started_at: Utc::now(),
+            rtc_turn: None,
+            release_catalog: None,
             shutdown_waiters: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -905,6 +1026,7 @@ impl Relay {
             state.in_flight.insert(
                 request_id,
                 InFlightRequest {
+                    context_query: None,
                     binding_token: binding.binding_token.clone(),
                     control_state: None,
                     agent_id: agent.hello.agent_instance_id,
@@ -1153,10 +1275,15 @@ impl Relay {
             ai_controller_token,
         );
         relay.state_path = Some(state_path.clone());
+        relay.tool_center = Some(Arc::new(remoteops_tool_center::ToolCenter::open(
+            state_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("tool-center"),
+        )?));
         let mut restored = RelayState::default();
         load_persisted_state(&state_path, &mut restored)?;
         save_persisted_state(&state_path, &restored)?;
-        relay.state = Arc::new(Mutex::new(restored));
         relay.enrollment_store = Some(Arc::new(EnrollmentStore::open(
             enrollment_database_path(&state_path),
             controller_owner_id,
@@ -1165,6 +1292,8 @@ impl Relay {
             portal_access::portal_database_path(&state_path),
             controller_owner_id,
         )?));
+        relay.reconcile_portal_admin_operations(&mut restored)?;
+        relay.state = Arc::new(Mutex::new(restored));
         Ok(relay)
     }
 
@@ -1318,6 +1447,9 @@ impl Relay {
     {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let hello = read_client_hello(&mut reader, CLIENT_HELLO_TIMEOUT).await?;
+        if let WireMessage::DesktopMedia(ticket) = hello {
+            return self.attach_desktop_media(ticket, reader, writer).await;
+        }
         let (sender, mut receiver, connection_closed) = outbound_channel();
         let writer_closed = connection_closed.clone();
         let writer_task = tokio::spawn(async move {
@@ -1356,10 +1488,17 @@ impl Relay {
     where
         R: AsyncRead + Unpin,
     {
-        if !remoteops_protocol::supports_protocol_version(hello.protocol_version) {
+        let test_pairing = hello.test_key_fingerprint.is_some();
+        if if test_pairing {
+            hello.protocol_version != remoteops_protocol::TEST_PAIRING_AGENT_PROTOCOL_VERSION
+        } else {
+            !remoteops_protocol::supports_protocol_version(hello.protocol_version)
+        } {
             bail!("Agent 协议版本不兼容：{}", hello.protocol_version);
         }
         let agent_id = hello.agent_instance_id;
+        let central_tools = hello.protocol_version >= 19;
+        let package_busy = Arc::new(tokio::sync::Semaphore::new(1));
         let registration = self.register_agent(hello, sender.clone()).await?;
         let connection_generation = registration.connection_generation;
         sender
@@ -1401,6 +1540,9 @@ impl Relay {
                         .finalize_agent_resume(agent_id, connection_generation)
                         .await
                     {
+                        if central_tools {
+                            self.send_tool_catalog(&sender);
+                        }
                         self.forward_connection_update(update).await;
                         info!(
                             agent_instance_id = %agent_id,
@@ -1444,6 +1586,49 @@ impl Relay {
                         &sender,
                     )
                     .await;
+                }
+                Ok(WireMessage::ControllerBindingRevoked {
+                    session_id,
+                    binding_token,
+                }) => {
+                    self.disconnect_binding_from_agent(
+                        agent_id,
+                        connection_generation,
+                        session_id,
+                        &binding_token,
+                    )
+                    .await;
+                }
+                Ok(WireMessage::ControlInitializationComplete { state }) => {
+                    self.complete_control_initialization(agent_id, connection_generation, state)
+                        .await;
+                }
+                Ok(WireMessage::ToolCatalogApplied { revision, error }) if central_tools => {
+                    self.record_catalog_applied(agent_id, connection_generation, revision, error)
+                        .await;
+                }
+                Ok(WireMessage::ToolPackageRequest {
+                    request_id,
+                    sha256,
+                    offset,
+                }) if central_tools => {
+                    self.send_tool_package(
+                        agent_id,
+                        connection_generation,
+                        request_id,
+                        sha256,
+                        offset,
+                        sender.clone(),
+                        package_busy.clone(),
+                    );
+                }
+                Ok(WireMessage::Desktop(event)) => {
+                    self.desktop_agent(agent_id, connection_generation, event)
+                        .await;
+                }
+                Ok(WireMessage::TcpForwardV2(frame)) => {
+                    self.tcp_from_agent(agent_id, connection_generation, frame)
+                        .await;
                 }
                 Ok(WireMessage::AgentPermissionModeChanged(update)) => {
                     self.update_agent_permission_mode(
@@ -1539,7 +1724,15 @@ impl Relay {
         }
         if sender
             .send(WireMessage::ControllerWelcome {
+                test_pairing_supported: true,
+                bridge_protocol_version: Some(remoteops_protocol::BRIDGE_PROTOCOL_VERSION),
+                tcp_forward_version: Some(remoteops_protocol::tcp_forward::TCP_FORWARD_VERSION),
+                desktop_version: Some(1),
+                resource_tools_schema_version: Some(1),
+                tool_center_schema_version: (hello.protocol_version >= 19).then_some(1),
                 protocol_version: hello.protocol_version,
+                global_guide: Some(self.global_guide().await),
+                release_catalog: self.release_catalog.clone(),
             })
             .is_err()
         {
@@ -1547,6 +1740,7 @@ impl Relay {
                 .await;
             bail!("Controller 连接已关闭");
         }
+        let tool_management_busy = Arc::new(tokio::sync::Semaphore::new(1));
         info!(
             controller_instance_id = %controller_id,
             owner_id = %owner_id,
@@ -1572,6 +1766,49 @@ impl Relay {
                 break;
             }
             match message {
+                Ok(WireMessage::GlobalGuideRequest { request_id }) => {
+                    let guide = self.global_guide().await;
+                    let _ = sender.send(WireMessage::GlobalGuideResponse {
+                        request_id,
+                        guide: Some(guide),
+                        error: None,
+                    });
+                }
+                Ok(WireMessage::TcpForwardPolicyRequest {
+                    request_id,
+                    session_id,
+                }) => {
+                    self.query_tcp_policy(
+                        controller_id,
+                        connection_generation,
+                        request_id,
+                        session_id,
+                        &sender,
+                    )
+                    .await;
+                }
+                Ok(WireMessage::Desktop(event)) => {
+                    self.desktop_controller(controller_id, connection_generation, event, &sender)
+                        .await;
+                }
+                Ok(WireMessage::TcpForwardV2(frame)) => {
+                    self.tcp_from_controller(controller_id, connection_generation, frame)
+                        .await;
+                }
+                Ok(WireMessage::ToolCenterRequest {
+                    request_id,
+                    request,
+                }) if hello.protocol_version >= 19 => {
+                    self.dispatch_tool_management(
+                        controller_id,
+                        connection_generation,
+                        request_id,
+                        request,
+                        sender.clone(),
+                        tool_management_busy.clone(),
+                    )
+                    .await;
+                }
                 Ok(WireMessage::ControlStateRequest(request)) => {
                     self.handle_controller_control_state(
                         controller_id,
@@ -1586,6 +1823,23 @@ impl Relay {
                         .pair_controller(controller_id, connection_generation, request)
                         .await;
                     let _ = sender.send(WireMessage::PairResult(result));
+                }
+                Ok(WireMessage::TcpForwardOpen {
+                    request_id,
+                    session_id,
+                    target_host,
+                    target_port,
+                    ..
+                }) => {
+                    let _ = sender.send(WireMessage::TcpForwardOpened {
+                        request_id,
+                        forward_id: request_id,
+                        connection_id: None,
+                        session_id,
+                        target_host,
+                        target_port,
+                        error: Some("旧 TCP 扩展已停用，请更新 MCP/Agent 使用授权转发 v2".into()),
+                    });
                 }
                 Ok(WireMessage::ReleaseSessionRequest(request)) => {
                     let result = self
@@ -1783,6 +2037,7 @@ impl Relay {
         installation_id: Uuid,
     ) -> Result<bool, StoreError> {
         let _gate = self.enrollment_gate.lock().await;
+        self.cancel_tool_management(installation_id).await;
         // Acquire the state lock before committing. No await may intervene between the durable
         // revoke and live cleanup, even if the requesting HTTP connection gets cancelled.
         let mut state = self.state.lock().await;
@@ -1917,7 +2172,7 @@ impl Relay {
             && state
                 .session_bindings
                 .get(&request.session_id)
-                .is_some_and(|bindings| bindings.human_takeover)
+                .is_some_and(SessionBindings::taken_over)
             && !ai_operation_allowed_after_takeover(&self.policy, &operation)
         {
             return approval_failure(
@@ -2101,6 +2356,16 @@ impl Relay {
         let now = Utc::now();
         let mut state = self.state.lock().await;
         let agent_id = hello.agent_instance_id;
+        if let Some(fingerprint) = &hello.test_key_fingerprint
+            && (hello.pairing_mode != PairingMode::AutoPerBoot
+                || fingerprint.len() != 64
+                || !fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+        {
+            bail!("测试密钥摘要或 Agent 模式无效");
+        }
+        reclaim_expired_test_codes(&mut state, now);
         if let Some(original) = state.agents.get(&agent_id).cloned() {
             if original.retired_boots.contains(&hello.boot_id) {
                 bail!("Agent 启动标识已经退役");
@@ -2132,6 +2397,9 @@ impl Relay {
             {
                 bail!("新启动必须提供已签发的 Agent 恢复令牌");
             }
+            if !new_boot && original.hello.test_key_fingerprint != hello.test_key_fingerprint {
+                bail!("同一次 Agent 启动不能切换测试密钥");
+            }
             let mut replacement = original.clone();
             if managed_bootstrap {
                 replacement.resume_token = None;
@@ -2142,18 +2410,37 @@ impl Relay {
                     bail!("Agent 未完成的启动切换次数过多，请恢复当前启动的握手");
                 }
                 replacement.retired_boots.insert(original.hello.boot_id);
-                replacement.lease =
-                    self.lease_for_agent(&state, agent_id, hello.pairing_mode, now)?;
+            }
+            let incompatible_code = !hello.supports_mixed_pairing_code
+                && original
+                    .lease
+                    .pairing_code
+                    .as_ref()
+                    .is_some_and(AccessCode::is_mixed_short);
+            let new_session = new_boot
+                || incompatible_code
+                || (hello.pairing_mode == PairingMode::LongPerBoot
+                    && !original.lease.is_valid_at(now))
+                || (hello.test_key_fingerprint.is_some() && original.test_pairing.is_none());
+            if new_session {
+                (replacement.lease, replacement.test_pairing) =
+                    self.lease_for_start(&state, &hello, replacement.test_pairing, now)?;
                 replacement.session_id = SessionId::new();
                 replacement.permission_mode = PermissionMode::ApprovalRequired;
             } else {
                 replacement.lease.renew(now, self.lease_lifetime);
+                if hello.test_key_fingerprint.is_some()
+                    && let Some(test) = replacement.test_pairing.as_mut()
+                {
+                    test.expires_at = now + TEST_PAIRING_RETENTION;
+                }
             }
             replacement.connection_generation = original
                 .connection_generation
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("Agent 连接代次已经耗尽"))?;
             replacement.sender = Some(sender);
+            replacement.visual_context = visual_context::VisualContext::default();
             replacement.hello = hello;
             replacement.managed_target_id = managed_target_id;
             replacement.legacy_boot = false;
@@ -2166,6 +2453,10 @@ impl Relay {
                 authenticated_token: replacement.hello.resume_token.clone(),
             });
             let welcome = AgentWelcome {
+                release_catalog: self.release_catalog.clone(),
+                allow_agent_ai_disconnect: replacement.managed_target_id.is_none(),
+                allow_agent_human_disconnect: replacement.managed_target_id.is_none(),
+                test_key_accepted: replacement.hello.test_key_fingerprint.is_some(),
                 pairing_code: replacement.lease.pairing_code.clone(),
                 pairing_mode: replacement.hello.pairing_mode,
                 managed_target_id: replacement.managed_target_id.clone(),
@@ -2176,7 +2467,7 @@ impl Relay {
             };
             replacement.persisted_lease_expires_at = replacement.lease.expires_at;
             let connection_generation = replacement.connection_generation;
-            if new_boot {
+            if new_session {
                 remove_pairing_index(&mut state, original.lease.pairing_code.as_ref());
                 insert_pairing_index(
                     &mut state,
@@ -2186,7 +2477,7 @@ impl Relay {
             }
             state.agents.insert(agent_id, replacement);
             if let Err(error) = self.persist_state_locked(&state) {
-                if new_boot {
+                if new_session {
                     remove_pairing_index(&mut state, welcome.pairing_code.as_ref());
                     insert_pairing_index(
                         &mut state,
@@ -2197,7 +2488,7 @@ impl Relay {
                 state.agents.insert(agent_id, original);
                 return Err(error.context("保存 Agent 恢复状态失败"));
             }
-            if new_boot {
+            if new_session {
                 end_restarted_session(&mut state, original.session_id);
             }
             if original.managed_target_id.is_some() {
@@ -2216,10 +2507,18 @@ impl Relay {
             });
         }
         ensure_agent_capacity(state.agents.len())?;
+        // 新登记没有旧设备的恢复凭据，不能继承曾使用同一 UUID 的设备授权。
+        if let Some(store) = &self.enrollment_store {
+            store.forget_device_grants(agent_id.as_uuid())?;
+        }
         let managed_target_id = self.validate_managed_agent(&hello)?;
-        let lease = self.lease_for_agent(&state, agent_id, hello.pairing_mode, now)?;
+        let (lease, test_pairing) = self.lease_for_start(&state, &hello, None, now)?;
         let resume_token = new_secret_token();
         let welcome = AgentWelcome {
+            release_catalog: self.release_catalog.clone(),
+            allow_agent_ai_disconnect: managed_target_id.is_none(),
+            allow_agent_human_disconnect: managed_target_id.is_none(),
+            test_key_accepted: test_pairing.is_some(),
             pairing_code: lease.pairing_code.clone(),
             pairing_mode: hello.pairing_mode,
             managed_target_id: managed_target_id.clone(),
@@ -2232,9 +2531,11 @@ impl Relay {
         state.agents.insert(
             agent_id,
             AgentRecord {
+                visual_context: visual_context::VisualContext::default(),
                 hello,
                 managed_target_id,
                 lease: lease.clone(),
+                test_pairing,
                 resume_token: None,
                 previous_resume_token: None,
                 legacy_boot: false,
@@ -2265,13 +2566,43 @@ impl Relay {
         })
     }
 
+    fn lease_for_start(
+        &self,
+        state: &RelayState,
+        hello: &AgentHello,
+        reserved: Option<TestPairingLease>,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<(PairingLease, Option<TestPairingLease>)> {
+        let agent_id = hello.agent_instance_id;
+        let Some(fingerprint) = hello.test_key_fingerprint.as_ref() else {
+            return Ok((self.lease_for_agent(state, hello, now)?, reserved));
+        };
+        let mixed = hello.supports_mixed_pairing_code;
+        let code = match reserved.filter(|lease| {
+            &lease.fingerprint == fingerprint && (mixed || !lease.code.is_mixed_short())
+        }) {
+            Some(lease) => lease.code,
+            None => unique_pairing_code(state, self.portal_store.as_deref(), mixed)?,
+        };
+        let lease = PairingLease::new(agent_id, code.clone(), now, self.lease_lifetime);
+        Ok((
+            lease,
+            Some(TestPairingLease {
+                fingerprint: fingerprint.clone(),
+                code,
+                expires_at: now + TEST_PAIRING_RETENTION,
+            }),
+        ))
+    }
+
     fn lease_for_agent(
         &self,
         state: &RelayState,
-        agent_id: AgentInstanceId,
-        mode: PairingMode,
+        hello: &AgentHello,
         now: DateTime<Utc>,
     ) -> anyhow::Result<PairingLease> {
+        let agent_id = hello.agent_instance_id;
+        let mode = hello.pairing_mode;
         if mode == PairingMode::ManagedOnDemand {
             Ok(PairingLease::without_code(
                 agent_id,
@@ -2281,7 +2612,15 @@ impl Relay {
         } else {
             Ok(PairingLease::new(
                 agent_id,
-                unique_pairing_code(state, self.portal_store.as_deref())?,
+                if mode == PairingMode::LongPerBoot {
+                    AccessCode::random_long()
+                } else {
+                    unique_pairing_code(
+                        state,
+                        self.portal_store.as_deref(),
+                        hello.supports_mixed_pairing_code,
+                    )?
+                },
                 now,
                 self.lease_lifetime,
             ))
@@ -2406,11 +2745,16 @@ impl Relay {
             original_last_seen,
             original_lease,
             original_lease_expired,
+            original_test_pairing,
             should_persist,
             lease_expires_at,
         ) = {
             let agent = state.agents.get_mut(&agent_id)?;
             if agent.connection_generation != connection_generation || !agent.ready {
+                return None;
+            }
+            if agent.hello.pairing_mode == PairingMode::LongPerBoot && !agent.lease.is_valid_at(now)
+            {
                 return None;
             }
             if now - agent.last_seen < minimum_interval {
@@ -2419,16 +2763,27 @@ impl Relay {
             let original_last_seen = agent.last_seen;
             let original_lease = agent.lease.clone();
             let original_lease_expired = agent.lease_expired;
+            let original_test_pairing = agent.test_pairing.clone();
+            let testing = agent.hello.test_key_fingerprint.is_some();
+            if testing {
+                let test = agent
+                    .test_pairing
+                    .as_mut()
+                    .filter(|test| test.expires_at > now)?;
+                test.expires_at = now + TEST_PAIRING_RETENTION;
+            }
             agent.last_seen = now;
             agent.lease.renew(now, self.lease_lifetime);
             agent.lease_expired = false;
             let lease_expires_at = agent.lease.expires_at;
             let persistence_reserve = self.lease_lifetime / 2;
-            let should_persist = agent.persisted_lease_expires_at - now <= persistence_reserve;
+            let should_persist =
+                testing || agent.persisted_lease_expires_at - now <= persistence_reserve;
             (
                 original_last_seen,
                 original_lease,
                 original_lease_expired,
+                original_test_pairing,
                 should_persist,
                 lease_expires_at,
             )
@@ -2443,6 +2798,7 @@ impl Relay {
                 agent.last_seen = original_last_seen;
                 agent.lease = original_lease;
                 agent.lease_expired = original_lease_expired;
+                agent.test_pairing = original_test_pairing;
             }
             warn!(
                 agent_instance_id = %agent_id,
@@ -2570,6 +2926,26 @@ impl Relay {
                 error: Some("ControllerApproved 只允许已认证 AI Controller 使用".to_owned()),
             };
         }
+        let initializes_control = state.agents.get(&agent_id).is_some_and(|agent| {
+            agent.hello.target_context.as_ref().is_some_and(|context| {
+                context.capabilities.iter().any(|capability| {
+                    capability.capability == "control_initialization_v1"
+                        && capability.status == remoteops_domain::CapabilityAvailability::Available
+                })
+            })
+        });
+        let installation_grant = (controller_kind == ControllerKind::Ai
+            && supports_installation_grants(&agent.hello))
+        .then(|| {
+            request.pairing_code.is_some()
+                && request.expected_session_id.is_none()
+                && managed_connection_id.is_none()
+                && controller.installation_id.is_some_and(|id| {
+                    self.enrollment_store()
+                        .and_then(|store| store.has_device_grant(id, agent_id.as_uuid()))
+                        .unwrap_or(false)
+                })
+        });
         let (binding_messages, replaced_binding) = {
             let bindings = state.session_bindings.entry(session_id).or_default();
             if managed_connection_id.is_some() {
@@ -2619,8 +2995,10 @@ impl Relay {
                     existing.controller_generation,
                 );
             }
-            if bindings.get(controller_kind).is_none() {
+            let new_binding = bindings.get(controller_kind).is_none();
+            if new_binding {
                 bindings.insert(SessionBinding {
+                    installation_grant,
                     controller_id,
                     owner_id,
                     controller_kind,
@@ -2635,6 +3013,16 @@ impl Relay {
             }
 
             control::initialize_binding_state(bindings, session_id, agent_generation);
+            if new_binding
+                && initializes_control
+                && controller_kind == ControllerKind::Ai
+                && let Some(current) = bindings
+                    .ai
+                    .as_mut()
+                    .and_then(|binding| binding.control_state.as_mut())
+            {
+                current.initialization_pending = true;
+            }
             (
                 bindings
                     .all()
@@ -2725,6 +3113,98 @@ impl Relay {
             error_code: None,
             error: None,
         }
+    }
+
+    // 现场只能释放本 Agent 当前会话的 AI 槽位；令牌区分同一控制端在同一代次的重新配对。
+    async fn disconnect_binding_from_agent(
+        &self,
+        agent_id: AgentInstanceId,
+        generation: u64,
+        session: SessionId,
+        token: &str,
+    ) {
+        let mut state = self.state.lock().await;
+        let Some(agent_sender) = state
+            .agents
+            .get(&agent_id)
+            .filter(|agent| {
+                agent.ready
+                    && agent.connection_generation == generation
+                    && agent.session_id == session
+                    && agent.managed_target_id.is_none()
+            })
+            .and_then(|agent| agent.sender.clone())
+        else {
+            return;
+        };
+        let Some(bindings) = state.session_bindings.get_mut(&session) else {
+            return;
+        };
+        if bindings.managed_connection_id.is_some() {
+            return;
+        }
+        let binding = if bindings
+            .ai
+            .as_ref()
+            .is_some_and(|b| b.binding_token == token)
+        {
+            bindings.ai.take()
+        } else if bindings
+            .human
+            .as_ref()
+            .is_some_and(|b| b.binding_token == token)
+        {
+            bindings.human_takeover = false;
+            bindings.human.take()
+        } else {
+            return;
+        }
+        .expect("已核对本代绑定");
+        let human = binding.controller_kind == ControllerKind::Human;
+        if bindings.is_empty() {
+            state.session_bindings.remove(&session);
+        }
+        if human {
+            desktop::close(&mut state, session);
+            refresh_control_state(&mut state, session);
+            if let Some(bindings) = state.session_bindings.get(&session)
+                && let Some(ai) = bindings.ai.as_ref()
+            {
+                let update = controller_binding(
+                    session,
+                    ai,
+                    bindings.permission_mode_for(ControllerKind::Ai),
+                );
+                let _ = agent_sender.send(WireMessage::ControllerBinding(update));
+            }
+        }
+        if let Some(controller) = state.controllers.get_mut(&binding.controller_id)
+            && controller.connection_generation == binding.controller_generation
+        {
+            controller.sessions.remove(&session);
+            let reason = if human {
+                "现场人员已断开人工运维"
+            } else {
+                "现场人员已断开 AI 工程师连接"
+            };
+            let _ = controller.sender.send(WireMessage::ConnectionRemoved {
+                session_id: session,
+                reason: reason.into(),
+            });
+        }
+        state.approvals.retain(|_, approval| {
+            approval.session_id != session
+                || approval.controller_id != binding.controller_id
+                || approval.controller_generation != binding.controller_generation
+        });
+        state
+            .in_flight
+            .retain(|_, request| request.session_id != session || request.binding_token != token);
+        let _ = agent_sender.send(WireMessage::ControllerBindingRevoked {
+            session_id: session,
+            binding_token: binding.binding_token,
+        });
+        send_session_connection_update(&state, session, None);
     }
 
     async fn release_controller_session(
@@ -2836,6 +3316,7 @@ impl Relay {
                 agent.permission_mode = permission_mode;
                 (agent.session_id, agent.sender.clone())
             };
+            desktop::close(&mut state, session_id);
             if let Some(bindings) = state.session_bindings.get_mut(&session_id) {
                 bindings.agent_permission_mode = permission_mode;
                 if let Some(binding) = bindings.ai.as_mut() {
@@ -2993,20 +3474,82 @@ impl Relay {
             );
             return;
         }
-        if request.operation.is_visual()
-            && let Some(context) = state
-                .agents
-                .values()
-                .find(|agent| agent.session_id == request.session_id)
-                .and_then(|agent| agent.hello.target_context.as_ref())
-            && !context.visual_allowed()
+        if matches!(
+            request.operation,
+            RemoteOperation::ValidateResourceTool { .. }
+                | RemoteOperation::PrepareBrowserPassword { .. }
+                | RemoteOperation::FillBrowserPassword { .. }
+        ) && (controller.protocol_version < 20
+            || !state.agents.values().any(|agent| {
+                agent.session_id == request.session_id && agent.hello.protocol_version >= 20
+            }))
         {
             send_request_error(
                 controller_sender,
                 &request,
-                context
-                    .visual_disabled_reason()
-                    .unwrap_or("product_policy_disabled"),
+                "resource_tools_v2_unsupported",
+                "该操作需要协议20的MCP、Relay和Agent",
+            );
+            return;
+        }
+        if let Err((code, message)) = self.check_tool_request(&state, &request) {
+            send_request_error(controller_sender, &request, code, message);
+            return;
+        }
+        if matches!(
+            request.operation,
+            RemoteOperation::DescribeHostCapabilities | RemoteOperation::QueryHostCapability { .. }
+        ) && !state.agents.values().any(|agent| {
+            agent.session_id == request.session_id && supports_host_business(&agent.hello)
+        }) {
+            send_request_error(
+                controller_sender,
+                &request,
+                "host_business_unsupported",
+                "目标未声明协议22及宿主业务能力，拒绝向旧Agent发送新操作",
+            );
+            return;
+        }
+        if request.operation.is_resource_tool()
+            && !state
+                .agents
+                .values()
+                .find(|agent| agent.session_id == request.session_id)
+                .is_some_and(|agent| {
+                    agent.hello.protocol_version >= 18
+                        && agent.hello.target_context.as_ref().is_some_and(|context| {
+                            context.schema_version == 1
+                                && context.capabilities.iter().any(|status| {
+                                    status.capability == "resource_tools_v1"
+                                        && status.status
+                                            == remoteops_domain::CapabilityAvailability::Available
+                                })
+                        })
+                })
+        {
+            send_request_error(
+                controller_sender,
+                &request,
+                "resource_tools_unsupported",
+                "目标未启用资源工具协议v1",
+            );
+            return;
+        }
+        if request.operation.is_visual()
+            && let Some(reason) = state
+                .agents
+                .values()
+                .find(|agent| agent.session_id == request.session_id)
+                .and_then(|agent| {
+                    agent
+                        .visual_context
+                        .disabled_reason(agent.hello.target_context.as_ref())
+                })
+        {
+            send_request_error(
+                controller_sender,
+                &request,
+                reason,
                 "目标产品或当前运行环境不允许图形操作",
             );
             return;
@@ -3057,6 +3600,24 @@ impl Relay {
             );
             return;
         }
+        if controller_kind == ControllerKind::Ai
+            && !session_bindings.taken_over()
+            && !matches!(session_bindings.visual_handoff, VisualHandoff::Ready)
+            && matches!(
+                request.operation,
+                RemoteOperation::VisualInvoke { .. }
+                    | RemoteOperation::VisualTypeText { .. }
+                    | RemoteOperation::VisualSendInput { .. }
+            )
+        {
+            send_request_error(
+                controller_sender,
+                &request,
+                "fresh_visual_observation_required",
+                "人工已交还控制。请重新观察截图或控件树，再操作当前画面。",
+            );
+            return;
+        }
         let mut permission_mode = session_bindings.permission_mode_for(controller_kind);
         if state.in_flight.contains_key(&request.request_id) {
             send_request_error(
@@ -3081,6 +3642,7 @@ impl Relay {
         }
 
         if matches!(request.operation, RemoteOperation::EmergencyStop) {
+            desktop::close(&mut state, request.session_id);
             let stopped_request_ids: Vec<_> = state
                 .in_flight
                 .iter()
@@ -3134,7 +3696,7 @@ impl Relay {
         let human_takeover = state
             .session_bindings
             .get(&request.session_id)
-            .is_some_and(|bindings| bindings.human_takeover);
+            .is_some_and(SessionBindings::taken_over);
         if controller_kind == ControllerKind::Ai
             && human_takeover
             && !ai_operation_allowed_after_takeover(&self.policy, &request.operation)
@@ -3283,6 +3845,12 @@ impl Relay {
             return;
         };
 
+        if matches!(request.operation, RemoteOperation::CloseConnection) {
+            desktop::close(&mut state, request.session_id);
+        }
+        if matches!(request.operation, RemoteOperation::ReleaseHumanTakeover) {
+            desktop::release_input(&mut state, request.session_id);
+        }
         let takeover_state = match &request.operation {
             RemoteOperation::HumanTakeover => Some(true),
             RemoteOperation::ReleaseHumanTakeover => Some(false),
@@ -3297,6 +3865,9 @@ impl Relay {
                 .expect("Controller 角色绑定已在同一锁内验证");
             let previous = bindings.human_takeover;
             bindings.human_takeover = next_state;
+            if previous != next_state {
+                bindings.visual_handoff = VisualHandoff::ObserveAgain;
+            }
             if let Some(binding) = bindings.ai.as_mut() {
                 binding.control_state = None;
             }
@@ -3305,9 +3876,38 @@ impl Relay {
             None
         };
         refresh_control_state(&mut state, request.session_id);
+        if controller_kind == ControllerKind::Ai
+            && matches!(
+                request.operation,
+                RemoteOperation::VisualObserve {
+                    include_screenshot: true,
+                    ..
+                } | RemoteOperation::VisualObserve {
+                    include_ui_tree: true,
+                    ..
+                }
+            )
+            && let Some(bindings) = state.session_bindings.get_mut(&request.session_id)
+            && !bindings.taken_over()
+            && !matches!(bindings.visual_handoff, VisualHandoff::Ready)
+        {
+            bindings.visual_handoff = VisualHandoff::Waiting(request.request_id);
+        }
+        let context_query = if matches!(request.operation, RemoteOperation::GetTargetContext)
+            && let Some(agent) = state.agents.get_mut(&agent_id)
+        {
+            agent
+                .visual_context
+                .begin(agent.hello.target_context.as_ref())
+                .map(|sequence| (agent.connection_generation, sequence))
+        } else {
+            None
+        };
+        tools::track_tool_start(&mut state.tool_state, &request);
         state.in_flight.insert(
             request.request_id,
             InFlightRequest {
+                context_query,
                 binding_token: binding.binding_token.clone(),
                 control_state: binding.control_state.clone(),
                 agent_id,
@@ -3345,7 +3945,24 @@ impl Relay {
                 permission_mode,
             ))]
         };
-        let request_message = WireMessage::AuthorizedRemoteRequest(AuthorizedRemoteRequest {
+        let tcp_rules = if matches!(request.operation, RemoteOperation::CreateTcpForward { .. }) {
+            match Self::register_tcp_forward(
+                &mut state,
+                controller_id,
+                controller_generation,
+                &request,
+            ) {
+                Ok(rules) => Some(rules),
+                Err(error) => {
+                    state.in_flight.remove(&request.request_id);
+                    send_request_error(controller_sender, &request, "tcp_forward_rejected", &error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let authorized = AuthorizedRemoteRequest {
             request: request.clone(),
             authorization: RelayAuthorization {
                 controller_instance_id: controller_id,
@@ -3355,11 +3972,19 @@ impl Relay {
                 binding_token: binding.binding_token,
                 approval,
             },
-        });
+        };
+        let request_message = tcp_rules.map_or_else(
+            || WireMessage::AuthorizedRemoteRequest(authorized.clone()),
+            |rules| WireMessage::TcpForwardAuthorized {
+                authorized: authorized.clone(),
+                rules,
+            },
+        );
         let binding_failed = binding_messages
             .into_iter()
             .any(|message| agent_sender.send(message).is_err());
         if binding_failed || agent_sender.send(request_message).is_err() {
+            tcp::close(&mut state, request.request_id, "Agent 转发授权发送失败");
             state.in_flight.remove(&request.request_id);
             if let Some(previous_takeover) = previous_takeover {
                 state
@@ -3445,12 +4070,32 @@ impl Relay {
                 );
                 return;
             }
+            tools::track_tool_response(&mut state.tool_state, &message);
+            if matches!(&message, WireMessage::Error { .. })
+                || matches!(&message,WireMessage::RemoteResponse(response) if response.error_code.is_some() || response.exit_code!=Some(0))
+            {
+                tcp::close(&mut state, request_id, "Agent 未成功建立转发授权");
+            }
             let original_binding_active = in_flight_binding_is_active(&state, &in_flight);
+            if original_binding_active
+                && terminal
+                && let Some((generation, sequence)) = in_flight.context_query
+                && generation == connection_generation
+                && let Some(agent) = state.agents.get_mut(&agent_id)
+            {
+                agent.visual_context.finish(
+                    sequence,
+                    agent.hello.target_context.as_ref(),
+                    &message,
+                );
+            }
             let mut senders = Vec::new();
             if original_binding_active
                 && let Some(controller) = state.controllers.get(&in_flight.controller_id)
                 && controller.connection_generation == in_flight.controller_generation
                 && controller.kind == in_flight.controller_kind
+                && (controller.protocol_version >= 20
+                    || !matches!(&message, WireMessage::RemoteEvent(event) if matches!(event.payload, remoteops_domain::EventPayload::ResourceToolProgress { .. } | remoteops_domain::EventPayload::OperationRequested { operation: RemoteOperation::ValidateResourceTool { .. } | RemoteOperation::PrepareBrowserPassword { .. } | RemoteOperation::FillBrowserPassword { .. } })))
             {
                 senders.push(controller.sender.clone());
             }
@@ -3466,12 +4111,36 @@ impl Relay {
                     .get(&human_binding.controller_id)
                     .filter(|controller| {
                         controller.connection_generation == human_binding.controller_generation
+                            && (controller.protocol_version >= 20 || !matches!(&message, WireMessage::RemoteEvent(event) if matches!(event.payload, remoteops_domain::EventPayload::ResourceToolProgress { .. } | remoteops_domain::EventPayload::OperationRequested { operation: RemoteOperation::ValidateResourceTool { .. } | RemoteOperation::PrepareBrowserPassword { .. } | RemoteOperation::FillBrowserPassword { .. } })))
                     })
             {
                 senders.push(human_controller.sender.clone());
             }
             if terminal && let Some(completed) = state.in_flight.remove(&request_id) {
                 if original_binding_active {
+                    if completed.controller_kind == ControllerKind::Ai
+                        && let WireMessage::RemoteResponse(response) = &message
+                        && let Some(bindings) = state.session_bindings.get_mut(&session_id)
+                        && !bindings.taken_over()
+                        && matches!(bindings.visual_handoff, VisualHandoff::Waiting(id) if id == request_id)
+                    {
+                        let observed = response.error_code.is_none()
+                            && response.details.as_ref().is_some_and(|v| {
+                                v.get("state").and_then(|s| s.as_str()) == Some("ready")
+                                    && (v
+                                        .get("screenshot_base64")
+                                        .and_then(|s| s.as_str())
+                                        .is_some_and(|s| !s.is_empty())
+                                        || v.pointer("/ui_tree/available")
+                                            .and_then(serde_json::Value::as_bool)
+                                            == Some(true))
+                            });
+                        bindings.visual_handoff = if observed {
+                            VisualHandoff::Ready
+                        } else {
+                            VisualHandoff::ObserveAgain
+                        };
+                    }
                     control::renew_after_success(&mut state, &completed, &message);
                 }
                 let failed = matches!(
@@ -3550,7 +4219,8 @@ impl Relay {
                 update
             });
             let mut failures = Vec::new();
-            if update.is_some() {
+            if let Some(descriptor) = &update {
+                tools::clear_session(&mut state.tool_state, descriptor.session_id);
                 let abandoned: Vec<_> = state
                     .in_flight
                     .iter()
@@ -3646,12 +4316,18 @@ impl Relay {
     #[allow(clippy::too_many_lines)]
     async fn cleanup_expired(&self) {
         self.cleanup_stale_controllers().await;
+        {
+            let mut state = self.state.lock().await;
+            self.prune_desktops(&mut state);
+            self.prune_tcp_locked(&mut state);
+        }
         let now = Utc::now();
         let (notifications, failures) = {
             let mut state = self.state.lock().await;
             state
                 .approvals
                 .retain(|_, approval| approval.expires_at > now);
+            let reclaimed_tests = reclaim_expired_test_codes(&mut state, now);
             let expired_ids: Vec<_> = state
                 .agents
                 .iter()
@@ -3730,7 +4406,9 @@ impl Relay {
                     info!(agent_instance_id = %agent_id, "已回收长期过期且未配对的 Agent 身份");
                 }
             }
-            if removed_any && let Err(error) = self.persist_state_locked(&state) {
+            if (removed_any || reclaimed_tests)
+                && let Err(error) = self.persist_state_locked(&state)
+            {
                 warn!(error = %error, "Relay 无法持久化租约清理结果");
             }
             (notifications, failures)
@@ -3915,6 +4593,13 @@ fn legacy_agent_was_paired() -> bool {
     true
 }
 
+fn validate_global_guide(guide: &GlobalGuide) -> anyhow::Result<()> {
+    if guide.markdown.len() > 32 * 1024 || guide.markdown.contains('\0') {
+        bail!("RemoteOps 全局操作指引最多 32 KiB，且不能包含 NUL 字符");
+    }
+    Ok(())
+}
+
 // 旧磁盘格式的迁移只作用于状态快照，不放宽在线 AgentHello 的必填字段。
 fn decode_persisted_state(contents: &str) -> anyhow::Result<PersistedRelayState> {
     let mut value: serde_json::Value = serde_json::from_str(contents)?;
@@ -3975,6 +4660,13 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
     let now = Utc::now();
     state.audit_log = persisted.audit_log;
     state.admin_password_hash = persisted.admin_password_hash;
+    state.global_guide = persisted.global_guide;
+    persisted
+        .tcp_forward_policy
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+    state.tcp.policy = persisted.tcp_forward_policy;
+    validate_global_guide(&state.global_guide)?;
     let mut session_ids = BTreeSet::new();
     ensure_agent_capacity(persisted.agents.len().saturating_sub(1))?;
     for persisted_agent in persisted.agents {
@@ -4020,8 +4712,10 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
         state.agents.insert(
             agent_id,
             AgentRecord {
+                visual_context: visual_context::VisualContext::default(),
                 hello,
                 lease: persisted_agent.lease,
+                test_pairing: persisted_agent.test_pairing,
                 resume_token: persisted_agent.resume_token,
                 previous_resume_token: persisted_agent.previous_resume_token,
                 legacy_boot: persisted_agent.legacy_boot,
@@ -4039,6 +4733,23 @@ fn load_persisted_state(path: &Path, state: &mut RelayState) -> anyhow::Result<(
                 permission_mode: PermissionMode::ApprovalRequired,
             },
         );
+    }
+    reclaim_expired_test_codes(state, now);
+    validate_persisted_test_codes(state)
+}
+
+fn validate_persisted_test_codes(state: &RelayState) -> anyhow::Result<()> {
+    let mut test_codes = BTreeSet::new();
+    for (agent_id, agent) in &state.agents {
+        if let Some(test) = &agent.test_pairing
+            && (!test_codes.insert(test.code.clone())
+                || state.pairing_index.get(&test.code).is_some_and(|owner| {
+                    owner != agent_id
+                        || agent.hello.test_key_fingerprint.as_ref() != Some(&test.fingerprint)
+                }))
+        {
+            bail!("Relay 状态文件包含重复的测试控制码");
+        }
     }
     Ok(())
 }
@@ -4061,6 +4772,7 @@ fn save_persisted_state(path: &Path, state: &RelayState) -> anyhow::Result<()> {
                 hello,
                 managed_target_id: agent.managed_target_id.clone(),
                 lease: agent.lease.clone(),
+                test_pairing: agent.test_pairing.clone(),
                 resume_token: agent.resume_token.clone(),
                 previous_resume_token: agent.previous_resume_token.clone(),
                 legacy_boot: agent.legacy_boot,
@@ -4072,10 +4784,12 @@ fn save_persisted_state(path: &Path, state: &RelayState) -> anyhow::Result<()> {
         })
         .collect::<Vec<_>>();
     let contents = serde_json::to_vec_pretty(&PersistedRelayState {
+        tcp_forward_policy: state.tcp.policy.clone(),
         version: PERSISTED_STATE_VERSION,
         agents,
         audit_log: state.audit_log.clone(),
         admin_password_hash: state.admin_password_hash.clone(),
+        global_guide: state.global_guide.clone(),
     })?;
     let file_name = path
         .file_name()
@@ -4220,6 +4934,7 @@ fn end_restarted_session(state: &mut RelayState, session_id: SessionId) {
 }
 
 fn end_session(state: &mut RelayState, session_id: SessionId, reason: &str) {
+    desktop::close(state, session_id);
     state.session_bindings.remove(&session_id);
     state
         .approvals
@@ -4263,12 +4978,22 @@ fn resume_token_matches(agent: &AgentRecord, supplied: Option<&String>) -> bool 
             })
 }
 
+fn supports_installation_grants(hello: &AgentHello) -> bool {
+    hello.target_context.as_ref().is_some_and(|context| {
+        context.capabilities.iter().any(|cap| {
+            cap.capability == "managed_install_grant_v1"
+                && cap.status == remoteops_domain::CapabilityAvailability::Available
+        })
+    })
+}
+
 fn controller_binding(
     session_id: SessionId,
     binding: &SessionBinding,
     permission_mode: PermissionMode,
 ) -> ControllerBinding {
     ControllerBinding {
+        installation_grant: binding.installation_grant,
         session_id,
         controller_instance_id: binding.controller_id,
         owner_id: binding.owner_id,
@@ -4359,14 +5084,24 @@ fn send_session_connection_update(
     }
 }
 
-fn remove_pairing_index(state: &mut RelayState, code: Option<&PairingCode>) {
+fn supports_host_business(hello: &AgentHello) -> bool {
+    hello.protocol_version == remoteops_protocol::BRIDGE_PROTOCOL_VERSION
+        && hello.target_context.as_ref().is_some_and(|context| {
+            context.capabilities.iter().any(|status| {
+                status.capability == "host_business_v1"
+                    && status.status == remoteops_domain::CapabilityAvailability::Available
+            })
+        })
+}
+
+fn remove_pairing_index(state: &mut RelayState, code: Option<&AccessCode>) {
     if let Some(code) = code {
         state.pairing_index.remove(code);
     }
 }
 fn insert_pairing_index(
     state: &mut RelayState,
-    code: Option<&PairingCode>,
+    code: Option<&AccessCode>,
     agent_id: AgentInstanceId,
 ) {
     if let Some(code) = code {
@@ -4374,15 +5109,56 @@ fn insert_pairing_index(
     }
 }
 
+fn reclaim_expired_test_codes(state: &mut RelayState, now: DateTime<Utc>) -> bool {
+    let mut reclaimed = false;
+    for agent in state.agents.values_mut() {
+        if agent
+            .test_pairing
+            .as_ref()
+            .is_some_and(|test| test.expires_at <= now)
+        {
+            let test = agent.test_pairing.take().expect("刚确认测试租约存在");
+            if agent.lease.pairing_code.as_ref() == Some(&test.code) {
+                state.pairing_index.remove(&test.code);
+                agent.lease.pairing_code = None;
+                agent.lease.expires_at = agent.lease.expires_at.min(now);
+            }
+            reclaimed = true;
+        }
+    }
+    reclaimed
+}
+
 fn unique_pairing_code(
     state: &RelayState,
     portal: Option<&PortalStore>,
-) -> anyhow::Result<PairingCode> {
+    mixed: bool,
+) -> anyhow::Result<AccessCode> {
+    // 保留 L、0、1；签发时避开容易与数字混淆的 I 和 O。
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
     let mut rng = rand::thread_rng();
     for _ in 0..100 {
-        let value = format!("{:09}", rng.gen_range(0_u32..1_000_000_000));
-        let code = PairingCode::parse(value).map_err(|error| anyhow!(error))?;
+        let value = if mixed {
+            let candidate: String = (0..9)
+                .map(|_| char::from(ALPHABET[rng.gen_range(0..ALPHABET.len())]))
+                .collect();
+            if !candidate.bytes().any(|b| b.is_ascii_digit())
+                || !candidate.bytes().any(|b| b.is_ascii_uppercase())
+            {
+                continue;
+            }
+            candidate
+        } else {
+            format!("{:09}", rng.gen_range(0_u32..1_000_000_000))
+        };
+        let code = AccessCode::parse(value).map_err(|error| anyhow!(error))?;
         if !state.pairing_index.contains_key(&code)
+            && !state.agents.values().any(|agent| {
+                agent
+                    .test_pairing
+                    .as_ref()
+                    .is_some_and(|test| test.code == code)
+            })
             && !portal
                 .map(|store| store.code_reserved(code.as_str(), Utc::now()))
                 .transpose()?
@@ -4408,8 +5184,13 @@ fn new_secret_token() -> String {
 #[cfg(test)]
 mod tests {
     include!("relay_control_tests.rs");
+    include!("relay_visual_context_tests.rs");
+    include!("relay_tcp_tests.rs");
     include!("relay_enrollment_tests.rs");
+    include!("relay_tool_tests.rs");
+    include!("relay_tool_transfer_tests.rs");
     include!("relay_boot_tests.rs");
+    include!("relay_bridge_tests.rs");
     include!("relay_portal_tests.rs");
     use std::path::PathBuf;
 
@@ -4483,6 +5264,7 @@ mod tests {
 
     fn hello(agent_instance_id: AgentInstanceId, resume_token: Option<String>) -> AgentHello {
         AgentHello {
+            test_key_fingerprint: None,
             target_context: None,
             pairing_mode: PairingMode::AutoPerBoot,
             managed_enrollment: None,
@@ -4497,6 +5279,7 @@ mod tests {
             credential_encryption_public_key: "test-public-key".to_owned(),
             credential_encryption_key_id: "test-key-id".to_owned(),
             mac_address: Some("00:11:22:33:44:55".to_owned()),
+            supports_mixed_pairing_code: false,
             supports_agent_shutdown: true,
         }
     }
@@ -4604,6 +5387,7 @@ mod tests {
                 ai_id,
                 generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -4683,6 +5467,7 @@ mod tests {
                 ai_id,
                 generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -4783,6 +5568,7 @@ mod tests {
                     ai_id,
                     generation,
                     PairRequest {
+                        expected_agent_id: None,
                         connection_resume_token: None,
                         expected_session_id: None,
                         request_id: RequestId::new(),
@@ -4848,6 +5634,8 @@ mod tests {
     async fn ai_sender(relay: &Relay, controller_id: ControllerInstanceId) -> Sender {
         controller_sender(relay, controller_id).await
     }
+
+    include!("relay_desktop_tests.rs");
 
     async fn human_sender(relay: &Relay, controller_id: ControllerInstanceId) -> Sender {
         controller_sender(relay, controller_id).await
@@ -5559,6 +6347,7 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -5579,6 +6368,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -5599,6 +6389,7 @@ mod tests {
                 other_ai_id,
                 other_ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -5641,6 +6432,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -5751,6 +6543,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -5772,6 +6565,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn onsite_disconnect_removes_only_current_ai_and_notifies_both_ends() {
+        let relay = relay(Duration::minutes(10));
+        let id = AgentInstanceId::new();
+        let (agent, mut arx, session) = ready_agent(&relay, id, None).await;
+        assert!(agent.welcome.allow_agent_ai_disconnect);
+        let generation = agent.connection_generation;
+        let pair = || PairRequest {
+            request_id: RequestId::new(),
+            pairing_code: agent.welcome.pairing_code.clone(),
+            expected_session_id: None,
+            expected_agent_id: None,
+            connection_resume_token: None,
+            permission_mode: PermissionMode::ApprovalRequired,
+        };
+        let (ai, ag, mut ai_rx) = register_controller(&relay, ControllerKind::Ai).await;
+        let (human, hg, mut human_rx) = register_controller(&relay, ControllerKind::Human).await;
+        for (controller, gen_id) in [(ai, ag), (human, hg)] {
+            assert!(
+                relay
+                    .pair_controller(controller, gen_id, pair())
+                    .await
+                    .connection
+                    .is_some()
+            );
+        }
+        let (at, ht) = {
+            let state = relay.state.lock().await;
+            let bindings = &state.session_bindings[&session];
+            (
+                bindings.ai.as_ref().unwrap().binding_token.clone(),
+                bindings.human.as_ref().unwrap().binding_token.clone(),
+            )
+        };
+        for (agent_id, g, s, token) in [
+            (id, generation + 1, session, &at),
+            (AgentInstanceId::new(), generation, session, &at),
+            (id, generation, SessionId::new(), &at),
+            (id, generation + 1, session, &ht),
+        ] {
+            relay
+                .disconnect_binding_from_agent(agent_id, g, s, token)
+                .await;
+        }
+        assert!(
+            relay.state.lock().await.session_bindings[&session]
+                .ai
+                .is_some()
+        );
+        while ai_rx.try_recv().is_ok() {}
+        while human_rx.try_recv().is_ok() {}
+        while arx.try_recv().is_ok() {}
+        relay
+            .disconnect_binding_from_agent(id, generation, session, &at)
+            .await;
+        assert!(
+            matches!(ai_rx.try_recv(), Ok(WireMessage::ConnectionRemoved { session_id, .. }) if session_id == session)
+        );
+        assert!(
+            matches!(arx.try_recv(), Ok(WireMessage::ControllerBindingRevoked { binding_token, .. }) if binding_token == at)
+        );
+        assert!(matches!(
+            human_rx.try_recv(),
+            Ok(WireMessage::ConnectionUpdated(_))
+        ));
+        {
+            let state = relay.state.lock().await;
+            assert!(state.session_bindings[&session].ai.is_none());
+            assert!(state.controllers[&human].sessions.contains(&session));
+            assert!(!state.controllers[&ai].sessions.contains(&session));
+        }
+        assert!(
+            relay
+                .pair_controller(ai, ag, pair())
+                .await
+                .connection
+                .is_some()
+        );
+        relay
+            .disconnect_binding_from_agent(id, generation, session, &at)
+            .await;
+        assert!(
+            relay.state.lock().await.session_bindings[&session]
+                .ai
+                .is_some()
+        );
+        relay
+            .disconnect_binding_from_agent(id, generation, session, &ht)
+            .await;
+        let state = relay.state.lock().await;
+        assert!(state.session_bindings[&session].human.is_none());
+        assert!(state.session_bindings[&session].ai.is_some());
+        assert!(state.controllers[&ai].sessions.contains(&session));
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn ai_permission_survives_later_human_pairing_takeover_and_release() {
         let relay = relay(Duration::minutes(10));
@@ -5785,6 +6673,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -5813,6 +6702,7 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6011,6 +6901,7 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6024,6 +6915,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "验证同一会话中急停前后的状态")]
     async fn human_emergency_stop_aborts_owner_requests_and_downgrades_session() {
         let relay = relay(Duration::minutes(10));
         let agent_id = AgentInstanceId::new();
@@ -6042,6 +6934,7 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6057,6 +6950,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6070,6 +6964,7 @@ mod tests {
         relay.state.lock().await.in_flight.insert(
             stopped_request_id,
             InFlightRequest {
+                context_query: None,
                 binding_token: String::new(),
                 control_state: None,
                 agent_id,
@@ -6141,6 +7036,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6153,6 +7049,7 @@ mod tests {
         relay.state.lock().await.in_flight.insert(
             stopped_request_id,
             InFlightRequest {
+                context_query: None,
                 binding_token: String::new(),
                 control_state: None,
                 agent_id,
@@ -6263,6 +7160,7 @@ mod tests {
                         id,
                         generation,
                         PairRequest {
+                            expected_agent_id: None,
                             connection_resume_token: None,
                             expected_session_id: None,
                             request_id: RequestId::new(),
@@ -6313,6 +7211,7 @@ mod tests {
                                 ai_id,
                                 ai_generation,
                                 PairRequest {
+                                    expected_agent_id: None,
                                     connection_resume_token: None,
                                     expected_session_id: None,
                                     request_id: RequestId::new(),
@@ -6352,6 +7251,7 @@ mod tests {
                             new_id,
                             new_generation,
                             PairRequest {
+                                expected_agent_id: None,
                                 connection_resume_token: None,
                                 expected_session_id: None,
                                 request_id: RequestId::new(),
@@ -6538,6 +7438,7 @@ mod tests {
                     id,
                     generation,
                     PairRequest {
+                        expected_agent_id: None,
                         connection_resume_token: None,
                         expected_session_id: None,
                         request_id: RequestId::new(),
@@ -6732,6 +7633,7 @@ mod tests {
                 first_id,
                 first_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6745,6 +7647,7 @@ mod tests {
                 second_id,
                 second_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6802,6 +7705,7 @@ mod tests {
                 first_id,
                 first_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6843,6 +7747,7 @@ mod tests {
                 second_id,
                 second_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6870,6 +7775,7 @@ mod tests {
                 controller_id,
                 generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6927,6 +7833,7 @@ mod tests {
                 ai_id,
                 ai_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -6980,6 +7887,7 @@ mod tests {
                 human_id,
                 human_generation,
                 PairRequest {
+                    expected_agent_id: None,
                     connection_resume_token: None,
                     expected_session_id: None,
                     request_id: RequestId::new(),
@@ -7082,6 +7990,7 @@ mod tests {
                     controller_id,
                     generation,
                     PairRequest {
+                        expected_agent_id: None,
                         connection_resume_token: None,
                         expected_session_id: None,
                         request_id: RequestId::new(),
@@ -7297,6 +8206,7 @@ mod tests {
                     controller_id,
                     generation,
                     PairRequest {
+                        expected_agent_id: None,
                         connection_resume_token: None,
                         expected_session_id: None,
                         request_id: RequestId::new(),

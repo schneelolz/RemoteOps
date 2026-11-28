@@ -1,6 +1,6 @@
 [package]
 name = "remoteops-policy"
-version.workspace = true
+version = "0.2.0-preview.6"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,9 @@ regex.workspace = true
 remoteops-domain = { path = "../remoteops-domain" }
 remoteops-serial = { path = "../remoteops-serial" }
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
